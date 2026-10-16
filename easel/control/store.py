@@ -198,13 +198,21 @@ class Store:
     def connect(cls, path: Path | str) -> "Store":
         """打开控制库并完成迁移；未知的新版本会被拒绝。
 
-        顺序刻意如此：先只设置连接级 PRAGMA（这类设置不落盘），再读取版本判定，
-        只有确认版本可迁移之后才执行迁移与 WAL 转换。因此拒绝未来版本时，
-        数据库字节、journal 模式与迁移记录都保持不变。
+        拒绝路径必须完全没有副作用，因此分两步：已存在的库先用**只读**连接做
+        版本预检，只有版本可迁移才打开读写连接。读写连接即使不执行写 SQL，
+        关闭时也可能把未 checkpoint 的 WAL 合并进主库——那会毁掉崩溃恢复所需的
+        日志，所以判定必须发生在它之前。
+
+        随后读写连接在取得迁移写锁后重新读取版本，迁移与 ``user_version``
+        在同一事务内提交，避免并发重复迁移。
         """
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         _restrict_directory(target.parent)
+        if target.exists():
+            stored_version = _read_version_without_side_effects(target)
+            if stored_version > SCHEMA_VERSION:
+                raise DomainError("unsupported_schema", 500)
         timeout_seconds = _BUSY_TIMEOUT_MS / 1000
         connection = sqlite3.connect(str(target), timeout=timeout_seconds,
                                      isolation_level=None)
@@ -269,26 +277,36 @@ class Store:
         """尝试一次 WAL 转换，返回本次是否已（或已是）WAL。
 
         ``PRAGMA journal_mode = WAL`` 不能在事务内执行，也不受 busy_timeout
-        保护：锁被占用时直接 ``database is locked`` 而不等待。单次尝试只返回
-        结果，不掩盖异常，方便调用方决定是否重试。
+        保护：锁被占用时直接 ``database is locked`` 而不等待。锁竞争会向上抛出
+        ``OperationalError``，由调用方决定是否重试；单次尝试不吞任何异常。
         """
-        try:
-            mode = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-        except sqlite3.OperationalError:
-            return False
+        mode = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
         return isinstance(mode, str) and mode.lower() == "wal"
 
     def _enable_wal(self) -> None:
-        """把库转换为 WAL；锁被短暂占用时按递增间隔有限重试。
+        """把库转换为 WAL；只对可恢复的锁竞争做有限重试。
 
-        转换只是部署层的性能与并发属性：即使始终失败数据库仍然可用，因此这里
-        不抛出，连接照常返回，由部署检查发现未生效的 WAL。
+        重试耗尽即视为打开失败：关闭连接并抛出 ``DomainError``，绝不返回一个
+        未启用 WAL 的 Store。非锁类的 ``OperationalError``（例如库损坏）既不
+        重试也不吞掉，原样抛出以便定位。
         """
         for attempt in range(_WAL_ATTEMPTS):
-            if self._convert_to_wal():
-                return
-            if attempt + 1 < _WAL_ATTEMPTS:
+            try:
+                if self._convert_to_wal():
+                    return
+            except sqlite3.OperationalError as error:
+                if not _is_lock_contention(error):
+                    raise
+                if attempt + 1 >= _WAL_ATTEMPTS:
+                    self.close()
+                    raise DomainError("wal_unavailable", 503) from error
                 time.sleep(_WAL_RETRY_SECONDS * (attempt + 1))
+                continue
+            # 语句执行成功但未转换到 WAL：短暂状态，按同样节奏重试
+            if attempt + 1 >= _WAL_ATTEMPTS:
+                self.close()
+                raise DomainError("wal_unavailable", 503)
+            time.sleep(_WAL_RETRY_SECONDS * (attempt + 1))
 
     # ------------------------------------------------------------------
     # 用户与 workspace
@@ -576,6 +594,38 @@ class Store:
             raise
         else:
             self._connection.execute("COMMIT")
+
+
+def _is_lock_contention(error: sqlite3.OperationalError) -> bool:
+    """区分可恢复的锁竞争与其他 OperationalError。
+
+    Python 3.10 的 ``sqlite3.OperationalError`` 没有 ``sqlite_errorcode``，
+    因此只能按 SQLite 的稳定错误文本判断；命中范围限定为 SQLITE_BUSY 与
+    SQLITE_LOCKED 两类消息。
+    """
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def _read_version_without_side_effects(path: Path) -> int:
+    """用只读连接读取 ``user_version``，不触发 WAL checkpoint。
+
+    ``mode=ro`` 会正常读取 WAL 中已提交的内容，因此"待恢复的 WAL 里写着未来
+    版本"也能被正确识别；``immutable=1`` 会忽略 WAL，读到过期版本，不能用于
+    这里的版本判定。只读访问可能更新共享内存的读者槽，这是读者记账，
+    不属于业务写入，也不会合并或删除待恢复的 WAL。
+    """
+    connection = sqlite3.connect(_read_only_uri(path), uri=True)
+    try:
+        return connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+
+def _read_only_uri(path: Path) -> str:
+    """构造只读连接 URI；Windows 路径使用正斜杠并转义 URI 保留字符。"""
+    raw = path.as_posix().replace("?", "%3f").replace("#", "%23")
+    return f"file:{raw}?mode=ro"
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:

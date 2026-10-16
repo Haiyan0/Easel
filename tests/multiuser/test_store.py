@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import hashlib
+import pathlib
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -75,7 +78,12 @@ def run_concurrently(path, worker, count: int = 2) -> list[Any]:
 
 
 def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
-    """多线程同步首次打开同一个库，返回成功的 Identity 与格式化后的异常文本。"""
+    """多线程同步**首次打开**同一个库，返回成功的 Identity 与全部异常文本。
+
+    屏障必须在 ``Store.open`` 之前：放到打开之后就无法保证"首次打开"这一步
+    真的在竞争，测不出冷启动初始化与迁移的并发窗口。线程内捕获 BaseException，
+    连断言类异常也带回主线程，不依赖线程默认的 stderr 输出。
+    """
     barrier = threading.Barrier(count, timeout=15)
     results: list[Identity] = []
     errors: list[str] = []
@@ -83,8 +91,8 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
     def worker(index: int) -> None:
         try:
+            barrier.wait()
             with Store.open(path) as store:
-                barrier.wait()
                 identity = store.create_user(f"用户{index}")
             with lock:
                 results.append(identity)
@@ -949,9 +957,110 @@ def test_disable_before_create_is_settled_deterministically(tmp_path):
         assert_error(still_blocked, 403, "user_disabled")
 
 
+def _open_write_connection(path, *, timeout_ms: int) -> sqlite3.Connection:
+    """构造读写连接；用于直接构造 Store 而不经过 Store.open 的迁移流程。"""
+    connection = sqlite3.connect(path, timeout=timeout_ms / 1000,
+                                 isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def _read_only_uri(path) -> str:
+    """构造只读连接 URI；Windows 路径需要正斜杠与转义。"""
+    raw = pathlib.Path(path).as_posix().replace("?", "%3f").replace("#", "%23")
+    return f"file:{raw}?mode=ro"
+
+
+def make_uncheckpointed_wal_database(script: str, path, *, version: int,
+                                     payload: str = "哨兵") -> None:
+    """在子进程里建库并保留未 checkpoint 的 WAL。
+
+    用 ``os._exit`` 跳过连接的正常关闭，模拟"一次崩溃恢复后尚未合并的 WAL"，
+    这正是拒绝路径最容易被意外改写的状态。
+    """
+    script_path = pathlib.Path(script)
+    script_path.write_text(
+        "import os, sqlite3, sys\n"
+        "path = sys.argv[1]\n"
+        "con = sqlite3.connect(path)\n"
+        "con.execute('PRAGMA journal_mode = WAL')\n"
+        "con.execute('CREATE TABLE future_only (id TEXT PRIMARY KEY)')\n"
+        "con.execute('INSERT INTO future_only (id) VALUES (?)', (sys.argv[2],))\n"
+        f"con.execute('PRAGMA user_version = %d')\n" % version +
+        "con.commit()\n"
+        "os._exit(0)\n",
+        encoding="utf-8")
+    subprocess.run([sys.executable, str(script_path), str(path), payload],
+                   check=True, capture_output=True)
+
+
+def read_only_snapshot(path) -> dict:
+    """用只读连接取快照；读写连接会 checkpoint,从而掩盖待恢复的 WAL。"""
+    connection = sqlite3.connect(_read_only_uri(path), uri=True)
+    try:
+        return {
+            "main_bytes": path.read_bytes(),
+            "wal_bytes": path.with_name(path.name + "-wal").read_bytes(),
+            "version": connection.execute("PRAGMA user_version").fetchone()[0],
+            "rows": connection.execute("SELECT id FROM future_only").fetchall(),
+            "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
+        }
+    finally:
+        connection.close()
+
+
 # --------------------------------------------------------------------------
 # 未知 schema 版本与迁移
 # --------------------------------------------------------------------------
+
+def test_future_version_with_pending_wal_is_rejected_without_checkpoint(tmp_path):
+    """带未 checkpoint WAL 的未来版本库：拒绝不得 checkpoint 主库或丢弃 WAL。
+
+    读写连接在关闭时会 checkpoint 合并 WAL，因此"没有执行写 SQL"不等于
+    "拒绝了写入"；版本预检必须是无副作用的只读读取。
+    """
+    path = tmp_path / "future_wal.sqlite3"
+    make_uncheckpointed_wal_database(tmp_path / "creator.py", path, version=999)
+    assert path.with_name(path.name + "-wal").exists(), "子进程应留下未合并的 WAL"
+
+    before = read_only_snapshot(path)
+    assert before["version"] == 999, "只读连接必须能读到 WAL 中的版本"
+
+    with pytest.raises(DomainError) as rejected:
+        with Store.open(path):
+            pass
+    assert_error(rejected, 500, "unsupported_schema")
+
+    after = read_only_snapshot(path)
+    assert after["main_bytes"] == before["main_bytes"], "拒绝不得改写主库字节"
+    assert after["wal_bytes"] == before["wal_bytes"], "拒绝不得删除或改写待恢复的 WAL"
+    assert after["version"] == 999
+    assert after["rows"] == before["rows"] == [("哨兵",)]
+    assert after["journal_mode"] == "wal", "拒绝不得改变 journal 模式"
+
+
+def test_future_version_rejection_never_destroys_pending_wal(tmp_path):
+    """拒绝之后,WAL 仍可被正确的一方恢复：读写连接的 checkpoint 才是破坏性的。"""
+    path = tmp_path / "future_wal2.sqlite3"
+    make_uncheckpointed_wal_database(tmp_path / "creator.py", path, version=999)
+
+    with pytest.raises(DomainError) as rejected:
+        with Store.open(path):
+            pass
+    assert_error(rejected, 500, "unsupported_schema")
+
+    assert path.with_name(path.name + "-wal").exists()
+    # 只有在显式打开读写连接时才会发生 checkpoint，这是被审的破坏性动作
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT id FROM future_only").fetchall() == [("哨兵",)]
+    finally:
+        connection.close()
+
+
+
 
 def test_newer_schema_version_is_rejected_without_touching_the_file(tmp_path):
     """拒绝未来版本前不得改变字节、journal 模式或迁移记录。"""
@@ -1097,8 +1206,10 @@ def test_wal_conversion_survives_a_transient_write_lock(tmp_path, monkeypatch):
     assert holding.wait(timeout=10), "持锁线程未就绪"
     try:
         # 锁被占用时单次转换立即失败：busy_timeout 对这个语句不生效
-        assert store._convert_to_wal() is False
-        assert store._convert_to_wal() is False
+        for _ in range(2):
+            with pytest.raises(sqlite3.OperationalError) as locked:
+                store._convert_to_wal()
+            assert "locked" in str(locked.value).lower()
 
         # 重试必须自行跨过锁窗口；用短的尝试间隔把窗口压到测试尺度
         monkeypatch_store_constants(monkeypatch, attempts=60, retry_seconds=0.02)
@@ -1146,6 +1257,103 @@ def test_workspace_state_changes_are_validated(tmp_path):
             assert_error(invalid, 400, "invalid_state")
 
         assert store.set_workspace_state("workspace-does-not-exist", "ready") is False
+
+
+def test_wal_retry_exhaustion_fails_loudly_and_closes_the_connection(tmp_path, monkeypatch):
+    """锁冲突耗尽重试预算时必须明确失败，而不是返回一个仍为 DELETE 的 Store。"""
+    path = tmp_path / "db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE legacy_notes (id TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch_store_constants(monkeypatch, attempts=3, retry_seconds=0.01)
+    victim = sqlite3.connect(path, timeout=0.1, isolation_level=None)
+    victim.execute("PRAGMA busy_timeout = 100")
+    victim.row_factory = sqlite3.Row
+    store = Store(victim, path)
+
+    holder = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")  # WAL 转换需要独占访问
+    holder.execute("INSERT INTO legacy_notes (id) VALUES ('lock')")
+    try:
+        with pytest.raises(DomainError) as exhausted:
+            store._enable_wal()
+        assert_error(exhausted, 503, "wal_unavailable")
+        # 失败路径必须关闭连接，不能留下句柄或锁
+        with pytest.raises(sqlite3.ProgrammingError):
+            victim.execute("SELECT 1")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    # 锁释放后同一个库仍能正常打开，且确实启用了 WAL
+    with Store.open(path) as reopened:
+        assert reopened.count_active_runs() == 0
+    final = sqlite3.connect(path)
+    try:
+        assert final.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        final.close()
+
+
+def test_wal_retry_runs_out_while_the_lock_is_held(tmp_path, monkeypatch):
+    """锁在整个重试窗口内保持时，打开失败；锁释放后可再次成功打开为 WAL。"""
+    path = tmp_path / "db"
+    with Store.open(path) as migrated:
+        assert migrated.count_active_runs() == 0
+    # 回到 DELETE 模式，让这次打开必须真正执行 WAL 转换
+    reset = sqlite3.connect(path, isolation_level=None)
+    assert reset.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+    reset.close()
+
+    monkeypatch_store_constants(monkeypatch, attempts=3, retry_seconds=0.01)
+    holder = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")  # 只持锁，不写入
+    try:
+        connection = _open_write_connection(path, timeout_ms=100)
+        store = Store(connection, path)
+        with pytest.raises(DomainError) as exhausted:
+            store._enable_wal()
+        assert_error(exhausted, 503, "wal_unavailable")
+        assert holder.in_transaction, "失败的打开不得影响持锁方的事务"
+        # 失败的 Store 不再持有可用连接：不会静默返回 DELETE 模式实例
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    with Store.open(path) as reopened:
+        assert reopened.count_active_runs() == 0
+    final = sqlite3.connect(path)
+    try:
+        assert final.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        final.close()
+
+
+def test_non_lock_operational_error_is_not_retried_or_swallowed(tmp_path, monkeypatch):
+    """非锁类 OperationalError 不能被当成锁竞争重试，也不能被吞掉。"""
+    path = tmp_path / "db"
+    calls = []
+
+    class FailingConnection:
+        """只复现非锁类 OperationalError 的连接替身；不替换任何 WAL SQL。"""
+
+        def execute(self, statement, *parameters):
+            calls.append(statement)
+            raise sqlite3.OperationalError("no such table: definitely_missing")
+
+    monkeypatch_store_constants(monkeypatch, attempts=5, retry_seconds=0.01)
+    store = Store(FailingConnection(), path)
+
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        store._enable_wal()
+    assert "definitely_missing" in str(raised.value)
+    assert len(calls) == 1, "非锁类错误不得进入重试"
 
 
 def test_newer_schema_version_is_rejected_without_rebuild(tmp_path):
