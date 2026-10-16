@@ -2,13 +2,18 @@
 
 设计要点：
 
-* 全部 SQL 参数化，事务显式 ``BEGIN IMMEDIATE``；并发约束（每空间 2、全局 8）
-  在事务内判定，不依赖进程内字典。
-* 每个连接显式开启外键、WAL 与 ``busy_timeout``。
+* 全部 SQL 参数化，事务显式 ``BEGIN IMMEDIATE``；并发约束（每空间 2、全局 8、
+  每会话 1）在事务内判定，不依赖进程内字典。
+* 每个连接显式开启外键与 ``busy_timeout``；WAL 是库的持久属性，只在确认
+  数据库版本可接受、且已取得迁移写锁之后转换一次。
 * 授权一律回溯数据库：``Identity`` 只提供 user_id/workspace_id，是否有效、
-  是否被禁用、workspace 是否属于该用户，都以库内记录为准。
-* 幂等（同一 ``client_request_id``）在容量检查之前识别，重试不会多占并发预算。
-* 未知的新版本数据库直接拒绝打开，不重建、不覆盖。
+  是否被禁用、workspace 是否属于该用户，都以库内记录为准。归属校验与
+  "允许接纳新任务的空间状态"是两件事：非 ready 空间不再接纳新任务，但已接纳
+  任务的收尾必须照常完成，否则并发额度会被永久占用。
+* 幂等（同一 ``client_request_id``）最先识别；随后是每会话单任务互斥，最后才是
+  容量判定。重试不会多占并发预算，也不会被互斥或容量挡下。
+* 未知的新版本数据库在读取版本后立即拒绝打开，此时连接尚未执行任何写入、
+  也不改变 journal 模式，不重建、不覆盖。
 """
 from __future__ import annotations
 
@@ -36,10 +41,17 @@ ACTIVE_RUN_STATUSES = ("reserved", "running", "awaiting_permission")
 TERMINAL_RUN_STATUSES = ("done", "failed", "interrupted", "cancelled")
 """终态；容量已释放，重复收尾必须安全且不重复释放。"""
 
-ACTIVE_WORKSPACE_STATES = ("ready",)
-"""可以接纳新任务的 workspace 状态。"""
+WORKSPACE_STATES = ("provisioning", "ready", "stopped", "failed")
+"""workspace 状态机；与 schema 的 CHECK 约束保持一致。"""
+
+READY_WORKSPACE_STATES = ("ready",)
+"""允许接纳新任务的 workspace 状态；收尾与归属读取不受它限制。"""
 
 _BUSY_TIMEOUT_MS = 5000
+
+_WAL_ATTEMPTS = 20
+_WAL_RETRY_SECONDS = 0.05
+"""冷库并发首次打开时，WAL 转换会短暂失败；有限重试而不是永久等待。"""
 
 _IDENTITY_COLUMNS = "users.id, users.display_name, users.role, workspaces.id AS workspace_id"
 
@@ -184,16 +196,21 @@ class Store:
 
     @classmethod
     def connect(cls, path: Path | str) -> "Store":
-        """打开控制库并完成迁移；未知的新版本会被拒绝。"""
+        """打开控制库并完成迁移；未知的新版本会被拒绝。
+
+        顺序刻意如此：先只设置连接级 PRAGMA（这类设置不落盘），再读取版本判定，
+        只有确认版本可迁移之后才执行迁移与 WAL 转换。因此拒绝未来版本时，
+        数据库字节、journal 模式与迁移记录都保持不变。
+        """
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         _restrict_directory(target.parent)
-        connection = sqlite3.connect(str(target), timeout=_BUSY_TIMEOUT_MS / 1000,
+        timeout_seconds = _BUSY_TIMEOUT_MS / 1000
+        connection = sqlite3.connect(str(target), timeout=timeout_seconds,
                                      isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         store = cls(connection, target)
         try:
             store._migrate()
@@ -214,21 +231,64 @@ class Store:
 
     def _migrate(self) -> None:
         """按版本推进 schema；比本代码更新的库一律拒绝，不做破坏性重建。"""
+        self._require_supported_version()
+        self._apply_migrations()
+        self._enable_wal()
+
+    def _require_supported_version(self) -> int:
+        """只读取版本；未知的新版本在此拒绝，此时尚未发生任何写入或模式转换。"""
         current = self._connection.execute("PRAGMA user_version").fetchone()[0]
         if current > SCHEMA_VERSION:
             raise DomainError("unsupported_schema", 500)
+        return current
+
+    def _apply_migrations(self) -> None:
+        """在写事务内重新读取版本并补齐迁移。
+
+        版本必须在取得写锁之后再读：否则两个并发连接会同时读到 0，
+        后拿锁的一方重复执行 migration 1。迁移与版本号在同一个事务里提交，
+        要么全部生效，要么全部回滚。
+        """
         with self._transaction():
-            for version in range(current + 1, SCHEMA_VERSION + 1):
-                statements = MIGRATIONS[version - 1] if version <= len(MIGRATIONS) else ()
+            version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise DomainError("unsupported_schema", 500)
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                statements = MIGRATIONS[target - 1] if target <= len(MIGRATIONS) else ()
                 if not statements:
                     raise DomainError("unsupported_schema", 500)
                 for statement in statements:
                     self._connection.execute(statement)
                 self._connection.execute(
-                    "INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (version, _now()))
-                # user_version 在显式事务内更新，迁移与版本号同时生效或不生效
-                self._connection.execute(f"PRAGMA user_version = {version}")
+                    "INSERT OR REPLACE INTO schema_migrations (version, applied_at)"
+                    " VALUES (?, ?)", (target, _now()))
+                # user_version 必须在事务内推进，避免提交了表却漏掉版本
+                self._connection.execute(f"PRAGMA user_version = {target}")
+
+    def _convert_to_wal(self) -> bool:
+        """尝试一次 WAL 转换，返回本次是否已（或已是）WAL。
+
+        ``PRAGMA journal_mode = WAL`` 不能在事务内执行，也不受 busy_timeout
+        保护：锁被占用时直接 ``database is locked`` 而不等待。单次尝试只返回
+        结果，不掩盖异常，方便调用方决定是否重试。
+        """
+        try:
+            mode = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        except sqlite3.OperationalError:
+            return False
+        return isinstance(mode, str) and mode.lower() == "wal"
+
+    def _enable_wal(self) -> None:
+        """把库转换为 WAL；锁被短暂占用时按递增间隔有限重试。
+
+        转换只是部署层的性能与并发属性：即使始终失败数据库仍然可用，因此这里
+        不抛出，连接照常返回，由部署检查发现未生效的 WAL。
+        """
+        for attempt in range(_WAL_ATTEMPTS):
+            if self._convert_to_wal():
+                return
+            if attempt + 1 < _WAL_ATTEMPTS:
+                time.sleep(_WAL_RETRY_SECONDS * (attempt + 1))
 
     # ------------------------------------------------------------------
     # 用户与 workspace
@@ -258,17 +318,36 @@ class Store:
                 (_now(), user_id))
         return cursor.rowcount == 1
 
+    def set_workspace_state(self, workspace_id: str, state: str) -> bool:
+        """按状态机切换 workspace 状态；返回该 workspace 是否存在。
+
+        非 ready 状态不再接纳新任务，但已接纳任务仍可收尾（见 ``_require_actor``）。
+        """
+        if state not in WORKSPACE_STATES:
+            raise DomainError("invalid_state", 400)
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE workspaces SET state = ? WHERE id = ?",
+                (state, _text(workspace_id)))
+            return self._workspace_exists(workspace_id)
+
+    def _workspace_exists(self, workspace_id: str) -> bool:
+        return self._connection.execute(
+            "SELECT 1 FROM workspaces WHERE id = ?", (workspace_id,)).fetchone() is not None
+
     # ------------------------------------------------------------------
     # 会话
     # ------------------------------------------------------------------
 
     def create_conversation(self, actor: Identity, title: str = "新对话") -> ConversationRecord:
         workspace_id = self._require_actor(actor)
+        self._require_ready_workspace(workspace_id)
         stamp = _now()
         conversation_id = uuid.uuid4().hex
-        # 归属与禁用状态在同一写事务内复查，避免检查后被禁用仍写入
+        # 归属、禁用状态与空间状态在同一写事务内复查，避免检查后被禁用仍写入
         with self._transaction():
             self._require_actor(actor)
+            self._require_ready_workspace(workspace_id)
             self._connection.execute(
                 "INSERT INTO conversations"
                 " (workspace_id, id, title, archived, created_at, updated_at)"
@@ -291,14 +370,20 @@ class Store:
 
     def reserve_run(self, actor: Identity, conversation_id: str, client_request_id: str,
                     input_digest: str, config_version: int) -> RunRecord:
-        """幂等接纳一次任务；重复请求返回原 Run，不重复占用并发预算。"""
+        """幂等接纳一次任务；重复请求返回原 Run，不重复占用并发预算。
+
+        判定顺序固定为：授权 → 会话归属 → 幂等 → 每会话互斥 → 容量。
+        幂等必须排在互斥与容量之前，否则合法重试会被挡下。
+        """
         workspace_id = self._require_actor(actor)
+        self._require_ready_workspace(workspace_id)
         conversation_id = _text(conversation_id)
         client_request_id = _text(client_request_id)
         input_digest = _text(input_digest)
         with self._transaction():
-            # 授权、幂等与容量判定共用同一个写事务，避免检查后被禁用仍写入
+            # 授权、互斥与容量判定共用同一个写事务，避免检查后被禁用仍写入
             self._require_actor(actor)
+            self._require_ready_workspace(workspace_id)
             self._require_conversation(workspace_id, conversation_id)
             existing = self._connection.execute(
                 "SELECT workspace_id, id, conversation_id, client_request_id, input_digest,"
@@ -306,11 +391,12 @@ class Store:
                 " WHERE workspace_id = ? AND client_request_id = ?",
                 (workspace_id, client_request_id)).fetchone()
             if existing is not None:
-                # 幂等重试必须在容量检查之前识别，否则重试会被 429 挡住
+                # 幂等重试必须在互斥与容量检查之前识别，否则重试会被 409/429 挡住
                 if (existing["conversation_id"] != conversation_id
                         or existing["input_digest"] != input_digest):
                     raise DomainError("request_conflict", 409)
                 return _run_record(existing)
+            self._require_conversation_free(workspace_id, conversation_id)
             self._require_capacity(workspace_id)
             run_id = uuid.uuid4().hex
             self._connection.execute(
@@ -418,6 +504,19 @@ class Store:
         if row is None:
             raise DomainError("not_found", 404)
 
+    def _require_conversation_free(self, workspace_id: str, conversation_id: str) -> None:
+        """同一会话同时只允许一个活跃 prompt。
+
+        活跃定义为尚未进入终态；终态任务不再占用会话额度，因此同一会话可以
+        在上一轮结束后继续下一轮。
+        """
+        busy = self._connection.execute(
+            "SELECT id FROM runs WHERE workspace_id = ? AND conversation_id = ?"
+            f" AND status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)}) LIMIT 1",
+            (workspace_id, conversation_id, *TERMINAL_RUN_STATUSES)).fetchone()
+        if busy is not None:
+            raise DomainError("conversation_busy", 409)
+
     def _require_capacity(self, workspace_id: str) -> None:
         """在事务内原子检查每空间 2 / 全局 8 的活跃任务预算。"""
         workspace_active = self._connection.execute(
@@ -430,11 +529,13 @@ class Store:
             raise DomainError("global_capacity", 429)
 
     def _require_actor(self, actor: Identity, *, allow_disabled: bool = False) -> str:
-        """按 user_id + workspace_id 重查归属与有效状态，返回该 workspace_id。
+        """按 user_id + workspace_id 重查归属，返回该 workspace_id。
 
-        Identity 只是传输对象：用户必须存在且未被禁用，workspace 必须确实属于该用户
-        且处于可接纳状态。收尾路径（``allow_disabled``）允许已禁用用户完成内部结算，
-        否则容量会被永久占用，但这不会放开任何新建或接纳入口。
+        Identity 只是传输对象：用户必须存在，workspace 必须确实属于该用户。
+        本方法**不**检查 workspace 状态，也不默认检查用户是否被禁用：
+        收尾路径（``allow_disabled``）必须在空间 failed/stopped 或用户被禁用时
+        仍可执行，否则已接纳任务无法进入终态、并发额度被永久占用。
+        接纳新任务的入口必须另外调用 :meth:`_require_ready_workspace`。
         """
         user_id = _text(actor.user_id)
         workspace_id = _text(actor.workspace_id)
@@ -447,10 +548,18 @@ class Store:
         workspace = self._connection.execute(
             "SELECT owner_user_id, state FROM workspaces WHERE id = ?",
             (workspace_id,)).fetchone()
-        if (workspace is None or workspace["owner_user_id"] != user_id
-                or workspace["state"] not in ACTIVE_WORKSPACE_STATES):
+        if workspace is None or workspace["owner_user_id"] != user_id:
             raise DomainError("unauthorized", 403)
         return workspace_id
+
+    def _require_ready_workspace(self, workspace_id: str) -> None:
+        """只有 ready 空间接纳新任务；非 ready 不影响已接纳任务的收尾。"""
+        row = self._connection.execute(
+            "SELECT state FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+        if row is None:
+            raise DomainError("unauthorized", 403)
+        if row["state"] not in READY_WORKSPACE_STATES:
+            raise DomainError("workspace_unavailable", 403)
 
     # ------------------------------------------------------------------
     # 事务
