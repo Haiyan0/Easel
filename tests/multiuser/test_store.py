@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 import time
@@ -98,6 +99,21 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
         thread.join(timeout=60)
     assert not any(thread.is_alive() for thread in threads), "并发打开未在超时内结束"
     return results, errors
+
+
+RELEASED_SCHEMA_FINGERPRINT = (
+    "76fb77382db7619c118c9e1ca395e3785b1996a27f440b7ca26f67e3e7ea4a82"
+)
+"""e0ad421（Task 1 首版）建库时的 schema 指纹；变更 schema 时必须同步更新。"""
+
+
+def schema_fingerprint(connection: sqlite3.Connection) -> str:
+    """对全部对象定义取规范化指纹，用于锁定发布版本的 schema。"""
+    rows = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
+        " AND name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
+    normalized = "\n".join(" ".join(row[0].split()) for row in rows)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def monkeypatch_store_constants(monkeypatch: pytest.MonkeyPatch, *,
@@ -1168,6 +1184,36 @@ def test_empty_database_file_is_initialized(tmp_path):
         user = store.create_user("A")
         conversation = store.create_conversation(user)
         assert store.get_conversation(user, conversation.id).id == conversation.id
+
+
+def test_database_created_by_the_released_schema_opens_and_upgrades(tmp_path):
+    """e0ad421 建出的库（version=1 的既有 schema）必须能直接打开使用。
+
+    本轮没有 schema 变更，所以该库应当一步不用迁移即可工作；一旦引入新迁移，
+    它也必须能从中升级，而不是被重建或拒绝。
+    """
+    path = tmp_path / "released.sqlite3"
+    with Store.open(path) as store:
+        original = store.create_user("原用户")
+        conversation = store.create_conversation(original, "既有会话")
+    # 模拟发布版建库后的状态：schema 已就位，版本为发布版记录的版本
+    assert count_migration_rows(path, 1) == 1
+
+    with Store.open(path) as reopened:
+        assert reopened.get_conversation(original, conversation.id).title == "既有会话"
+        fresh = reopened.create_user("新用户")
+        run = reserve(reopened, fresh, reopened.create_conversation(fresh).id)
+        assert reopened.get_run(fresh, run.id).id == run.id
+
+    assert count_migration_rows(path, 1) == 1, "打开既有库不得重复执行已完成的迁移"
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        # schema 指纹锁定发布版本：任何 schema 变更都会让本用例失败，
+        # 迫使实现同步新增迁移并更新这里的指纹
+        assert schema_fingerprint(connection) == RELEASED_SCHEMA_FINGERPRINT
+    finally:
+        connection.close()
 
 
 def test_version_zero_database_is_migrated_in_place(tmp_path):
