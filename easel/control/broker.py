@@ -86,37 +86,49 @@ def _canonical(value: object) -> str:
 
 
 class _LeaseGuard:
-    """请求额度生命周期：心跳续期、丢失检测与“先关闭后回收”顺序。"""
+    """请求额度与唯一关闭任务：所有结束路径等待同一次清理完成后才回收。
+
+    关闭竞争的关键是：response/client 的 ``is_closed`` 标志会在底层 stream /
+    transport 真正关闭前就置位；因此不能依赖重复 close 或布尔标志判断完成。
+    这里只创建一个 cleanup task，心跳丢失、chunks finally、外部 aclose 与取消
+    都通过 ``shield`` 等待同一任务，绝不取消它；租约只在该任务末尾删除。
+    """
 
     def __init__(self, broker: "BrokerService", lease_id: str):
         self._broker = broker
         self._lease_id = lease_id
-        self._released = False
-        self._abort = None
+        self._cleanup_task: asyncio.Task | None = None
         self._heartbeat: asyncio.Task | None = None
+        self._open_task: asyncio.Task | None = None
+        self._response = None
+        self._context = None
+        self._client = None
+        self._body = None
         self.gone = asyncio.Event()
+
+    def bind(self, **resources) -> None:
+        allowed = {"open_task", "response", "context", "client", "body"}
+        for name, value in resources.items():
+            if name not in allowed:
+                raise TypeError(f"unknown resource: {name}")
+            setattr(self, f"_{name}", value)
 
     def start(self) -> None:
         self._heartbeat = asyncio.create_task(self._heartbeat_loop())
 
-    def set_abort(self, abort) -> None:
-        self._abort = abort
+    def start_cleanup(self) -> None:
+        """同步启动唯一清理任务；调用者无需等待即可继续取消路径。"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup())
 
-    async def release(self, *, from_heartbeat: bool = False) -> None:
-        if self._released:
-            return
-        # 先置位，避免正常关闭与心跳丢失路径并发重复回收
-        self._released = True
+    async def close(self) -> None:
+        """启动或等待唯一清理；等待者可被取消，但清理任务本身不被取消。"""
+        self.start_cleanup()
         heartbeat = self._heartbeat
-        if heartbeat is not None and not from_heartbeat:
+        if heartbeat is not None and heartbeat is not asyncio.current_task():
+            # 只取消等待者；唯一 cleanup task 会继续执行到 close gate 完成
             heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-        await self._broker._db(self._broker.release_lease, self._lease_id)
+        await asyncio.shield(self._cleanup_task)
 
     async def _heartbeat_loop(self) -> None:
         interval = max(1.0, self._broker._lease_ttl / 3)
@@ -133,85 +145,115 @@ class _LeaseGuard:
             except Exception:
                 rowcount = 0
             if rowcount == 0:
-                # 续期失败或 UPDATE 零行都表示租约已丢失：先终止在途请求
+                # 续期失败或 UPDATE 零行都表示租约已丢失：先完成唯一清理
                 self.gone.set()
-                abort = self._abort
-                if abort is not None:
-                    try:
-                        await abort()
-                    except Exception:
-                        pass
-                await self.release(from_heartbeat=True)
+                await self.close()
                 return
+
+    async def _cleanup(self) -> None:
+        try:
+            open_task = self._open_task
+            if open_task is not None and not open_task.done():
+                open_task.cancel()
+                # 等待完成但不吞掉 cleanup 自身的取消
+                await asyncio.wait({open_task})
+                if not open_task.cancelled():
+                    try:
+                        open_task.exception()
+                    except BaseException:
+                        pass
+            response = self._response
+            if response is not None:
+                try:
+                    await response.aclose()
+                except Exception:
+                    pass
+            context = self._context
+            if context is not None:
+                try:
+                    await context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            client = self._client
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+            body = self._body
+            closer = getattr(body, "aclose", None)
+            if closer is not None:
+                try:
+                    await closer()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            # 唯一清理被取消时不得提前回收额度，让租约按 TTL 自然过期
+            raise
+        await self._broker._db(self._broker.release_lease, self._lease_id)
 
 
 @dataclass
 class BrokerResponse:
-    """已打开的上游响应；chunks() 流式产出并在结束/异常时释放额度。"""
+    """已打开的上游响应；chunks() 流式产出并在结束/异常时等待同一清理。"""
 
     status_code: int
     headers: dict[str, str]
     _response: httpx.Response = field(repr=False)
-    _context: object = field(repr=False)
-    _client: httpx.AsyncClient = field(repr=False)
     _guard: _LeaseGuard = field(repr=False)
-    _closed: bool = field(default=False, repr=False)
 
     async def chunks(self) -> AsyncIterator[bytes]:
+        cancelled = False
+        next_task = None
+        gone_task = None
         try:
             iterator = self._response.aiter_raw()
             gone_task = asyncio.create_task(self._guard.gone.wait())
-            next_task = None
-            try:
-                while True:
-                    next_task = asyncio.create_task(anext(iterator))
-                    done, _pending = await asyncio.wait(
-                        {next_task, gone_task},
-                        return_when=asyncio.FIRST_COMPLETED)
-                    if gone_task in done:
-                        next_task.cancel()
+            while True:
+                next_task = asyncio.create_task(anext(iterator))
+                done, _pending = await asyncio.wait(
+                    {next_task, gone_task},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if gone_task in done:
+                    next_task.cancel()
+                    # 不直接 await：避免当前读取任务的取消被 next_task 的
+                    # CancelledError 混淆；等待完成但不吞掉自身取消
+                    await asyncio.wait({next_task})
+                    if not next_task.cancelled():
                         try:
-                            await next_task
+                            next_task.exception()
                         except BaseException:
                             pass
-                        raise DomainError("lease_lost", 503)
-                    try:
-                        chunk = next_task.result()
-                    except StopAsyncIteration:
-                        break
-                    if self._guard.gone.is_set():
-                        raise DomainError("lease_lost", 503)
-                    yield chunk
-            finally:
-                if next_task is not None and not next_task.done():
-                    next_task.cancel()
-                    try:
-                        await next_task
-                    except BaseException:
-                        pass
-                gone_task.cancel()
+                    raise DomainError("lease_lost", 503)
                 try:
-                    await gone_task
-                except asyncio.CancelledError:
-                    pass
+                    chunk = next_task.result()
+                except StopAsyncIteration:
+                    break
+                if self._guard.gone.is_set():
+                    raise DomainError("lease_lost", 503)
+                yield chunk
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            await self.aclose()
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+            if gone_task is not None:
+                gone_task.cancel()
+            if cancelled:
+                # 读取方取消不能取消唯一清理；启动后在后台完成关闭与回收
+                self._guard.start_cleanup()
+                heartbeat = self._guard._heartbeat
+                if (heartbeat is not None
+                        and heartbeat is not asyncio.current_task()):
+                    heartbeat.cancel()
+            else:
+                # 不 await 子任务：它们的 CancelledError 可能与本任务取消混淆
+                await self.aclose()
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._response.aclose()
-        finally:
-            try:
-                await self._context.__aexit__(None, None, None)
-            except Exception:
-                pass
-            try:
-                await self._client.aclose()
-            finally:
-                await self._guard.release()
+        # 不做 is_closed 短路：guard 内部共享同一 cleanup task 并等待完成
+        await self._guard.close()
 
 
 async def _read_bounded(body, limit: int) -> bytes:
@@ -768,64 +810,17 @@ class BrokerService:
         lease_id = await self._db(
             self.acquire_lease, token, workspace_id, run_id, channel)
         guard = _LeaseGuard(self, lease_id)
-        guard.start()
-
-        async def close_body() -> None:
-            closer = getattr(prepared_body, "aclose", None)
-            if closer is not None:
-                await closer()
-
-        client = None
-        context = None
-        open_task = None
-        response = None
-
-        async def cleanup_client(target=None) -> None:
-            if target is not None:
-                try:
-                    await target.aclose()
-                except Exception:
-                    pass
-            if context is not None:
-                try:
-                    await context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            if client is not None:
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-
-        async def cleanup_all() -> None:
-            if open_task is not None and not open_task.done():
-                open_task.cancel()
-                try:
-                    await open_task
-                except BaseException:
-                    pass
-            await cleanup_client(response)
-            await close_body()
-            await guard.release()
-
         try:
             client = self._egress.client()
+            guard.bind(client=client)
             context = client.stream(
                 upstream.method, upstream.url, headers=upstream.headers,
                 content=prepared_body, follow_redirects=False)
+            guard.bind(context=context)
             # 从等待连接/发送请求体/等待响应头开始就允许心跳丢失终止
             open_task = asyncio.create_task(context.__aenter__())
-
-            async def cancel_open() -> None:
-                open_task.cancel()
-                try:
-                    await open_task
-                except BaseException:
-                    pass
-                # 取消连接/上传/等待响应头后，关闭 context 与 client
-                await cleanup_client()
-
-            guard.set_abort(cancel_open)
+            guard.bind(open_task=open_task, body=prepared_body)
+            guard.start()
             gone_task = asyncio.create_task(guard.gone.wait())
             try:
                 await asyncio.wait({open_task, gone_task},
@@ -842,16 +837,15 @@ class BrokerService:
                     response = open_task.result()
                 except BaseException:
                     response = None
+                guard.bind(response=response)
                 raise DomainError("lease_lost", 503)
 
             response = open_task.result()
-
-            async def close_upstream() -> None:
-                await cleanup_client(response)
-
-            guard.set_abort(close_upstream)
-            # 请求体已发送完毕，关闭 multipart 临时 spool
-            await close_body()
+            guard.bind(response=response)
+            # 请求体已发送完毕，提前释放 multipart spool（清理会再次 no-op）
+            closer = getattr(prepared_body, "aclose", None)
+            if closer is not None:
+                await closer()
             if guard.gone.is_set():
                 raise DomainError("lease_lost", 503)
             if 300 <= response.status_code < 400:
@@ -861,19 +855,17 @@ class BrokerService:
                 status_code=response.status_code,
                 headers=_response_headers(response),
                 _response=response,
-                _context=context,
-                _client=client,
                 _guard=guard,
             )
         except DomainError:
-            await cleanup_all()
+            await guard.close()
             raise
         except httpx.HTTPError:
-            await cleanup_all()
+            await guard.close()
             # 不向上暴露底层连接细节
             raise DomainError("upstream_unavailable", 502) from None
         except BaseException:
-            await cleanup_all()
+            await guard.close()
             raise
 
     @staticmethod

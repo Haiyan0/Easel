@@ -766,6 +766,214 @@ class GatedTransport(httpx.AsyncBaseTransport):
         return httpx.Response(200, stream=ChunkStream([b"late"]))
 
 
+class ReadGateStream(httpx.AsyncByteStream):
+    """先产生一块，再等待 read_gate；用于让 anext 保持等待状态。"""
+
+    def __init__(self, state):
+        self.state = state
+
+    async def __aiter__(self):
+        yield b"one"
+        await self.state["read_gate"].wait()
+        yield b"two"
+
+    async def aclose(self):
+        self.state["stream_closed"] = True
+
+
+class GatedCloseStream(ReadGateStream):
+    """底层 stream.aclose 在 close_gate 放行前不完成。"""
+
+    async def aclose(self):
+        self.state["close_started"].set()
+        await self.state["close_gate"].wait()
+        self.state["closed"] = True
+
+
+class GatedCloseTransport(httpx.AsyncBaseTransport):
+    """底层 transport.aclose 在 close_gate 放行前不完成。"""
+
+    def __init__(self, state):
+        self.state = state
+
+    async def handle_async_request(self, request):
+        return httpx.Response(200, stream=ReadGateStream(self.state))
+
+    async def aclose(self):
+        self.state["close_started"].set()
+        await self.state["close_gate"].wait()
+        self.state["closed"] = True
+
+
+def _close_gate_state() -> dict:
+    return {
+        "close_started": asyncio.Event(),
+        "close_gate": asyncio.Event(),
+        "read_gate": asyncio.Event(),
+        "closed": False,
+    }
+
+
+def _fail_renew(lease_id, expires_at):
+    raise RuntimeError("renew failed")
+
+
+def raw_lease_count(store) -> int:
+    """包含已过 TTL 但尚未完成清理的行；用于断言额度未被提前删除。"""
+    return store._connection.execute(
+        "SELECT COUNT(*) FROM broker_leases").fetchone()[0]
+
+
+def test_cleanup_gate_holds_lease_until_response_stream_closes(tmp_path):
+    state = _close_gate_state()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=GatedCloseStream(state)))
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+        store.renew_broker_lease = _fail_renew
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+            chunks = response.chunks()
+            assert await anext(chunks) == b"one"
+            pending = asyncio.create_task(anext(chunks))
+
+            await asyncio.wait_for(state["close_started"].wait(), 4)
+            # gate 未放行：底层关闭未完成，租约不能提前回收
+            assert not pending.done()
+            assert raw_lease_count(store) == 1
+            assert state["closed"] is False
+
+            state["close_gate"].set()
+            state["read_gate"].set()
+            with pytest.raises(DomainError) as lost:
+                await pending
+            assert lost.value.code == "lease_lost"
+            assert state["closed"] is True
+            assert raw_lease_count(store) == 0
+            assert response._guard._cleanup_task.done()
+            assert response._guard._heartbeat.done()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
+def test_cleanup_gate_holds_lease_until_transport_closes(tmp_path):
+    state = _close_gate_state()
+    transport = GatedCloseTransport(state)
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+        store.renew_broker_lease = _fail_renew
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+            chunks = response.chunks()
+            assert await anext(chunks) == b"one"
+            pending = asyncio.create_task(anext(chunks))
+
+            await asyncio.wait_for(state["close_started"].wait(), 4)
+            assert not pending.done()
+            assert raw_lease_count(store) == 1
+            assert state["stream_closed"] is True
+            assert state["closed"] is False
+
+            state["close_gate"].set()
+            state["read_gate"].set()
+            with pytest.raises(DomainError) as lost:
+                await pending
+            assert lost.value.code == "lease_lost"
+            assert state["closed"] is True
+            assert raw_lease_count(store) == 0
+            assert response._guard._cleanup_task.done()
+            assert response._guard._heartbeat.done()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
+def test_cleanup_waits_after_reader_cancel_and_active_aclose(tmp_path):
+    state = _close_gate_state()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=GatedCloseStream(state)))
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+        store.renew_broker_lease = _fail_renew
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+            chunks = response.chunks()
+            assert await anext(chunks) == b"one"
+            pending = asyncio.create_task(anext(chunks))
+
+            await asyncio.wait_for(state["close_started"].wait(), 4)
+            state["read_gate"].set()
+            pending.cancel()
+
+            # 读取方取消后主动 aclose：仍等待同一次底层清理
+            close_waiter = asyncio.create_task(response.aclose())
+            await asyncio.sleep(0)
+            assert not close_waiter.done()
+            assert raw_lease_count(store) == 1
+            assert state["closed"] is False
+
+            state["close_gate"].set()
+            await close_waiter
+            assert state["closed"] is True
+            assert raw_lease_count(store) == 0
+            assert response._guard._cleanup_task.done()
+            assert response._guard._heartbeat.done()
+
+            # 被取消的读取任务也必须在清理完成后结束，不留 anext
+            with pytest.raises((asyncio.CancelledError, DomainError)):
+                await pending
+            current = asyncio.current_task()
+            leftovers = []
+            for _ in range(5):
+                await asyncio.sleep(0)
+                leftovers = [
+                    task for task in asyncio.all_tasks()
+                    if task is not current and not task.done()]
+                if not leftovers:
+                    break
+            assert not leftovers, leftovers
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
 def test_renewal_failure_before_response_headers_cancels_inflight(tmp_path):
     transport = GatedTransport()
     with broker_env(tmp_path, {"speech": speech_route()},
