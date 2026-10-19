@@ -21,8 +21,7 @@ def _key(env: str, label: str, *, required: bool = True, secret: bool = True,
     }
 
 
-MODEL_GROUPS: dict[str, dict[str, Any]] = {
-    "image": {
+MODEL_GROUPS: dict[str, dict[str, Any]] = {    "image": {
         "label": "AI 生图",
         "settings": [],
         "providers": [{
@@ -180,6 +179,30 @@ MODEL_GROUPS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+# 供应商能力元数据：只按 (group, provider) 追加字段，不复制 provider 定义。
+# broker_adapter=None 表示多人模式尚无受控转发适配器；此类在线供应商不得发布
+# 为可用默认配置。override_allowed 表示 member 可保存个人完整路由。
+_BROKER_ADAPTERS: dict[tuple[str, str], str] = {
+    ("image", "openai"): "openai-compatible",
+    ("voice", "openai-compatible"): "openai-compatible",
+}
+for _group_name, _group_spec in MODEL_GROUPS.items():
+    for _provider in _group_spec["providers"]:
+        _provider.setdefault(
+            "broker_adapter", _BROKER_ADAPTERS.get((_group_name, _provider["id"])))
+        _provider.setdefault("override_allowed", True)
+
+
+def provider_metadata(group: str, provider_id: str) -> dict[str, Any]:
+    """返回供应商的 broker/override 元数据；未知供应商抛 KeyError。"""
+    for provider in MODEL_GROUPS[group]["providers"]:
+        if provider["id"] == provider_id:
+            return {
+                "broker_adapter": provider.get("broker_adapter"),
+                "override_allowed": bool(provider.get("override_allowed", False)),
+            }
+    raise KeyError(f"{group}/{provider_id}")
 
 
 def model_group(name: str) -> dict[str, Any]:

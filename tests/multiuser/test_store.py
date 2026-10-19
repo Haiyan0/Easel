@@ -111,9 +111,9 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
 
 RELEASED_SCHEMA_FINGERPRINT = (
-    "d5d97ae6654ed9916ac652cc587000e67051b583c108bc4f575aeab754b845d2"
+    "00446909e18229dabe8bff65f4da1ebf58ada1223ccad617dc2b972758cbda23"
 )
-"""当前发布版（schema v2，Task 2）的 schema 指纹；变更 schema 时必须同步更新。"""
+"""当前发布版（schema v3，Task 4）的 schema 指纹；变更 schema 时必须同步更新。"""
 
 
 def schema_fingerprint(connection: sqlite3.Connection) -> str:

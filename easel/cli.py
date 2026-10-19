@@ -270,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="控制目录（存放 control.sqlite3）")
     p_serve.add_argument("--public-origin", required=True,
                          help="浏览器公共 Origin，例如 https://easel.example.com")
+    p_serve.add_argument("--master-key-file", required=True,
+                         help="受保护的 32 字节 AES-GCM master key 文件")
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_serve.add_argument("--port", type=int, default=7861, help="端口（默认 7861）")
     p_serve.set_defaults(func=cmd_serve_control)

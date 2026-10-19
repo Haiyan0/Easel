@@ -5,7 +5,14 @@ from fastapi.testclient import TestClient
 
 from easel.cli import main
 from easel.control.auth import AuthService
+from easel.control.config import ConfigService
 from easel.control.store import Store
+
+
+def write_key(tmp_path, name="master.key", data=b"k" * 32):
+    path = tmp_path / name
+    path.write_bytes(data)
+    return path
 
 
 def parse_output(output: str) -> dict[str, str]:
@@ -100,10 +107,12 @@ def test_serve_control_wires_app_and_public_origin(tmp_path, monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr(control_cli.uvicorn, "run", fake_run)
+    key_file = write_key(tmp_path)
 
     code = main(["serve-control",
                  "--control-dir", str(tmp_path / "control"),
                  "--public-origin", "https://easel.test/",
+                 "--master-key-file", str(key_file),
                  "--host", "127.0.0.1", "--port", "9999"])
     assert code == 0
     assert captured["host"] == "127.0.0.1"
@@ -123,13 +132,76 @@ def test_serve_control_rejects_invalid_origin_before_opening_store(
     started = []
     monkeypatch.setattr(control_cli.uvicorn, "run",
                         lambda *args, **kwargs: started.append(True))
+    key_file = write_key(tmp_path)
 
     control_dir = tmp_path / "control"
     code = main(["serve-control", "--control-dir", str(control_dir),
-                 "--public-origin", "http://easel.test"])
+                 "--public-origin", "http://easel.test",
+                 "--master-key-file", str(key_file)])
     captured = capsys.readouterr()
 
     assert code != 0
     assert "invalid_origin" in captured.err
     assert started == [], "非法 Origin 不得启动 HTTP 服务"
     assert not control_dir.exists(), "非法配置不得创建或打开控制库"
+
+
+def test_serve_control_rejects_missing_or_malformed_master_key(
+        tmp_path, monkeypatch, capsys):
+    from easel.control import cli as control_cli
+
+    started = []
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda *args, **kwargs: started.append(True))
+
+    missing = main(["serve-control",
+                    "--control-dir", str(tmp_path / "missing-control"),
+                    "--public-origin", "https://easel.test",
+                    "--master-key-file", str(tmp_path / "no.key")])
+    missing_err = capsys.readouterr().err
+    assert missing != 0
+    assert "master_key_unavailable" in missing_err
+    assert not (tmp_path / "missing-control").exists()
+
+    short_key = write_key(tmp_path, "short.key", b"k" * 31)
+    malformed = main(["serve-control",
+                      "--control-dir", str(tmp_path / "short-control"),
+                      "--public-origin", "https://easel.test",
+                      "--master-key-file", str(short_key)])
+    malformed_err = capsys.readouterr().err
+    assert malformed != 0
+    assert "invalid_master_key" in malformed_err
+    assert not (tmp_path / "short-control").exists()
+    assert started == []
+
+
+def test_serve_control_rejects_key_mismatching_existing_ciphertext(
+        tmp_path, monkeypatch, capsys):
+    from easel.control import cli as control_cli
+
+    started = []
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda *args, **kwargs: started.append(True))
+
+    control_dir = tmp_path / "control"
+    with Store.open(control_dir / "control.sqlite3") as store:
+        admin = store.create_user("Owner", "admin")
+        ConfigService(store, b"a" * 32).publish(admin, {"defaults": {"speech": {
+            "provider": "openai-compatible",
+            "model": "tts-default",
+            "base_url": "https://provider.example/v1",
+            "protocol": "openai",
+            "secret": "admin-secret-sentinel",
+            "options": {},
+        }}}, expected_version=0)
+
+    wrong_key = write_key(tmp_path, "wrong.key", b"b" * 32)
+    code = main(["serve-control", "--control-dir", str(control_dir),
+                 "--public-origin", "https://easel.test",
+                 "--master-key-file", str(wrong_key)])
+    captured = capsys.readouterr()
+
+    assert code != 0
+    assert "invalid_master_key" in captured.err
+    assert "admin-secret-sentinel" not in captured.err
+    assert started == []

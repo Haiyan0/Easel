@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import AuthService
+from .config import ConfigService
 from .policy import authorize, public_route
 from .store import Store
 from .types import DomainError, Identity
@@ -35,12 +36,18 @@ SESSION_COOKIE = "__Host-easel_session"
 """__Host- 前缀要求 Secure、Path=/ 且无 Domain。"""
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
-_IMPLEMENTED_ROUTES = frozenset({
+_IMPLEMENTED_EXACT = frozenset({
     ("GET", "/api/health"),
     ("POST", "/api/auth/exchange"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
+    ("POST", "/api/admin/managed-config"),
+    ("GET", "/api/settings/models"),
+    ("POST", "/api/settings/models/save"),
 })
+_IMPLEMENTED_PATTERNS = (
+    ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
+)
 """control 本轮真正装配的路由；其余已分类业务显式 503。"""
 
 _MEMBER_CAPABILITIES = ("workspace",)
@@ -144,6 +151,49 @@ def _middleware_error(request: Request, code: str, status: int) -> JSONResponse:
         headers={"Cache-Control": "no-store"})
 
 
+def _implemented_route(method: str, path: str) -> bool:
+    if (method, path) in _IMPLEMENTED_EXACT:
+        return True
+    return any(method == allowed and pattern.fullmatch(path)
+               for allowed, pattern in _IMPLEMENTED_PATTERNS)
+
+
+def _config_service(request: Request) -> ConfigService:
+    service = getattr(request.app.state, "config_service", None)
+    if service is None:
+        raise DomainError("capability_unavailable", 503)
+    return service
+
+
+def _parse_if_match(value: str | None) -> int:
+    if value is None:
+        raise DomainError("invalid_if_match", 400)
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    if not value.isdigit():
+        raise DomainError("invalid_if_match", 400)
+    return int(value)
+
+
+async def _read_json_body(request: Request, limit: int = 65536) -> dict:
+    length = request.headers.get("content-length")
+    if length is not None and (not length.isdigit() or int(length) > limit):
+        raise DomainError("invalid_body", 400)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise DomainError("invalid_body", 400)
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise DomainError("invalid_body", 400) from None
+    if not isinstance(payload, dict):
+        raise DomainError("invalid_body", 400)
+    return payload
+
+
 def _identity_view(identity: Identity, csrf_token: str) -> dict:
     capabilities = (_ADMIN_CAPABILITIES if identity.role == "admin"
                     else _MEMBER_CAPABILITIES)
@@ -194,7 +244,7 @@ async def _guard_request(request: Request, call_next):
     path = request.url.path
 
     if public_route(method, path):
-        if (method, path) not in _IMPLEMENTED_ROUTES:
+        if not _implemented_route(method, path):
             return _middleware_error(request, "capability_unavailable", 503)
         return await call_next(request)
 
@@ -222,20 +272,22 @@ async def _guard_request(request: Request, call_next):
     decision = authorize(identity, method, path)
     if decision.kind in ("unknown", "forbidden"):
         return _middleware_error(request, "forbidden", 403)
-    if (method, path) not in _IMPLEMENTED_ROUTES:
+    if not _implemented_route(method, path):
         # 已分类但本轮未装配：明确 503，不伪造成功，也不透传 local
         return _middleware_error(request, "capability_unavailable", 503)
+    request.state.identity = identity
     return await call_next(request)
 
 
 def create_app(*, store: Store, auth: AuthService,
                config: ControlConfig | None = None,
+               config_service: ConfigService | None = None,
                runtime=None, broker=None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
     传入的 ``store`` 提供控制库位置；应用在 lifespan 中用专用数据库线程打开
     自己的连接并在退出时关闭，以保持 SQLite 的线程归属。未提供 ``config`` 时
-    Origin 校验失败关闭。
+    Origin 校验失败关闭；未提供 ``config_service`` 时配置业务明确 503。
     """
     control_path = Path(store.path).absolute()
     public_origin = config.public_origin if config is not None else None
@@ -256,6 +308,12 @@ def create_app(*, store: Store, auth: AuthService,
             app.state.control_store = await loop.run_in_executor(
                 executor, Store.connect, control_path)
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)
+            if config_service is not None:
+                # with_store 会读取并校验已有密文，必须在数据库专用线程执行
+                app.state.config_service = await loop.run_in_executor(
+                    executor, config_service.with_store, app.state.control_store)
+            else:
+                app.state.config_service = None
             yield
         finally:
             try:
@@ -369,5 +427,45 @@ def create_app(*, store: Store, auth: AuthService,
                                secure=True, httponly=True, samesite="lax")
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.get("/api/settings/models")
+    async def get_model_settings(request: Request):
+        service = _config_service(request)
+        settings = await _run_db(
+            request, service.public_settings, request.state.identity)
+        return JSONResponse(settings,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/settings/models/save")
+    async def save_model_settings(request: Request):
+        service = _config_service(request)
+        payload = await _read_json_body(request)
+        channel = payload.get("channel")
+        route = payload.get("route")
+        if not isinstance(channel, str) or not isinstance(route, dict):
+            raise DomainError("invalid_route", 400)
+        await _run_db(request, service.save_override,
+                      request.state.identity, channel, route)
+        return JSONResponse({"ok": True},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/settings/models/overrides/{channel}")
+    async def clear_model_override(request: Request, channel: str):
+        service = _config_service(request)
+        await _run_db(request, service.clear_override,
+                      request.state.identity, channel)
+        return Response(status_code=204,
+                        headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/admin/managed-config")
+    async def publish_managed_config(request: Request):
+        service = _config_service(request)
+        expected_version = _parse_if_match(request.headers.get("if-match"))
+        settings = await _read_json_body(request)
+        version = await _run_db(
+            request, service.publish, request.state.identity,
+            settings, expected_version)
+        return JSONResponse({"version": version},
+                            headers={"Cache-Control": "no-store"})
 
     return app

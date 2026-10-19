@@ -12,6 +12,7 @@ import uvicorn
 
 from .app import ControlConfig, create_app
 from .auth import AuthService
+from .config import ConfigService, load_master_key
 from .store import Store
 from .types import DomainError
 
@@ -62,9 +63,25 @@ def cmd_serve_control(args) -> int:
     except ValueError:
         print("错误：invalid_origin", file=sys.stderr)
         return 2
+    try:
+        master_key = load_master_key(args.master_key_file)
+    except OSError:
+        print("错误：master_key_unavailable", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("错误：invalid_master_key", file=sys.stderr)
+        return 2
+
     store = Store.connect(_control_db(args.control_dir))
     try:
-        app = create_app(store=store, auth=AuthService(store), config=config)
+        try:
+            # 已有密文与 key 不匹配必须在服务启动前明确失败
+            config_service = ConfigService(store, master_key)
+        except ValueError:
+            print("错误：invalid_master_key", file=sys.stderr)
+            return 2
+        app = create_app(store=store, auth=AuthService(store), config=config,
+                         config_service=config_service)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
         store.close()

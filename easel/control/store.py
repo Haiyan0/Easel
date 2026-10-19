@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -27,7 +28,7 @@ from typing import Iterator, Literal
 
 from .types import ConversationRecord, DomainError, Identity, RunRecord
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -209,6 +210,31 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """
         CREATE INDEX auth_failures_lookup_idx
             ON auth_failures (source, token_digest, attempted_at)
+        """,
+    ),
+    # 版本 3：管理员默认配置版本与个人覆盖；只追加，不改写版本 1/2。
+    (
+        """
+        CREATE TABLE managed_revisions (
+            version INTEGER PRIMARY KEY,
+            public_json TEXT NOT NULL,
+            encrypted_secrets BLOB NOT NULL,
+            created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            created_at INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE workspace_overrides (
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            channel TEXT NOT NULL CHECK (channel IN ('speech', 'image', 'video', 'music')),
+            route_kind TEXT NOT NULL CHECK (route_kind IN ('complete', 'managed-model')),
+            public_json TEXT NOT NULL,
+            encrypted_secrets BLOB,
+            version INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (workspace_id, channel)
+        )
         """,
     ),
 )
@@ -596,6 +622,124 @@ class Store:
             self._connection.execute(
                 "INSERT INTO auth_failures (source, token_digest, attempted_at)"
                 " VALUES (?, ?, ?)", (source, token_digest, now))
+
+    # ------------------------------------------------------------------
+    # 配置：默认版本与个人覆盖
+    # ------------------------------------------------------------------
+
+    def require_identity(self, actor: Identity) -> Identity:
+        """按数据库重查演员身份（含禁用与 workspace 归属），返回当前角色。"""
+        workspace_id = self._require_actor(actor)
+        row = self._connection.execute(
+            "SELECT role FROM users WHERE id = ?", (actor.user_id,)).fetchone()
+        if row is None:
+            raise DomainError("unauthorized", 403)
+        return Identity(actor.user_id, workspace_id, row["role"])
+
+    def publish_managed_revision(self, actor: Identity, public_json: str,
+                                 encrypted_secrets: bytes, expected_version: int,
+                                 now: int) -> int:
+        """管理员发布默认配置；版本比较与写入在同一写事务内。"""
+        with self._transaction():
+            self._require_actor(actor)
+            row = self._connection.execute(
+                "SELECT role FROM users WHERE id = ?", (actor.user_id,)).fetchone()
+            if row is None or row["role"] != "admin":
+                raise DomainError("forbidden", 403)
+            current = self._connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM managed_revisions").fetchone()[0]
+            if current != expected_version:
+                raise DomainError("version_conflict", 409)
+            new_version = expected_version + 1
+            self._connection.execute(
+                "INSERT INTO managed_revisions"
+                " (version, public_json, encrypted_secrets, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (new_version, public_json, encrypted_secrets, actor.user_id, now))
+        return new_version
+
+    def latest_managed_revision(self) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT version, public_json, encrypted_secrets, created_by, created_at"
+            " FROM managed_revisions ORDER BY version DESC LIMIT 1").fetchone()
+
+    def get_workspace_override(self, workspace_id: str,
+                               channel: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT workspace_id, channel, route_kind, public_json,"
+            " encrypted_secrets, version, created_at, updated_at"
+            " FROM workspace_overrides WHERE workspace_id = ? AND channel = ?",
+            (_text(workspace_id), _text(channel))).fetchone()
+
+    def list_workspace_overrides(self, workspace_id: str) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            "SELECT workspace_id, channel, route_kind, public_json,"
+            " encrypted_secrets, version, created_at, updated_at"
+            " FROM workspace_overrides WHERE workspace_id = ? ORDER BY channel",
+            (_text(workspace_id),)).fetchall()
+
+    def first_encrypted_override(self) -> sqlite3.Row | None:
+        """启动校验 key 时取一条真实密文；没有密文返回 None。"""
+        return self._connection.execute(
+            "SELECT workspace_id, channel, encrypted_secrets"
+            " FROM workspace_overrides WHERE encrypted_secrets IS NOT NULL"
+            " ORDER BY workspace_id, channel LIMIT 1").fetchone()
+
+    def save_workspace_override(self, actor: Identity, channel: str,
+                                route_kind: str, public_json: str,
+                                encrypted_secrets: bytes | None,
+                                keep_existing_secret: dict | None,
+                                now: int) -> int:
+        """原子保存个人覆盖；空 Key 仅在既有个人凭证作用域相同时复用密文。"""
+        if route_kind not in ("complete", "managed-model"):
+            raise DomainError("invalid_route", 400)
+        with self._transaction():
+            workspace_id = self._require_actor(actor)
+            existing = self._connection.execute(
+                "SELECT route_kind, public_json, encrypted_secrets, version"
+                " FROM workspace_overrides WHERE workspace_id = ? AND channel = ?",
+                (workspace_id, _text(channel))).fetchone()
+            if encrypted_secrets is None and keep_existing_secret is not None:
+                if existing is None or existing["route_kind"] != "complete":
+                    raise DomainError("personal_credentials_required", 400)
+                try:
+                    old_public = json.loads(existing["public_json"])
+                except (TypeError, ValueError):
+                    raise DomainError("personal_credentials_required", 400) from None
+                if any(old_public.get(key) != keep_existing_secret.get(key)
+                       for key in ("provider", "base_url", "protocol")):
+                    raise DomainError("personal_credentials_required", 400)
+                encrypted_secrets = existing["encrypted_secrets"]
+            if route_kind == "complete" and encrypted_secrets is None:
+                raise DomainError("personal_credentials_required", 400)
+            if route_kind == "managed-model":
+                encrypted_secrets = None
+            revision = (existing["version"] if existing is not None else 0) + 1
+            self._connection.execute(
+                "INSERT INTO workspace_overrides"
+                " (workspace_id, channel, route_kind, public_json, encrypted_secrets,"
+                " version, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(workspace_id, channel) DO UPDATE SET"
+                " route_kind = excluded.route_kind,"
+                " public_json = excluded.public_json,"
+                " encrypted_secrets = excluded.encrypted_secrets,"
+                " version = excluded.version,"
+                " updated_at = excluded.updated_at",
+                (workspace_id, _text(channel), route_kind, public_json,
+                 encrypted_secrets, revision, now, now))
+        return revision
+
+    def clear_workspace_override(self, actor: Identity, channel: str,
+                                 now: int) -> bool:
+        """清除本人覆盖；只能删除 actor 自己的 workspace 行。"""
+        with self._transaction():
+            workspace_id = self._require_actor(actor)
+            cursor = self._connection.execute(
+                "DELETE FROM workspace_overrides"
+                " WHERE workspace_id = ? AND channel = ?",
+                (workspace_id, _text(channel)))
+        return cursor.rowcount == 1
 
     def _active_login(self, token_digest: str, now: int, idle_seconds: int) -> sqlite3.Row:
         """读取仍有效的登录行；失效原因统一 401。"""
