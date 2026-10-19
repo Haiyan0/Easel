@@ -69,6 +69,16 @@ def test_known_control_plane_hostnames_are_rejected(host):
     assert_error(denied, 403, "destination_denied")
 
 
+@pytest.mark.parametrize("host", [
+    "control", "worker", "provisioner", "metadata.google.internal",
+])
+def test_control_plane_hostnames_are_denied_at_connect_time(host):
+    policy = EgressPolicy(resolver=lambda name, port: ["10.0.0.5"])
+    with pytest.raises(DomainError) as denied:
+        policy.validate_url(f"https://{host}/", resolve=True)
+    assert_error(denied, 403, "destination_denied")
+
+
 def test_admin_approved_host_and_network_exceptions_are_exact():
     policy = EgressPolicy(
         approved_hosts=frozenset({"provider.internal"}),
