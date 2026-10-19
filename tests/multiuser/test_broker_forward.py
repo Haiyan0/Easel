@@ -69,7 +69,8 @@ def chat_route(**overrides) -> dict:
 
 
 @contextmanager
-def broker_env(tmp_path, defaults: dict, *, transport=None, clock=None):
+def broker_env(tmp_path, defaults: dict, *, transport=None, clock=None,
+               lease_ttl: int = 120, lease_clock=None):
     with Store.open(tmp_path / "control.sqlite3") as store:
         admin = store.create_user("Owner", "admin")
         member = store.create_user("Member")
@@ -79,7 +80,8 @@ def broker_env(tmp_path, defaults: dict, *, transport=None, clock=None):
         run = store.reserve_run(member, conversation.id, "req-1", "digest", 1)
         egress = EgressGateway(transport=transport) if transport is not None else None
         broker = BrokerService(store, config, clock=clock or (lambda: 1000.0),
-                               egress=egress)
+                               egress=egress, lease_ttl=lease_ttl,
+                               lease_clock=lease_clock)
         yield store, config, broker, admin, member, run
 
 
@@ -152,6 +154,29 @@ def multipart_parts(parts, *, closing: bool = True) -> bytes:
     if closing:
         body.extend(f"--{BOUNDARY}--\r\n".encode())
     return bytes(body)
+
+
+async def parse_multipart_form(body: bytes, content_type: str):
+    """用真实 Starlette/python-multipart 解析最终上游字节。"""
+    from starlette.requests import Request
+
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [
+            (b"content-type", content_type.encode("latin-1")),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    }, receive)
+    return await request.form()
 
 
 MODEL_HEADER = b'Content-Disposition: form-data; name="model"'
@@ -408,6 +433,85 @@ def test_multipart_model_is_validated_and_body_preserved(tmp_path):
             assert record.get("calls", 0) == 0
 
 
+def test_multipart_extended_parameters_cannot_rename_a_field(tmp_path):
+    record: dict = {}
+    transport = capture_transport(record)
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+
+        async def scenario(data: bytes):
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/transcriptions",
+                headers={
+                    "content-type": f"multipart/form-data; boundary={BOUNDARY}",
+                    "content-length": str(len(data)),
+                },
+                body=aiter_body(data, chunks=2))
+            return b"".join([chunk async for chunk in response.chunks()])
+
+        name_star = (b"Content-Disposition: form-data; name=\"ignored\"; "
+                     b"name*=utf-8''model")
+        name_star_only = b"Content-Disposition: form-data; name*=utf-8''model"
+        continuation = (b"Content-Disposition: form-data; name*0=\"mo\"; "
+                        b"name*1=\"del\"")
+        filename_star = (b"Content-Disposition: form-data; name=\"file\"; "
+                         b"filename*=utf-8''a.wav")
+        escaped_filename = (b"Content-Disposition: form-data; name=\"file\"; "
+                            b"filename=\"a\\\"; name=model\"")
+        escaped_name = (b"Content-Disposition: form-data; "
+                        b"name=\"mod\\\\el\"")
+        spaced_name = (b"Content-Disposition: form-data; name=\" model \"")
+
+        cases = [
+            multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (name_star, b"forbidden-expensive-model"),
+            ]),
+            multipart_parts([
+                (name_star_only, b"forbidden-expensive-model"),
+                (MODEL_HEADER, b"tts-default"),
+            ]),
+            multipart_parts([(name_star_only, b"tts-default")]),
+            multipart_parts([(continuation, b"tts-default")]),
+            multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (filename_star, b"RIFF"),
+            ]),
+            multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (escaped_filename, b"RIFF"),
+            ]),
+            multipart_parts([(escaped_name, b"tts-default")]),
+            multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (spaced_name, b"forbidden-expensive-model"),
+            ]),
+        ]
+        for body in cases:
+            record.pop("calls", None)
+            with pytest.raises(DomainError) as invalid:
+                asyncio.run(scenario(body))
+            assert_error(invalid, 400, "invalid_request")
+            assert record.get("calls", 0) == 0
+
+        # 正常 multipart 仍能通过，且真实下游解析器只看到一个授权 model
+        valid = multipart_parts([
+            (MODEL_HEADER, b"tts-default"),
+            (FILE_HEADER, b"RIFF-audio"),
+        ])
+        asyncio.run(scenario(valid))
+        assert record["body"] == valid
+        form = asyncio.run(parse_multipart_form(
+            record["body"],
+            f"multipart/form-data; boundary={BOUNDARY}"))
+        assert form.getlist("model") == ["tts-default"]
+        assert "file" in form
+
+
 def test_multipart_parser_only_reads_part_headers_not_file_content(tmp_path):
     record: dict = {}
     transport = capture_transport(record)
@@ -644,6 +748,119 @@ def test_early_close_releases_stream_and_lease(tmp_path):
         assert store.count_broker_leases(1000) == 0
 
     assert closed.get("closed") is True
+
+
+class GatedTransport(httpx.AsyncBaseTransport):
+    """在返回响应头前阻塞，用于验证前四阶段的租约丢失终止。"""
+
+    def __init__(self):
+        self.started = 0
+        self.gate = asyncio.Event()
+        self.two_started = asyncio.Event()
+
+    async def handle_async_request(self, request):
+        self.started += 1
+        if self.started >= 2:
+            self.two_started.set()
+        await self.gate.wait()
+        return httpx.Response(200, stream=ChunkStream([b"late"]))
+
+
+def test_renewal_failure_before_response_headers_cancels_inflight(tmp_path):
+    transport = GatedTransport()
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+
+        def failing_renew(lease_id, expires_at):
+            raise RuntimeError("renew failed")
+
+        store.renew_broker_lease = failing_renew
+
+        async def open_call():
+            return await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+
+        async def scenario():
+            first = asyncio.create_task(open_call())
+            second = asyncio.create_task(open_call())
+            await asyncio.wait_for(transport.two_started.wait(), 3)
+            assert store.count_broker_leases(int(time.time())) == 2
+
+            results = await asyncio.wait_for(
+                asyncio.gather(first, second, return_exceptions=True), 4)
+            for result in results:
+                assert isinstance(result, DomainError), result
+                assert result.status == 503, result
+                assert result.code == "lease_lost", result
+            assert store.count_broker_leases(int(time.time())) == 0
+
+            # 旧请求已被取消，不能随后成功；额度可被新请求重新接纳
+            transport.gate.set()
+            third = await open_call()
+            fourth = await open_call()
+            assert transport.started == 4
+            await third.aclose()
+            await fourth.aclose()
+            assert store.count_broker_leases(int(time.time())) == 0
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
+def test_zero_row_renewal_terminates_open_stream(tmp_path):
+    transport = capture_transport({}, chunks=(b"one", b"two"))
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+
+        async def open_call():
+            return await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+
+        async def scenario():
+            first = await open_call()
+            second = await open_call()
+            assert store.count_broker_leases(int(time.time())) == 2
+
+            # 模拟另一连接回收旧租约（到期清理/重新接纳）
+            rows = store._connection.execute(
+                "SELECT id FROM broker_leases").fetchall()
+            for row in rows:
+                store.release_broker_lease(row["id"])
+
+            third = await open_call()
+            fourth = await open_call()
+            assert store.count_broker_leases(int(time.time())) == 2
+
+            # 下一次 heartbeat UPDATE 0 行，旧流必须被终止
+            await asyncio.sleep(1.3)
+            for response in (first, second):
+                with pytest.raises(DomainError) as lost:
+                    await anext(response.chunks())
+                assert lost.value.code == "lease_lost"
+                assert lost.value.status == 503
+
+            await third.aclose()
+            await fourth.aclose()
+            assert store.count_broker_leases(int(time.time())) == 0
+
+        asyncio.run(scenario())
 
 
 def test_open_streams_keep_capacity_after_token_expiry(tmp_path):

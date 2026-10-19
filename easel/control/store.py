@@ -930,12 +930,13 @@ class Store:
                  lease_now, lease_now + lease_ttl))
         return lease_id
 
-    def renew_broker_lease(self, lease_id: str, expires_at: int) -> None:
-        """在途流心跳续期；只更新仍存在的租约。"""
+    def renew_broker_lease(self, lease_id: str, expires_at: int) -> int:
+        """在途流心跳续期；返回受影响行数，0 表示租约已丢失。"""
         with self._transaction():
-            self._connection.execute(
+            cursor = self._connection.execute(
                 "UPDATE broker_leases SET expires_at = ? WHERE id = ?",
                 (int(expires_at), _text(lease_id)))
+        return cursor.rowcount
 
     def release_broker_lease(self, lease_id: str) -> None:
         """释放额度；重复释放安全。"""

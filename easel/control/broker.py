@@ -85,6 +85,66 @@ def _canonical(value: object) -> str:
         raise DomainError("configuration_invalid", 500) from None
 
 
+class _LeaseGuard:
+    """请求额度生命周期：心跳续期、丢失检测与“先关闭后回收”顺序。"""
+
+    def __init__(self, broker: "BrokerService", lease_id: str):
+        self._broker = broker
+        self._lease_id = lease_id
+        self._released = False
+        self._abort = None
+        self._heartbeat: asyncio.Task | None = None
+        self.gone = asyncio.Event()
+
+    def start(self) -> None:
+        self._heartbeat = asyncio.create_task(self._heartbeat_loop())
+
+    def set_abort(self, abort) -> None:
+        self._abort = abort
+
+    async def release(self, *, from_heartbeat: bool = False) -> None:
+        if self._released:
+            return
+        # 先置位，避免正常关闭与心跳丢失路径并发重复回收
+        self._released = True
+        heartbeat = self._heartbeat
+        if heartbeat is not None and not from_heartbeat:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        await self._broker._db(self._broker.release_lease, self._lease_id)
+
+    async def _heartbeat_loop(self) -> None:
+        interval = max(1.0, self._broker._lease_ttl / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                rowcount = await self._broker._db(
+                    self._broker._store.renew_broker_lease,
+                    self._lease_id,
+                    int(self._broker._lease_clock())
+                    + self._broker._lease_ttl)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                rowcount = 0
+            if rowcount == 0:
+                # 续期失败或 UPDATE 零行都表示租约已丢失：先终止在途请求
+                self.gone.set()
+                abort = self._abort
+                if abort is not None:
+                    try:
+                        await abort()
+                    except Exception:
+                        pass
+                await self.release(from_heartbeat=True)
+                return
+
+
 @dataclass
 class BrokerResponse:
     """已打开的上游响应；chunks() 流式产出并在结束/异常时释放额度。"""
@@ -94,13 +154,46 @@ class BrokerResponse:
     _response: httpx.Response = field(repr=False)
     _context: object = field(repr=False)
     _client: httpx.AsyncClient = field(repr=False)
-    _release: Callable[[], Awaitable[None]] = field(repr=False)
+    _guard: _LeaseGuard = field(repr=False)
     _closed: bool = field(default=False, repr=False)
 
     async def chunks(self) -> AsyncIterator[bytes]:
         try:
-            async for chunk in self._response.aiter_raw():
-                yield chunk
+            iterator = self._response.aiter_raw()
+            gone_task = asyncio.create_task(self._guard.gone.wait())
+            next_task = None
+            try:
+                while True:
+                    next_task = asyncio.create_task(anext(iterator))
+                    done, _pending = await asyncio.wait(
+                        {next_task, gone_task},
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if gone_task in done:
+                        next_task.cancel()
+                        try:
+                            await next_task
+                        except BaseException:
+                            pass
+                        raise DomainError("lease_lost", 503)
+                    try:
+                        chunk = next_task.result()
+                    except StopAsyncIteration:
+                        break
+                    if self._guard.gone.is_set():
+                        raise DomainError("lease_lost", 503)
+                    yield chunk
+            finally:
+                if next_task is not None and not next_task.done():
+                    next_task.cancel()
+                    try:
+                        await next_task
+                    except BaseException:
+                        pass
+                gone_task.cancel()
+                try:
+                    await gone_task
+                except asyncio.CancelledError:
+                    pass
         finally:
             await self.aclose()
 
@@ -118,7 +211,7 @@ class BrokerResponse:
             try:
                 await self._client.aclose()
             finally:
-                await self._release()
+                await self._guard.release()
 
 
 async def _read_bounded(body, limit: int) -> bytes:
@@ -249,10 +342,100 @@ def _read_mp_suffix(stream, boundary: bytes) -> str:
     raise DomainError("invalid_request", 400)
 
 
-_DISPOSITION_NAME = re.compile(
-    rb'(?:^|;)\s*name=(?:"([^"]*)"|([^;\s]+))', re.IGNORECASE)
-_DISPOSITION_FILENAME = re.compile(
-    rb'(?:^|;)\s*filename=(?:"([^"]*)"|([^;\s]+))', re.IGNORECASE)
+def _parse_content_disposition(value: bytes) -> tuple[bytes, dict[bytes, bytes]]:
+    """解析 Content-Disposition 参数，拒绝扩展/连续编码/未知/重复参数。
+
+    下游 multipart 解析器可能把 ``name*=utf-8''model`` 或 ``name*0`` 解释为
+    ``name=model``；broker 不能只看普通 name 后继续按正则猜测。任何含 ``*``
+    的扩展参数、重复参数、未知参数、字段名转义都会让两边语义产生差异，直接
+    400。只允许规范化的 ``name`` / ``filename``。
+    """
+    index = 0
+    length = len(value)
+
+    def skip_ows() -> None:
+        nonlocal index
+        while index < length and value[index:index + 1] in (b" ", b"\t"):
+            index += 1
+
+    skip_ows()
+    start = index
+    while index < length and value[index:index + 1] != b";":
+        index += 1
+    disposition_type = value[start:index].strip().lower()
+    if (not disposition_type or b" " in disposition_type
+            or b"\t" in disposition_type):
+        raise DomainError("invalid_request", 400)
+
+    params: dict[bytes, bytes] = {}
+    while index < length:
+        # value[index] == b";"
+        index += 1
+        skip_ows()
+        if index >= length:
+            raise DomainError("invalid_request", 400)
+
+        attr_start = index
+        while (index < length
+               and value[index:index + 1] not in (b"=", b";", b" ", b"\t")):
+            index += 1
+        attr = value[attr_start:index].lower()
+        if not attr or b"*" in attr:
+            raise DomainError("invalid_request", 400)
+        skip_ows()
+        if index >= length or value[index:index + 1] != b"=":
+            raise DomainError("invalid_request", 400)
+        index += 1
+        skip_ows()
+        if index >= length:
+            raise DomainError("invalid_request", 400)
+
+        had_escape = False
+        if value[index:index + 1] == b'"':
+            index += 1
+            out = bytearray()
+            while index < length:
+                char = value[index:index + 1]
+                if char == b"\\":
+                    had_escape = True
+                    if index + 1 >= length:
+                        raise DomainError("invalid_request", 400)
+                    out.extend(value[index + 1:index + 2])
+                    index += 2
+                    continue
+                if char == b'"':
+                    index += 1
+                    break
+                if char in (b"\r", b"\n", b"\x00"):
+                    raise DomainError("invalid_request", 400)
+                out.extend(char)
+                index += 1
+            else:
+                raise DomainError("invalid_request", 400)
+            param_value = bytes(out)
+        else:
+            start = index
+            while (index < length
+                   and value[index:index + 1] not in (b";", b" ", b"\t")):
+                index += 1
+            param_value = value[start:index]
+            if (not param_value
+                    or any(byte < 0x21 or byte > 0x7e or byte in b'";\\'
+                           for byte in param_value)):
+                raise DomainError("invalid_request", 400)
+
+        if attr in params:
+            raise DomainError("invalid_request", 400)
+        if attr not in (b"name", b"filename"):
+            raise DomainError("invalid_request", 400)
+        if had_escape:
+            # quoted-pair 在不同解析器中可能被展开成参数分隔符/字段名
+            raise DomainError("invalid_request", 400)
+        params[attr] = param_value
+        skip_ows()
+        if index < length and value[index:index + 1] != b";":
+            raise DomainError("invalid_request", 400)
+    return disposition_type, params
 
 
 def _validate_multipart(stream, boundary: bytes,
@@ -277,17 +460,13 @@ def _validate_multipart(stream, boundary: bytes,
         disposition = headers.get(b"content-disposition")
         if disposition is None:
             raise DomainError("invalid_request", 400)
-        name_matches = list(_DISPOSITION_NAME.finditer(disposition))
-        if len(name_matches) != 1:
-            # 缺失或重复 name 参数都会让上游解析产生歧义
+        disposition_type, params = _parse_content_disposition(disposition)
+        if disposition_type != b"form-data":
             raise DomainError("invalid_request", 400)
-        name_match = name_matches[0]
-        name = (name_match.group(1) if name_match.group(1) is not None
-                else name_match.group(2))
-        filename_matches = list(_DISPOSITION_FILENAME.finditer(disposition))
-        if len(filename_matches) > 1:
+        name = params.get(b"name")
+        if not name:
             raise DomainError("invalid_request", 400)
-        has_filename = bool(filename_matches)
+        has_filename = b"filename" in params
 
         lowered = name.lower()
         if lowered in _FORBIDDEN_FORM_FIELDS:
@@ -311,6 +490,9 @@ def _validate_multipart(stream, boundary: bytes,
                 raise DomainError("invalid_request", 400)
             model_values.append(value)
         else:
+            # 下游若把空白/大小写归一化成 model，则与 broker 判定不一致
+            if name.strip().lower() == b"model":
+                raise DomainError("invalid_request", 400)
             _skip_mp_value(stream, boundary)
 
         if _read_mp_suffix(stream, boundary) == "close":
@@ -535,27 +717,6 @@ class BrokerService:
             _token_digest(token), workspace_id, run_id, channel,
             int(self._clock()), int(self._lease_clock()), self._lease_ttl)
 
-    async def _renew_lease_loop(self, lease_id: str, on_failure=None) -> None:
-        """流未关闭期间持续续期；续期失败时终止在途流并释放额度。"""
-        interval = max(1.0, self._lease_ttl / 3)
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                expires_at = int(self._lease_clock()) + self._lease_ttl
-                await self._db(self._store.renew_broker_lease, lease_id,
-                               expires_at)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # 无法续期时不能继续无额度运行：先关闭上游再释放
-                if on_failure is not None:
-                    try:
-                        await on_failure()
-                    except Exception:
-                        pass
-                await self._db(self.release_lease, lease_id)
-                return
-
     def release_lease(self, lease_id: str) -> None:
         if not isinstance(lease_id, str) or not lease_id:
             raise DomainError("invalid_argument", 400)
@@ -606,70 +767,94 @@ class BrokerService:
             raise DomainError("egress_unavailable", 503)
         lease_id = await self._db(
             self.acquire_lease, token, workspace_id, run_id, channel)
-        abort_box: dict = {}
-
-        async def abort_stream() -> None:
-            abort = abort_box.get("abort")
-            if abort is not None:
-                await abort()
-
-        heartbeat = asyncio.create_task(
-            self._renew_lease_loop(lease_id, abort_stream))
-        released = False
-
-        async def release_once() -> None:
-            nonlocal released
-            if released:
-                return
-            released = True
-            heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            await self._db(self.release_lease, lease_id)
+        guard = _LeaseGuard(self, lease_id)
+        guard.start()
 
         async def close_body() -> None:
             closer = getattr(prepared_body, "aclose", None)
             if closer is not None:
                 await closer()
 
+        client = None
+        context = None
+        open_task = None
+        response = None
+
+        async def cleanup_client(target=None) -> None:
+            if target is not None:
+                try:
+                    await target.aclose()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    await context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
+        async def cleanup_all() -> None:
+            if open_task is not None and not open_task.done():
+                open_task.cancel()
+                try:
+                    await open_task
+                except BaseException:
+                    pass
+            await cleanup_client(response)
+            await close_body()
+            await guard.release()
+
         try:
             client = self._egress.client()
             context = client.stream(
                 upstream.method, upstream.url, headers=upstream.headers,
                 content=prepared_body, follow_redirects=False)
-            try:
-                response = await context.__aenter__()
-            except BaseException:
-                try:
-                    await context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                await close_body()
-                await client.aclose()
-                raise
-            # 续期失败时先关闭已打开的上游流，再由心跳释放额度
-            async def abort_opened() -> None:
-                await response.aclose()
-                try:
-                    await context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                await client.aclose()
+            # 从等待连接/发送请求体/等待响应头开始就允许心跳丢失终止
+            open_task = asyncio.create_task(context.__aenter__())
 
-            abort_box["abort"] = abort_opened
+            async def cancel_open() -> None:
+                open_task.cancel()
+                try:
+                    await open_task
+                except BaseException:
+                    pass
+                # 取消连接/上传/等待响应头后，关闭 context 与 client
+                await cleanup_client()
+
+            guard.set_abort(cancel_open)
+            gone_task = asyncio.create_task(guard.gone.wait())
+            try:
+                await asyncio.wait({open_task, gone_task},
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                gone_task.cancel()
+                try:
+                    await gone_task
+                except asyncio.CancelledError:
+                    pass
+
+            if guard.gone.is_set():
+                try:
+                    response = open_task.result()
+                except BaseException:
+                    response = None
+                raise DomainError("lease_lost", 503)
+
+            response = open_task.result()
+
+            async def close_upstream() -> None:
+                await cleanup_client(response)
+
+            guard.set_abort(close_upstream)
             # 请求体已发送完毕，关闭 multipart 临时 spool
             await close_body()
+            if guard.gone.is_set():
+                raise DomainError("lease_lost", 503)
             if 300 <= response.status_code < 400:
-                await response.aclose()
-                try:
-                    await context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                await client.aclose()
                 # 默认不跟随重定向，也绝不把上游 Key 发到跳转目标
                 raise DomainError("upstream_redirect", 502)
             return BrokerResponse(
@@ -678,20 +863,17 @@ class BrokerService:
                 _response=response,
                 _context=context,
                 _client=client,
-                _release=release_once,
+                _guard=guard,
             )
         except DomainError:
-            await close_body()
-            await release_once()
+            await cleanup_all()
             raise
         except httpx.HTTPError:
-            await close_body()
-            await release_once()
+            await cleanup_all()
             # 不向上暴露底层连接细节
             raise DomainError("upstream_unavailable", 502) from None
         except BaseException:
-            await close_body()
-            await release_once()
+            await cleanup_all()
             raise
 
     @staticmethod
