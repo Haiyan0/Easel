@@ -349,6 +349,127 @@ def test_publish_is_atomic_across_channels(tmp_path):
             "SELECT COUNT(*) FROM managed_revisions").fetchone()[0] == 0
 
 
+OPTION_SENTINEL = "option-secret-sentinel-4b2e"
+
+
+def test_options_reject_credential_structures_for_all_route_kinds(tmp_path):
+    with control(tmp_path) as (store, config, admin, member):
+        bad_options = [
+            {"headers": {"api-key": OPTION_SENTINEL}},
+            {"Headers": {"API-Key": OPTION_SENTINEL}},
+            {"auth": {"token": OPTION_SENTINEL}},
+            {"credentials": {"api-key": OPTION_SENTINEL}},
+            {"api-key": OPTION_SENTINEL},
+            {"API_KEY": OPTION_SENTINEL},
+            {"base_url": "https://evil.example/v1"},
+            {"env": {"EVIL": "1"}},
+            {"argv": ["--evil"]},
+            {"runtime": "evil"},
+            {"speed": [1.0]},
+        ]
+
+        for options in bad_options:
+            with pytest.raises(DomainError) as invalid:
+                publish_speech(config, admin,
+                               route=speech_route(options=options))
+            assert_error(invalid, 400, "invalid_route")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM managed_revisions").fetchone()[0] == 0
+
+        publish_speech(config, admin, route=speech_route(
+            options={"speed": 1.2}, allowed_models=["tts-default"]))
+
+        for options in bad_options:
+            with pytest.raises(DomainError) as invalid:
+                config.save_override(member, "speech",
+                                     speech_route(options=options))
+            assert_error(invalid, 400, "invalid_route")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM workspace_overrides").fetchone()[0] == 0
+
+        for options in bad_options:
+            with pytest.raises(DomainError) as invalid:
+                config.save_override(member, "speech", {
+                    "route_kind": "managed-model", "options": options})
+            assert_error(invalid, 400, "invalid_route")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM workspace_overrides").fetchone()[0] == 0
+
+        # 正常非敏感参数仍可用
+        config.save_override(member, "speech", speech_route(
+            options={"speed": 1.5, "format": "mp3"}))
+        resolved = config.resolve(member, "speech")
+        assert resolved.options["speed"] == 1.5
+        assert resolved.options["format"] == "mp3"
+        assert OPTION_SENTINEL not in json.dumps(
+            config.public_settings(member), ensure_ascii=False)
+        rows = "".join(row[0] for row in store._connection.execute(
+            "SELECT public_json FROM managed_revisions"
+            " UNION ALL SELECT public_json FROM workspace_overrides"))
+        assert OPTION_SENTINEL not in rows
+
+
+def test_non_finite_options_are_rejected_atomically(tmp_path):
+    with control(tmp_path) as (store, config, admin, member):
+        publish_speech(config, admin, route=speech_route(
+            options={"speed": 1.0}, allowed_models=["tts-default"]))
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with pytest.raises(DomainError) as invalid:
+                publish_speech(config, admin, version=1,
+                               route=speech_route(options={"speed": value}))
+            assert_error(invalid, 400, "invalid_route")
+        assert store._connection.execute(
+            "SELECT MAX(version) FROM managed_revisions").fetchone()[0] == 1
+        assert config.resolve(member, "speech").options["speed"] == 1.0
+
+        config.save_override(member, "speech", speech_route(
+            secret=PERSONAL_SECRET, options={"speed": 1.5}))
+        before = store._connection.execute(
+            "SELECT public_json, encrypted_secrets, version"
+            " FROM workspace_overrides WHERE workspace_id = ? AND channel = 'speech'",
+            (member.workspace_id,)).fetchone()
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with pytest.raises(DomainError) as invalid:
+                config.save_override(member, "speech", speech_route(
+                    secret="new-secret", options={"speed": value}))
+            assert_error(invalid, 400, "invalid_route")
+        after = store._connection.execute(
+            "SELECT public_json, encrypted_secrets, version"
+            " FROM workspace_overrides WHERE workspace_id = ? AND channel = 'speech'",
+            (member.workspace_id,)).fetchone()
+        assert tuple(after) == tuple(before)
+        assert config.resolve(member, "speech").options["speed"] == 1.5
+
+        config.save_override(member, "speech", {
+            "route_kind": "managed-model", "options": {"speed": 1.2}})
+        before = store._connection.execute(
+            "SELECT public_json, encrypted_secrets, version"
+            " FROM workspace_overrides WHERE workspace_id = ? AND channel = 'speech'",
+            (member.workspace_id,)).fetchone()
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with pytest.raises(DomainError) as invalid:
+                config.save_override(member, "speech", {
+                    "route_kind": "managed-model",
+                    "options": {"speed": value}})
+            assert_error(invalid, 400, "invalid_route")
+        after = store._connection.execute(
+            "SELECT public_json, encrypted_secrets, version"
+            " FROM workspace_overrides WHERE workspace_id = ? AND channel = 'speech'",
+            (member.workspace_id,)).fetchone()
+        assert tuple(after) == tuple(before)
+        assert config.resolve(member, "speech").options["speed"] == 1.2
+
+        # 嵌套结构即使包含非有限数字也在结构边界被拒
+        for options in (
+            {"nested": {"speed": float("inf")}},
+            {"speed": [float("nan")]},
+        ):
+            with pytest.raises(DomainError) as invalid:
+                publish_speech(config, admin, version=1,
+                               route=speech_route(options=options))
+            assert_error(invalid, 400, "invalid_route")
+
+
 def test_default_publish_requires_broker_adapter(tmp_path):
     with control(tmp_path) as (store, config, admin, member):
         route = speech_route(provider="dashscope", secret={"DASHSCOPE_API_KEY": "d"})

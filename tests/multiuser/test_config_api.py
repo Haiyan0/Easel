@@ -1,6 +1,7 @@
 """Task 4 control 配置 API：If-Match 发布、脱敏读取、个人覆盖。"""
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
 import pytest
@@ -213,6 +214,63 @@ def test_config_routes_are_503_without_config_service(tmp_path):
         assert client.delete(
             "/api/settings/models/overrides/speech",
             headers=write_headers(csrf)).status_code == 503
+
+
+def test_http_options_cannot_smuggle_credentials_or_poison_settings(tmp_path):
+    option_sentinel = "option-secret-sentinel-http"
+    with config_api(tmp_path) as (client, store, auth, service, admin, member):
+        csrf = login(client, auth, admin, admin)
+        headers = {**write_headers(csrf), "If-Match": "0"}
+
+        for options in (
+            {"headers": {"api-key": option_sentinel}},
+            {"Headers": {"API-Key": option_sentinel}},
+            {"auth": {"token": option_sentinel}},
+            {"credentials": {"api-key": option_sentinel}},
+        ):
+            response = client.post(
+                "/api/admin/managed-config",
+                json={"defaults": {"speech": speech_route(options=options)}},
+                headers=headers)
+            assert response.status_code == 400, response.text
+            assert response.json()["code"] == "invalid_route"
+            assert option_sentinel not in response.text
+        assert service.public_settings(admin)["version"] == 0
+
+        published = client.post(
+            "/api/admin/managed-config",
+            json={"defaults": {"speech": speech_route(
+                options={"speed": 1.0})}},
+            headers=headers)
+        assert published.status_code == 200
+        assert published.json() == {"version": 1}
+
+        base = json.dumps({"defaults": {"speech": speech_route(options={})}})
+        poison_bodies = [
+            base.replace('"options": {}', '"options": {"speed": 1e309}'),
+            base.replace('"options": {}', '"options": {"speed": NaN}'),
+            base.replace('"options": {}', '"options": {"speed": Infinity}'),
+            base.replace('"options": {}', '"options": {"speed": -Infinity}'),
+        ]
+        for body in poison_bodies:
+            response = client.post(
+                "/api/admin/managed-config",
+                content=body.encode("utf-8"),
+                headers={**write_headers(csrf), "If-Match": "1",
+                         "Content-Type": "application/json"})
+            assert response.status_code == 400, (body, response.text)
+            assert response.json()["code"] == "invalid_route"
+        assert service.public_settings(admin)["version"] == 1
+
+        login(client, auth, admin, member)
+        settings = client.get("/api/settings/models")
+        assert settings.status_code == 200, settings.text
+        assert "Infinity" not in settings.text
+        assert "NaN" not in settings.text
+        assert option_sentinel not in settings.text
+        rows = "".join(row[0] for row in store._connection.execute(
+            "SELECT public_json FROM managed_revisions"))
+        assert "Infinity" not in rows and "NaN" not in rows
 
 
 def test_publish_errors_do_not_echo_secrets(tmp_path):

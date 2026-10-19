@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -41,18 +42,24 @@ _COMPLETE_FIELDS = frozenset({"route_kind", "provider", "model", "base_url",
                               "protocol", "secret", "options"})
 _MANAGED_MODEL_FIELDS = frozenset({"route_kind", "model", "options"})
 
-_SENSITIVE_OPTION_KEYS = frozenset({"key", "keys"})
-_SENSITIVE_OPTION_PARTS = (
-    "secret", "api_key", "apikey", "token", "password", "credential",
-    "authorization", "base_url", "baseurl", "protocol", "provider", "env",
-    "argv", "command", "runtime", "sandbox", "plugins", "chat",
-)
+_ALLOWED_OPTION_KEYS = frozenset({
+    # 非敏感能力参数；键统一小写，值只允许标量。
+    "speed", "rate", "pitch", "volume", "format", "output_format",
+    "sample_rate", "bitrate", "quality", "language", "voice", "voice_id",
+    "speaker", "style", "emotion", "instruct", "instruction", "instructions",
+    "seed", "steps", "num_inference_steps", "n", "temperature", "top_p",
+    "top_k", "presence_penalty", "frequency_penalty", "max_tokens",
+    "timeout", "response_format", "duration", "seconds", "fps",
+    "num_frames", "width", "height", "size", "image_size", "aspect_ratio",
+    "guidance", "guidance_scale", "cfg_scale", "prompt_strength",
+    "negative_prompt", "audio_format", "delimiter",
+})
 
 
 def _canonical(value: Any) -> str:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=True)
+                          ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError):
         raise DomainError("invalid_route", 400) from None
 
@@ -94,38 +101,44 @@ def _validate_base_url(value: Any) -> str:
     return value
 
 
-def _sensitive_option_key(key: str) -> bool:
-    lowered = key.lower()
-    return (lowered in _SENSITIVE_OPTION_KEYS
-            or any(part in lowered for part in _SENSITIVE_OPTION_PARTS))
-
-
 def _validate_options(value: Any) -> dict:
+    """只接受明确允许的非敏感标量能力参数。
+
+    采用允许列表而不是凭证关键词黑名单：headers/auth/credentials 等结构、
+    嵌套字典/数组、路由与底座参数都不是能力参数，统一 400 拒绝。这样凭证
+    只能走 ``secret`` 进入加密 bundle，无法从 options 形成明文旁路。
+    """
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise DomainError("invalid_route", 400)
 
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, item in node.items():
-                if (not isinstance(key, str) or not key
-                        or _sensitive_option_key(key)):
-                    raise DomainError("invalid_route", 400)
-                walk(item)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-        elif isinstance(node, str):
-            if any(ord(char) < 32 for char in node):
+    normalized: dict = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key or key != key.strip():
+            raise DomainError("invalid_route", 400)
+        name = key.lower()
+        if name not in _ALLOWED_OPTION_KEYS or name in normalized:
+            raise DomainError("invalid_route", 400)
+        if isinstance(item, bool) or item is None:
+            normalized[name] = item
+        elif isinstance(item, int):
+            normalized[name] = item
+        elif isinstance(item, float):
+            if not math.isfinite(item):
                 raise DomainError("invalid_route", 400)
-        elif not (isinstance(node, (int, float, bool)) or node is None):
+            normalized[name] = item
+        elif isinstance(item, str):
+            if any(ord(char) < 32 for char in item):
+                raise DomainError("invalid_route", 400)
+            normalized[name] = item
+        else:
+            # 嵌套字典/数组等结构一律拒绝，避免认证头/凭证结构绕过
             raise DomainError("invalid_route", 400)
 
-    walk(value)
-    if len(_canonical(value)) > 16384:
+    if len(_canonical(normalized)) > 16384:
         raise DomainError("invalid_route", 400)
-    return value
+    return normalized
 
 
 def _provider_spec(channel: str, provider_id: str) -> dict:
