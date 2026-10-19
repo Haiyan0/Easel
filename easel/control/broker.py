@@ -535,14 +535,26 @@ class BrokerService:
             _token_digest(token), workspace_id, run_id, channel,
             int(self._clock()), int(self._lease_clock()), self._lease_ttl)
 
-    async def _renew_lease_loop(self, lease_id: str) -> None:
-        """流未关闭期间持续续期；进程崩溃后租约按 lease_ttl 自然过期。"""
+    async def _renew_lease_loop(self, lease_id: str, on_failure=None) -> None:
+        """流未关闭期间持续续期；续期失败时终止在途流并释放额度。"""
         interval = max(1.0, self._lease_ttl / 3)
         while True:
             await asyncio.sleep(interval)
-            expires_at = int(self._lease_clock()) + self._lease_ttl
-            await self._db(self._store.renew_broker_lease, lease_id,
-                           expires_at)
+            try:
+                expires_at = int(self._lease_clock()) + self._lease_ttl
+                await self._db(self._store.renew_broker_lease, lease_id,
+                               expires_at)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 无法续期时不能继续无额度运行：先关闭上游再释放
+                if on_failure is not None:
+                    try:
+                        await on_failure()
+                    except Exception:
+                        pass
+                await self._db(self.release_lease, lease_id)
+                return
 
     def release_lease(self, lease_id: str) -> None:
         if not isinstance(lease_id, str) or not lease_id:
@@ -594,7 +606,15 @@ class BrokerService:
             raise DomainError("egress_unavailable", 503)
         lease_id = await self._db(
             self.acquire_lease, token, workspace_id, run_id, channel)
-        heartbeat = asyncio.create_task(self._renew_lease_loop(lease_id))
+        abort_box: dict = {}
+
+        async def abort_stream() -> None:
+            abort = abort_box.get("abort")
+            if abort is not None:
+                await abort()
+
+        heartbeat = asyncio.create_task(
+            self._renew_lease_loop(lease_id, abort_stream))
         released = False
 
         async def release_once() -> None:
@@ -631,6 +651,16 @@ class BrokerService:
                 await close_body()
                 await client.aclose()
                 raise
+            # 续期失败时先关闭已打开的上游流，再由心跳释放额度
+            async def abort_opened() -> None:
+                await response.aclose()
+                try:
+                    await context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                await client.aclose()
+
+            abort_box["abort"] = abort_opened
             # 请求体已发送完毕，关闭 multipart 临时 spool
             await close_body()
             if 300 <= response.status_code < 400:
