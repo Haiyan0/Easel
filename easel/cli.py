@@ -274,6 +274,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="受保护的 32 字节 AES-GCM master key 文件")
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_serve.add_argument("--port", type=int, default=7861, help="端口（默认 7861）")
+    p_serve.add_argument("--egress-proxy", default=None,
+                         help="受控出口代理 URL，例如 http://127.0.0.1:8899")
+    p_serve.add_argument("--egress-policy", default=None,
+                         help="管理员出口策略 JSON（approved_hosts/approved_cidrs）")
     p_serve.set_defaults(func=cmd_serve_control)
 
     # admin：仅本地/服务器执行，不提供远程无认证等价接口

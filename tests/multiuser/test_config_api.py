@@ -293,7 +293,7 @@ def test_invalid_channels_and_bodies_are_rejected(tmp_path):
 
         unknown_channel = client.post(
             "/api/admin/managed-config",
-            json={"defaults": {"chat": speech_route()}}, headers=headers)
+            json={"defaults": {"runtime": speech_route()}}, headers=headers)
         assert unknown_channel.status_code == 400
         assert unknown_channel.json()["code"] == "invalid_channel"
 

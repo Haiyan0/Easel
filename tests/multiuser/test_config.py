@@ -519,7 +519,7 @@ def test_secret_bundle_shapes_match_registry(tmp_path):
 def test_unknown_channel_and_expected_version_validation(tmp_path):
     with control(tmp_path) as (store, config, admin, member):
         with pytest.raises(DomainError) as channel:
-            config.resolve(member, "chat")
+            config.resolve(member, "runtime")
         assert_error(channel, 400, "invalid_channel")
 
         for expected in (-1, True, "0", 1.5):
@@ -736,3 +736,100 @@ def test_registry_exposes_broker_and_override_metadata():
         "openai-compatible"
     assert provider_metadata("video", "dashscope")["broker_adapter"] is None
     assert provider_metadata("video", "dashscope")["override_allowed"] is True
+    assert provider_metadata("chat", "deepseek")["broker_adapter"] == "deepseek-acp"
+    assert provider_metadata("chat", "deepseek")["override_allowed"] is False
+
+
+# --------------------------------------------------------------------------
+# Task 5：受管主聊天模型与出口策略一致性
+# --------------------------------------------------------------------------
+
+def chat_route(**overrides) -> dict:
+    route = {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "base_url": "https://chat.example/v1",
+        "protocol": "openai",
+        "secret": {"CHAT_API_KEY": "chat-secret-sentinel"},
+        "options": {},
+        "allowed_models": ["deepseek-chat", "deepseek-reasoner"],
+    }
+    route.update(overrides)
+    return route
+
+
+def test_default_model_must_be_inside_allowed_models(tmp_path):
+    with control(tmp_path) as (store, config, admin, member):
+        with pytest.raises(DomainError) as invalid:
+            publish_speech(config, admin, model="tts-other",
+                           allowed_models=["tts-default"])
+        assert_error(invalid, 400, "invalid_route")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM managed_revisions").fetchone()[0] == 0
+
+
+def test_chat_is_admin_managed_and_member_cannot_override(tmp_path):
+    with control(tmp_path) as (store, config, admin, member):
+        assert config.publish(admin, {"defaults": {"chat": chat_route()}},
+                              expected_version=0) == 1
+
+        resolved = config.resolve(member, "chat")
+        assert resolved.source == "admin"
+        assert resolved.provider == "deepseek"
+        assert resolved.model == "deepseek-chat"
+        assert resolved.credential_ref == "managed:1:chat"
+        assert resolved.allowed_models == ("deepseek-chat", "deepseek-reasoner")
+
+        for action in (
+            lambda: config.save_override(member, "chat", chat_route()),
+            lambda: config.clear_override(member, "chat"),
+        ):
+            with pytest.raises(DomainError) as denied:
+                action()
+            assert_error(denied, 403, "override_not_allowed")
+
+        public = config.public_settings(member)["channels"]["chat"]
+        assert public["configured"] is True
+        assert public["source"] == "admin"
+        assert public["mode"] == "inherited"
+        assert public["override_allowed"] is False
+        assert public["broker_adapter"] == "deepseek-acp"
+        assert public["broker_supported"] is True
+        assert "chat-secret-sentinel" not in json.dumps(public, ensure_ascii=False)
+
+
+def test_chat_route_rejects_unknown_provider_and_non_https(tmp_path):
+    with control(tmp_path) as (store, config, admin, member):
+        with pytest.raises(DomainError) as unknown:
+            config.publish(admin, {"defaults": {"chat": chat_route(
+                provider="openai")}}, expected_version=0)
+        assert_error(unknown, 400, "unknown_provider")
+
+        with pytest.raises(DomainError) as insecure:
+            config.publish(admin, {"defaults": {"chat": chat_route(
+                base_url="http://chat.example/v1")}}, expected_version=0)
+        assert_error(insecure, 403, "destination_denied")
+
+
+def test_save_and_issue_share_egress_policy(tmp_path):
+    from easel.control.egress import EgressPolicy
+
+    policy = EgressPolicy(approved_hosts=frozenset({"provider.internal"}))
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        admin = store.create_user("Owner", "admin")
+        member = store.create_user("Member")
+        config = ConfigService(store, MASTER_KEY, egress_policy=policy)
+
+        with pytest.raises(DomainError) as private:
+            publish_speech(config, admin, route=speech_route(
+                base_url="https://10.0.0.5/v1"))
+        assert_error(private, 403, "destination_denied")
+
+        # 管理员批准的主机在保存阶段同样放行
+        assert publish_speech(config, admin, route=speech_route(
+            base_url="https://provider.internal/v1")) == 1
+
+        with pytest.raises(DomainError) as personal:
+            config.save_override(member, "speech", speech_route(
+                base_url="https://127.0.0.1/v1", secret="x"))
+        assert_error(personal, 403, "destination_denied")

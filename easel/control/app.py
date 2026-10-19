@@ -23,9 +23,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..providers.openai import BROKER_ROUTE_TABLE
 from .auth import AuthService
 from .config import ConfigService
 from .policy import authorize, public_route
@@ -34,6 +35,8 @@ from .types import DomainError, Identity
 
 SESSION_COOKIE = "__Host-easel_session"
 """__Host- 前缀要求 Secure、Path=/ 且无 Domain。"""
+
+_INTERNAL_BROKER_PREFIX = "/internal/broker/"
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _IMPLEMENTED_EXACT = frozenset({
@@ -158,6 +161,22 @@ def _implemented_route(method: str, path: str) -> bool:
                for allowed, pattern in _IMPLEMENTED_PATTERNS)
 
 
+def _broker_route_registered(method: str, path: str) -> bool:
+    """broker 内部路由使用精确 channel + method + 相对 path 白名单。"""
+    if not path.startswith(_INTERNAL_BROKER_PREFIX):
+        return False
+    rest = path[len(_INTERNAL_BROKER_PREFIX):]
+    channel, separator, relative_path = rest.partition("/")
+    if not separator:
+        return False
+    normalized = method.upper()
+    return any(
+        channel == expected_channel and normalized == expected_method
+        and relative_path == expected_path
+        for expected_channel, expected_method, expected_path, _body
+        in BROKER_ROUTE_TABLE)
+
+
 def _config_service(request: Request) -> ConfigService:
     service = getattr(request.app.state, "config_service", None)
     if service is None:
@@ -192,6 +211,18 @@ async def _read_json_body(request: Request, limit: int = 65536) -> dict:
     if not isinstance(payload, dict):
         raise DomainError("invalid_body", 400)
     return payload
+
+
+class BrokerStreamingResponse(StreamingResponse):
+    """流式转发响应；结束、异常或客户端断开都关闭上游并释放额度。"""
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
 
 def _identity_view(identity: Identity, csrf_token: str) -> dict:
@@ -243,6 +274,13 @@ async def _guard_request(request: Request, call_next):
     method = _effective_method(request.method)
     path = request.url.path
 
+    if path.startswith(_INTERNAL_BROKER_PREFIX):
+        # broker 使用独立 opaque token 分支，不读取浏览器 Cookie/CSRF；
+        # 未登记的 /internal/broker/* 一律 404，不回落到 public /api 边界。
+        if _broker_route_registered(method, path):
+            return await call_next(request)
+        return _middleware_error(request, "not_found", 404)
+
     if public_route(method, path):
         if not _implemented_route(method, path):
             return _middleware_error(request, "capability_unavailable", 503)
@@ -290,6 +328,8 @@ def create_app(*, store: Store, auth: AuthService,
     Origin 校验失败关闭；未提供 ``config_service`` 时配置业务明确 503。
     """
     control_path = Path(store.path).absolute()
+    if broker is not None and config_service is None:
+        raise ValueError("broker requires config_service")
     public_origin = config.public_origin if config is not None else None
     if public_origin is not None:
         # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
@@ -303,7 +343,6 @@ def create_app(*, store: Store, auth: AuthService,
         app.state.db_executor = executor
         app.state.public_origin = public_origin
         app.state.runtime = runtime
-        app.state.broker = broker
         try:
             app.state.control_store = await loop.run_in_executor(
                 executor, Store.connect, control_path)
@@ -314,6 +353,16 @@ def create_app(*, store: Store, auth: AuthService,
                     executor, config_service.with_store, app.state.control_store)
             else:
                 app.state.config_service = None
+            if broker is not None:
+                # 阻塞数据库调用仍走专用线程；流式释放也要走同一线程
+                def broker_db_runner(function, *args):
+                    return loop.run_in_executor(
+                        executor, functools.partial(function, *args))
+                app.state.broker = broker.with_store(
+                    app.state.control_store, app.state.config_service,
+                    db_runner=broker_db_runner)
+            else:
+                app.state.broker = None
             yield
         finally:
             try:
@@ -467,5 +516,45 @@ def create_app(*, store: Store, auth: AuthService,
             settings, expected_version)
         return JSONResponse({"version": version},
                             headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------
+    # provider broker：独立 opaque token 分支，精确注册首批 adapter 路由
+    # ------------------------------------------------------------------
+
+    def _make_broker_handler(channel: str, route_method: str,
+                             relative_path: str):
+        async def handler(request: Request):
+            service = getattr(request.app.state, "broker", None)
+            if service is None:
+                raise DomainError("capability_unavailable", 503)
+            token = request.headers.get("x-easel-broker-token", "")
+            workspace_id = request.headers.get("x-easel-workspace-id", "")
+            run_id = request.headers.get("x-easel-run-id", "")
+            if not token or not workspace_id or not run_id:
+                raise DomainError("invalid_token", 401)
+
+            body = None
+            if route_method in ("POST", "PUT", "PATCH"):
+                async def body_stream():
+                    async for chunk in request.stream():
+                        yield chunk
+                body = body_stream()
+
+            result = await service.forward(
+                token=token, workspace_id=workspace_id, run_id=run_id,
+                channel=channel, method=route_method,
+                relative_path=relative_path, headers=request.headers,
+                body=body)
+            return BrokerStreamingResponse(
+                result.chunks(), status_code=result.status_code,
+                headers=result.headers)
+
+        return handler
+
+    for _channel, _method, _relative_path, _body_kind in BROKER_ROUTE_TABLE:
+        app.add_api_route(
+            f"/internal/broker/{_channel}/{_relative_path}",
+            _make_broker_handler(_channel, _method, _relative_path),
+            methods=[_method], include_in_schema=False)
 
     return app

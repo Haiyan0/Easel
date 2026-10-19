@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .egress import EgressPolicy
 from .store import Store
 from .types import DomainError, EffectiveRoute, Identity
 
@@ -36,8 +37,13 @@ from model_registry import MODEL_GROUPS, provider_metadata  # noqa: E402
 
 MASTER_KEY_BYTES = 32
 CHANNELS = ("speech", "image", "video", "music")
+"""member 可保存个人覆盖的能力通道。"""
+
+ADMIN_CHANNELS = ("speech", "image", "video", "music", "chat")
+"""管理员受管配置通道；chat 只能由管理员配置，member 不能覆盖。"""
+
 _REGISTRY_GROUP = {"speech": "voice", "image": "image", "video": "video",
-                   "music": "music"}
+                   "music": "music", "chat": "chat"}
 _COMPLETE_FIELDS = frozenset({"route_kind", "provider", "model", "base_url",
                               "protocol", "secret", "options"})
 _MANAGED_MODEL_FIELDS = frozenset({"route_kind", "model", "options"})
@@ -71,6 +77,11 @@ def _scope_bytes(scope: dict) -> bytes:
 
 def _require_channel(channel: str) -> None:
     if not isinstance(channel, str) or channel not in CHANNELS:
+        raise DomainError("invalid_channel", 400)
+
+
+def _require_admin_channel(channel: str) -> None:
+    if not isinstance(channel, str) or channel not in ADMIN_CHANNELS:
         raise DomainError("invalid_channel", 400)
 
 
@@ -236,6 +247,9 @@ def _validate_complete_route(channel: str, route: Any, *,
             model = _text_field(item, max_length=256)
             if model not in normalized:
                 normalized.append(model)
+        if public["model"] not in normalized:
+            # 默认模型必须在允许集合内，否则省略 model 的请求会越界
+            raise DomainError("invalid_route", 400)
         public["allowed_models"] = normalized
     return public
 
@@ -276,18 +290,24 @@ def load_master_key(path: Path) -> bytes:
 class ConfigService:
     """默认/个人能力配置；所有秘密只在服务端内存中解密。"""
 
-    def __init__(self, store: Store, master_key: bytes):
+    def __init__(self, store: Store, master_key: bytes,
+                 egress_policy: EgressPolicy | None = None):
         if (not isinstance(master_key, (bytes, bytearray))
                 or len(master_key) != MASTER_KEY_BYTES):
             raise ValueError(
                 f"master_key must be exactly {MASTER_KEY_BYTES} bytes")
+        if egress_policy is None:
+            egress_policy = EgressPolicy()
+        if not isinstance(egress_policy, EgressPolicy):
+            raise TypeError("egress_policy must be EgressPolicy")
         self._store = store
         self._key = bytes(master_key)
+        self.egress_policy = egress_policy
         self._verify_existing_ciphertext()
 
     def with_store(self, store: Store) -> "ConfigService":
         """在同一 master key 下为应用线程重建服务；会重新校验已有密文。"""
-        return ConfigService(store, self._key)
+        return ConfigService(store, self._key, egress_policy=self.egress_policy)
 
     def _now(self) -> int:
         return int(time.time())
@@ -323,6 +343,82 @@ class ConfigService:
     def _workspace_scope(self, workspace_id: str, channel: str) -> dict:
         return {"scope": "workspace", "workspace_id": workspace_id,
                 "channel": channel}
+
+    def _snapshot_scope(self, snapshot_id: str) -> dict:
+        return {"scope": "broker", "snapshot_id": snapshot_id}
+
+    @staticmethod
+    def _validated_bundle(value: Any) -> dict[str, str]:
+        """凭证 bundle 只允许非空字符串键值；不回显内容。"""
+        if not isinstance(value, dict) or not value:
+            raise DomainError("secret_unavailable", 500)
+        bundle: dict[str, str] = {}
+        for key, item in value.items():
+            if (not isinstance(key, str) or not key or not isinstance(item, str)
+                    or not item or any(char in item for char in "\r\n\0")):
+                raise DomainError("secret_unavailable", 500)
+            bundle[key] = item
+        return bundle
+
+    def seal_broker_snapshot(self, bundle: dict, snapshot_id: str) -> bytes:
+        """把签发时的凭证 bundle 重新加密到 token 快照作用域。"""
+        bundle = self._validated_bundle(bundle)
+        return self._encrypt(bundle, self._snapshot_scope(snapshot_id))
+
+    def open_broker_snapshot(self, snapshot_id: str) -> dict[str, str]:
+        """仅服务器内部 adapter 使用；解密 token 快照。"""
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise DomainError("secret_unavailable", 500)
+        row = self._store.get_broker_snapshot(snapshot_id)
+        if row is None:
+            raise DomainError("secret_unavailable", 500)
+        return self._validated_bundle(
+            self._decrypt(row["encrypted_secrets"],
+                          self._snapshot_scope(snapshot_id)))
+
+    def credentials_for_ref(self, credential_ref: str) -> dict[str, str]:
+        """按 credential_ref 解密服务端凭证；调用者不能提交任意引用。
+
+        支持的引用形式均来自服务端 resolve 结果：
+
+        * ``managed:<version>:<channel>`` —— 不可变管理员版本；
+        * ``workspace:<workspace_id>:<channel>:<revision>`` —— 个人完整路由，
+          revision 必须与当前行一致（签发 token 时会另行保存不可变快照）；
+        * ``snapshot:<snapshot_id>`` —— broker token 自己的加密快照。
+        """
+        if not isinstance(credential_ref, str) or not credential_ref:
+            raise DomainError("secret_unavailable", 500)
+        parts = credential_ref.split(":")
+        if len(parts) == 2 and parts[0] == "snapshot":
+            return self.open_broker_snapshot(parts[1])
+        if len(parts) == 3 and parts[0] == "managed":
+            version_text, channel = parts[1], parts[2]
+            if not version_text.isdigit():
+                raise DomainError("secret_unavailable", 500)
+            version = int(version_text)
+            row = self._store.get_managed_revision(version)
+            if row is None:
+                raise DomainError("secret_unavailable", 500)
+            decrypted = self._decrypt(row["encrypted_secrets"],
+                                      self._managed_scope(version))
+            return self._validated_bundle(decrypted.get(channel))
+        if len(parts) == 4 and parts[0] == "workspace":
+            workspace_id, channel, version_text = parts[1], parts[2], parts[3]
+            if not version_text.isdigit():
+                raise DomainError("secret_unavailable", 500)
+            row = self._store.get_workspace_override(workspace_id, channel)
+            if (row is None or row["route_kind"] != "complete"
+                    or int(row["version"]) != int(version_text)
+                    or row["encrypted_secrets"] is None):
+                raise DomainError("secret_unavailable", 500)
+            return self._validated_bundle(self._decrypt(
+                row["encrypted_secrets"],
+                self._workspace_scope(workspace_id, channel)))
+        raise DomainError("secret_unavailable", 500)
+
+    def export_credentials(self, route: EffectiveRoute) -> dict[str, str]:
+        """签发快照时复制当前生效凭证；明文只停留在服务端内存。"""
+        return self.credentials_for_ref(route.credential_ref)
 
     def _verify_existing_ciphertext(self) -> None:
         latest = self._store.latest_managed_revision()
@@ -365,10 +461,12 @@ class ConfigService:
         public_defaults: dict[str, dict] = {}
         secret_bundle: dict[str, dict] = {}
         for channel, route in defaults.items():
-            _require_channel(channel)
+            _require_admin_channel(channel)
             public = _validate_complete_route(
                 channel, route, allow_allowed_models=True,
                 for_admin_default=True)
+            # 保存时即执行与签发/实际请求一致的出口前置校验
+            self.egress_policy.validate_url(public["base_url"], resolve=False)
             metadata = provider_metadata(_REGISTRY_GROUP[channel],
                                          public["provider"])
             if metadata["broker_adapter"] is None:
@@ -409,6 +507,9 @@ class ConfigService:
     # ------------------------------------------------------------------
 
     def save_override(self, actor: Identity, channel: str, route: dict) -> None:
+        if channel == "chat":
+            # 主聊天模型由管理员配置，member 不能加入个人覆盖
+            raise DomainError("override_not_allowed", 403)
         _require_channel(channel)
         identity = self._store.require_identity(actor)
         if not isinstance(route, dict):
@@ -420,6 +521,7 @@ class ConfigService:
             public = _validate_complete_route(
                 channel, route, allow_allowed_models=False,
                 for_admin_default=False)
+            self.egress_policy.validate_url(public["base_url"], resolve=False)
             secret = route.get("secret")
             if _secret_is_empty(secret):
                 encrypted = None
@@ -455,6 +557,8 @@ class ConfigService:
         raise DomainError("invalid_route", 400)
 
     def clear_override(self, actor: Identity, channel: str) -> None:
+        if channel == "chat":
+            raise DomainError("override_not_allowed", 403)
         _require_channel(channel)
         self._store.clear_workspace_override(actor, channel, self._now())
 
@@ -463,6 +567,26 @@ class ConfigService:
     # ------------------------------------------------------------------
 
     def resolve(self, actor: Identity, channel: str) -> EffectiveRoute:
+        if channel == "chat":
+            # 主聊天模型只解析管理员受管版本；member 不能覆盖
+            self._store.require_identity(actor)
+            defaults, version = self._load_managed_defaults(verify=True)
+            managed = defaults.get("chat")
+            if managed is None:
+                raise DomainError("not_configured", 404)
+            return EffectiveRoute(
+                channel="chat",
+                provider=managed["provider"],
+                model=managed["model"],
+                base_url=managed["base_url"],
+                protocol=managed["protocol"],
+                credential_ref=f"managed:{version}:chat",
+                source="admin",
+                version=version,
+                options=dict(managed.get("options") or {}),
+                allowed_models=tuple(
+                    managed.get("allowed_models") or (managed["model"],)),
+            )
         _require_channel(channel)
         identity = self._store.require_identity(actor)
         workspace_id = identity.workspace_id
@@ -490,6 +614,7 @@ class ConfigService:
                     source="user",
                     version=int(override["version"]),
                     options=dict(public.get("options") or {}),
+                    allowed_models=(public["model"],),
                 )
             if override["route_kind"] == "managed-model":
                 defaults, version = self._load_managed_defaults(verify=True)
@@ -511,6 +636,8 @@ class ConfigService:
                     source="user",
                     version=version,
                     options=options,
+                    allowed_models=tuple(
+                        managed.get("allowed_models") or (model,)),
                 )
             raise DomainError("configuration_invalid", 500)
 
@@ -528,6 +655,8 @@ class ConfigService:
             source="admin",
             version=version,
             options=dict(managed.get("options") or {}),
+            allowed_models=tuple(
+                managed.get("allowed_models") or (managed["model"],)),
         )
 
     def public_settings(self, actor: Identity) -> dict:
@@ -548,7 +677,7 @@ class ConfigService:
                      self._store.list_workspace_overrides(identity.workspace_id)}
         managed_verified = False
         channels: dict[str, dict] = {}
-        for channel in CHANNELS:
+        for channel in ADMIN_CHANNELS:
             override = overrides.get(channel)
             managed = managed_defaults.get(channel)
             entry = {
@@ -562,7 +691,8 @@ class ConfigService:
                 "protocol": None,
                 "options": {},
                 "broker_adapter": None,
-                "override_allowed": True,
+                "broker_supported": False,
+                "override_allowed": channel != "chat",
             }
             if override is not None:
                 try:
@@ -629,7 +759,15 @@ class ConfigService:
                 metadata = provider_metadata(
                     _REGISTRY_GROUP[channel], entry["provider"])
                 entry["broker_adapter"] = metadata["broker_adapter"]
-                entry["override_allowed"] = metadata["override_allowed"]
+                entry["override_allowed"] = (
+                    metadata["override_allowed"] and channel != "chat")
+                # 支持矩阵必须反映实际 adapter，而不是只看 metadata 非空
+                try:
+                    from ..providers.openai import adapter_supported
+                    entry["broker_supported"] = adapter_supported(
+                        _REGISTRY_GROUP[channel], entry["provider"])
+                except (ImportError, KeyError):
+                    entry["broker_supported"] = False
             channels[channel] = entry
 
         return {"version": latest_version, "channels": channels}

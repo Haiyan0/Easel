@@ -28,7 +28,7 @@ from typing import Iterator, Literal
 
 from .types import ConversationRecord, DomainError, Identity, RunRecord
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -235,6 +235,36 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (workspace_id, channel)
         )
+        """,
+    ),
+    # 版本 4：broker 不可变配置快照与请求并发租约；只追加，不改写旧迁移。
+    (
+        "ALTER TABLE broker_tokens ADD COLUMN snapshot_id TEXT",
+        "ALTER TABLE broker_tokens ADD COLUMN route_json TEXT",
+        "ALTER TABLE broker_tokens ADD COLUMN encrypted_secrets BLOB",
+        """
+        CREATE UNIQUE INDEX broker_tokens_snapshot_idx
+            ON broker_tokens (snapshot_id)
+        """,
+        """
+        CREATE TABLE broker_leases (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            token_digest TEXT NOT NULL,
+            acquired_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            FOREIGN KEY (workspace_id, run_id)
+                REFERENCES runs(workspace_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE INDEX broker_leases_workspace_idx
+            ON broker_leases (workspace_id, expires_at)
+        """,
+        """
+        CREATE INDEX broker_leases_expiry_idx ON broker_leases (expires_at)
         """,
     ),
 )
@@ -740,6 +770,145 @@ class Store:
                 " WHERE workspace_id = ? AND channel = ?",
                 (workspace_id, _text(channel)))
         return cursor.rowcount == 1
+
+    def get_managed_revision(self, version: int) -> sqlite3.Row | None:
+        """按版本读取不可变管理员配置快照；旧版本永不覆盖。"""
+        if type(version) is not int or version < 1:
+            return None
+        return self._connection.execute(
+            "SELECT version, public_json, encrypted_secrets, created_by, created_at"
+            " FROM managed_revisions WHERE version = ?", (version,)).fetchone()
+
+    # ------------------------------------------------------------------
+    # Provider broker：令牌、不可变快照与并发租约
+    # ------------------------------------------------------------------
+
+    def create_broker_token(self, actor: Identity, run_id: str, channel: str, *,
+                            token_digest: str, snapshot_id: str,
+                            route_json: str, encrypted_secrets: bytes,
+                            config_version: int, now: int,
+                            expires_at: int) -> None:
+        """在事务内复查 Run 归属与活跃状态后写入令牌摘要和加密快照。"""
+        with self._transaction():
+            workspace_id = self._require_actor(actor)
+            run = self._fetch_run(workspace_id, _text(run_id))
+            if run.status not in ACTIVE_RUN_STATUSES:
+                raise DomainError("terminal_run", 409)
+            self._connection.execute(
+                "INSERT INTO broker_tokens"
+                " (token_digest, workspace_id, run_id, channel, config_version,"
+                " created_at, expires_at, revoked_at, snapshot_id, route_json,"
+                " encrypted_secrets)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (_text(token_digest), workspace_id, run.id, _text(channel),
+                 int(config_version), int(now), int(expires_at),
+                 _text(snapshot_id), _text(route_json),
+                 bytes(encrypted_secrets)))
+
+    def get_broker_snapshot(self, snapshot_id: str) -> sqlite3.Row | None:
+        """按快照 ID 读取密文；明文只允许 ConfigService 在服务端解密。"""
+        return self._connection.execute(
+            "SELECT encrypted_secrets FROM broker_tokens WHERE snapshot_id = ?",
+            (_text(snapshot_id),)).fetchone()
+
+    def _broker_token_row(self, token_digest: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT broker_tokens.token_digest, broker_tokens.workspace_id,"
+            " broker_tokens.run_id, broker_tokens.channel,"
+            " broker_tokens.config_version, broker_tokens.created_at,"
+            " broker_tokens.expires_at, broker_tokens.revoked_at,"
+            " broker_tokens.snapshot_id, broker_tokens.route_json,"
+            " broker_tokens.encrypted_secrets,"
+            " runs.status AS run_status, users.disabled_at AS user_disabled_at"
+            " FROM broker_tokens"
+            " JOIN runs ON runs.workspace_id = broker_tokens.workspace_id"
+            " AND runs.id = broker_tokens.run_id"
+            " JOIN workspaces ON workspaces.id = broker_tokens.workspace_id"
+            " JOIN users ON users.id = workspaces.owner_user_id"
+            " WHERE broker_tokens.token_digest = ?",
+            (_text(token_digest),)).fetchone()
+
+    def _require_broker_token_locked(self, token_digest: str, workspace_id: str,
+                                     run_id: str, channel: str,
+                                     now: int) -> sqlite3.Row:
+        """令牌校验：先认证摘要，再核对 Run/workspace/channel 与活跃状态。
+
+        失败信息只含错误码，不回显摘要、令牌或凭证。
+        """
+        row = self._broker_token_row(token_digest)
+        if (row is None or row["revoked_at"] is not None
+                or int(now) >= int(row["expires_at"])):
+            raise DomainError("invalid_token", 401)
+        # 外空间/外 Run 资源统一 404，避免泄露令牌归属
+        if row["workspace_id"] != workspace_id or row["run_id"] != run_id:
+            raise DomainError("not_found", 404)
+        if row["channel"] != channel:
+            raise DomainError("not_found", 404)
+        if row["user_disabled_at"] is not None:
+            raise DomainError("user_disabled", 403)
+        if row["run_status"] not in ACTIVE_RUN_STATUSES:
+            raise DomainError("terminal_run", 409)
+        if (row["snapshot_id"] is None or row["route_json"] is None
+                or row["encrypted_secrets"] is None):
+            raise DomainError("invalid_token", 401)
+        return row
+
+    def consume_broker_token(self, token_digest: str, workspace_id: str,
+                             run_id: str, channel: str, now: int) -> sqlite3.Row:
+        """读取并校验令牌；不消耗令牌，活跃 Run 可在有效期内多次调用。"""
+        return self._require_broker_token_locked(
+            token_digest, workspace_id, run_id, channel, int(now))
+
+    def revoke_broker_tokens(self, workspace_id: str, run_id: str,
+                             now: int) -> int:
+        """撤销某 Run 的全部令牌；跨连接立即生效。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE broker_tokens SET revoked_at = ?"
+                " WHERE workspace_id = ? AND run_id = ? AND revoked_at IS NULL",
+                (int(now), _text(workspace_id), _text(run_id)))
+        return cursor.rowcount
+
+    def acquire_broker_lease(self, token_digest: str, workspace_id: str,
+                             run_id: str, channel: str, now: int) -> str:
+        """原子检查并占用 broker 请求额度（每空间 2、整机 8）。"""
+        with self._transaction():
+            row = self._require_broker_token_locked(
+                token_digest, workspace_id, run_id, channel, int(now))
+            # 过期租约不再占额度；与本次检查和插入处于同一写事务
+            self._connection.execute(
+                "DELETE FROM broker_leases WHERE expires_at <= ?", (int(now),))
+            workspace_active = self._connection.execute(
+                "SELECT COUNT(*) AS total FROM broker_leases"
+                " WHERE workspace_id = ? AND expires_at > ?",
+                (workspace_id, int(now))).fetchone()["total"]
+            if workspace_active >= self.max_active_runs_per_workspace:
+                raise DomainError("workspace_capacity", 429)
+            total = self._connection.execute(
+                "SELECT COUNT(*) AS total FROM broker_leases"
+                " WHERE expires_at > ?", (int(now),)).fetchone()["total"]
+            if total >= self.max_active_runs_total:
+                raise DomainError("global_capacity", 429)
+
+            lease_id = uuid.uuid4().hex
+            self._connection.execute(
+                "INSERT INTO broker_leases"
+                " (id, workspace_id, run_id, channel, token_digest,"
+                " acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (lease_id, workspace_id, run_id, channel, _text(token_digest),
+                 int(now), int(row["expires_at"])))
+        return lease_id
+
+    def release_broker_lease(self, lease_id: str) -> None:
+        """释放额度；重复释放安全。"""
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM broker_leases WHERE id = ?", (_text(lease_id),))
+
+    def count_broker_leases(self, now: int) -> int:
+        return self._connection.execute(
+            "SELECT COUNT(*) AS total FROM broker_leases WHERE expires_at > ?",
+            (int(now),)).fetchone()["total"]
 
     def _active_login(self, token_digest: str, now: int, idle_seconds: int) -> sqlite3.Row:
         """读取仍有效的登录行；失效原因统一 401。"""

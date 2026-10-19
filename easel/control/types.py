@@ -80,6 +80,8 @@ class EffectiveRoute:
     source: Literal["admin", "user"]
     version: int
     options: dict
+    allowed_models: tuple[str, ...] = ()
+    """broker 允许请求的模型集合；空元组表示只允许 ``model`` 本身。"""
 
 
 @dataclass(frozen=True)

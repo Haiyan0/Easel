@@ -12,7 +12,9 @@ import uvicorn
 
 from .app import ControlConfig, create_app
 from .auth import AuthService
+from .broker import BrokerService
 from .config import ConfigService, load_master_key
+from .egress import EgressGateway, load_policy
 from .store import Store
 from .types import DomainError
 
@@ -72,16 +74,36 @@ def cmd_serve_control(args) -> int:
         print("错误：invalid_master_key", file=sys.stderr)
         return 2
 
+    # 出口策略必须在打开控制库、启动 HTTP 之前校验失败
+    policy_path = getattr(args, "egress_policy", None)
+    egress_proxy = getattr(args, "egress_proxy", None)
+    if policy_path is not None:
+        try:
+            policy = load_policy(policy_path)
+        except ValueError:
+            print("错误：egress_policy_invalid", file=sys.stderr)
+            return 2
+    else:
+        from .egress import EgressPolicy
+        policy = EgressPolicy()
+    try:
+        egress = EgressGateway(policy=policy, proxy_url=egress_proxy)
+    except ValueError:
+        print("错误：egress_proxy_invalid", file=sys.stderr)
+        return 2
+
     store = Store.connect(_control_db(args.control_dir))
     try:
         try:
             # 已有密文与 key 不匹配必须在服务启动前明确失败
-            config_service = ConfigService(store, master_key)
+            config_service = ConfigService(store, master_key,
+                                           egress_policy=policy)
         except ValueError:
             print("错误：invalid_master_key", file=sys.stderr)
             return 2
+        broker = BrokerService(store, config_service, egress=egress)
         app = create_app(store=store, auth=AuthService(store), config=config,
-                         config_service=config_service)
+                         config_service=config_service, broker=broker)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
         store.close()

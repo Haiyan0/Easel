@@ -178,12 +178,29 @@ MODEL_GROUPS: dict[str, dict[str, Any]] = {    "image": {
             },
         ],
     },
+    "chat": {
+        "label": "主聊天模型（管理员受管）",
+        "settings": [],
+        "providers": [
+            {
+                "id": "deepseek", "name": "DeepSeek（OpenAI 兼容）",
+                "keys": [
+                    _key("CHAT_API_KEY", "API Key"),
+                    _key("CHAT_BASE_URL", "API 根地址", secret=False),
+                    _key("CHAT_MODEL", "模型", required=False, secret=False),
+                ],
+                "broker_adapter": "deepseek-acp",
+                "override_allowed": False,
+            },
+        ],
+    },
 }
 
 # 供应商能力元数据：只按 (group, provider) 追加字段，不复制 provider 定义。
 # broker_adapter=None 表示多人模式尚无受控转发适配器；此类在线供应商不得发布
 # 为可用默认配置。override_allowed 表示 member 可保存个人完整路由。
 _BROKER_ADAPTERS: dict[tuple[str, str], str] = {
+    ("chat", "deepseek"): "deepseek-acp",
     ("image", "openai"): "openai-compatible",
     ("voice", "openai-compatible"): "openai-compatible",
 }
