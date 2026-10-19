@@ -71,7 +71,15 @@ def _installation_directories(environment: dict[str, str], home: Path) -> list[P
 
 
 def web_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Find user-installed Agent CLIs when a non-interactive launcher loses PATH."""
+    """Find user-installed Agent CLIs when a non-interactive launcher loses PATH.
+
+    worker 模式的 PATH 来自受管运行环境；这里不得扫描宿主 HOME/NPM/Node
+    安装目录，否则会把宿主可执行文件或秘密重新带回 worker。
+    """
+    mode = next((value for key, value in environment.items()
+                 if str(key).upper() == "EASEL_SERVICE_MODE"), "local")
+    if str(mode).strip().lower() == "worker":
+        return dict(environment)
     result = dict(environment)
     path_key = next((key for key in result if key.upper() == "PATH"), "PATH") if WINDOWS else "PATH"
     current_path = result.get(path_key, os.defpath)

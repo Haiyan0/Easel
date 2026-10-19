@@ -19,11 +19,18 @@ MAX_IDLE_PROCESSES = 8
 MAX_CLIENT_REQUESTS = 64
 
 
-async def close_sessions(session_key: str | None = None):
+async def close_sessions(session_key: str | None = None,
+                         workspace_id: str | None = None):
+    """关闭指定 namespace 的会话；workspace_id 为空时匹配全部（local 兼容）。
+
+    内部调用必须同时传入 workspace_id 与 session_key，避免两个 workspace
+    使用相同 session_key 时错误关闭对方的私有 stdio 进程。
+    """
     loop = asyncio.get_running_loop()
     pool = _POOLS.get(loop, {})
     selected = [(key, entry) for key, entry in list(pool.items())
-                if session_key is None or key[1] == session_key]
+                if (workspace_id is None or key[1] == workspace_id)
+                and (session_key is None or key[2] == session_key)]
     for key, entry in selected:
         pool.pop(key, None)
         if entry["timer"]:
@@ -42,7 +49,8 @@ async def connection(request: RunRequest, command: list[str], notify, respond, *
         return
     loop = asyncio.get_running_loop()
     pool = _POOLS.setdefault(loop, {})
-    key = (acp, request.session_key)
+    # namespace 必须覆盖 workspace：不同空间的同名会话不能共用进程或锁
+    key = (acp, request.workspace_id, request.session_key)
     signature = hashlib.sha256(json.dumps([
         str(request.cwd.resolve()), sorted(request.env.items()), command,
         request.model, request.sandbox, harness_instructions(request),
@@ -69,10 +77,12 @@ async def connection(request: RunRequest, command: list[str], notify, respond, *
                 await previous["rpc"].__aexit__()
             idle = [(old_key, value) for old_key, value in pool.items() if not value["busy"]]
             if len(idle) >= MAX_IDLE_PROCESSES:
-                await close_sessions(idle[0][0][1])
+                await close_sessions(idle[0][0][2],
+                                     workspace_id=idle[0][0][1])
             await rpc.__aenter__()
         except BaseException:
-            await close_sessions(request.session_key)
+            await close_sessions(request.session_key,
+                                 workspace_id=request.workspace_id)
             raise
     rpc = entry["rpc"]
     if entry["timer"]:
@@ -85,7 +95,8 @@ async def connection(request: RunRequest, command: list[str], notify, respond, *
     try:
         yield rpc
     except BaseException:
-        await close_sessions(request.session_key)
+        await close_sessions(request.session_key,
+                             workspace_id=request.workspace_id)
         raise
     else:
         while True:
@@ -93,7 +104,8 @@ async def connection(request: RunRequest, command: list[str], notify, respond, *
                     if not value["busy"] and old_key != key]
             if len(idle) < MAX_IDLE_PROCESSES:
                 break
-            await close_sessions(idle[0][0][1])
+            await close_sessions(idle[0][0][2],
+                                 workspace_id=idle[0][0][1])
         if pool.get(key) is not entry:
             return
         rpc.notify = lambda method, params: None
@@ -106,7 +118,8 @@ async def connection(request: RunRequest, command: list[str], notify, respond, *
         async def expire():
             await asyncio.sleep(IDLE_SECONDS)
             entry["timer"] = None
-            await close_sessions(request.session_key)
+            await close_sessions(request.session_key,
+                                 workspace_id=request.workspace_id)
 
         entry["timer"] = asyncio.create_task(expire())
         entry["busy"] = False

@@ -198,6 +198,14 @@ def test_web_environment_tolerates_inaccessible_installations(home, monkeypatch)
     assert runtime_env.web_environment(environment) == environment
 
 
+def test_worker_environment_never_scans_host_installations(home, monkeypatch):
+    discover = Mock(side_effect=AssertionError("worker 不得扫描宿主目录"))
+    monkeypatch.setattr(runtime_env, "_installation_directories", discover)
+    environment = {"EASEL_SERVICE_MODE": "worker", "PATH": str(home / "empty")}
+    assert runtime_env.web_environment(environment) == environment
+    discover.assert_not_called()
+
+
 def test_web_launcher_passes_recovered_environment(monkeypatch):
     environment = {"PATH": "/current", "EASEL_AGENT_RUNTIME": "openclaw"}
     recovered = {**environment, "PATH": "/agents:/current"}

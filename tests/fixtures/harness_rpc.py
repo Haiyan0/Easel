@@ -137,6 +137,16 @@ while True:
         reply(message, {})
     elif method == "environment":
         reply(message, {"cwd": os.getcwd(), "root": os.environ.get("EASEL_ROOT")})
+    elif method == "runtime":
+        reply(message, {
+            "cwd": os.getcwd(),
+            "root": os.environ.get("EASEL_ROOT"),
+            "home": os.environ.get("HOME"),
+            "dsh_home": os.environ.get("DSH_HOME"),
+            "dsh_agents_home": os.environ.get("DSH_AGENTS_HOME"),
+            "workspace": os.environ.get("EASEL_WORKSPACE_ID"),
+            "command": sys.argv,
+        })
     elif method == "malformed":
         print("not-json", flush=True)
     elif method == "quit":

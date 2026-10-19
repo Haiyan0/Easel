@@ -21,17 +21,20 @@ def workspace_documents(root: Path) -> list[Path]:
 
 def harness_instructions(request: RunRequest) -> str:
     root = request.cwd.resolve()
-    python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    # 代码/技能/规则来自只读代码根；产物、画像与工作目录来自本人数据根。
+    code_root = (request.code_root or request.cwd).resolve()
+    python = code_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     runtime = request.env.get("EASEL_AGENT_RUNTIME", "当前所选引擎")
     documents = "\n\n".join(
         f"## 共享工作区：{document.name}\n\n{document.read_text(encoding='utf-8')}"
-        for document in workspace_documents(root))
+        for document in workspace_documents(code_root))
     return (
         documents + "\n\n## 运行时项目根与执行引擎\n\n"
         f"当前执行引擎：{runtime}；权限范围：{request.sandbox}。"
         "引擎与模型供应商分开选择；只使用当前引擎真实提供的工具，不冒充其它引擎。"
         f"项目根绝对路径：{root}；先切换到该目录再运行项目脚本。"
-        f"技能库：{root / 'skills' / 'builtin'}；共享脚本：{root / 'skills' / 'shared' / 'scripts'}。"
+        f"技能库：{code_root / 'skills' / 'builtin'}；共享脚本："
+        f"{code_root / 'skills' / 'shared' / 'scripts'}。"
         "每个 SKILL.md 是流程规范，不要求使用原生 /skill 命令；先读取对应技能再执行。"
         f"Python 优先使用 {python}；产物保存到 {root / 'outputs'}。"
         f"账号画像位于 {root / 'profiles'}；直接使用该实际路径，"

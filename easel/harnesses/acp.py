@@ -50,7 +50,14 @@ class ACPAdapter:
                 return {"outcome": {"outcome": "cancelled"}}
             return {"outcome": {"outcome": "selected", "optionId": labels[selected[0]]}}
 
-        command = list(request.command) if request.command else list(acp_command(request.cwd))
+        if request.command:
+            # 受管命令来自已验签快照；只做 argv 校验，不读取可写工作区文件
+            command = list(acp_command(request.cwd,
+                                       managed_command=request.command))
+        elif request.workspace_id:
+            raise HarnessError("worker 模式缺少受管 ACP 命令")
+        else:
+            command = list(acp_command(request.cwd))
         async with connection(request, command, notify, respond, acp=True) as rpc:
             if rpc.initialized is None:
                 rpc.initialized = await rpc.call("initialize", {

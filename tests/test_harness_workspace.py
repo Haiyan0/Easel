@@ -42,6 +42,31 @@ def test_native_harnesses_receive_all_shared_documents_and_actual_runtime(tmp_pa
     assert "额外工具权限必须由用户确认" in instructions
 
 
+def test_harness_instructions_split_code_and_workspace_roots(tmp_path):
+    code = tmp_path / "code"
+    workspace = tmp_path / "workspace"
+    source = code / "agents" / "workspace"
+    source.mkdir(parents=True)
+    (source / "AGENTS.md").write_text("共享业务规则", encoding="utf-8")
+    (source / "SOUL.md").write_text("共享人格", encoding="utf-8")
+    for directory in (code / "skills" / "builtin",
+                      code / "skills" / "shared" / "scripts",
+                      code / ".venv" / ("Scripts" if os.name == "nt" else "bin")):
+        directory.mkdir(parents=True, exist_ok=True)
+    (workspace / "outputs").mkdir(parents=True)
+    (workspace / "profiles").mkdir(parents=True)
+    request = RunRequest("hello", workspace, {"EASEL_AGENT_RUNTIME": "acp"},
+                         code_root=code)
+    instructions = harness_instructions(request)
+    assert "共享业务规则" in instructions and "共享人格" in instructions
+    assert str(code / "skills" / "builtin") in instructions
+    assert str(code / "skills" / "shared" / "scripts") in instructions
+    assert str(code / ".venv") in instructions
+    assert str(workspace / "outputs") in instructions
+    assert str(workspace / "profiles") in instructions
+    assert f"项目根绝对路径：{workspace.resolve()}" in instructions
+
+
 def test_missing_shared_agents_document_is_not_silently_ignored(tmp_path):
     source = tmp_path / "agents" / "workspace"
     source.mkdir(parents=True)

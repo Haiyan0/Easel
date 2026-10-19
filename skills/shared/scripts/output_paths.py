@@ -9,7 +9,20 @@ from pathlib import Path
 
 
 def _discover_root() -> Path:
+    # 统一走脚本侧路径 helper：worker 用显式 EASEL_WORKSPACE_ROOT，
+    # local 显式 EASEL_ROOT 也走同一入口；无配置时保留原有源码布局扫描。
     configured = os.environ.get("EASEL_ROOT", "").strip()
+    mode = (os.environ.get("EASEL_SERVICE_MODE") or "local").strip().lower()
+    if mode == "worker" or configured:
+        try:
+            from runtime_paths import resolve_runtime_paths
+        except ImportError:
+            resolve_runtime_paths = None
+        if resolve_runtime_paths is not None:
+            try:
+                return resolve_runtime_paths().workspace_root
+            except RuntimeError:
+                pass
     if configured:
         return Path(configured).expanduser().resolve()
     for parent in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):

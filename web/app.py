@@ -56,10 +56,49 @@ from easel.harnesses import store as harness_store
 from easel.harnesses.base import HarnessError, RunRequest
 from easel.control.policy import worker_allowed
 from easel.control.types import DomainError
+from easel.worker.config import (SnapshotAdmissionStore, WorkerConfigSnapshot,
+                                 build_run_env, load_worker_snapshot)
+from easel.worker.context import resolve_paths, service_mode
 from easel.worker.guard import load_worker_identity, verify_worker_request
 
 # worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
 _WORKER_IDENTITY = load_worker_identity()
+_RUNTIME_PATHS = resolve_paths(os.environ, PROJECT_ROOT)
+_SERVICE_MODE = service_mode(os.environ)
+_WORKER_SNAPSHOT: WorkerConfigSnapshot | None = None
+_WORKER_ADMISSION: dict | None = None
+
+WORKER_SNAPSHOT_FILE_ENV = "EASEL_WORKER_SNAPSHOT_FILE"
+WORKER_PUBLIC_KEY_FILE_ENV = "EASEL_WORKER_PUBLIC_KEY_FILE"
+
+
+def _workspace_namespace() -> str:
+    """RPC 进程池/关闭使用的 workspace namespace；local 为空。"""
+    return _WORKER_SNAPSHOT.workspace_id if _WORKER_SNAPSHOT is not None else ""
+
+
+def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
+    """启动时加载唯一受管快照：缺文件/公钥/run 或验签失败即失败关闭。"""
+    snapshot_file = (os.environ.get(WORKER_SNAPSHOT_FILE_ENV) or "").strip()
+    public_key_file = (os.environ.get(WORKER_PUBLIC_KEY_FILE_ENV) or "").strip()
+    run_id = (os.environ.get("EASEL_RUN_ID") or "").strip()
+    if not snapshot_file or not public_key_file or not run_id:
+        raise RuntimeError(
+            "worker 模式必须显式配置受管快照文件、公钥文件和 EASEL_RUN_ID")
+    if _WORKER_IDENTITY is None:
+        raise RuntimeError("worker 受管快照需要固定 worker 身份")
+    snapshot = load_worker_snapshot(
+        snapshot_file, public_key_file,
+        expected_workspace_id=_WORKER_IDENTITY.workspace_id,
+        expected_run_id=run_id)
+    admission = SnapshotAdmissionStore(
+        _RUNTIME_PATHS.state_root / "snapshot_admissions.sqlite3"
+    ).admit(snapshot)
+    return snapshot, admission
+
+
+if _SERVICE_MODE == "worker":
+    _WORKER_SNAPSHOT, _WORKER_ADMISSION = _load_worker_runtime()
 try:
     from easel.gateway_questions import (
         GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
@@ -85,9 +124,10 @@ def _qbridge_warn_once(key: str, message: str) -> None:
     _QBRIDGE_WARNED.add(key)
     print(message, file=sys.stderr, flush=True)
 
-PROFILES_DIR = PROJECT_ROOT / "profiles"
-SKILLS_DIR = PROJECT_ROOT / "skills"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+# 代码/技能来自只读 code_root；产物/画像写 workspace_root；状态写 state_root。
+PROFILES_DIR = _RUNTIME_PATHS.workspace_root / "profiles"
+SKILLS_DIR = _RUNTIME_PATHS.code_root / "skills"
+OUTPUTS_DIR = _RUNTIME_PATHS.workspace_root / "outputs"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
@@ -210,7 +250,7 @@ def _heal_openclaw_session(sk: str) -> None:
 
 # 制作层/直接执行层/chat 超时统一走 easel/timeouts.py（CLI/Web/skill 三入口单一真相源）
 
-SHARED_SCRIPTS = PROJECT_ROOT / "skills" / "shared" / "scripts"
+SHARED_SCRIPTS = _RUNTIME_PATHS.code_root / "skills" / "shared" / "scripts"
 if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
@@ -248,7 +288,7 @@ LOGIN_RUNNERS: dict[str, dict] = {
 # ---- 微信公众号（wechat-oa）凭证式接入 ----
 # 复用 skill-wechat-publisher 的发布引擎与配置：凭证存在其 wechat-publisher.yaml，
 # 发布/取数脚本都从这里读账号。web 侧统一用账号 key "web"。
-WECHAT_SKILL_DIR = PROJECT_ROOT / "skills" / "builtin" / "skill-wechat-publisher"
+WECHAT_SKILL_DIR = _RUNTIME_PATHS.code_root / "skills" / "builtin" / "skill-wechat-publisher"
 WECHAT_SKILL_SCRIPTS = WECHAT_SKILL_DIR / "scripts"
 WECHAT_PUBLISH_SCRIPT = WECHAT_SKILL_SCRIPTS / "publish.py"
 WECHAT_CONFIG_YAML = WECHAT_SKILL_DIR / "wechat-publisher.yaml"
@@ -432,7 +472,7 @@ for _spec in SKILL_API_REQUIREMENTS.values():
             _ENV_ALLOWLIST.add(_key["env"])
             _ENV_ALLOWLIST.update(_key.get("aliases", []))
 
-ENV_FILE = PROJECT_ROOT / ".env"
+ENV_FILE = _RUNTIME_PATHS.workspace_root / ".env"
 _HARNESS_LOOP = None
 _PLACEHOLDER_RE = re.compile(r"replace_me|your[-_]?api[-_]?key|xxx|^\.{3}$|^<.*>$", re.I)
 
@@ -868,7 +908,34 @@ def _direct_api_enabled() -> bool:
     return _harness_settings()["runtime"] == "api"
 
 
+def _managed_harness_settings() -> dict:
+    """worker 的底座选择只来自验签 agent，不读取 .env 或工作区 config.json。"""
+    agent = dict(_WORKER_SNAPSHOT.agent)
+    runtime = agent.get("runtime", "acp")
+    if runtime not in ("acp", "codex", "opencode"):
+        raise HTTPException(409, "worker 受管底座无效")
+    model = agent.get("model", "")
+    models = agent.get("models")
+    if models is None:
+        models = {runtime: model} if isinstance(model, str) and model else {}
+    if (not isinstance(models, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str)
+                   or len(value) > 240 for key, value in models.items())):
+        raise HTTPException(409, "worker 受管模型配置无效")
+    sandbox = agent.get("sandbox", "workspace-write")
+    if sandbox not in ("read-only", "workspace-write"):
+        raise HTTPException(409, "worker 受管权限配置无效")
+    auto_approve = agent.get("codex_auto_approve",
+                             agent.get("auto_approve", False))
+    if not isinstance(auto_approve, bool):
+        raise HTTPException(409, "worker 受管自动批准配置无效")
+    return {"runtime": runtime, "models": models, "sandbox": sandbox,
+            "codex_auto_approve": auto_approve}
+
+
 def _harness_settings() -> dict:
+    if _WORKER_SNAPSHOT is not None:
+        return _managed_harness_settings()
     try:
         return harness_store.settings(OUTPUTS_DIR, read_settings(ENV_FILE))
     except HarnessError as error:
@@ -1796,7 +1863,7 @@ async def api_harness_settings_save(req: HarnessSettingsRequest):
     config["models"] = {**config["models"], req.runtime: req.model.strip()}
     harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
     from easel.harnesses.rpc import close_sessions
-    await close_sessions()
+    await close_sessions(workspace_id=_workspace_namespace())
     return await api_harness_settings()
 
 
@@ -1815,7 +1882,7 @@ async def api_chat_transport_save(req: ChatTransportRequest):
     config["runtime"] = "api" if req.transport == "api" else "openclaw"
     harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
     from easel.harnesses.rpc import close_sessions
-    await close_sessions()
+    await close_sessions(workspace_id=_workspace_namespace())
     return _model_channels()
 
 
@@ -3040,11 +3107,34 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
         _RUNNING_CHAT[sk] = proc
         _save_turn(pk, "running", "", {"turn_id": turn_id, "runtime": runtime})
         claimed = True
-        env = {**read_settings(ENV_FILE), **_proxy_env(), "EASEL_AGENT_RUNTIME": runtime,
-               "EASEL_ROOT": str(PROJECT_ROOT)}
-        request = RunRequest(message, PROJECT_ROOT, env, native_id,
+        if _WORKER_SNAPSHOT is not None:
+            # worker：命令/模型/sandbox 来自验签快照，环境只含受管路径与 token
+            managed = dict(_WORKER_SNAPSHOT.agent)
+            command = managed.get("command")
+            if command is not None:
+                if (not isinstance(command, (list, tuple)) or not command
+                        or not all(isinstance(part, str) and part
+                                   for part in command)):
+                    raise HarnessError("worker 受管命令格式无效")
+                command = tuple(command)
+            elif runtime == "acp":
+                raise HarnessError("worker 模式缺少受管 ACP 命令")
+            else:
+                command = ()
+            env = build_run_env(_RUNTIME_PATHS, _WORKER_SNAPSHOT, os.environ)
+        else:
+            command = ()
+            env = {**read_settings(ENV_FILE), **_proxy_env(),
+                   "EASEL_AGENT_RUNTIME": runtime,
+                   "EASEL_ROOT": str(PROJECT_ROOT)}
+        request = RunRequest(message, PROJECT_ROOT if _WORKER_SNAPSHOT is None
+                             else _RUNTIME_PATHS.workspace_root, env, native_id,
                              config["models"].get(runtime, ""), config["sandbox"], timeout,
-                             session_key=sk, codex_auto_approve=config.get("codex_auto_approve", False))
+                             command=command, session_key=sk,
+                             codex_auto_approve=config.get("codex_auto_approve", False),
+                             workspace_id=_workspace_namespace(),
+                             code_root=None if _WORKER_SNAPSHOT is None
+                             else _RUNTIME_PATHS.code_root)
         await asyncio.wait_for(harnesses.adapter(runtime).run(
             request, receive, ask,
             lambda identifier: harness_store.bind(SESSIONS_DIR, sk, runtime, identifier)), timeout)
@@ -5300,7 +5390,8 @@ async def api_delete_session(session_key: str):
     record = harness_store.binding(SESSIONS_DIR, session_key)
     if record and record.get("runtime") != "openclaw":
         from easel.harnesses.rpc import close_sessions
-        await close_sessions(session_key)
+        await close_sessions(session_key,
+                             workspace_id=_workspace_namespace())
         harness_store.binding_path(SESSIONS_DIR, session_key).unlink(missing_ok=True)
         _turn_file(f"web:{session_key}").unlink(missing_ok=True)
         return {"deleted": True, "nativeHistoryDeleted": False}

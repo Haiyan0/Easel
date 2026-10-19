@@ -35,6 +35,10 @@ class RunRequest:
     command: tuple[str, ...] = ()
     session_key: str = ""
     codex_auto_approve: bool = False
+    workspace_id: str = ""
+    """worker 的 workspace namespace；local 为空，保持原有进程池行为。"""
+    code_root: Path | None = None
+    """只读代码根；为空时沿用 ``cwd``（local 兼容行为）。"""
 
 
 class Adapter(Protocol):
