@@ -111,9 +111,9 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
 
 RELEASED_SCHEMA_FINGERPRINT = (
-    "76fb77382db7619c118c9e1ca395e3785b1996a27f440b7ca26f67e3e7ea4a82"
+    "d5d97ae6654ed9916ac652cc587000e67051b583c108bc4f575aeab754b845d2"
 )
-"""e0ad421（Task 1 首版）建库时的 schema 指纹；变更 schema 时必须同步更新。"""
+"""当前发布版（schema v2，Task 2）的 schema 指纹；变更 schema 时必须同步更新。"""
 
 
 def schema_fingerprint(connection: sqlite3.Connection) -> str:
@@ -1472,10 +1472,9 @@ def test_empty_database_file_is_initialized(tmp_path):
 
 
 def test_database_created_by_the_released_schema_opens_and_upgrades(tmp_path):
-    """e0ad421 建出的库（version=1 的既有 schema）必须能直接打开使用。
+    """当前发布版 schema 建出的库必须能直接重开，不得重复执行已完成迁移。
 
-    本轮没有 schema 变更，所以该库应当一步不用迁移即可工作；一旦引入新迁移，
-    它也必须能从中升级，而不是被重建或拒绝。
+    跨版本升级由 ``test_auth.py`` 的冻结 v1 fixture 用例单独验证。
     """
     path = tmp_path / "released.sqlite3"
     with Store.open(path) as store:

@@ -22,6 +22,8 @@ from easel.commands.doctor import cmd_doctor
 from easel.commands.gateway import cmd_gateway
 from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
+from easel.control.cli import (cmd_admin_bootstrap, cmd_admin_invite,
+                               cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
 from easel.persona import persona_prefix
@@ -261,6 +263,31 @@ def main(argv: list[str] | None = None) -> int:
     p_web = sub.add_parser("web", help="启动 Web UI")
     p_web.add_argument("--port", type=int, default=7860, help="端口（默认 7860）")
     p_web.set_defaults(func=cmd_web)
+
+    # serve-control
+    p_serve = sub.add_parser("serve-control", help="启动多人控制面 HTTP 服务")
+    p_serve.add_argument("--control-dir", required=True,
+                         help="控制目录（存放 control.sqlite3）")
+    p_serve.add_argument("--public-origin", required=True,
+                         help="浏览器公共 Origin，例如 https://easel.example.com")
+    p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
+    p_serve.add_argument("--port", type=int, default=7861, help="端口（默认 7861）")
+    p_serve.set_defaults(func=cmd_serve_control)
+
+    # admin：仅本地/服务器执行，不提供远程无认证等价接口
+    p_admin = sub.add_parser("admin", help="本地管理员操作")
+    admin_sub = p_admin.add_subparsers(dest="admin_command", required=True)
+    p_bootstrap = admin_sub.add_parser("bootstrap", help="引导首个管理员")
+    p_bootstrap.add_argument("--control-dir", required=True)
+    p_bootstrap.add_argument("--name", required=True, help="管理员显示名")
+    p_bootstrap.set_defaults(func=cmd_admin_bootstrap)
+    p_invite = admin_sub.add_parser("invite", help="为现有用户签发一次性邀请")
+    p_invite.add_argument("--control-dir", required=True)
+    p_invite.add_argument("--admin-user-id", required=True, help="执行邀请的管理员用户 ID")
+    p_invite.add_argument("--user-id", required=True, help="被邀请用户 ID")
+    p_invite.add_argument("--ttl-seconds", type=int, default=604800,
+                          help="邀请有效期秒数（默认 604800）")
+    p_invite.set_defaults(func=cmd_admin_invite)
 
     args = parser.parse_args(argv)
     try:

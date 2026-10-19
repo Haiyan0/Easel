@@ -27,7 +27,7 @@ from typing import Iterator, Literal
 
 from .types import ConversationRecord, DomainError, Identity, RunRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -165,6 +165,50 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             version INTEGER PRIMARY KEY,
             applied_at INTEGER NOT NULL
         )
+        """,
+    ),
+    # 版本 2：邀请、浏览器登录与失败限速；只追加，不改写版本 1。
+    (
+        """
+        CREATE TABLE invites (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            token_digest TEXT NOT NULL UNIQUE,
+            expires_at INTEGER NOT NULL,
+            redeemed_at INTEGER,
+            revoked_at INTEGER,
+            created_at INTEGER NOT NULL,
+            created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE INDEX invites_user_idx ON invites (user_id, created_at)
+        """,
+        """
+        CREATE TABLE logins (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            token_digest TEXT NOT NULL UNIQUE,
+            csrf_digest TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        )
+        """,
+        """
+        CREATE INDEX logins_user_idx ON logins (user_id, revoked_at)
+        """,
+        """
+        CREATE TABLE auth_failures (
+            source TEXT NOT NULL,
+            token_digest TEXT NOT NULL,
+            attempted_at INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX auth_failures_lookup_idx
+            ON auth_failures (source, token_digest, attempted_at)
         """,
     ),
 )
@@ -352,6 +396,203 @@ class Store:
     def _workspace_exists(self, workspace_id: str) -> bool:
         return self._connection.execute(
             "SELECT 1 FROM workspaces WHERE id = ?", (workspace_id,)).fetchone() is not None
+
+    # ------------------------------------------------------------------
+    # 认证：本地引导、邀请与登录
+    # ------------------------------------------------------------------
+
+    def get_identity(self, user_id: str) -> Identity:
+        """按数据库读取用户当前身份；角色与 workspace 不信任调用方传入值。"""
+        row = self._connection.execute(
+            "SELECT users.id, users.role, workspaces.id AS workspace_id"
+            " FROM users JOIN workspaces ON workspaces.owner_user_id = users.id"
+            " WHERE users.id = ?", (_text(user_id),)).fetchone()
+        if row is None:
+            raise DomainError("not_found", 404)
+        return Identity(row["id"], row["workspace_id"], row["role"])
+
+    def bootstrap_admin(self, display_name: str, token_digest: str,
+                        now: int, expires_at: int) -> tuple[Identity, str]:
+        """本地引导首个管理员并签发首个邀请；已有管理员时整体拒绝。
+
+        管理员存在性判定、用户创建与邀请写入在同一写事务内完成，避免两个
+        并发的 bootstrap 各建一个管理员。
+        """
+        user_id = uuid.uuid4().hex
+        workspace_id = uuid.uuid4().hex
+        invite_id = uuid.uuid4().hex
+        with self._transaction():
+            existing = self._connection.execute(
+                "SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone()
+            if existing is not None:
+                raise DomainError("admin_exists", 409)
+            self._connection.execute(
+                "INSERT INTO users (id, display_name, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (user_id, display_name, now))
+            self._connection.execute(
+                "INSERT INTO workspaces (id, owner_user_id, state, config_version, created_at)"
+                " VALUES (?, ?, 'ready', 0, ?)", (workspace_id, user_id, now))
+            self._connection.execute(
+                "INSERT INTO invites (id, user_id, token_digest, expires_at, created_at, created_by)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (invite_id, user_id, token_digest, expires_at, now, user_id))
+        return Identity(user_id, workspace_id, "admin"), invite_id
+
+    def create_invite(self, actor: Identity, user_id: str, token_digest: str,
+                      now: int, expires_at: int) -> str:
+        """管理员为真实存在且未禁用的用户创建邀请，返回 invite id。"""
+        invite_id = uuid.uuid4().hex
+        target_user_id = _text(user_id)
+        with self._transaction():
+            # 角色必须查库，不能信任 Identity.role；禁用状态与 workspace 归属同时复查
+            self._require_actor(actor)
+            row = self._connection.execute(
+                "SELECT role FROM users WHERE id = ?", (actor.user_id,)).fetchone()
+            if row is None or row["role"] != "admin":
+                raise DomainError("forbidden", 403)
+            target = self._connection.execute(
+                "SELECT disabled_at FROM users WHERE id = ?", (target_user_id,)).fetchone()
+            if target is None:
+                raise DomainError("not_found", 404)
+            if target["disabled_at"] is not None:
+                raise DomainError("user_disabled", 403)
+            self._connection.execute(
+                "INSERT INTO invites (id, user_id, token_digest, expires_at, created_at, created_by)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (invite_id, target_user_id, token_digest, expires_at, now, actor.user_id))
+        return invite_id
+
+    def revoke_invite(self, token_digest: str, now: int) -> bool:
+        """撤销尚未兑换的邀请；返回本次调用是否改变了状态。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE invites SET revoked_at = ?"
+                " WHERE token_digest = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+                (now, _text(token_digest)))
+        return cursor.rowcount == 1
+
+    def redeem_invite(self, token_digest: str, login_id: str,
+                      login_token_digest: str, csrf_digest: str,
+                      now: int, expires_at: int) -> Identity:
+        """事务内单次兑换邀请并创建登录；任何失效原因统一 401。
+
+        ``BEGIN IMMEDIATE`` 使两个连接对同一邀请串行化：后到者看到的
+        ``redeemed_at`` 已非空，只能失败。
+        """
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT invites.id, invites.user_id, invites.expires_at,"
+                " invites.redeemed_at, invites.revoked_at,"
+                " users.role, users.disabled_at, workspaces.id AS workspace_id"
+                " FROM invites"
+                " JOIN users ON users.id = invites.user_id"
+                " JOIN workspaces ON workspaces.owner_user_id = users.id"
+                " WHERE invites.token_digest = ?", (_text(token_digest),)).fetchone()
+            if (row is None or row["redeemed_at"] is not None
+                    or row["revoked_at"] is not None or row["expires_at"] <= now
+                    or row["disabled_at"] is not None):
+                raise DomainError("unauthorized", 401)
+            cursor = self._connection.execute(
+                "UPDATE invites SET redeemed_at = ?"
+                " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+                (now, row["id"]))
+            if cursor.rowcount != 1:
+                raise DomainError("unauthorized", 401)
+            self._connection.execute(
+                "INSERT INTO logins (id, user_id, token_digest, csrf_digest,"
+                " created_at, last_seen_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (login_id, row["user_id"], login_token_digest, csrf_digest,
+                 now, now, expires_at))
+        return Identity(row["user_id"], row["workspace_id"], row["role"])
+
+    def _active_login(self, token_digest: str, now: int, idle_seconds: int) -> sqlite3.Row:
+        """读取仍有效的登录行；失效原因统一 401。"""
+        row = self._connection.execute(
+            "SELECT logins.id, logins.user_id, logins.csrf_digest,"
+            " logins.last_seen_at, logins.expires_at, logins.revoked_at,"
+            " users.role, users.disabled_at, workspaces.id AS workspace_id"
+            " FROM logins"
+            " JOIN users ON users.id = logins.user_id"
+            " JOIN workspaces ON workspaces.owner_user_id = users.id"
+            " WHERE logins.token_digest = ?", (_text(token_digest),)).fetchone()
+        if (row is None or row["revoked_at"] is not None
+                or row["disabled_at"] is not None
+                or now >= row["expires_at"]
+                or now - row["last_seen_at"] >= idle_seconds):
+            raise DomainError("unauthorized", 401)
+        return row
+
+    def authenticate_login(self, token_digest: str, now: int, idle_seconds: int,
+                           *, touch: bool = True) -> Identity:
+        """校验登录并按需滑动更新 last_seen；绝不延长绝对期限。"""
+        with self._transaction():
+            row = self._active_login(token_digest, now, idle_seconds)
+            if touch:
+                self._connection.execute(
+                    "UPDATE logins SET last_seen_at = ?"
+                    " WHERE id = ? AND revoked_at IS NULL", (now, row["id"]))
+        return Identity(row["user_id"], row["workspace_id"], row["role"])
+
+    def session_csrf_digest(self, token_digest: str, now: int,
+                            idle_seconds: int) -> str:
+        """读取有效登录的 CSRF 摘要；不更新活动时间。"""
+        row = self._active_login(token_digest, now, idle_seconds)
+        return row["csrf_digest"]
+
+    def revoke_login(self, token_digest: str, now: int, idle_seconds: int) -> None:
+        """持久撤销当前登录；无效登录返回 401 且不改变任何行。"""
+        with self._transaction():
+            row = self._active_login(token_digest, now, idle_seconds)
+            self._connection.execute(
+                "UPDATE logins SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (now, row["id"]))
+
+    def revoke_all_logins(self, user_id: str, now: int) -> int:
+        """撤销该用户的全部登录；返回受影响条数。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE logins SET revoked_at = ?"
+                " WHERE user_id = ? AND revoked_at IS NULL", (now, _text(user_id)))
+        return cursor.rowcount
+
+    def check_auth_rate_limit(self, source: str, token_digest: str, now: int,
+                              window_seconds: int, max_failures: int) -> int:
+        """检查失败计数；返回 0 允许尝试，否则返回 Retry-After 秒数。
+
+        同时按来源和令牌摘要计数，任一维度达到上限即拒绝：只按
+        ``(source, token_digest)`` 组合计数会让攻击者换一个猜测 token 就获得
+        新额度。计数落库，多个 AuthService 或新连接不能绕过；窗口外记录在
+        检查时清理。
+        """
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM auth_failures WHERE attempted_at <= ?", (now - window_seconds,))
+            by_source = self._connection.execute(
+                "SELECT COUNT(*) AS total, MIN(attempted_at) AS oldest"
+                " FROM auth_failures WHERE source = ?", (source,)).fetchone()
+            by_digest = self._connection.execute(
+                "SELECT COUNT(*) AS total, MIN(attempted_at) AS oldest"
+                " FROM auth_failures WHERE token_digest = ?",
+                (token_digest,)).fetchone()
+            retry_after = 0
+            if by_source["total"] >= max_failures:
+                retry_after = max(
+                    retry_after, by_source["oldest"] + window_seconds - now)
+            if by_digest["total"] >= max_failures:
+                retry_after = max(
+                    retry_after, by_digest["oldest"] + window_seconds - now)
+            return max(1, retry_after) if retry_after else 0
+
+    def record_auth_failure(self, source: str, token_digest: str, now: int,
+                            window_seconds: int) -> None:
+        """记录一次兑换失败；不保存原始 token。"""
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM auth_failures WHERE attempted_at <= ?", (now - window_seconds,))
+            self._connection.execute(
+                "INSERT INTO auth_failures (source, token_digest, attempted_at)"
+                " VALUES (?, ?, ?)", (source, token_digest, now))
 
     # ------------------------------------------------------------------
     # 会话
