@@ -129,7 +129,7 @@ _RULES: tuple[_Route, ...] = (
     _route("GET", r"^/api/chat/jobs/([^/]+)/stream$", TASK, "turn", 1),
     _route("POST", r"^/api/chat/stream$", TASK),
     _route("POST", r"^/api/chat/question/answer$", TASK),
-    _route("GET", r"^/api/chat/question/status$", TASK),
+    _route("POST", r"^/api/chat/question/status$", TASK),
     _route("POST", r"^/api/chat/stop$", TASK),
     _route("POST", r"^/api/chat$", TASK),
     _route("POST", r"^/api/skill$", TASK),

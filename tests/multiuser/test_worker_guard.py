@@ -131,6 +131,7 @@ def test_forward_to_worker_rebuilds_headers_at_the_actual_call_boundary():
                 "Content-Type": "application/json",
             },
             content=b'{"message":"hi"}',
+            params={"stream": "1"},
             workspace_id=WORKSPACE, service_token=TOKEN)
     finally:
         client.close()
@@ -138,7 +139,7 @@ def test_forward_to_worker_rebuilds_headers_at_the_actual_call_boundary():
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert captured["method"] == "POST"
-    assert captured["url"] == "http://worker.internal/api/chat/stream"
+    assert captured["url"] == "http://worker.internal/api/chat/stream?stream=1"
     assert captured["body"] == b'{"message":"hi"}'
     for stripped in ("authorization", "cookie", "x-easel-role",
                      "x-forwarded-for", "forwarded"):
@@ -146,6 +147,80 @@ def test_forward_to_worker_rebuilds_headers_at_the_actual_call_boundary():
     assert captured["headers"]["x-easel-workspace-id"] == WORKSPACE
     assert captured["headers"]["x-easel-service-token"] == TOKEN
     assert captured["headers"]["content-type"] == "application/json"
+
+
+def test_forward_to_worker_strips_client_defaults_without_mutating_client():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = {key.lower(): value
+                               for key, value in request.headers.items()}
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        headers={
+            "Authorization": "Bearer client-default",
+            "X-Easel-Role": "admin",
+            "X-Easel-Service-Token": "client-default-token",
+            "Forwarded": "for=203.0.113.9",
+            "X-Forwarded-Proto": "https",
+            "Accept": "application/json",
+        },
+        cookies={"client-cookie": "evil"},
+    )
+    before_headers = dict(client.headers)
+    before_cookies = dict(client.cookies)
+    before_auth = client.auth
+    try:
+        response = forward_to_worker(
+            client, "POST", "http://worker.internal/api/chat/stream",
+            headers={"Content-Type": "application/json",
+                     "X-Easel-Role": "explicit-evil"},
+            content=b'{"message":"hi"}',
+            workspace_id=WORKSPACE, service_token=TOKEN)
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    headers = captured["headers"]
+    for stripped in ("authorization", "cookie", "x-easel-role",
+                     "forwarded", "x-forwarded-proto"):
+        assert stripped not in headers, stripped
+    # 客户端默认的内部 token/workspace 必须被服务端固定值覆盖
+    assert headers["x-easel-workspace-id"] == WORKSPACE
+    assert headers["x-easel-service-token"] == TOKEN
+    assert headers["x-easel-service-token"] != "client-default-token"
+    assert headers["content-type"] == "application/json"
+    assert headers["accept"] == "application/json"
+
+    # 调用不得通过临时清空/恢复共享 client 状态来规避合并
+    assert dict(client.headers) == before_headers
+    assert dict(client.cookies) == before_cookies
+    assert client.auth is before_auth
+
+
+def test_forward_to_worker_overrides_client_basic_auth():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = {key.lower(): value
+                               for key, value in request.headers.items()}
+        return httpx.Response(200)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler),
+                          auth=("user", "pass"))
+    try:
+        response = forward_to_worker(
+            client, "GET", "http://worker.internal/api/upload/limits",
+            headers={}, workspace_id=WORKSPACE, service_token=TOKEN)
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert "authorization" not in captured["headers"]
+    assert captured["headers"]["x-easel-workspace-id"] == WORKSPACE
+    assert captured["headers"]["x-easel-service-token"] == TOKEN
 
 
 def test_build_worker_headers_replaces_every_incoming_easel_header():
@@ -217,6 +292,34 @@ def test_worker_allows_own_workspace_routes(worker_client):
         "/api/upload/limits", headers=INTERNAL_HEADERS).status_code == 200
     assert worker_client.get(
         "/api/outputs", headers=INTERNAL_HEADERS).status_code == 200
+
+
+def test_worker_question_status_uses_the_real_post_contract(
+        worker_client, monkeypatch):
+    monkeypatch.setitem(web._HARNESS_QUESTIONS, "harness_pending",
+                        {"status": "pending"})
+
+    response = worker_client.post(
+        "/api/chat/question/status",
+        headers=INTERNAL_HEADERS,
+        json={"questionIds": ["harness_pending", "harness_missing"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "questions": {
+            "harness_pending": {"status": "pending"},
+            "harness_missing": {"status": "not_found"},
+        },
+    }
+
+    # 没有真实 GET 处理器：有凭证也必须默认拒绝
+    assert worker_client.get(
+        "/api/chat/question/status", headers=INTERNAL_HEADERS).status_code == 403
+    # 缺凭证仍先 401
+    assert worker_client.post(
+        "/api/chat/question/status",
+        json={"questionIds": []}).status_code == 401
 
 
 def test_worker_upload_cannot_escape_into_managed_acp_file(worker_client, tmp_path):

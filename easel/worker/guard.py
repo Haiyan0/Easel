@@ -34,6 +34,16 @@ _STRIPPED_HEADERS = frozenset({"authorization", "cookie", "forwarded"})
 _STRIPPED_PREFIXES = ("x-easel-", "x-forwarded-")
 
 
+class _NoAuth(httpx.Auth):
+    """显式覆盖共享 client 的自动 auth，避免 Basic/Bearer 被重新注入。"""
+
+    def auth_flow(self, request):  # type: ignore[override]
+        yield request
+
+
+_NO_AUTH = _NoAuth()
+
+
 @dataclass(frozen=True)
 class WorkerIdentity:
     """worker 启动时固定的实例身份；token 不出现在默认 repr。"""
@@ -114,15 +124,33 @@ def build_worker_headers(headers: Mapping[str, str], *,
     return cleaned
 
 
+def _strip_request_headers(headers: httpx.Headers) -> None:
+    """删除最终 Request 上由 client 默认 headers/cookies 合并进来的禁用头。"""
+    for key in {name.lower() for name in headers.keys()}:
+        if (key in _STRIPPED_HEADERS
+                or key.startswith(_STRIPPED_PREFIXES)):
+            del headers[key]
+
+
 def forward_to_worker(client: httpx.Client, method: str, url: str, *,
                       headers: Mapping[str, str],
                       workspace_id: str, service_token: str,
                       content: bytes | str | None = None,
                       params: Mapping[str, str] | None = None
                       ) -> httpx.Response:
-    """最小转发适配器；真实调用下游前完成头清洗与内部凭证重建。"""
-    return client.request(
-        method, url,
-        headers=build_worker_headers(
-            headers, workspace_id=workspace_id, service_token=service_token),
-        content=content, params=params)
+    """最小转发适配器；保证最终发出的请求经过清洗。
+
+    不能只清洗传入的 ``headers``：``Client.build_request`` 会把 client 默认
+    headers、cookie jar 与 base_url 合并进 Request，``Client.send`` 还会应用
+    自动 auth。这里先构建 Request，再从最终 headers 删除禁用项，最后用无操作
+    auth 覆盖 client 默认认证；不修改共享 client 的 headers/cookies/auth。
+    """
+    headers = build_worker_headers(
+        headers, workspace_id=workspace_id, service_token=service_token)
+    request = client.build_request(method, url, headers=headers,
+                                   content=content, params=params)
+    # 默认 headers/cookies 已合并；统一删除后再从服务端固定身份重建内部头
+    _strip_request_headers(request.headers)
+    request.headers[WORKSPACE_HEADER] = workspace_id
+    request.headers[SERVICE_TOKEN_HEADER] = service_token
+    return client.send(request, auth=_NO_AUTH, follow_redirects=False)

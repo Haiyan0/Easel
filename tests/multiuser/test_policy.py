@@ -166,6 +166,14 @@ def test_head_is_classified_as_read():
     assert authorize(MEMBER, "HEAD", "/api/env").kind == UNKNOWN
 
 
+def test_question_status_uses_the_real_post_contract():
+    assert authorize(MEMBER, "POST", "/api/chat/question/status").kind == TASK
+    assert worker_allowed("POST", "/api/chat/question/status") is True
+    # 没有真实 GET 处理器：不得为旧错误登记保留放行
+    assert authorize(MEMBER, "GET", "/api/chat/question/status").kind == UNKNOWN
+    assert worker_allowed("GET", "/api/chat/question/status") is False
+
+
 # --------------------------------------------------------------------------
 # control HTTP 边界
 # --------------------------------------------------------------------------
@@ -325,3 +333,23 @@ def test_public_routes_are_exact_at_http_boundary(tmp_path):
         assert client.post("/api/health", json={},
                            headers={"Origin": ORIGIN}).status_code == 401
         assert client.get("/api/auth/exchange").status_code == 401
+
+
+def test_question_status_post_is_classified_but_not_implemented(tmp_path):
+    with control_client(tmp_path) as (client, store, auth, admin, member):
+        csrf = login(client, auth, admin, member)
+        payload = {"questionIds": ["harness_missing"]}
+
+        response = client.post(
+            "/api/chat/question/status", json=payload,
+            headers={"Origin": ORIGIN, "X-CSRF-Token": csrf})
+        assert response.status_code == 503, response.text
+        assert response.json()["code"] == "capability_unavailable"
+
+        missing_csrf = client.post(
+            "/api/chat/question/status", json=payload,
+            headers={"Origin": ORIGIN})
+        assert missing_csrf.status_code == 403
+
+        # 没有 GET 处理器，也不得被策略放行
+        assert client.get("/api/chat/question/status").status_code == 403
