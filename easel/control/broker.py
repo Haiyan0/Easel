@@ -142,13 +142,19 @@ class _LeaseGuard:
             pass
 
     async def close(self) -> None:
-        """启动或等待唯一清理；等待者可被取消，但清理任务本身不被取消。"""
+        """启动或等待唯一清理；等待者可被取消，但清理任务本身不被取消。
+
+        只有唯一清理真正完成后才停止/等待心跳。等待者在关闭期间被取消时，
+        shield 保留的后台清理仍在继续，必须保持续期，否则旧额度会在流关闭
+        前过期并被其他请求复用；清理完成后的 done callback 会停止心跳。
+        """
         self.start_cleanup()
+        cleanup = self._cleanup_task
         try:
-            await asyncio.shield(self._cleanup_task)
+            await asyncio.shield(cleanup)
         finally:
-            # 等待者被取消也要停掉心跳；唯一 cleanup task 仍在后台完成
-            await self._join_heartbeat()
+            if cleanup.done():
+                await self._join_heartbeat()
 
     async def _heartbeat_loop(self) -> None:
         interval = max(1.0, self._broker._lease_ttl / 3)
