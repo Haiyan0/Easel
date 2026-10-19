@@ -54,6 +54,12 @@ from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mod
 from easel import harnesses
 from easel.harnesses import store as harness_store
 from easel.harnesses.base import HarnessError, RunRequest
+from easel.control.policy import worker_allowed
+from easel.control.types import DomainError
+from easel.worker.guard import load_worker_identity, verify_worker_request
+
+# worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
+_WORKER_IDENTITY = load_worker_identity()
 try:
     from easel.gateway_questions import (
         GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
@@ -500,7 +506,11 @@ def _loopback_peer(request: Request) -> bool:
 
 
 app.add_middleware(CORSMiddleware, allow_origins=_LOCAL_ORIGINS, allow_methods=["*"], allow_headers=["*"])
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1'] + _EXTRA_HOSTS)
+# worker 模式下请求来自 control 的内部网络，Host 不是信任边界；由固定服务凭证
+# 与 workspace 校验负责准入。local 模式保持原有 Host 收紧。
+_TRUSTED_HOSTS = (['*'] if _WORKER_IDENTITY is not None
+                  else ['localhost', '127.0.0.1'] + _EXTRA_HOSTS)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_TRUSTED_HOSTS)
 
 
 @app.middleware('http')
@@ -518,7 +528,27 @@ async def local_write_guard(request: Request, call_next):
     中间件与下面的 TrustedHostMiddleware。这里防的是「浏览器打开恶意网页」
     这一类跨站攻击，不是「网络可达即视为可信」的边界——不要把本服务暴露在
     不受信任的网络（公共 WiFi、无防火墙的公网主机）上。
+
+    worker 模式下先校验固定 workspace 与内部服务凭证，再按显式路由分类拒绝
+    受管/未知接口；通过后不再套用本机浏览器写守卫（请求来自 control 内部）。
     """
+    if _WORKER_IDENTITY is not None:
+        try:
+            verify_worker_request(
+                request.headers,
+                _WORKER_IDENTITY.workspace_id,
+                _WORKER_IDENTITY.service_token,
+            )
+        except DomainError:
+            return JSONResponse(
+                {'code': 'unauthorized', 'detail': 'unauthorized'},
+                status_code=401)
+        if not worker_allowed(request.method, request.url.path):
+            return JSONResponse(
+                {'code': 'forbidden', 'detail': 'forbidden'},
+                status_code=403)
+        return await call_next(request)
+
     origin = request.headers.get('origin')
     if request.url.path == '/api/clipper' and origin and re.fullmatch(r'chrome-extension://[a-p]{32}', origin):
         headers = {

@@ -194,6 +194,16 @@ class AuthService:
         return self._store.authenticate_login(
             _digest(token), self._now(), self.SESSION_IDLE_SECONDS)
 
+    def inspect(self, token: str) -> Identity:
+        """校验登录但不更新活动时间。
+
+        写请求在 Origin/CSRF/路由授权通过前使用它，避免失败请求改变会话。
+        """
+        if not _valid_token(token):
+            raise DomainError("unauthorized", 401)
+        return self._store.authenticate_login(
+            _digest(token), self._now(), self.SESSION_IDLE_SECONDS, touch=False)
+
     def csrf_token(self, token: str) -> str:
         """为有效登录恢复 CSRF token；不刷新活动时间。"""
         if not _valid_token(token):

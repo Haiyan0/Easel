@@ -444,19 +444,30 @@ def test_control_config_normalizes_valid_https_origins(origin, expected):
 # 公开路由与线程/lifespan
 # --------------------------------------------------------------------------
 
-def test_health_is_minimal_and_unknown_routes_do_not_fall_back(tmp_path):
+def test_health_is_minimal_and_private_paths_default_deny(tmp_path):
     with control_api(tmp_path) as (client, store, auth, admin, member, invite):
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json() == {"status": "ok"}
 
-        for path in ("/api/sessions", "/docs", "/openapi.json",
-                     "/api/admin/bootstrap", "/api/unknown"):
+        private_paths = ("/api/sessions", "/docs", "/openapi.json",
+                         "/api/admin/bootstrap", "/api/unknown", "/api/env")
+        # 未认证的私有/未知路径统一先 401，不暴露是否存在
+        for path in private_paths:
             response = client.get(path)
-            assert response.status_code == 404, path
-            assert response.json()["code"] == "not_found"
-            assert response.json()["request_id"]
-        assert client.post("/api/admin/bootstrap").status_code == 404
+            assert response.status_code == 401, path
+            assert response.json()["code"] == "unauthorized"
+        assert client.post("/api/admin/bootstrap").status_code == 401
+
+        csrf = exchange(client, invite).json()["csrfToken"]
+        # 已分类但未装配的 control 路由明确 503；未知路由 403
+        assert client.get("/api/sessions").status_code == 503
+        for path in ("/docs", "/openapi.json", "/api/admin/bootstrap",
+                     "/api/unknown", "/api/env"):
+            assert client.get(path).status_code == 403, path
+        response = client.post("/api/admin/bootstrap", json={},
+                               headers={"Origin": ORIGIN, "X-CSRF-Token": csrf})
+        assert response.status_code == 403
 
 
 def test_api_serializes_database_access_on_its_own_thread(tmp_path):

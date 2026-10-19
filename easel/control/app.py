@@ -27,11 +27,21 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import AuthService
+from .policy import authorize, public_route
 from .store import Store
 from .types import DomainError, Identity
 
 SESSION_COOKIE = "__Host-easel_session"
 """__Host- 前缀要求 Secure、Path=/ 且无 Domain。"""
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_IMPLEMENTED_ROUTES = frozenset({
+    ("GET", "/api/health"),
+    ("POST", "/api/auth/exchange"),
+    ("GET", "/api/auth/me"),
+    ("POST", "/api/auth/logout"),
+})
+"""control 本轮真正装配的路由；其余已分类业务显式 503。"""
 
 _MEMBER_CAPABILITIES = ("workspace",)
 _ADMIN_CAPABILITIES = ("workspace", "admin")
@@ -121,6 +131,19 @@ def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "")
 
 
+def _effective_method(method: str) -> str:
+    """HEAD 按 GET 分类；其余方法统一大写。"""
+    normalized = method.upper()
+    return "GET" if normalized == "HEAD" else normalized
+
+
+def _middleware_error(request: Request, code: str, status: int) -> JSONResponse:
+    return JSONResponse(
+        {"code": code, "detail": code, "request_id": _request_id(request)},
+        status_code=status,
+        headers={"Cache-Control": "no-store"})
+
+
 def _identity_view(identity: Identity, csrf_token: str) -> dict:
     capabilities = (_ADMIN_CAPABILITIES if identity.role == "admin"
                     else _MEMBER_CAPABILITIES)
@@ -158,6 +181,51 @@ async def _read_invite_token(request: Request) -> str:
         return ""
     token = payload.get("token")
     return token if isinstance(token, str) else ""
+
+
+async def _guard_request(request: Request, call_next):
+    """先认证、再路由授权；未登记路由与受管写入默认拒绝。
+
+    公开路由仅限 policy 明确登记的精确 method+path；其余（包括未知路径）
+    必须先有有效 Cookie 登录。写请求在授权前校验精确 Origin 与 CSRF，并用
+    ``inspect``（不更新 last_seen）避免失败请求改变有效会话。
+    """
+    method = _effective_method(request.method)
+    path = request.url.path
+
+    if public_route(method, path):
+        if (method, path) not in _IMPLEMENTED_ROUTES:
+            return _middleware_error(request, "capability_unavailable", 503)
+        return await call_next(request)
+
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return _middleware_error(request, "unauthorized", 401)
+    service: AuthService = request.app.state.auth
+    try:
+        identity = await _run_db(request, service.inspect, token)
+    except DomainError:
+        return _middleware_error(request, "unauthorized", 401)
+
+    if request.method.upper() not in _SAFE_METHODS:
+        if not _origin_allowed(request):
+            return _middleware_error(request, "origin_denied", 403)
+        try:
+            expected = await _run_db(request, service.csrf_token, token)
+        except DomainError:
+            return _middleware_error(request, "unauthorized", 401)
+        provided = request.headers.get("x-csrf-token", "")
+        if (not provided or not provided.isascii()
+                or not hmac.compare_digest(provided, expected)):
+            return _middleware_error(request, "csrf_invalid", 403)
+
+    decision = authorize(identity, method, path)
+    if decision.kind in ("unknown", "forbidden"):
+        return _middleware_error(request, "forbidden", 403)
+    if (method, path) not in _IMPLEMENTED_ROUTES:
+        # 已分类但本轮未装配：明确 503，不伪造成功，也不透传 local
+        return _middleware_error(request, "capability_unavailable", 503)
+    return await call_next(request)
 
 
 def create_app(*, store: Store, auth: AuthService,
@@ -201,9 +269,9 @@ def create_app(*, store: Store, auth: AuthService,
                   openapi_url=None, lifespan=lifespan)
 
     @app.middleware("http")
-    async def request_identity(request: Request, call_next):
+    async def control_guard(request: Request, call_next):
         request.state.request_id = uuid.uuid4().hex
-        response = await call_next(request)
+        response = await _guard_request(request, call_next)
         response.headers.setdefault("X-Request-ID", request.state.request_id)
         return response
 
