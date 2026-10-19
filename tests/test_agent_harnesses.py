@@ -179,14 +179,53 @@ def test_codex_rejects_replacement_thread_on_resume(tmp_path):
     assert not any(message.get("method") == "turn/start" for message in audit(tmp_path))
 
 
-def test_acp_rejects_replacement_session_on_resume(tmp_path):
+@pytest.mark.parametrize("mode", ["wrong-resume", "wrong-modern-resume"])
+def test_acp_rejects_replacement_session_on_resume(tmp_path, mode):
     async def reject(questions):
         raise AssertionError("No permissions expected")
 
     with pytest.raises(HarnessError, match="历史"):
-        asyncio.run(ACPAdapter().run(request_for(tmp_path, "acp", mode="wrong-resume", native_id="original"),
+        asyncio.run(ACPAdapter().run(request_for(tmp_path, "acp", mode=mode, native_id="original"),
                                     lambda *args: None, reject, lambda identifier: None))
+    resume_method = "session/resume" if mode == "wrong-modern-resume" else "session/load"
+    assert any(message.get("method") == resume_method for message in audit(tmp_path))
     assert not any(message.get("method") == "session/prompt" for message in audit(tmp_path))
+
+
+@pytest.mark.parametrize("mode", ["resume-only", "both-resume"])
+def test_acp_resumes_same_history_after_process_cleanup(tmp_path, mode):
+    from dataclasses import replace
+    from easel.harnesses.rpc import close_sessions
+
+    async def reject(questions):
+        raise AssertionError("No permissions expected")
+
+    async def scenario():
+        request = replace(request_for(tmp_path, "acp", mode), session_key="modern-acp")
+        identifiers = []
+        events = []
+        adapter = ACPAdapter()
+        try:
+            for turn in range(2):
+                await adapter.run(request, lambda *event: events.append(event), reject, identifiers.append)
+                request = replace(request, native_id=identifiers[-1])
+            await close_sessions("modern-acp")
+            await adapter.run(request, lambda *event: events.append(event), reject, identifiers.append)
+            assert identifiers == ["native-session"] * 3
+            messages = audit(tmp_path)
+            methods = [message.get("method") for message in messages]
+            assert methods.count("initialize") == 2
+            assert methods.count("session/new") == 1
+            assert methods.count("session/resume") == 1
+            assert "session/load" not in methods
+            resume = next(message for message in messages if message.get("method") == "session/resume")
+            assert resume["params"] == {"sessionId": "native-session", "cwd": str(tmp_path), "mcpServers": []}
+            assert methods.count("session/prompt") == 3
+            assert events == [("thinking", "思考"), ("token", "你好")] * 3
+        finally:
+            await close_sessions()
+
+    asyncio.run(scenario())
 
 
 def test_pooled_connections_isolate_sessions_and_configuration(tmp_path):

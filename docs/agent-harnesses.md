@@ -96,6 +96,22 @@ Web 不提供任意命令输入。内容是 JSON argv 数组，不走 shell。�
 只对可信管理员提供这个配置入口。Windows 使用可执行程序，npm 工具推荐
 `node` 加原生脚本路径，而不是 `.cmd` 或 `.bat`。
 
+DeepSeek Harness 从源码安装依赖并构建后，可将上述配置替换为以下内容（路径按本机安装位置调整）：
+
+```json
+{
+  "command": [
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\path\\to\\deepseek-harness\\apps\\cli\\lib\\bin.js",
+    "--profile", "acp"
+  ]
+}
+```
+
+Easel 自动启动该 stdio 子进程，无需预先启动 Harness 的 Web 服务。模型和凭证沿用 Harness 原生配置；子进程的工作目录是 Easel 根目录，因此 Harness checkout 中的 `.env` 不会因脚本位于该目录而自动加载。可在 Harness home（默认 `~/.dsh/`）中配置原生凭证。选择「通用 ACP」时模型覆盖留空即可使用 ACP profile 的默认模型。
+
+Windows 用户环境变量的修改不会更新已运行的 Easel 进程。若 Harness Web 可以聊天而 Easel 启动的 ACP 报缺少 Key，请从能读取 `DEEPSEEK_API_KEY` 的新终端重新启动 Easel，使其子进程继承相同环境；无需把 Key 写入 `acp.json`。
+
 ## 会话与兼容性
 
 - 切换前必须结束或停止所有运行中任务；切换后新建对话，不在已有会话中悄悄换边。
@@ -118,7 +134,7 @@ Web 不提供任意命令输入。内容是 JSON argv 数组，不走 shell。�
 - Web 展示的聊天记录保存在当前浏览器本地，原生上下文按服务器持久化的会话 ID 续接；
   刷新或 Web 重启不会新建原生会话，但清空浏览器数据或换浏览器不等同于迁移聊天记录。
 - ACP 不声明客户端文件 / terminal 能力，因此依赖客户端代执行这些工具的 Agent 暂不支持；
-  需要 Agent 自带工具。协议版本必须是 ACP v1；历史续接要求 `loadSession`。
+  需要 Agent 自带工具。协议版本必须是 ACP v1；历史续接优先使用 `sessionCapabilities.resume` 声明的 `session/resume`，否则使用 `loadSession` 声明的 `session/load`。两者均未声明时拒绝续接，不自动新建会话替换历史。
 - “CLI 已安装”不是认证成功或模型在线的证明；用实际消息或 `easel ping` 验证。
 - `easel chat`、`easel skill`、`easel ping` 使用所选底座。新底座不需要 OpenClaw gateway。
 

@@ -1002,8 +1002,10 @@ def _scrape_notes(platform: str, page, cfg: dict) -> list[dict]:
                       wait_until="commit", timeout=10000)
             if _login_wall(page):
                 return []
+            # 真机 2026 校准：作品管理页改版后无 <a href=/video/>（点击回站内）、封面走 CSS 背景图，
+            # 旧选择器 a[href*='/video/'], img 恒超时 → 恒空。改等作品标题节点（类名带 hash 后缀，用前缀匹配）。
             try:
-                page.wait_for_selector("a[href*='/video/'], img", timeout=6000)
+                page.wait_for_selector("[class*='info-title-text'], [class*='info-title-operation']", timeout=6000)
             except Exception:
                 return []
             page.wait_for_timeout(800)   # 等作品列表异步渲染

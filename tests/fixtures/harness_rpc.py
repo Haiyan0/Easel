@@ -52,7 +52,12 @@ while True:
     message = receive()
     method = message.get("method")
     if method == "initialize":
-        reply(message, {"protocolVersion": 1, "agentCapabilities": {"loadSession": mode != "no-resume"}})
+        capabilities = {"loadSession": mode != "no-resume"}
+        if mode in ("resume-only", "both-resume", "wrong-modern-resume"):
+            capabilities = {"sessionCapabilities": {"resume": {}}}
+            if mode == "both-resume":
+                capabilities["loadSession"] = True
+        reply(message, {"protocolVersion": 1, "agentCapabilities": capabilities})
     elif method == "initialized":
         pass
     elif method == "model/list":
@@ -69,11 +74,14 @@ while True:
         if mode == "stable-resume" and method == "thread/resume":
             thread_id = message["params"]["threadId"]
         reply(message, {"thread": {"id": thread_id}})
-    elif method in ("session/new", "session/load"):
-        if method == "session/load":
-            session_id = "replacement" if mode == "wrong-resume" else message["params"]["sessionId"]
-        reply(message, {"sessionId": session_id,
-                        "configOptions": [{"category": "model", "id": "model", "type": "select"}]})
+    elif method in ("session/new", "session/load", "session/resume"):
+        if method in ("session/load", "session/resume"):
+            session_id = "replacement" if mode in ("wrong-resume", "wrong-modern-resume") else message["params"]["sessionId"]
+        result = {"sessionId": session_id,
+                  "configOptions": [{"category": "model", "id": "model", "type": "select"}]}
+        if method == "session/resume" and mode != "wrong-modern-resume":
+            result.pop("sessionId")
+        reply(message, result)
     elif method == "session/set_config_option":
         reply(message, {})
     elif method in ("turn/interrupt", "session/cancel"):

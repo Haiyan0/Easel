@@ -64,9 +64,14 @@ class ACPAdapter:
             if session_id and rpc.native_id == session_id:
                 result = rpc.session_info
             elif session_id:
-                if not capabilities.get("loadSession"):
+                session_capabilities = capabilities.get("sessionCapabilities") or {}
+                if "resume" in session_capabilities:
+                    resume_method = "session/resume"
+                elif capabilities.get("loadSession"):
+                    resume_method = "session/load"
+                else:
                     raise HarnessError("此 ACP Agent 不支持历史续接；请新建对话")
-                result = await rpc.call("session/load", {**params, "sessionId": session_id})
+                result = await rpc.call(resume_method, {**params, "sessionId": session_id})
                 if result.get("sessionId", session_id) != session_id:
                     raise HarnessError("ACP 返回了不同的原生会话 ID，不会替换已有历史")
             else:
