@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import sqlite3
 import subprocess
@@ -968,9 +969,8 @@ def _open_write_connection(path, *, timeout_ms: int) -> sqlite3.Connection:
 
 
 def _read_only_uri(path) -> str:
-    """构造只读连接 URI；Windows 路径需要正斜杠与转义。"""
-    raw = pathlib.Path(path).as_posix().replace("?", "%3f").replace("#", "%23")
-    return f"file:{raw}?mode=ro"
+    """用标准库把绝对 Path 转成 file URI，避免复制生产代码的转义逻辑。"""
+    return f"{pathlib.Path(os.path.abspath(path)).as_uri()}?mode=ro"
 
 
 def make_uncheckpointed_wal_database(script: str, path, *, version: int,
@@ -1058,6 +1058,83 @@ def test_future_version_rejection_never_destroys_pending_wal(tmp_path):
         assert connection.execute("SELECT id FROM future_only").fetchall() == [("哨兵",)]
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("name", [
+    "control%20db.sqlite3",
+    "control%23db.sqlite3",
+    "control%25db.sqlite3",
+    "control db.sqlite3",
+    "控制#db.sqlite3",
+])
+def test_special_character_names_reopen_the_same_database(tmp_path, name):
+    """百分号转义样式、空格、中文与井号文件名：创建后必须能重开同一文件。"""
+    path = tmp_path / name
+    with Store.open(path) as store:
+        actor = store.create_user("重开用户")
+        conversation = store.create_conversation(actor)
+        run = reserve(store, actor, conversation.id)
+
+    with Store.open(path) as reopened:
+        assert reopened.get_run(actor, run.id).id == run.id
+
+
+def test_percent_encoded_directory_reopens_the_same_database(tmp_path):
+    """目录名含百分号转义样式时，重开仍指向同一数据库。"""
+    path = tmp_path / "工作区%20%23%25" / "control%20db.sqlite3"
+    with Store.open(path) as store:
+        actor = store.create_user("目录用户")
+        conversation = store.create_conversation(actor)
+        run = reserve(store, actor, conversation.id)
+
+    with Store.open(path) as reopened:
+        assert reopened.get_run(actor, run.id).id == run.id
+
+
+def test_percent_encoded_relative_path_reopens_the_same_database(tmp_path, monkeypatch):
+    """相对路径（含百分号的当前目录）重开时，只读预检必须指向同一文件。"""
+    base = tmp_path / "工作区%20目录"
+    base.mkdir()
+    monkeypatch.chdir(base)
+    path = pathlib.Path("control%25db.sqlite3")
+    with Store.open(path) as store:
+        actor = store.create_user("相对路径用户")
+        conversation = store.create_conversation(actor)
+        run = reserve(store, actor, conversation.id)
+
+    with Store.open(path) as reopened:
+        assert reopened.get_run(actor, run.id).id == run.id
+
+
+def test_percent_encoded_future_wal_does_not_read_the_space_named_database(tmp_path):
+    """%20 文件名与同目录空格文件名并存：预检必须读目标库，拒绝不得有副作用。"""
+    spaced = tmp_path / "control db.sqlite3"
+    with Store.open(spaced) as store:
+        actor = store.create_user("当前库用户")
+        conversation = store.create_conversation(actor)
+        reserve(store, actor, conversation.id)
+    spaced_before = spaced.read_bytes()
+    assert not spaced.with_name(spaced.name + "-wal").exists(), "正常关闭后不应留有 WAL"
+
+    encoded = tmp_path / "control%20db.sqlite3"
+    make_uncheckpointed_wal_database(tmp_path / "creator.py", encoded, version=999)
+    assert encoded.with_name(encoded.name + "-wal").exists(), "子进程应留下未合并的 WAL"
+
+    before = read_only_snapshot(encoded)
+    assert before["version"] == 999, "独立标准 URI 必须读到目标库 WAL 中的版本"
+
+    with pytest.raises(DomainError) as rejected:
+        with Store.open(encoded):
+            pass
+    assert_error(rejected, 500, "unsupported_schema")
+
+    after = read_only_snapshot(encoded)
+    assert after["main_bytes"] == before["main_bytes"], "拒绝不得改写目标主库字节"
+    assert after["wal_bytes"] == before["wal_bytes"], "拒绝不得删除或改写目标 WAL"
+    assert after["version"] == 999
+    assert after["rows"] == before["rows"] == [("哨兵",)]
+    assert encoded.with_name(encoded.name + "-wal").exists()
+    assert spaced.read_bytes() == spaced_before, "不得读写同目录空格名称的另一个库"
 
 
 

@@ -623,9 +623,9 @@ def _read_version_without_side_effects(path: Path) -> int:
 
 
 def _read_only_uri(path: Path) -> str:
-    """构造只读连接 URI；Windows 路径使用正斜杠并转义 URI 保留字符。"""
-    raw = path.as_posix().replace("?", "%3f").replace("#", "%23")
-    return f"file:{raw}?mode=ro"
+    """构造只读连接 URI；用绝对 Path 的标准 file URI 编码，保证与读写连接
+    指向同一文件（相对路径先转为绝对路径，保留现有兼容性）。"""
+    return f"{Path(os.path.abspath(path)).as_uri()}?mode=ro"
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
