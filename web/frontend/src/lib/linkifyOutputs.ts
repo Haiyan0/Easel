@@ -23,8 +23,8 @@ const IMG_RE = /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico)$/i;
 const TRAILING = /[.,;:!~～、，。；：！？]+$/;
 
 /** 绝对路径前缀：盘符 / ~ / POSIX 路径，后面任意层级接到 outputs 分隔符为止。
- *  lookbehind 排除字母数字:.\/ —— 防 `https://host/outputs/` 这类 URL 被误伤。 */
-const ABS_PREFIX = /(?<![A-Za-z0-9:.\/])(?:[A-Za-z]:[\\/]|~|\/)(?:[^\s`|~～<>"'“”‘’，。；：！？、（）【】《》「」]*?[\\/])?outputs[\\/]/g;
+ *  lookbehind 排除字母数字:./ —— 防 `https://host/outputs/` 这类 URL 被误伤。 */
+const ABS_PREFIX = /(?<![A-Za-z0-9:./])(?:[A-Za-z]:[\\/]|~|\/)(?:[^\s`|~～<>"'“”‘’，。；：！？、（）【】《》「」]*?[\\/])?outputs[\\/]/g;
 
 /** outputs/ 之后允许出现在路径里的字符：排除空白、反引号、ASCII 竖线/波浪/括号引号、
  *  常见中西文标点（它们常紧跟路径出现，如「outputs/a.png，共 7 张」里的逗号）。

@@ -491,11 +491,29 @@ export interface PublishResult {
   pending?: boolean;
 }
 
+export interface PublishingPolicy {
+  mode: 'manual' | 'automated';
+  automaticSubmission: boolean;
+}
+
+export function fetchPublishingPolicy(): Promise<PublishingPolicy> {
+  return request('/api/publishing-policy');
+}
+
+/** Create a local export only; no social platform is contacted. */
+export function exportManualPackage(platform: string, payload: {
+  title: string; body: string; tags: string; media: string[]; reviewed: boolean;
+}): Promise<{ path: string; filename: string; published: false }> {
+  return request(`/api/manual-publish/${encodeURIComponent(platform)}/export`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
 /** 一键发布到某平台（真发布，--exec）。media 为 outputs 相对路径数组。
  * 抖音返回 {async:true}，需轮询 publishStatus；其他平台同步返回结果。 */
 export function publishNow(
   platform: string,
-  payload: { title: string; body: string; media: string[]; tags?: string },
+  payload: { title: string; body: string; media: string[]; tags?: string; persona?: string },
 ): Promise<PublishResult> {
   return request<PublishResult>(`/api/publish/${encodeURIComponent(platform)}`, {
     method: 'POST',
@@ -701,8 +719,12 @@ export function streamChat(
           : await fetch(`${BASE}/api/chat/jobs/${encodeURIComponent(turnId || '')}/stream?after=${lastEventId}`, {
               signal: controller.signal,
             });
-        if (!first && res.status === 404 && onRecoveryUnavailable) {
-          onRecoveryUnavailable();
+        // jobs 流 404 = 任务记录不存在（后端重启丢日志 / 首发请求 5xx 没起 supervisor）。
+        // 必须终结：旧逻辑依赖 onRecoveryUnavailable（新发送不传），不传时静默落进
+        // 无限重试（1s 一次 ×130 分钟），onError 永不触发，会话卡死在「自动续接」。
+        if (!first && res.status === 404) {
+          if (onRecoveryUnavailable) onRecoveryUnavailable();
+          else onError(new Error('任务记录不存在或已失效，无法续接；请重新发送'));
           return;
         }
         if (await consume(res)) return;

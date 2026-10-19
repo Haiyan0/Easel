@@ -48,6 +48,7 @@ from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
                            profile_exists, valid_persona_name, _FILE_ORDER)
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
+from easel.manual_publish import build_package, publishing_mode
 from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
                               history_path, read_settings, stream_chat)
 from easel import harnesses
@@ -965,9 +966,19 @@ def _agent_thinking_level() -> str:
     return THINKING_LEVEL
 
 
+def _publishing_message(message: str) -> str:
+    if publishing_mode(read_settings(ENV_FILE)) == "manual":
+        return ("【当前 Web 发布方式：人工提交】AI 只负责创作、排版、素材和审核建议。"
+                "不要调用发布脚本、发布接口、浏览器代填或代点发布。"
+                "引导用户在发布中心审核、复制或导出，再在官方页面亲自提交。"
+                "导出、复制、打开网页和排期均不代表已发布。\n\n" + message)
+    return message
+
+
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
     if _direct_api_enabled():
         raise HTTPException(409, "API 直连模式支持聊天；此操作需要具备文件和技能执行工具的 Agent 运行时")
+    msg = _publishing_message(msg)
     sk = session_id or f'web-{int(time.time() * 1000)}'
     runtime = _chat_backend(session_id)
     if runtime not in ("api", "openclaw"):
@@ -985,7 +996,6 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
         if _HARNESS_LOOP is not None and _HARNESS_LOOP.is_running():
             return asyncio.run_coroutine_threadsafe(execute(), _HARNESS_LOOP).result(timeout + 15)
         return asyncio.run(execute())
-    _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效
     # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
     cmd = openclaw_base_cmd() + ['--profile', OPENCLAW_PROFILE, 'agent', '--agent', 'main',
            '--session-key', f'agent:main:{sk}', '--session-id', _openclaw_session_id(sk),
@@ -995,6 +1005,8 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
     xlock = _CrossProcLock(sk)
     if not xlock.acquire(timeout=min(timeout, 300)):
         return '⏳ 这个会话正在另一个窗口运行，请稍候再试'
+    # 同 supervisor：先拿到锁再 heal，避免与正在追加 transcript 的进程并发重写丢行
+    _heal_openclaw_session(sk)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
         out = clean_agent_output(r.stdout or '')
@@ -1024,7 +1036,9 @@ def check_gateway() -> bool:
     try:
         # 端口不能写死：Easel 用 --profile easel，OpenClaw 对非默认 profile 会走
         # 20000 + fnv1a32(profile) % 40000（easel → 37289），见 easel/gateway_endpoint.py。
-        with urllib.request.urlopen(healthz_url(), timeout=3) as response:
+        # 回环 healthz 探针不能继承 http_proxy；否则设置页会把健康的本机 gateway 误报离线。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(healthz_url(), timeout=3) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -1246,7 +1260,7 @@ async def api_settings_bootstrap():
         'envKeyOk': env_ok,
         'routeOk': bool(route_ok),
         'routeDetail': route_detail,
-        'gatewayUp': bool(route_ok) if direct else bool(check_gateway()),
+        'gatewayUp': bool(route_ok) if direct else bool(await asyncio.to_thread(check_gateway)),
         'openclawConfigExists': _oc_config_path().is_file(),
         'installWarnings': warnings,
     }
@@ -1283,7 +1297,8 @@ async def api_gateway_restart():
         return {'ok': False, 'note': '重启超时；可稍后刷新，或手动运行 bash scripts/gateway.sh restart'}
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'note': f'重启失败：{e}'}
-    up = check_gateway()
+    # check_gateway 里有阻塞的 urllib 探针（最多 3s）：丢线程，别卡事件循环
+    up = await asyncio.to_thread(check_gateway)
     tail = clean_agent_output(r.stdout or '')[-200:]
     return {'ok': bool(up), 'gatewayUp': bool(up),
             'note': tail or ('网关已重启' if up else '网关未就绪，请查看 /tmp/easel-gateway.log')}
@@ -1895,11 +1910,13 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
                 models = prov.get('models') if isinstance(prov.get('models'), list) and prov.get('models') else [{}]
                 if not isinstance(models[0], dict):
                     models = [{}]
-                if models[0].get('id') != model:
+                old_model = models[0].get('id')
+                if old_model != model:
                     models[0]['id'] = model
                     changed = True
                 model_name = models[0].get('name')
-                if not isinstance(model_name, str) or not model_name.strip():
+                if (not isinstance(model_name, str) or not model_name.strip()
+                        or (model_name == old_model and old_model != model)):
                     models[0]['name'] = model
                     changed = True
                 prov['models'] = models
@@ -2207,7 +2224,10 @@ async def api_settings_models_save(req: ModelSaveRequest):
             # model 可能本来就是 provider/model 形式：anthropic 行的 model 直接取自
             # .env 的 CLAUDE_MODEL，而那个值按约定就写成 anthropic/claude-opus-4-7。
             # 无脑拼前缀会写出 anthropic/anthropic/claude-opus-4-7，主模型随即不可路由。
-            primary_ref = model if '/' in model else f'{pkey}/{model}'
+            # 自定义供应商的模型 ID 是上游原值，可能包含命名空间
+            # （如 LiteLLM 的 dashscope/qwen-*），必须保留并加上实际供应商。
+            primary_ref = (f'{pkey}/{model}' if slot == 'custom'
+                           else model if model.startswith(f'{pkey}/') else f'{pkey}/{model}')
     if not updates and not provider_updates and not primary_ref:
         raise HTTPException(400, '没有可保存的改动（key 留空表示不改）')
     if is_chat and direct:
@@ -2622,7 +2642,7 @@ def _chat_message(req: ChatRequest) -> str:
         message = f"{message}\n\n{context}" if message else context
     if not message:
         raise HTTPException(400, "消息不能为空")
-    return chat_turn_message(message, req.persona)
+    return _publishing_message(chat_turn_message(message, req.persona))
 
 
 def _direct_chat_content(req: ChatRequest) -> tuple[str | list, str]:
@@ -2829,11 +2849,25 @@ def _read_job_events(turn_id: str, after: int = 0) -> list[dict]:
         return []
     events = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            if int(event.get("id", 0)) > after:
-                events.append(event)
-    except (OSError, ValueError, json.JSONDecodeError):
+        # Read/decode each record separately: a concurrent append can end in
+        # partial JSON or even half a UTF-8 character. Keep valid records and
+        # retry the incomplete tail on the next read without changing the log.
+        with path.open("rb") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("id")
+                if (type(event_id) is not int or event_id <= 0
+                        or not isinstance(event.get("event"), str)
+                        or not event["event"]):
+                    continue
+                if event_id > after:
+                    events.append(event)
+    except OSError:
         return []
     return events
 
@@ -3005,6 +3039,9 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             _save_turn(pk, "done", snapshot, {
                 "turn_id": turn_id, "runtime": runtime,
                 "clean_end": clean_end, "stop_reason": reason})
+        # 注意：claim 失败（锁被占/底座已切换）时刻意**不**落盘——保留上一轮的
+        # 结果快照不被失败轮覆盖（见 test_failed_ownership_check_does_not_overwrite_
+        # previous_result）；错误经 SSE 事件流（job log）回放可见。
         proc.finish()
         if _RUNNING_CHAT.get(sk) is proc:
             _RUNNING_CHAT.pop(sk, None)
@@ -3206,10 +3243,6 @@ async def api_chat_stream(req: ChatRequest):
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
 
-        # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
-        if not direct and not alternate:
-            _save_turn(pk, "running", "", {"turn_id": turn_id})
-
         event_path = _job_event_file(turn_id)
         try:
             event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3306,11 +3339,14 @@ async def api_chat_stream(req: ChatRequest):
                             if rc:
                                 run_info["sse_thinking"] = True
                                 run_info["thinking_chars"] += len(rc)
-                                _emit("thinking", rc)
+                                q.put_nowait({"t": "thinking", "text": rc})
                             c = delta.get("content")
                             if c:
                                 got_text = True
-                                _emit("token", c)
+                                # Already on the event loop: enqueue directly.
+                                # _emit schedules a callback which can run after
+                                # this coroutine's completion sentinel.
+                                q.put_nowait({"t": "token", "text": c})
                             if delta.get("tool_calls") and not tool_noted:
                                 tool_noted = True
                                 to_client("activity", "🔧 正在执行操作…")
@@ -3329,15 +3365,6 @@ async def api_chat_stream(req: ChatRequest):
                 # 主循环读到它时，前面的 token 必然已全部消费过。
                 q.put_nowait(SENTINEL)
                 hproc.finish()
-
-        _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
-        # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
-        # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
-        # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
-        try:
-            raw_start_offset = SHARED_RAW_STREAM.stat().st_size
-        except OSError:
-            raw_start_offset = 0
 
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
@@ -3361,41 +3388,75 @@ async def api_chat_stream(req: ChatRequest):
         xlock = _CrossProcLock(sk)
         if lock.locked():
             to_client("activity", "⏳ 这个会话上一条还在跑，排队等它结束再开始…")
-        await lock.acquire()
-        # flock 可能阻塞（等另一进程/标签跑完），放线程池避免卡住事件循环
-        got = await loop.run_in_executor(None, xlock.acquire, min(TIMEOUT_CHAT, 300))
-        if not got:
-            lock.release()
-            _save_turn(pk, "done", "这个会话正在另一个窗口运行，请稍候再试。", {
-                "turn_id": turn_id, "clean_end": False, "stop_reason": "session_lock_timeout",
-            })
-            to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
-            to_client("done", sessionKey=sk)
-            client_q.put_nowait(CLIENT_DONE)
-            return
+        locked = claimed = started = False
+        startup_reason = "spawn_failed"
+        startup_error = None
+        try:
+            await lock.acquire()
+            locked = True
+            # Match direct-API locking: nonblocking attempts with cancellable
+            # sleeps. An executor worker could acquire a lock after cancellation
+            # and outlive its owner, leaving the session permanently locked.
+            lock_deadline = time.monotonic() + min(TIMEOUT_CHAT, 300)
+            while True:
+                if xlock.acquire(0):
+                    break
+                xlock.release()
+                if time.monotonic() >= lock_deadline:
+                    startup_error = "这个会话正在另一个窗口运行，请稍候再试。"
+                    return
+                await asyncio.sleep(0.2)
 
-        # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
-        # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
-        is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
-        if is_http:
-            # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
-            proc = _GatewayHttpProc()
-        else:
+            # Only the owner of both locks may replace the session snapshot.
+            _save_turn(pk, "running", "", {"turn_id": turn_id})
+            claimed = True
+
+            # 拿到两层锁之后再清洗历史：sanitize 是读-改-写，若与上一轮仍往同一
+            # transcript 追加的 openclaw 并发，会丢掉 heal 读到 replace 之间追加的行。
+            _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
+
+            # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
+            # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
+            # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
             try:
+                raw_start_offset = SHARED_RAW_STREAM.stat().st_size
+            except OSError:
+                raw_start_offset = 0
+
+            # Transport selection includes a blocking network probe; keep it
+            # off the event loop. It cannot start an agent or acquire locks.
+            is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+            if is_http:
+                # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
+                proc = _GatewayHttpProc()
+            else:
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
                 )
-            except BaseException:
-                lock.release()
+            started = True
+        except asyncio.CancelledError:
+            startup_reason = "cancelled"
+            raise
+        except Exception:
+            startup_error = "❌ 启动失败，请重试"
+            return
+        finally:
+            if not started:
+                # A queued/cancelled waiter never owns the previous snapshot.
+                # Persist an owned failure before releasing either lock.
+                if claimed:
+                    _save_turn(pk, "done", startup_error or "", {
+                        "turn_id": turn_id, "clean_end": False,
+                        "stop_reason": startup_reason,
+                    })
                 xlock.release()
-                _save_turn(pk, "done", "❌ 启动失败，请重试", {
-                    "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
-                })
-                to_client("error", "❌ 启动失败，请重试")
+                if locked:
+                    lock.release()
+                if startup_error:
+                    to_client("error", startup_error)
                 to_client("done", sessionKey=sk)
                 client_q.put_nowait(CLIENT_DONE)
-                return
         _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
         # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
         # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
@@ -3575,7 +3636,10 @@ async def api_chat_stream(req: ChatRequest):
             except Exception:
                 pass
             finally:
-                loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
+                # HTTP completion belongs to _run_gateway_turn. The optional
+                # raw reader must not end that stream or overtake its tokens.
+                if not is_http:
+                    loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
 
         stdout_fut = None
         if is_http:
@@ -3733,6 +3797,9 @@ async def api_chat_stream(req: ChatRequest):
 
     def _bg_done(t):
         _BG_TASKS.discard(t)
+        if t.cancelled():
+            client_q.put_nowait(CLIENT_DONE)
+            return
         try:
             exc = t.exception()   # 取出异常避免「never retrieved」告警
         except Exception:
@@ -4107,11 +4174,27 @@ async def api_upload(
         ext = Path(name).suffix.lower()
         if ext not in UPLOAD_EXTS:
             raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        data = await f.read()
-        if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+        # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
+        # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
+        cap = MAX_UPLOAD_MB * 1024 * 1024
         target = _unique_upload_path(dest, name)
-        target.write_bytes(data)
+        size = 0
+        try:
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > cap:
+                        raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+                    out.write(chunk)
+        except HTTPException:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
         rel = f"_inbox/{scope}/{batch}/{target.name}"
         saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
     if not saved:
@@ -4391,7 +4474,8 @@ async def api_save_credentials(platform: str, req: WechatCredentials):
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
     _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    ok, msg = _wechat_verify_token()
+    # 验证要真连微信接口（最长 30s）：丢线程池，避免卡住整个事件循环
+    ok, msg = await asyncio.to_thread(_wechat_verify_token)
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop(platform, None)
     if ok:
@@ -4635,6 +4719,15 @@ async def api_logout(platform: str):
         with _WHOAMI_LOCK:
             _WHOAMI_CACHE.pop(platform, None)
         return {'ok': True, 'deleted': deleted}
+    proc = LOGIN_PROCESSES.pop(platform, None)
+    if proc is not None and proc.poll() is None:
+        # 与上面公众号分支同理：停掉仍在跑的登录进程，否则它会把 success 标记
+        # 又写回 {platform}.json，账号在退出后“复活”成已登录。
+        try:
+            proc.terminate()
+            await asyncio.to_thread(proc.wait, timeout=5)
+        except Exception:
+            pass
     prof_name = cfg.get('profile')
     if prof_name:
         pdir = (BROWSER_PROFILES / prof_name).resolve()
@@ -4775,6 +4868,38 @@ class PublishRequest(BaseModel):
     body: str = ''
     media: list[str] = []
     tags: str = ''
+    persona: str = ''
+
+
+class ManualPublishRequest(BaseModel):
+    title: str = Field(default='', max_length=1000)
+    body: str = Field(default='', max_length=100000)
+    tags: str = Field(default='', max_length=2000)
+    media: list[str] = Field(default_factory=list, max_length=32)
+    reviewed: StrictBool = False
+
+
+@app.get("/api/publishing-policy")
+def api_publishing_policy():
+    mode = publishing_mode(read_settings(ENV_FILE))
+    return {"mode": mode, "automaticSubmission": mode == "automated"}
+
+
+def _require_automated_publishing() -> None:
+    if publishing_mode(read_settings(ENV_FILE)) != "automated":
+        raise HTTPException(403, '当前为人工发布模式，请审核后复制或导出，在平台官方发布页亲自提交')
+
+
+@app.post("/api/manual-publish/{platform}/export")
+def api_manual_publish_export(platform: str, req: ManualPublishRequest):
+    """Build a local handoff package; never contact a platform or mark it published."""
+    try:
+        package = build_package(OUTPUTS_DIR, platform, req.title, req.body,
+                                req.tags, req.media, req.reviewed)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return {"path": package.relative_to(OUTPUTS_DIR.resolve()).as_posix(),
+            "filename": package.name, "published": False}
 
 
 def _write_publish_status(status_file: Path, state: str, message: str = '') -> None:
@@ -4800,8 +4925,25 @@ def _read_publish_status(platform: str) -> dict:
     return {'state': 'unknown', 'message': ''}
 
 
+def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = '',
+                               tags: str = '', ptype: str = '') -> None:
+    try:
+        scripts_dir = str(SHARED_SCRIPTS)
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import calendar_ops
+        with _schedule_lock():
+            calendar_ops.record_publish(cfg['name'], title, note=body[:200],
+                                        tags=tags, ptype=ptype,
+                                        source='publish-page', profile=profile,
+                                        data_path=SCHEDULE_FILE, forward_log=True)
+    except Exception:
+        pass
+
+
 def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                    status_file: Path, code_file: Path) -> None:
+                    status_file: Path, code_file: Path, profile: str = '',
+                    tags: str = '', ptype: str = '') -> None:
     """后台线程跑发布脚本（脚本自身把 starting/sms_required/verifying/success/error 写进 status_file）。
     结束后兜底补写终态 + 记 _publish.log + 成功则回流排期。"""
     ok = False
@@ -4830,19 +4972,12 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
     except OSError:
         pass
     if ok:
-        try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published', 'note': body[:200],
-                          'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
-        except Exception:
-            pass
+        _record_successful_publish(title, body, cfg, profile, tags, ptype)
 
 
 def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                         status_file: Path, code_file: Path) -> dict:
+                         status_file: Path, code_file: Path, profile: str = '',
+                         tags: str = '', ptype: str = '') -> dict:
     """启动异步发布：清旧码/状态 → 起后台线程 → 立即返回。前端轮询 /api/publish/{p}/status，
     遇 sms_required 弹输入框、提交到 /api/publish/{p}/sms。"""
     try:
@@ -4851,7 +4986,7 @@ def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: d
         pass
     _write_publish_status(status_file, 'starting', '发布中…（若触发风控会要求短信验证）')
     threading.Thread(target=_run_publish_bg,
-                     args=(platform, cmd, title, body, cfg, status_file, code_file),
+                     args=(platform, cmd, title, body, cfg, status_file, code_file, profile, tags, ptype),
                      daemon=True).start()
     # 关键：**不返回 ok:true**——这只是「已启动」的应答，真正结果要靠轮询 /status。
     # 若这里给 ok:true，旧前端会把它当「已发布」立刻显示成功（假成功 bug，真机踩过）。
@@ -4869,6 +5004,7 @@ async def api_publish_status(platform: str):
 @app.post("/api/publish/{platform}/sms")
 async def api_publish_sms(platform: str, req: SmsCodeRequest):
     """发布触发短信墙时回填验证码（写发布 runner 轮询的一次性验证码文件）。"""
+    _require_automated_publishing()
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
@@ -4882,12 +5018,16 @@ async def api_publish_sms(platform: str, req: SmsCodeRequest):
 @app.post("/api/publish/{platform}")
 async def api_publish(platform: str, req: PublishRequest):
     """一键发布：分发到对应 publisher 脚本真发（--exec）。二次确认在前端。"""
+    _require_automated_publishing()
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
     backend = cfg['backend']
     if backend == 'unsupported':
         raise HTTPException(400, f"{cfg['name']} 暂不支持一键发布")
+    profile = (req.persona or '').strip()
+    if profile and (not valid_persona_name(profile) or not profile_exists(profile)):
+        raise HTTPException(400, '选择的画像不存在或名称非法')
     if not req.title.strip() and not req.body.strip():
         raise HTTPException(400, '标题/正文不能为空')
     imgs, vids = [], []
@@ -4906,6 +5046,7 @@ async def api_publish(platform: str, req: PublishRequest):
         raise HTTPException(400, f"{cfg['name']} 只能发视频，请附带一个视频文件")
     title = req.title.strip() or req.body.strip()[:20]
     tags = req.tags or ''
+    publish_type = '视频' if vids else ('文章' if platform == 'wechat-oa' else '图文')
     py = sys.executable
     if platform == 'xiaohongshu':
         base = [py, str(SHARED_SCRIPTS / 'xhs_publish.py')]
@@ -4928,7 +5069,8 @@ async def api_publish(platform: str, req: PublishRequest):
         status_file = PUBLISH_DIR / 'douyin.json'
         code_file = PUBLISH_DIR / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
-        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file,
+                                    profile, tags, publish_type)
     elif platform == 'wechat-oa':
         # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
         # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
@@ -4948,10 +5090,11 @@ async def api_publish(platform: str, req: PublishRequest):
         if extra_imgs:
             body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
         md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
-        conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
-                               str(md_path), '-o', str(html_path)],
-                              cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=60)
+        conv = await asyncio.to_thread(
+            subprocess.run, [py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
+                             str(md_path), '-o', str(html_path)],
+            cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=60)
         if conv.returncode != 0 or not html_path.is_file():
             raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
         wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
@@ -4984,15 +5127,7 @@ async def api_publish(platform: str, req: PublishRequest):
     except Exception:
         pass
     if ok:
-        try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published',
-                          'note': req.body[:200], 'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
-        except Exception:
-            pass
+        _record_successful_publish(title, req.body, cfg, profile, tags, publish_type)
     return {'ok': ok, 'message': '发布成功' if ok else '发布失败（见 detail）', 'detail': detail}
 
 
@@ -5277,6 +5412,14 @@ SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
 SCHEDULE_KINDS = {"content", "event"}
 
+# _schedule.json 读-改-写串行化：发布回流（后台线程 _run_publish_bg + 事件循环上的
+# api_publish 成功路径）与增删改端点并发时，不加锁会互相覆盖丢记录。
+_SCHEDULE_LOCK = threading.Lock()
+
+
+def _schedule_lock() -> threading.Lock:
+    return _SCHEDULE_LOCK
+
 
 def _read_schedule() -> list[dict]:
     if not SCHEDULE_FILE.is_file():
@@ -5316,58 +5459,61 @@ async def api_schedule_list():
 
 @app.post("/api/schedule")
 async def api_schedule_create(req: ScheduleItem):
-    items = _read_schedule()
-    kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
-    st = req.status if req.status in SCHEDULE_STATUSES else "idea"
-    item = {
-        "id": uuid.uuid4().hex[:12],
-        "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
-        "date": req.date,
-        "platform": req.platform,
-        "time": req.time,
-        "status": st,
-        "note": req.note,
-        "kind": kind,
-        "url": req.url,
-        "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
-        "event_type": req.event_type,
-        "end_date": req.end_date,
-    }
-    items.append(item)
-    _write_schedule(items)
+    with _schedule_lock():
+        items = _read_schedule()
+        kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
+        st = req.status if req.status in SCHEDULE_STATUSES else "idea"
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
+            "date": req.date,
+            "platform": req.platform,
+            "time": req.time,
+            "status": st,
+            "note": req.note,
+            "kind": kind,
+            "url": req.url,
+            "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
+            "event_type": req.event_type,
+            "end_date": req.end_date,
+        }
+        items.append(item)
+        _write_schedule(items)
     return item
 
 
 @app.put("/api/schedule/{sid}")
 async def api_schedule_update(sid: str, req: ScheduleItem):
-    items = _read_schedule()
-    for it in items:
-        if it.get("id") == sid:
-            kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
-            it.update({
-                "title": req.title.strip() or it.get("title", "未命名"),
-                "date": req.date,
-                "platform": req.platform,
-                "time": req.time,
-                "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
-                "note": req.note,
-                "kind": kind,
-                "url": req.url,
-                "event_type": req.event_type,
-                "end_date": req.end_date,
-            })
-            _write_schedule(items)
-            return it
+    with _schedule_lock():
+        items = _read_schedule()
+        for it in items:
+            if it.get("id") == sid:
+                kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
+                it.update({
+                    "title": req.title.strip() or it.get("title", "未命名"),
+                    "date": req.date,
+                    "platform": req.platform,
+                    "time": req.time,
+                    "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
+                    "note": req.note,
+                    "kind": kind,
+                    "url": req.url,
+                    "event_type": req.event_type,
+                    "end_date": req.end_date,
+                })
+                _write_schedule(items)
+                return it
     raise HTTPException(404, "排期不存在")
 
 
 @app.delete("/api/schedule/{sid}")
 async def api_schedule_delete(sid: str):
-    items = _read_schedule()
-    new = [it for it in items if it.get("id") != sid]
-    if len(new) == len(items):
-        raise HTTPException(404, "排期不存在")
-    _write_schedule(new)
+    with _schedule_lock():
+        items = _read_schedule()
+        new = [it for it in items if it.get("id") != sid]
+        if len(new) == len(items):
+            raise HTTPException(404, "排期不存在")
+        _write_schedule(new)
     return {"ok": True, "deleted": sid}
 
 
@@ -5378,8 +5524,10 @@ async def api_schedule_context(days: int = 14):
     cmd = [sys.executable, str(SHARED_SCRIPTS / "calendar_ops.py"),
            "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
     try:
-        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=20)
+        # 冷启动要起一个 Python 子进程（最长 20s）：丢线程池，避免卡住事件循环
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=20)
         return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
     except Exception:
         return {}

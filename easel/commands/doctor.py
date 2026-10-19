@@ -123,7 +123,10 @@ def _gateway_healthy() -> bool:
     不是 18789，写死就会「gateway 活着、doctor 报 FAIL」。
     """
     try:
-        with urllib.request.urlopen(healthz_url(), timeout=5) as response:
+        # 127.0.0.1 探针绝不能继承系统 http_proxy（direct_api 同款 doctrine）：
+        # 默认 opener 会把回环请求发给代理，代理不可达时健康的网关被误报为 FAIL。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(healthz_url(), timeout=5) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -156,6 +159,10 @@ def _env_key_valid() -> bool:
 
     ping 才是权威连通性测试；这里只做静态配置存在性检查。
     """
+    cli_ok, _detail = _primary_model_cli_available()
+    if cli_ok:
+        return True
+
     settings = read_settings(PROJECT_ROOT / ".env")
     if any(settings.get(name, "").strip() for name in (
             "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_MODEL", "EASEL_DIRECT_API_KEY")):
@@ -206,6 +213,40 @@ def _env_key_valid() -> bool:
     return False
 
 
+def _cli_backend(primary: str) -> dict[str, object] | None:
+    if "/" not in primary:
+        return None
+    provider = primary.split("/", 1)[0]
+    try:
+        from easel.local_agents import KNOWN_AGENT_CLIS
+    except Exception:  # noqa: BLE001
+        return None
+    for item in KNOWN_AGENT_CLIS:
+        if item.get("openclaw_provider") == provider:
+            return item
+    return None
+
+
+def _primary_model_cli_available() -> tuple[bool, str]:
+    cfg_path = _openclaw_config_path()
+    if not cfg_path.is_file():
+        return False, ""
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, ""
+    primary = (((cfg.get("agents") or {}).get("defaults") or {})
+               .get("model") or {}).get("primary") or ""
+    backend = _cli_backend(primary)
+    if not backend:
+        return False, ""
+    commands = tuple(backend.get("commands") or ())
+    if any(shutil.which(str(cmd)) for cmd in commands):
+        return True, ""
+    label = backend.get("label") or backend.get("id") or primary.split("/", 1)[0]
+    return False, f"primary 是 {primary}，但未在 PATH 找到 {label} CLI（{', '.join(map(str, commands))}）"
+
+
 def _openclaw_config_path() -> Path:
     """easel 用独立 profile，不碰用户本机的 OpenClaw 配置。
 
@@ -245,6 +286,12 @@ def _primary_model_routable() -> tuple[bool, str]:
         return True, ""
 
     provider = primary.split("/", 1)[0]
+    backend = _cli_backend(primary)
+    if backend:
+        if any(shutil.which(str(cmd)) for cmd in (backend.get("commands") or ())):
+            return True, ""
+        return False, (f"primary 是 {primary}，但未在 PATH 找到 "
+                       f"{backend.get('label') or provider} CLI —— 请先安装并登录后再试")
     providers = (cfg.get("models") or {}).get("providers") or {}
     entry = providers.get(provider)
     if not isinstance(entry, dict):
@@ -257,6 +304,53 @@ def _primary_model_routable() -> tuple[bool, str]:
         return False, (f"models.providers.{provider} 没有 apiKey —— "
                        "在 .env 填好真实 key 后重新跑 setup 脚本")
     return True, ""
+
+
+def _tool_loop_policy() -> list[str]:
+    """Describe saved switches only; do not infer runtime support or defaults."""
+    try:
+        cfg = json.loads(_openclaw_config_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ["无法读取 JSON 配置；循环保护状态未知"]
+    if not isinstance(cfg, dict):
+        return ["配置根节点不是对象；循环保护状态未知"]
+
+    def switch(scope):
+        if not isinstance(scope, dict):
+            return "格式异常"
+        for key in ("tools", "loopDetection"):
+            if key not in scope:
+                return "未设置"
+            scope = scope[key]
+            if not isinstance(scope, dict):
+                return "格式异常"
+        if "enabled" not in scope:
+            return "未设置"
+        value = scope["enabled"]
+        if type(value) is not bool:
+            return "格式异常"
+        return "显式开启" if value else "显式关闭"
+
+    lines = [f"tools.loopDetection.enabled：{switch(cfg)}"]
+    agents = cfg.get("agents", {})
+    if not isinstance(agents, dict):
+        return lines + ["agents 格式异常；无法检查 Agent 覆盖"]
+    # Both saved layouts exist in supported-era OpenClaw releases. Inspect
+    # separately; do not guess which one a running gateway actually consumes.
+    for layout, expected in (("list", list), ("entries", dict)):
+        if layout not in agents:
+            continue
+        entries = agents[layout]
+        if not isinstance(entries, expected):
+            lines.append(f"agents.{layout} 格式异常；无法检查 Agent 覆盖")
+            continue
+        states = [switch(entry) for entry in (entries.values() if layout == "entries" else entries)]
+        counts = "，".join(f"{state} {states.count(state)}" for state in
+                           ("显式开启", "显式关闭", "未设置", "格式异常"))
+        lines.append(f"agents.{layout} 的 Agent 开关：{counts}")
+    if "list" in agents and "entries" in agents:
+        lines.append("同时存在 list / entries；请用所装 OpenClaw 版本核对配置布局")
+    return lines
 
 
 def cmd_doctor(_args) -> int:
@@ -346,6 +440,11 @@ def cmd_doctor(_args) -> int:
         pass
 
     if not direct:
+        print("  OpenClaw 循环保护（只读配置诊断，不计入环境就绪结果）")
+        for line in _tool_loop_policy():
+            print(f"    └─ {line}")
+        print("    未设置不等于关闭；继承、默认值和运行时支持由 OpenClaw 版本决定。")
+        print("    已保存配置不证明网关已加载，也不代表每任务工具调用预算。")
         # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
         route_ok, route_detail = _primary_model_routable()
         all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
