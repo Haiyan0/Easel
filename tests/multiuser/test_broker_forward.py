@@ -805,12 +805,32 @@ class GatedCloseTransport(httpx.AsyncBaseTransport):
         self.state["closed"] = True
 
 
+class EofCloseStream(httpx.AsyncByteStream):
+    """正常 body EOF 后的首次关闭在 close_gate 放行前不完成。"""
+
+    def __init__(self, state):
+        self.state = state
+
+    async def __aiter__(self):
+        yield b"one"
+
+    async def aclose(self):
+        self.state["close_started"].set()
+        try:
+            await self.state["close_gate"].wait()
+            self.state["closed"] = True
+        except asyncio.CancelledError:
+            self.state["close_cancelled"] = True
+            raise
+
+
 def _close_gate_state() -> dict:
     return {
         "close_started": asyncio.Event(),
         "close_gate": asyncio.Event(),
         "read_gate": asyncio.Event(),
         "closed": False,
+        "close_cancelled": False,
     }
 
 
@@ -822,6 +842,20 @@ def raw_lease_count(store) -> int:
     """包含已过 TTL 但尚未完成清理的行；用于断言额度未被提前删除。"""
     return store._connection.execute(
         "SELECT COUNT(*) FROM broker_leases").fetchone()[0]
+
+
+async def assert_no_leftover_tasks() -> None:
+    """清理完成后只允许当前任务存活。"""
+    current = asyncio.current_task()
+    leftovers = []
+    for _ in range(10):
+        await asyncio.sleep(0)
+        leftovers = [
+            task for task in asyncio.all_tasks()
+            if task is not current and not task.done()]
+        if not leftovers:
+            break
+    assert not leftovers, leftovers
 
 
 def test_cleanup_gate_holds_lease_until_response_stream_closes(tmp_path):
@@ -967,6 +1001,135 @@ def test_cleanup_waits_after_reader_cancel_and_active_aclose(tmp_path):
                 if not leftovers:
                     break
             assert not leftovers, leftovers
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
+def test_eof_close_is_owned_by_cleanup_gate(tmp_path):
+    """自然 EOF 的首次关闭也必须由唯一清理持有并等待完成。"""
+    state = _close_gate_state()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=EofCloseStream(state)))
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3,
+                    lease_clock=lambda: 1000.0) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+            chunks = response.chunks()
+            assert await anext(chunks) == b"one"
+            pending = asyncio.create_task(anext(chunks))
+
+            # body 自然 EOF 后开始底层关闭；此时读取仍不能自行结束
+            await asyncio.wait_for(state["close_started"].wait(), 4)
+            store.renew_broker_lease = _fail_renew
+
+            # 续期失败发生在关闭未完成期间：不得截断关闭或提前释放额度
+            await asyncio.wait_for(response._guard.gone.wait(), 4)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not pending.done()
+            assert state["closed"] is False
+            assert state["close_cancelled"] is False
+            assert raw_lease_count(store) == 1
+            # 用租约时钟断言有效租约，而不是只数已过期行
+            assert store.count_broker_leases(1000) == 1
+
+            # 有效租约实际占用发送能力：可再占一条，第三条被空间上限拒绝
+            probe = broker.acquire_lease(
+                token, member.workspace_id, run.id, "speech")
+            with pytest.raises(DomainError) as over:
+                broker.acquire_lease(
+                    token, member.workspace_id, run.id, "speech")
+            assert_error(over, 429, "workspace_capacity")
+            broker.release_lease(probe)
+            assert store.count_broker_leases(1000) == 1
+
+            # gate 放行后关闭完成才回收额度，读取得到明确终态
+            state["close_gate"].set()
+            with pytest.raises((StopAsyncIteration, DomainError)) as ended:
+                await pending
+            if isinstance(ended.value, DomainError):
+                assert ended.value.code == "lease_lost"
+            assert state["closed"] is True
+            assert state["close_cancelled"] is False
+            assert raw_lease_count(store) == 0
+            assert store.count_broker_leases(1000) == 0
+            assert response._guard._cleanup_task.done()
+            assert response._guard._heartbeat.done()
+            await assert_no_leftover_tasks()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            store.renew_broker_lease = original_renew
+
+
+def test_eof_close_waits_after_reader_cancel_and_active_aclose(tmp_path):
+    """EOF 关闭期间读取取消并主动 aclose：仍等待同一次关闭完成。"""
+    state = _close_gate_state()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=EofCloseStream(state)))
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, lease_ttl=3,
+                    lease_clock=lambda: 1000.0) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        original_renew = store.renew_broker_lease
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+            chunks = response.chunks()
+            assert await anext(chunks) == b"one"
+            pending = asyncio.create_task(anext(chunks))
+
+            await asyncio.wait_for(state["close_started"].wait(), 4)
+            store.renew_broker_lease = _fail_renew
+            await asyncio.wait_for(response._guard.gone.wait(), 4)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert state["closed"] is False
+            assert state["close_cancelled"] is False
+            assert store.count_broker_leases(1000) == 1
+
+            # 读取方取消发生在 EOF 关闭等待期间；关闭不能被截断
+            pending.cancel()
+            close_waiter = asyncio.create_task(response.aclose())
+            await asyncio.sleep(0)
+            assert not close_waiter.done()
+            assert store.count_broker_leases(1000) == 1
+            assert state["closed"] is False
+            assert state["close_cancelled"] is False
+
+            state["close_gate"].set()
+            await close_waiter
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert state["closed"] is True
+            assert state["close_cancelled"] is False
+            assert store.count_broker_leases(1000) == 0
+            assert raw_lease_count(store) == 0
+            assert response._guard._cleanup_task.done()
+            assert response._guard._heartbeat.done()
+            await assert_no_leftover_tasks()
 
         try:
             asyncio.run(scenario())

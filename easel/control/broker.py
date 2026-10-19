@@ -120,15 +120,35 @@ class _LeaseGuard:
         """同步启动唯一清理任务；调用者无需等待即可继续取消路径。"""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup())
+            # 清理结束才停止心跳：慢关闭期间租约仍须续期，不能被复用额度
+            self._cleanup_task.add_done_callback(self._stop_heartbeat)
+
+    def _stop_heartbeat(self, _task=None) -> None:
+        heartbeat = self._heartbeat
+        if heartbeat is not None and heartbeat is not asyncio.current_task():
+            heartbeat.cancel()
+
+    async def _join_heartbeat(self) -> None:
+        """停止并等待心跳，保证关闭返回时不留后台任务。"""
+        heartbeat = self._heartbeat
+        if heartbeat is None or heartbeat is asyncio.current_task():
+            return
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     async def close(self) -> None:
         """启动或等待唯一清理；等待者可被取消，但清理任务本身不被取消。"""
         self.start_cleanup()
-        heartbeat = self._heartbeat
-        if heartbeat is not None and heartbeat is not asyncio.current_task():
-            # 只取消等待者；唯一 cleanup task 会继续执行到 close gate 完成
-            heartbeat.cancel()
-        await asyncio.shield(self._cleanup_task)
+        try:
+            await asyncio.shield(self._cleanup_task)
+        finally:
+            # 等待者被取消也要停掉心跳；唯一 cleanup task 仍在后台完成
+            await self._join_heartbeat()
 
     async def _heartbeat_loop(self) -> None:
         interval = max(1.0, self._broker._lease_ttl / 3)
@@ -207,7 +227,11 @@ class BrokerResponse:
         next_task = None
         gone_task = None
         try:
-            iterator = self._response.aiter_raw()
+            # 直接迭代原始 AsyncByteStream：httpx 的 aiter_raw 在自然 EOF 时
+            # 会自行调用 response.aclose 并先把 is_closed 置真；该首次关闭若随
+            # 读取任务取消而被截断，唯一清理会误判响应已关闭并提前释放额度。
+            # 这里让读取只消费字节，关闭始终由 guard 的唯一清理发起并等待完成。
+            iterator = self._response.stream.__aiter__()
             gone_task = asyncio.create_task(self._guard.gone.wait())
             while True:
                 next_task = asyncio.create_task(anext(iterator))
@@ -241,12 +265,9 @@ class BrokerResponse:
             if gone_task is not None:
                 gone_task.cancel()
             if cancelled:
-                # 读取方取消不能取消唯一清理；启动后在后台完成关闭与回收
+                # 读取方取消不能取消唯一清理；启动后在后台完成关闭与回收，
+                # 心跳在清理结束前继续续期，避免慢关闭期间额度被其他请求复用
                 self._guard.start_cleanup()
-                heartbeat = self._guard._heartbeat
-                if (heartbeat is not None
-                        and heartbeat is not asyncio.current_task()):
-                    heartbeat.cancel()
             else:
                 # 不 await 子任务：它们的 CancelledError 可能与本任务取消混淆
                 await self.aclose()
