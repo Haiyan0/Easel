@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from easel.control.egress import (
@@ -152,6 +153,38 @@ def test_gateway_requires_explicit_proxy_or_injected_transport():
     with pytest.raises(DomainError) as unavailable:
         EgressGateway().client()
     assert_error(unavailable, 503, "egress_unavailable")
+
+
+def test_proxy_without_explicit_policy_fails_closed():
+    gateway = EgressGateway(proxy_url="http://127.0.0.1:8899")
+    assert gateway.configured is False
+    with pytest.raises(DomainError) as unavailable:
+        gateway.client()
+    assert_error(unavailable, 503, "egress_unavailable")
+
+
+def test_explicit_empty_policy_with_proxy_is_allowed():
+    gateway = EgressGateway(EgressPolicy(),
+                            proxy_url="http://127.0.0.1:8899")
+    assert gateway.configured is True
+    client = gateway.client()
+    try:
+        assert isinstance(client, httpx.AsyncClient)
+    finally:
+        import asyncio
+        asyncio.run(client.aclose())
+
+
+def test_injected_transport_is_allowed_without_policy():
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    gateway = EgressGateway(transport=transport)
+    assert gateway.configured is True
+    client = gateway.client()
+    try:
+        assert isinstance(client, httpx.AsyncClient)
+    finally:
+        import asyncio
+        asyncio.run(client.aclose())
 
 
 def test_proxy_url_requires_explicit_valid_authority():

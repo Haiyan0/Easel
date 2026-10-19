@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import contextmanager
 
 import httpx
@@ -138,6 +139,24 @@ def multipart_model_after_file(actual_model: str,
         f"{actual_model}\r\n"
         f"--{BOUNDARY}--\r\n"
     ).encode()
+
+
+def multipart_parts(parts, *, closing: bool = True) -> bytes:
+    body = bytearray()
+    for headers, value in parts:
+        body.extend(f"--{BOUNDARY}\r\n".encode())
+        body.extend(headers)
+        body.extend(b"\r\n\r\n")
+        body.extend(value)
+        body.extend(b"\r\n")
+    if closing:
+        body.extend(f"--{BOUNDARY}--\r\n".encode())
+    return bytes(body)
+
+
+MODEL_HEADER = b'Content-Disposition: form-data; name="model"'
+FILE_HEADER = (b'Content-Disposition: form-data; name="file"; '
+               b'filename="a.wav"\r\nContent-Type: audio/wav')
 
 
 def capture_transport(record: dict, *, status: int = 200,
@@ -426,6 +445,101 @@ def test_multipart_parser_only_reads_part_headers_not_file_content(tmp_path):
         assert record.get("calls") == 1
 
 
+def test_duplicate_and_trailing_multipart_fields_are_rejected(tmp_path):
+    record: dict = {}
+    transport = capture_transport(record)
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+
+        async def scenario(data: bytes):
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/transcriptions",
+                headers={
+                    "content-type": f"multipart/form-data; boundary={BOUNDARY}",
+                    "content-length": str(len(data)),
+                },
+                body=aiter_body(data, chunks=3))
+            return b"".join([chunk async for chunk in response.chunks()])
+
+        cases = {
+            # 同一 chunk 内重复 model
+            "same_chunk": multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (MODEL_HEADER, b"forbidden-model"),
+                (FILE_HEADER, b"RIFF"),
+            ]),
+            # 后置重复 model（跨 chunk 时在已缓冲前缀之后）
+            "later_chunk": multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (FILE_HEADER, b"RIFF" * 4096),
+                (MODEL_HEADER, b"forbidden-model"),
+            ]),
+            # model 之后追加禁用路由字段
+            "trailing_forbidden": multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (FILE_HEADER, b"RIFF"),
+                (b'Content-Disposition: form-data; name="base_url"',
+                 b"https://evil.example/v1"),
+            ]),
+            # 文件字段名不能冒充 model
+            "filename_shadow": multipart_parts([
+                (b'Content-Disposition: form-data; name="file"; '
+                 b'filename="model"', b"tts-default"),
+                (MODEL_HEADER, b"forbidden-model"),
+            ]),
+            # 同一 part 重复 name 参数：上游选择哪个都不确定
+            "duplicate_name_param": multipart_parts([
+                (b'Content-Disposition: form-data; name="model"; '
+                 b'name="file"', b"tts-default"),
+            ]),
+            # 缺少结束 boundary 的畸形 multipart
+            "missing_closing": multipart_parts([
+                (MODEL_HEADER, b"tts-default"),
+                (FILE_HEADER, b"RIFF"),
+            ], closing=False),
+        }
+        for name, body in cases.items():
+            record.pop("calls", None)
+            with pytest.raises(DomainError) as invalid:
+                asyncio.run(scenario(body))
+            assert_error(invalid, 400, "invalid_request")
+            assert record.get("calls", 0) == 0, name
+
+
+def test_large_multipart_is_spooled_and_forwarded_unchanged(tmp_path):
+    record: dict = {}
+    transport = capture_transport(record)
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport) as (
+            store, config, broker, admin, member, run):
+        token = broker.issue(member, run.id, "speech")
+        file_bytes = b"RIFF" + b"\x00\xff" * (1024 * 1024)
+        body = multipart_parts([
+            (MODEL_HEADER, b"tts-default"),
+            (FILE_HEADER, file_bytes),
+        ])
+
+        async def scenario():
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/transcriptions",
+                headers={
+                    "content-type": f"multipart/form-data; boundary={BOUNDARY}",
+                },
+                body=aiter_body(body, chunks=16))
+            return b"".join([chunk async for chunk in response.chunks()])
+
+        asyncio.run(scenario())
+
+    assert record["body"] == body
+    assert record["calls"] == 1
+
+
 def test_personal_and_admin_credentials_never_mix(tmp_path):
     record: dict = {}
     transport = capture_transport(record)
@@ -530,6 +644,44 @@ def test_early_close_releases_stream_and_lease(tmp_path):
         assert store.count_broker_leases(1000) == 0
 
     assert closed.get("closed") is True
+
+
+def test_open_streams_keep_capacity_after_token_expiry(tmp_path):
+    record: dict = {}
+    transport = capture_transport(record, chunks=(b"one", b"two"))
+    now = {"value": 1000.0}
+    with broker_env(tmp_path, {"speech": speech_route()},
+                    transport=transport, clock=lambda: now["value"]) as (
+            store, config, broker, admin, member, run):
+        token1 = broker.issue(member, run.id, "speech")
+
+        async def open_call(token):
+            return await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"},
+                body=aiter_body(json.dumps(
+                    {"model": "tts-default"}).encode()))
+
+        async def scenario():
+            first = await open_call(token1)
+            second = await open_call(token1)
+            assert store.count_broker_leases(int(time.time())) == 2
+
+            now["value"] = 2800.0
+            token2 = broker.issue(member, run.id, "speech")
+            with pytest.raises(DomainError) as over:
+                await open_call(token2)
+            assert_error(over, 429, "workspace_capacity")
+
+            await first.aclose()
+            await second.aclose()
+            assert store.count_broker_leases(int(time.time())) == 0
+            third = await open_call(token2)
+            await third.aclose()
+
+        asyncio.run(scenario())
 
 
 def test_upstream_error_releases_lease(tmp_path):

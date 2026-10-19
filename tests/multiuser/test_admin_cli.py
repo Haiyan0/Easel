@@ -1,12 +1,16 @@
 """Task 2 本地 CLI：管理员引导、邀请与服务启动装配。"""
 from __future__ import annotations
 
+import asyncio
+
+import pytest
 from fastapi.testclient import TestClient
 
 from easel.cli import main
 from easel.control.auth import AuthService
 from easel.control.config import ConfigService
 from easel.control.store import Store
+from easel.control.types import DomainError
 
 
 def write_key(tmp_path, name="master.key", data=b"k" * 32):
@@ -205,3 +209,90 @@ def test_serve_control_rejects_key_mismatching_existing_ciphertext(
     assert "invalid_master_key" in captured.err
     assert "admin-secret-sentinel" not in captured.err
     assert started == []
+
+
+# --------------------------------------------------------------------------
+# T5-R1-04：生产出口代理与策略必须显式装配
+# --------------------------------------------------------------------------
+
+def _serve_control_with_egress(tmp_path, monkeypatch, *extra_args):
+    from easel.control import cli as control_cli
+
+    captured: dict = {}
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda app, **kwargs: captured.setdefault("app", app))
+    key_file = write_key(tmp_path)
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", "https://easel.test",
+                 "--master-key-file", str(key_file),
+                 *extra_args])
+    return code, captured.get("app")
+
+
+def test_serve_control_proxy_without_policy_fails_closed(
+        tmp_path, monkeypatch, capsys):
+    code, app = _serve_control_with_egress(
+        tmp_path, monkeypatch,
+        "--egress-proxy", "http://127.0.0.1:8899")
+    assert code == 0, capsys.readouterr().err
+    with TestClient(app, base_url="https://easel.test"):
+        egress = app.state.broker.egress
+        assert egress.configured is False
+        with pytest.raises(DomainError) as unavailable:
+            egress.client()
+        assert unavailable.value.status == 503
+        assert unavailable.value.code == "egress_unavailable"
+
+
+def test_serve_control_policy_without_proxy_fails_closed(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+    code, app = _serve_control_with_egress(
+        tmp_path, monkeypatch, "--egress-policy", str(policy))
+    assert code == 0
+    with TestClient(app, base_url="https://easel.test"):
+        egress = app.state.broker.egress
+        assert egress.configured is False
+        with pytest.raises(DomainError) as unavailable:
+            egress.client()
+        assert unavailable.value.status == 503
+
+
+def test_serve_control_valid_proxy_and_policy_creates_client(
+        tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+    code, app = _serve_control_with_egress(
+        tmp_path, monkeypatch,
+        "--egress-proxy", "http://127.0.0.1:8899",
+        "--egress-policy", str(policy))
+    assert code == 0
+    with TestClient(app, base_url="https://easel.test"):
+        egress = app.state.broker.egress
+        assert egress.configured is True
+        client = egress.client()
+        assert client is not None
+        asyncio.run(client.aclose())
+
+
+def test_serve_control_invalid_egress_policy_fails_before_start(
+        tmp_path, monkeypatch, capsys):
+    from easel.control import cli as control_cli
+
+    started = []
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda *args, **kwargs: started.append(True))
+    key_file = write_key(tmp_path)
+    missing = tmp_path / "missing-policy.json"
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", "https://easel.test",
+                 "--master-key-file", str(key_file),
+                 "--egress-proxy", "http://127.0.0.1:8899",
+                 "--egress-policy", str(missing)])
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "egress_policy_invalid" in captured.err
+    assert started == []
+    assert not (tmp_path / "control").exists()

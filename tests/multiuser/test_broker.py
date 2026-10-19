@@ -1,10 +1,12 @@
 """Task 5 broker：Run 范围令牌、配置快照、生命周期与并发预算。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from contextlib import contextmanager
 
+import httpx
 import pytest
 
 from easel.control.broker import BrokerService
@@ -391,3 +393,127 @@ def test_broker_requires_same_egress_policy_as_config(tmp_path):
             policy=EgressPolicy(approved_hosts=frozenset({"provider.internal"})))
         with pytest.raises(ValueError):
             BrokerService(store, config, egress=mismatched)
+
+
+# --------------------------------------------------------------------------
+# T5-R1-01：路由与凭证必须在一致事务中取得
+# --------------------------------------------------------------------------
+
+class PausingConfigService(ConfigService):
+    """在一致快照读取点暂停，供双连接交错测试使用。"""
+
+    def __init__(self, store: Store, master_key: bytes):
+        super().__init__(store, master_key)
+        self.snapshot_entered = threading.Event()
+        self.resume = threading.Event()
+
+    def snapshot_from_rows(self, workspace_id, channel, managed_row,
+                           override_row):
+        route, bundle = super().snapshot_from_rows(
+            workspace_id, channel, managed_row, override_row)
+        self.snapshot_entered.set()
+        if not self.resume.wait(5):
+            raise RuntimeError("test resume timeout")
+        return route, bundle
+
+
+def test_issue_reads_route_and_credentials_in_one_transaction(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        admin = setup.create_user("Owner", "admin")
+        member = setup.create_user("Member")
+        config = ConfigService(setup, MASTER_KEY)
+        publish_speech(config, admin)
+        config.save_override(member, "speech", speech_route(
+            model="old-model", base_url="https://old.example/v1",
+            secret="old-key-sentinel"))
+        run = reserve_run(setup, member)
+
+    holder: dict = {}
+    ready = threading.Event()
+    issued: dict = {}
+
+    def issuer():
+        with Store.open(path) as store:
+            pausing = PausingConfigService(store, MASTER_KEY)
+            holder["config"] = pausing
+            ready.set()
+            issued["token"] = BrokerService(
+                store, pausing, clock=lambda: 1000.0).issue(
+                    member, run.id, "speech")
+
+    def mutator():
+        with Store.open(path) as store:
+            config = ConfigService(store, MASTER_KEY)
+            config.clear_override(member, "speech")
+            config.save_override(member, "speech", speech_route(
+                model="new-model", base_url="https://new.example/v1",
+                secret="new-key-sentinel"))
+
+    issuer_thread = threading.Thread(target=issuer)
+    issuer_thread.start()
+    assert ready.wait(2), "issuer 未就绪"
+    pausing = holder["config"]
+    # 旧实现没有一致快照入口，issue 不会在这里暂停
+    assert pausing.snapshot_entered.wait(2), (
+        "issue 未在一致事务内读取路由与凭证")
+
+    mutator_thread = threading.Thread(target=mutator)
+    mutator_thread.start()
+    pausing.resume.set()
+    issuer_thread.join(10)
+    mutator_thread.join(10)
+    assert not issuer_thread.is_alive(), "issue 未结束"
+    assert not mutator_thread.is_alive(), "双连接更新未结束"
+
+    with Store.open(path) as store:
+        config = ConfigService(store, MASTER_KEY)
+        record: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            record["url"] = str(request.url)
+            record["authorization"] = request.headers.get("authorization")
+
+            class Stream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"ok"
+
+                async def aclose(self):
+                    pass
+
+            return httpx.Response(200, stream=Stream())
+
+        broker = BrokerService(
+            store, config, clock=lambda: 1000.0,
+            egress=EgressGateway(transport=httpx.MockTransport(handler)))
+        old_route = broker.authorize(
+            issued["token"], member.workspace_id, run.id, "speech")
+        assert old_route.base_url == "https://old.example/v1"
+        assert old_route.model == "old-model"
+        assert config.credentials_for_ref(old_route.credential_ref)[
+            "VOICE_API_KEY"] == "old-key-sentinel"
+
+        async def call(token: str, model: str):
+            async def body():
+                yield json.dumps({"model": model}).encode()
+            response = await broker.forward(
+                token=token, workspace_id=member.workspace_id, run_id=run.id,
+                channel="speech", method="POST",
+                relative_path="audio/speech",
+                headers={"content-type": "application/json"}, body=body())
+            return b"".join([chunk async for chunk in response.chunks()])
+
+        assert asyncio.run(call(issued["token"], "old-model")) == b"ok"
+        assert record["url"] == "https://old.example/v1/audio/speech"
+        assert record["authorization"] == "Bearer old-key-sentinel"
+
+        new_token = broker.issue(member, run.id, "speech")
+        new_route = broker.authorize(
+            new_token, member.workspace_id, run.id, "speech")
+        assert new_route.base_url == "https://new.example/v1"
+        assert new_route.model == "new-model"
+        assert config.credentials_for_ref(new_route.credential_ref)[
+            "VOICE_API_KEY"] == "new-key-sentinel"
+        assert asyncio.run(call(new_token, "new-model")) == b"ok"
+        assert record["url"] == "https://new.example/v1/audio/speech"
+        assert record["authorization"] == "Bearer new-key-sentinel"

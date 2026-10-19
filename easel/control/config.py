@@ -291,11 +291,16 @@ class ConfigService:
     """默认/个人能力配置；所有秘密只在服务端内存中解密。"""
 
     def __init__(self, store: Store, master_key: bytes,
-                 egress_policy: EgressPolicy | None = None):
+                 egress_policy: EgressPolicy | None = None, *,
+                 egress_policy_configured: bool | None = None):
         if (not isinstance(master_key, (bytes, bytearray))
                 or len(master_key) != MASTER_KEY_BYTES):
             raise ValueError(
                 f"master_key must be exactly {MASTER_KEY_BYTES} bytes")
+        if egress_policy_configured is None:
+            egress_policy_configured = egress_policy is not None
+        if not isinstance(egress_policy_configured, bool):
+            raise TypeError("egress_policy_configured must be bool")
         if egress_policy is None:
             egress_policy = EgressPolicy()
         if not isinstance(egress_policy, EgressPolicy):
@@ -303,11 +308,15 @@ class ConfigService:
         self._store = store
         self._key = bytes(master_key)
         self.egress_policy = egress_policy
+        self.egress_policy_configured = egress_policy_configured
         self._verify_existing_ciphertext()
 
     def with_store(self, store: Store) -> "ConfigService":
         """在同一 master key 下为应用线程重建服务；会重新校验已有密文。"""
-        return ConfigService(store, self._key, egress_policy=self.egress_policy)
+        return ConfigService(
+            store, self._key,
+            egress_policy=self.egress_policy,
+            egress_policy_configured=self.egress_policy_configured)
 
     def _now(self) -> int:
         return int(time.time())
@@ -566,59 +575,89 @@ class ConfigService:
     # 解析与脱敏视图
     # ------------------------------------------------------------------
 
-    def resolve(self, actor: Identity, channel: str) -> EffectiveRoute:
+    @staticmethod
+    def _public_payload(row, *, defaults: bool) -> dict:
+        try:
+            payload = json.loads(row["public_json"])
+            if not isinstance(payload, dict):
+                raise ValueError
+            if defaults:
+                payload = payload.get("defaults")
+                if not isinstance(payload, dict):
+                    raise ValueError
+            return payload
+        except (TypeError, ValueError):
+            raise DomainError("configuration_invalid", 500) from None
+
+    def _managed_bundle(self, managed_row, channel: str) -> dict[str, str]:
+        version = int(managed_row["version"])
+        decrypted = self._decrypt(managed_row["encrypted_secrets"],
+                                  self._managed_scope(version))
+        return self._validated_bundle(decrypted.get(channel))
+
+    def snapshot_from_rows(self, workspace_id: str, channel: str,
+                           managed_row, override_row
+                           ) -> tuple[EffectiveRoute, dict[str, str]]:
+        """从同一事务读取的行同时构建路由与凭证，不重新查库。
+
+        issue 在写事务内调用本方法；管理员发布/个人覆盖更新必须等待该事务
+        提交，因此不会出现旧地址配新 Key（或反之）的快照。
+        """
         if channel == "chat":
-            # 主聊天模型只解析管理员受管版本；member 不能覆盖
-            self._store.require_identity(actor)
-            defaults, version = self._load_managed_defaults(verify=True)
-            managed = defaults.get("chat")
+            if managed_row is None:
+                raise DomainError("not_configured", 404)
+            version = int(managed_row["version"])
+            managed = self._public_payload(
+                managed_row, defaults=True).get("chat")
             if managed is None:
                 raise DomainError("not_configured", 404)
-            return EffectiveRoute(
-                channel="chat",
-                provider=managed["provider"],
-                model=managed["model"],
-                base_url=managed["base_url"],
-                protocol=managed["protocol"],
-                credential_ref=f"managed:{version}:chat",
-                source="admin",
-                version=version,
-                options=dict(managed.get("options") or {}),
-                allowed_models=tuple(
-                    managed.get("allowed_models") or (managed["model"],)),
+            return (
+                EffectiveRoute(
+                    channel="chat",
+                    provider=managed["provider"],
+                    model=managed["model"],
+                    base_url=managed["base_url"],
+                    protocol=managed["protocol"],
+                    credential_ref=f"managed:{version}:chat",
+                    source="admin",
+                    version=version,
+                    options=dict(managed.get("options") or {}),
+                    allowed_models=tuple(
+                        managed.get("allowed_models") or (managed["model"],)),
+                ),
+                self._managed_bundle(managed_row, "chat"),
             )
-        _require_channel(channel)
-        identity = self._store.require_identity(actor)
-        workspace_id = identity.workspace_id
-        override = self._store.get_workspace_override(workspace_id, channel)
 
-        if override is not None:
-            try:
-                public = json.loads(override["public_json"])
-                if not isinstance(public, dict):
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise DomainError("configuration_invalid", 500) from None
-            if override["route_kind"] == "complete":
-                self._decrypt(
-                    override["encrypted_secrets"],
-                    self._workspace_scope(workspace_id, channel))
-                return EffectiveRoute(
-                    channel=channel,
-                    provider=public["provider"],
-                    model=public["model"],
-                    base_url=public["base_url"],
-                    protocol=public["protocol"],
-                    credential_ref=(
-                        f"workspace:{workspace_id}:{channel}:{override['version']}"),
-                    source="user",
-                    version=int(override["version"]),
-                    options=dict(public.get("options") or {}),
-                    allowed_models=(public["model"],),
+        _require_channel(channel)
+        if override_row is not None:
+            public = self._public_payload(override_row, defaults=False)
+            if override_row["route_kind"] == "complete":
+                bundle = self._validated_bundle(self._decrypt(
+                    override_row["encrypted_secrets"],
+                    self._workspace_scope(workspace_id, channel)))
+                return (
+                    EffectiveRoute(
+                        channel=channel,
+                        provider=public["provider"],
+                        model=public["model"],
+                        base_url=public["base_url"],
+                        protocol=public["protocol"],
+                        credential_ref=(
+                            f"workspace:{workspace_id}:{channel}:"
+                            f"{override_row['version']}"),
+                        source="user",
+                        version=int(override_row["version"]),
+                        options=dict(public.get("options") or {}),
+                        allowed_models=(public["model"],),
+                    ),
+                    bundle,
                 )
-            if override["route_kind"] == "managed-model":
-                defaults, version = self._load_managed_defaults(verify=True)
-                managed = defaults.get(channel)
+            if override_row["route_kind"] == "managed-model":
+                if managed_row is None:
+                    raise DomainError("not_configured", 404)
+                version = int(managed_row["version"])
+                managed = self._public_payload(
+                    managed_row, defaults=True).get(channel)
                 if managed is None:
                     raise DomainError("not_configured", 404)
                 model = public.get("model") or managed["model"]
@@ -626,38 +665,57 @@ class ConfigService:
                     raise DomainError("model_not_allowed", 409)
                 options = {**(managed.get("options") or {}),
                            **(public.get("options") or {})}
-                return EffectiveRoute(
-                    channel=channel,
-                    provider=managed["provider"],
-                    model=model,
-                    base_url=managed["base_url"],
-                    protocol=managed["protocol"],
-                    credential_ref=f"managed:{version}:{channel}",
-                    source="user",
-                    version=version,
-                    options=options,
-                    allowed_models=tuple(
-                        managed.get("allowed_models") or (model,)),
+                return (
+                    EffectiveRoute(
+                        channel=channel,
+                        provider=managed["provider"],
+                        model=model,
+                        base_url=managed["base_url"],
+                        protocol=managed["protocol"],
+                        credential_ref=f"managed:{version}:{channel}",
+                        source="user",
+                        version=version,
+                        options=options,
+                        allowed_models=tuple(
+                            managed.get("allowed_models") or (model,)),
+                    ),
+                    self._managed_bundle(managed_row, channel),
                 )
             raise DomainError("configuration_invalid", 500)
 
-        defaults, version = self._load_managed_defaults(verify=True)
-        managed = defaults.get(channel)
+        if managed_row is None:
+            raise DomainError("not_configured", 404)
+        version = int(managed_row["version"])
+        managed = self._public_payload(
+            managed_row, defaults=True).get(channel)
         if managed is None:
             raise DomainError("not_configured", 404)
-        return EffectiveRoute(
-            channel=channel,
-            provider=managed["provider"],
-            model=managed["model"],
-            base_url=managed["base_url"],
-            protocol=managed["protocol"],
-            credential_ref=f"managed:{version}:{channel}",
-            source="admin",
-            version=version,
-            options=dict(managed.get("options") or {}),
-            allowed_models=tuple(
-                managed.get("allowed_models") or (managed["model"],)),
+        return (
+            EffectiveRoute(
+                channel=channel,
+                provider=managed["provider"],
+                model=managed["model"],
+                base_url=managed["base_url"],
+                protocol=managed["protocol"],
+                credential_ref=f"managed:{version}:{channel}",
+                source="admin",
+                version=version,
+                options=dict(managed.get("options") or {}),
+                allowed_models=tuple(
+                    managed.get("allowed_models") or (managed["model"],)),
+            ),
+            self._managed_bundle(managed_row, channel),
         )
+
+    def resolve(self, actor: Identity, channel: str) -> EffectiveRoute:
+        if channel != "chat":
+            _require_channel(channel)
+        identity = self._store.require_identity(actor)
+        managed_row, override_row = self._store.read_config_rows(
+            identity.workspace_id, channel)
+        route, _bundle = self.snapshot_from_rows(
+            identity.workspace_id, channel, managed_row, override_row)
+        return route
 
     def public_settings(self, actor: Identity) -> dict:
         identity = self._store.require_identity(actor)

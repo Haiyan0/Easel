@@ -84,8 +84,9 @@ def cmd_serve_control(args) -> int:
             print("错误：egress_policy_invalid", file=sys.stderr)
             return 2
     else:
-        from .egress import EgressPolicy
-        policy = EgressPolicy()
+        # 未显式提交策略时保留“未配置”状态；没有 proxy 或策略都必须
+        # 在 broker 联网前返回 503，不能构造隐式默认策略冒充管理员配置。
+        policy = None
     try:
         egress = EgressGateway(policy=policy, proxy_url=egress_proxy)
     except ValueError:

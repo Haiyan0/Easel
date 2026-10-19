@@ -216,18 +216,40 @@ def _validate_proxy_url(proxy_url: object) -> str | None:
 
 
 class EgressGateway:
-    """按显式配置创建 HTTPX 客户端；绝不回退到直连。"""
+    """按显式配置创建 HTTPX 客户端；绝不回退到直连。
+
+    ``policy_explicit`` 区分“管理员显式提交的空策略”与“未配置策略”。
+    只有显式策略（或显式测试 transport）才能创建客户端；仅给 proxy_url
+    而没有策略仍视为未配置，联网前返回 503。
+    """
 
     def __init__(self, policy: EgressPolicy | None = None, *,
                  proxy_url: str | None = None,
-                 transport: httpx.AsyncBaseTransport | None = None):
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 policy_explicit: bool | None = None):
+        if policy is not None and not isinstance(policy, EgressPolicy):
+            raise TypeError("policy must be an EgressPolicy")
+        if transport is not None and not isinstance(
+                transport, httpx.AsyncBaseTransport):
+            raise TypeError("transport must be an AsyncBaseTransport")
         self.policy = policy if policy is not None else EgressPolicy()
+        self.policy_configured = (
+            policy is not None if policy_explicit is None
+            else bool(policy_explicit))
         self.proxy_url = _validate_proxy_url(proxy_url)
         self.transport = transport
 
+    @property
+    def configured(self) -> bool:
+        """显式测试 transport 或“代理 + 显式策略”都算可联网。"""
+        if self.transport is not None:
+            return True
+        return self.proxy_url is not None and self.policy_configured
+
     def with_transport(self, transport: httpx.AsyncBaseTransport) -> "EgressGateway":
         return EgressGateway(self.policy, proxy_url=self.proxy_url,
-                             transport=transport)
+                             transport=transport,
+                             policy_explicit=self.policy_configured)
 
     def client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(connect=DEFAULT_CONNECT_TIMEOUT,
@@ -238,7 +260,7 @@ class EgressGateway:
         if self.transport is not None:
             return httpx.AsyncClient(transport=self.transport, trust_env=False,
                                      follow_redirects=False, timeout=timeout)
-        if self.proxy_url is not None:
+        if self.proxy_url is not None and self.policy_configured:
             return httpx.AsyncClient(proxy=self.proxy_url, trust_env=False,
                                      follow_redirects=False, timeout=timeout)
         raise DomainError("egress_unavailable", 503)

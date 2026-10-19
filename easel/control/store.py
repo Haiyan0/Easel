@@ -715,6 +715,18 @@ class Store:
             " FROM workspace_overrides WHERE encrypted_secrets IS NOT NULL"
             " ORDER BY workspace_id, channel LIMIT 1").fetchone()
 
+    def read_config_rows(self, workspace_id: str, channel: str):
+        """在同一读事务中读取最新受管版本与个人覆盖行。
+
+        SQLite WAL 下读事务对两行提供一致快照；返回的行值不会随后续写入
+        改变。chat 不使用个人覆盖。
+        """
+        with self._read_transaction():
+            managed = self.latest_managed_revision()
+            override = (None if channel == "chat"
+                        else self.get_workspace_override(workspace_id, channel))
+        return managed, override
+
     def save_workspace_override(self, actor: Identity, channel: str,
                                 route_kind: str, public_json: str,
                                 encrypted_secrets: bytes | None,
@@ -783,24 +795,34 @@ class Store:
     # Provider broker：令牌、不可变快照与并发租约
     # ------------------------------------------------------------------
 
-    def create_broker_token(self, actor: Identity, run_id: str, channel: str, *,
-                            token_digest: str, snapshot_id: str,
-                            route_json: str, encrypted_secrets: bytes,
-                            config_version: int, now: int,
-                            expires_at: int) -> None:
-        """在事务内复查 Run 归属与活跃状态后写入令牌摘要和加密快照。"""
+    def create_broker_token_atomic(self, actor: Identity, run_id: str,
+                                   channel: str, *, token_digest: str,
+                                   snapshot_id: str, now: int, expires_at: int,
+                                   build) -> None:
+        """在同一个写事务内读取配置行、构建快照并写入令牌。
+
+        ``build(workspace_id, channel, managed_row, override_row)`` 必须只使用
+        传入的行和纯计算（解密/重新加密），不得再次查询数据库。这样路由与
+        凭证来自同一快照，其他连接无法在两者之间插入更新。
+        """
+        channel = _text(channel)
         with self._transaction():
             workspace_id = self._require_actor(actor)
             run = self._fetch_run(workspace_id, _text(run_id))
             if run.status not in ACTIVE_RUN_STATUSES:
                 raise DomainError("terminal_run", 409)
+            managed = self.latest_managed_revision()
+            override = (None if channel == "chat"
+                        else self.get_workspace_override(workspace_id, channel))
+            route_json, encrypted_secrets, config_version = build(
+                workspace_id, channel, managed, override)
             self._connection.execute(
                 "INSERT INTO broker_tokens"
                 " (token_digest, workspace_id, run_id, channel, config_version,"
                 " created_at, expires_at, revoked_at, snapshot_id, route_json,"
                 " encrypted_secrets)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
-                (_text(token_digest), workspace_id, run.id, _text(channel),
+                (_text(token_digest), workspace_id, run.id, channel,
                  int(config_version), int(now), int(expires_at),
                  _text(snapshot_id), _text(route_json),
                  bytes(encrypted_secrets)))
@@ -870,23 +892,32 @@ class Store:
         return cursor.rowcount
 
     def acquire_broker_lease(self, token_digest: str, workspace_id: str,
-                             run_id: str, channel: str, now: int) -> str:
-        """原子检查并占用 broker 请求额度（每空间 2、整机 8）。"""
+                             run_id: str, channel: str, token_now: int,
+                             lease_now: int, lease_ttl: int) -> str:
+        """原子检查并占用 broker 请求额度（每空间 2、整机 8）。
+
+        token_now 只用于校验令牌是否仍接纳新调用；lease_now/lease_ttl 是
+        独立的崩溃恢复时钟。租约在流关闭前由心跳续期，不随 token 到期释放。
+        """
+        if type(lease_ttl) is not int or lease_ttl <= 0:
+            raise DomainError("invalid_argument", 400)
+        token_now = int(token_now)
+        lease_now = int(lease_now)
         with self._transaction():
-            row = self._require_broker_token_locked(
-                token_digest, workspace_id, run_id, channel, int(now))
-            # 过期租约不再占额度；与本次检查和插入处于同一写事务
+            self._require_broker_token_locked(
+                token_digest, workspace_id, run_id, channel, token_now)
+            # 只回收心跳停止（例如进程崩溃）的过期租约
             self._connection.execute(
-                "DELETE FROM broker_leases WHERE expires_at <= ?", (int(now),))
+                "DELETE FROM broker_leases WHERE expires_at <= ?", (lease_now,))
             workspace_active = self._connection.execute(
                 "SELECT COUNT(*) AS total FROM broker_leases"
                 " WHERE workspace_id = ? AND expires_at > ?",
-                (workspace_id, int(now))).fetchone()["total"]
+                (workspace_id, lease_now)).fetchone()["total"]
             if workspace_active >= self.max_active_runs_per_workspace:
                 raise DomainError("workspace_capacity", 429)
             total = self._connection.execute(
                 "SELECT COUNT(*) AS total FROM broker_leases"
-                " WHERE expires_at > ?", (int(now),)).fetchone()["total"]
+                " WHERE expires_at > ?", (lease_now,)).fetchone()["total"]
             if total >= self.max_active_runs_total:
                 raise DomainError("global_capacity", 429)
 
@@ -896,8 +927,15 @@ class Store:
                 " (id, workspace_id, run_id, channel, token_digest,"
                 " acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (lease_id, workspace_id, run_id, channel, _text(token_digest),
-                 int(now), int(row["expires_at"])))
+                 lease_now, lease_now + lease_ttl))
         return lease_id
+
+    def renew_broker_lease(self, lease_id: str, expires_at: int) -> None:
+        """在途流心跳续期；只更新仍存在的租约。"""
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE broker_leases SET expires_at = ? WHERE id = ?",
+                (int(expires_at), _text(lease_id)))
 
     def release_broker_lease(self, lease_id: str) -> None:
         """释放额度；重复释放安全。"""
@@ -905,7 +943,9 @@ class Store:
             self._connection.execute(
                 "DELETE FROM broker_leases WHERE id = ?", (_text(lease_id),))
 
-    def count_broker_leases(self, now: int) -> int:
+    def count_broker_leases(self, now: int | None = None) -> int:
+        if now is None:
+            now = int(time.time())
         return self._connection.execute(
             "SELECT COUNT(*) AS total FROM broker_leases WHERE expires_at > ?",
             (int(now),)).fetchone()["total"]
@@ -1227,6 +1267,18 @@ class Store:
     # ------------------------------------------------------------------
     # 事务
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        """显式只读事务，为多行读取提供一致快照。"""
+        self._connection.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
