@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 import functools
 import hmac
+import ipaddress
 import json
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -33,6 +36,62 @@ SESSION_COOKIE = "__Host-easel_session"
 _MEMBER_CAPABILITIES = ("workspace",)
 _ADMIN_CAPABILITIES = ("workspace", "admin")
 
+_HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9-]+$")
+
+
+def _normalize_public_origin(value: str) -> str:
+    """校验并规范化公共 HTTPS Origin。
+
+    只接受浏览器 Origin 的合法形状：https、主机/可选端口，无用户信息、路径
+    （单个根斜杠可规范化）、query 或 fragment。默认端口 443 省略，主机名统一
+    小写，避免配置值与浏览器发送的 Origin 无谓不一致。
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("public_origin 必须显式配置")
+    if any(char.isspace() for char in value) or "\\" in value:
+        raise ValueError("public_origin 不得包含空白或反斜杠")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("public_origin 不是合法 URI") from error
+    if parsed.scheme.lower() != "https":
+        raise ValueError("public_origin 必须使用 https")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("public_origin 端口非法")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("public_origin 不得包含用户信息")
+    if parsed.query or parsed.fragment:
+        raise ValueError("public_origin 不得包含 query/fragment")
+    if parsed.path not in ("", "/"):
+        raise ValueError("public_origin 不得包含路径")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("public_origin 缺少主机")
+    if not host.isascii():
+        raise ValueError("public_origin 主机必须为 ASCII")
+    if ":" in host:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as error:
+            raise ValueError("public_origin IPv6 主机非法") from error
+        if address.version != 6:
+            raise ValueError("public_origin 主机非法")
+    else:
+        labels = host.rstrip(".").split(".")
+        if (host.startswith(".") or ".." in host
+                or any(not label or not _HOST_LABEL_PATTERN.fullmatch(label)
+                       or label.startswith("-") or label.endswith("-")
+                       for label in labels)):
+            raise ValueError("public_origin 主机非法")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("public_origin 端口非法")
+    host = host.lower()
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != 443:
+        netloc += f":{port}"
+    return f"https://{netloc}"
+
 
 @dataclass(frozen=True)
 class ControlConfig:
@@ -41,9 +100,10 @@ class ControlConfig:
     public_origin: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.public_origin, str) or not self.public_origin.strip():
+        if not isinstance(self.public_origin, str):
             raise ValueError("public_origin 必须显式配置")
-        object.__setattr__(self, "public_origin", self.public_origin.rstrip("/"))
+        object.__setattr__(
+            self, "public_origin", _normalize_public_origin(self.public_origin))
 
 
 def _source(request: Request) -> str:
@@ -111,6 +171,9 @@ def create_app(*, store: Store, auth: AuthService,
     """
     control_path = Path(store.path).absolute()
     public_origin = config.public_origin if config is not None else None
+    if public_origin is not None:
+        # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
+        public_origin = _normalize_public_origin(public_origin)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -178,25 +241,23 @@ def create_app(*, store: Store, auth: AuthService,
         source = _source(request)
         service: AuthService = request.app.state.auth
 
-        retry_after = await _run_db(
-            request, service.rate_limit_retry_after, source, invite)
-        if retry_after:
+        # 限速准入、兑换与失败记账在同一数据库事务内完成
+        outcome = await _run_db(
+            request, service.exchange_with_rate_limit, source, invite)
+        if outcome.status == "rate_limited":
             return JSONResponse(
                 {"code": "rate_limited", "detail": "rate_limited",
                  "request_id": _request_id(request)},
                 status_code=429,
-                headers={"Retry-After": str(retry_after),
+                headers={"Retry-After": str(outcome.retry_after),
                          "Cache-Control": "no-store"})
+        if outcome.status == "denied":
+            raise DomainError("unauthorized", 401)
 
-        try:
-            session = await _run_db(request, service.exchange, invite)
-        except DomainError as error:
-            if error.status == 401:
-                await _run_db(
-                    request, service.record_failed_exchange, source, invite)
-            raise
-
-        identity = await _run_db(request, service.authenticate, session.token)
+        session = outcome.session
+        identity = outcome.identity
+        if session is None or identity is None:
+            raise DomainError("unauthorized", 401)
         response = JSONResponse(
             _identity_view(identity, session.csrf_token),
             headers={"Cache-Control": "no-store"})

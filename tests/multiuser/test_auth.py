@@ -279,6 +279,121 @@ def test_csrf_token_survives_service_restart_and_new_connection(tmp_path):
         assert_error(expired, 401)
 
 
+@pytest.mark.parametrize("token", [
+    "\ud800",          # 孤立高代理项
+    "\udfff",          # 孤立低代理项
+    "",
+    "x" * 600,         # 超长
+    None,
+    123,
+    [],
+    {},
+])
+def test_malformed_tokens_are_401_without_encoding_errors(tmp_path, token):
+    """畸形凭证统一 401，不能在哈希/派生阶段抛出编码异常。"""
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        admin = store.create_user("Owner", "admin")
+        member = store.create_user("Member")
+        auth = AuthService(store, clock=lambda: 1000.0)
+        auth.create_invite(admin, member.user_id)
+
+        for method in (auth.exchange, auth.authenticate, auth.csrf_token):
+            with pytest.raises(DomainError) as rejected:
+                method(token)
+            assert_error(rejected, 401)
+        assert scalar(store, "SELECT COUNT(*) FROM logins") == 0
+
+
+def test_exchange_with_rate_limit_caps_concurrent_failures(tmp_path):
+    """20 个并发请求抢同一来源额度：最多 10 个 401，其余 429。"""
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        setup.create_user("Owner", "admin")
+        setup.create_user("Member")
+
+    barrier = threading.Barrier(20, timeout=30)
+    outcomes = []
+    lock = threading.Lock()
+
+    def attempt(index):
+        with Store.open(path) as store:
+            auth = AuthService(store, clock=lambda: 1000.0)
+            barrier.wait()
+            outcome = auth.exchange_with_rate_limit(
+                "203.0.113.10", f"concurrent-invalid-{index}")
+            with lock:
+                outcomes.append(outcome)
+
+    threads = [threading.Thread(target=attempt, args=(index,)) for index in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert sum(outcome.status == "denied" for outcome in outcomes) == 10
+    rate_limited = [outcome for outcome in outcomes if outcome.status == "rate_limited"]
+    assert len(rate_limited) == 10
+    assert all(outcome.retry_after > 0 for outcome in rate_limited)
+
+
+def test_rate_limit_digest_dimension_caps_distinct_sources(tmp_path):
+    """不同来源并发使用同一错误 token：摘要维度仍然只允许 10 次。"""
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        setup.create_user("Owner", "admin")
+        setup.create_user("Member")
+
+    barrier = threading.Barrier(20, timeout=30)
+    outcomes = []
+    lock = threading.Lock()
+
+    def attempt(index):
+        with Store.open(path) as store:
+            auth = AuthService(store, clock=lambda: 1000.0)
+            barrier.wait()
+            outcome = auth.exchange_with_rate_limit(
+                f"198.51.100.{index}", "same-invalid-token")
+            with lock:
+                outcomes.append(outcome)
+
+    threads = [threading.Thread(target=attempt, args=(index,)) for index in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert sum(outcome.status == "denied" for outcome in outcomes) == 10
+    assert sum(outcome.status == "rate_limited" for outcome in outcomes) == 10
+
+
+def test_rate_limited_valid_invite_is_not_consumed_and_recovers(tmp_path):
+    """限速拒绝先于兑换：合法邀请不被消耗，窗口过后仍可使用。"""
+    clock = MutableClock()
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        admin = store.create_user("Owner", "admin")
+        member = store.create_user("Member")
+        auth = AuthService(store, clock=clock)
+
+        for index in range(10):
+            outcome = auth.exchange_with_rate_limit("203.0.113.20", f"bad-{index}")
+            assert outcome.status == "denied"
+
+        invite = auth.create_invite(admin, member.user_id)
+        blocked = auth.exchange_with_rate_limit("203.0.113.20", invite)
+        assert blocked.status == "rate_limited"
+        assert blocked.retry_after > 0
+        assert scalar(
+            store, "SELECT redeemed_at FROM invites WHERE token_digest = ?",
+            (hashlib.sha256(invite.encode()).hexdigest(),)) is None, "被拒时不得消耗邀请"
+
+        clock.advance(600)
+        accepted = auth.exchange_with_rate_limit("203.0.113.20", invite)
+        assert accepted.status == "ok"
+        assert auth.authenticate(accepted.session.token) == member
+
+
 # --------------------------------------------------------------------------
 # 授权边界
 # --------------------------------------------------------------------------

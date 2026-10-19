@@ -471,6 +471,36 @@ class Store:
                 (now, _text(token_digest)))
         return cursor.rowcount == 1
 
+    def _redeem_invite_locked(self, token_digest: str, login_id: str,
+                              login_token_digest: str, csrf_digest: str,
+                              now: int, expires_at: int) -> Identity | None:
+        """在已持有写事务时尝试兑换；任何失效原因返回 None 且不写入。"""
+        row = self._connection.execute(
+            "SELECT invites.id, invites.user_id, invites.expires_at,"
+            " invites.redeemed_at, invites.revoked_at,"
+            " users.role, users.disabled_at, workspaces.id AS workspace_id"
+            " FROM invites"
+            " JOIN users ON users.id = invites.user_id"
+            " JOIN workspaces ON workspaces.owner_user_id = users.id"
+            " WHERE invites.token_digest = ?", (_text(token_digest),)).fetchone()
+        if (row is None or row["redeemed_at"] is not None
+                or row["revoked_at"] is not None or row["expires_at"] <= now
+                or row["disabled_at"] is not None):
+            return None
+        cursor = self._connection.execute(
+            "UPDATE invites SET redeemed_at = ?"
+            " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+            (now, row["id"]))
+        if cursor.rowcount != 1:
+            return None
+        self._connection.execute(
+            "INSERT INTO logins (id, user_id, token_digest, csrf_digest,"
+            " created_at, last_seen_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (login_id, row["user_id"], login_token_digest, csrf_digest,
+             now, now, expires_at))
+        return Identity(row["user_id"], row["workspace_id"], row["role"])
+
     def redeem_invite(self, token_digest: str, login_id: str,
                       login_token_digest: str, csrf_digest: str,
                       now: int, expires_at: int) -> Identity:
@@ -480,31 +510,92 @@ class Store:
         ``redeemed_at`` 已非空，只能失败。
         """
         with self._transaction():
-            row = self._connection.execute(
-                "SELECT invites.id, invites.user_id, invites.expires_at,"
-                " invites.redeemed_at, invites.revoked_at,"
-                " users.role, users.disabled_at, workspaces.id AS workspace_id"
-                " FROM invites"
-                " JOIN users ON users.id = invites.user_id"
-                " JOIN workspaces ON workspaces.owner_user_id = users.id"
-                " WHERE invites.token_digest = ?", (_text(token_digest),)).fetchone()
-            if (row is None or row["redeemed_at"] is not None
-                    or row["revoked_at"] is not None or row["expires_at"] <= now
-                    or row["disabled_at"] is not None):
+            identity = self._redeem_invite_locked(
+                token_digest, login_id, login_token_digest, csrf_digest,
+                now, expires_at)
+            if identity is None:
                 raise DomainError("unauthorized", 401)
-            cursor = self._connection.execute(
-                "UPDATE invites SET redeemed_at = ?"
-                " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
-                (now, row["id"]))
-            if cursor.rowcount != 1:
-                raise DomainError("unauthorized", 401)
+        return identity
+
+    def redeem_invite_limited(self, *, source: str, token_digest: str,
+                              login_id: str, login_token_digest: str,
+                              csrf_digest: str, now: int, expires_at: int,
+                              window_seconds: int, max_failures: int
+                              ) -> tuple[str, Identity | None, int]:
+        """限速准入、邀请兑换与失败记账在同一个写事务内完成。
+
+        返回 ``(status, identity, retry_after)``：
+
+        * ``rate_limited``：额度已满，未读取/消耗邀请；
+        * ``denied``：邀请无效，失败记录已随事务提交；
+        * ``ok``：兑换成功。
+
+        拒绝路径不能靠抛异常回滚，否则失败计数会一起丢失；因此返回状态，
+        由调用方在事务提交后映射为 401。
+        """
+        with self._transaction():
+            self._prune_auth_failures(now, window_seconds)
+            retry_after = self._rate_limit_retry_after_locked(
+                source, token_digest, now, window_seconds, max_failures)
+            if retry_after:
+                return "rate_limited", None, retry_after
+            identity = self._redeem_invite_locked(
+                token_digest, login_id, login_token_digest, csrf_digest,
+                now, expires_at)
+            if identity is None:
+                self._connection.execute(
+                    "INSERT INTO auth_failures (source, token_digest, attempted_at)"
+                    " VALUES (?, ?, ?)", (source, token_digest, now))
+                return "denied", None, 0
+            return "ok", identity, 0
+
+    def _prune_auth_failures(self, now: int, window_seconds: int) -> None:
+        self._connection.execute(
+            "DELETE FROM auth_failures WHERE attempted_at <= ?",
+            (now - window_seconds,))
+
+    def _rate_limit_retry_after_locked(self, source: str, token_digest: str,
+                                       now: int, window_seconds: int,
+                                       max_failures: int) -> int:
+        """在已持有写事务时计算限速结果；0 表示允许。"""
+        by_source = self._connection.execute(
+            "SELECT COUNT(*) AS total, MIN(attempted_at) AS oldest"
+            " FROM auth_failures WHERE source = ?", (source,)).fetchone()
+        by_digest = self._connection.execute(
+            "SELECT COUNT(*) AS total, MIN(attempted_at) AS oldest"
+            " FROM auth_failures WHERE token_digest = ?",
+            (token_digest,)).fetchone()
+        retry_after = 0
+        if by_source["total"] >= max_failures:
+            retry_after = max(
+                retry_after, by_source["oldest"] + window_seconds - now)
+        if by_digest["total"] >= max_failures:
+            retry_after = max(
+                retry_after, by_digest["oldest"] + window_seconds - now)
+        return max(1, retry_after) if retry_after else 0
+
+    def check_auth_rate_limit(self, source: str, token_digest: str, now: int,
+                              window_seconds: int, max_failures: int) -> int:
+        """检查失败计数；返回 0 允许尝试，否则返回 Retry-After 秒数。
+
+        同时按来源和令牌摘要计数，任一维度达到上限即拒绝：只按
+        ``(source, token_digest)`` 组合计数会让攻击者换一个猜测 token 就获得
+        新额度。计数落库，多个 AuthService 或新连接不能绕过；窗口外记录在
+        检查时清理。
+        """
+        with self._transaction():
+            self._prune_auth_failures(now, window_seconds)
+            return self._rate_limit_retry_after_locked(
+                source, token_digest, now, window_seconds, max_failures)
+
+    def record_auth_failure(self, source: str, token_digest: str, now: int,
+                            window_seconds: int) -> None:
+        """记录一次兑换失败；不保存原始 token。"""
+        with self._transaction():
+            self._prune_auth_failures(now, window_seconds)
             self._connection.execute(
-                "INSERT INTO logins (id, user_id, token_digest, csrf_digest,"
-                " created_at, last_seen_at, expires_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (login_id, row["user_id"], login_token_digest, csrf_digest,
-                 now, now, expires_at))
-        return Identity(row["user_id"], row["workspace_id"], row["role"])
+                "INSERT INTO auth_failures (source, token_digest, attempted_at)"
+                " VALUES (?, ?, ?)", (source, token_digest, now))
 
     def _active_login(self, token_digest: str, now: int, idle_seconds: int) -> sqlite3.Row:
         """读取仍有效的登录行；失效原因统一 401。"""

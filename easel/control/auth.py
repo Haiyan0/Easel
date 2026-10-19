@@ -15,7 +15,8 @@ import hmac
 import secrets
 import time
 import uuid
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Literal
 
 from .store import Store
 from .types import BrowserSession, DomainError, Identity
@@ -34,9 +35,19 @@ RATE_LIMIT_MAX_FAILURES = 10
 _CSRF_CONTEXT = b"easel-csrf-v1"
 
 
+def _token_bytes(value: str) -> bytes:
+    """令牌的确定性字节表示。
+
+    JSON 允许孤立 UTF-16 代理项转义（如 ``\\ud800``），``json.loads`` 会得到
+    含代理项的 Python 字符串。这里用 ``surrogatepass`` 保证哈希/派生阶段不会
+    抛 ``UnicodeEncodeError``；这类值不可能匹配真实令牌，最终仍按 401 处理。
+    """
+    return value.encode("utf-8", "surrogatepass")
+
+
 def _digest(value: str) -> str:
     """令牌摘要；数据库只保存它，不保存明文。"""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_token_bytes(value)).hexdigest()
 
 
 def _new_token() -> str:
@@ -49,7 +60,7 @@ def _csrf_token(session_token: str) -> str:
     使用 HMAC 而不是直接回传登录 token：拿到派生值无法反推 Cookie 凭证；
     同一登录在刷新或重启后稳定得到同一 CSRF，服务端用数据库中的摘要校验。
     """
-    return hmac.new(session_token.encode("utf-8"), _CSRF_CONTEXT,
+    return hmac.new(_token_bytes(session_token), _CSRF_CONTEXT,
                     hashlib.sha256).hexdigest()
 
 
@@ -60,6 +71,16 @@ def _valid_token(value: object) -> bool:
 def _failure_digest(value: object) -> str:
     """失败限速键：非法/缺失 token 也要有稳定的摘要键。"""
     return _digest(value if isinstance(value, str) else "")
+
+
+@dataclass(frozen=True)
+class ExchangeOutcome:
+    """一次“限速准入 + 兑换”的原子结果。"""
+
+    status: Literal["ok", "denied", "rate_limited"]
+    retry_after: int = 0
+    session: BrowserSession | None = None
+    identity: Identity | None = None
 
 
 class AuthService:
@@ -120,7 +141,11 @@ class AuthService:
     # ------------------------------------------------------------------
 
     def exchange(self, invite: str) -> BrowserSession:
-        """单次兑换邀请并创建登录；登录 token 与邀请 token 不同。"""
+        """单次兑换邀请并创建登录；登录 token 与邀请 token 不同。
+
+        这是不含来源限速的底层原语；HTTP 入口必须使用
+        :meth:`exchange_with_rate_limit` 以获得原子限速与失败记账。
+        """
         if not _valid_token(invite):
             raise DomainError("unauthorized", 401)
         login_token = _new_token()
@@ -131,6 +156,36 @@ class AuthService:
             _digest(invite), login_id, _digest(login_token), _digest(csrf_token),
             now, now + self.SESSION_ABSOLUTE_SECONDS)
         return BrowserSession(login_id, login_token, csrf_token)
+
+    def exchange_with_rate_limit(self, source: str, invite: object) -> ExchangeOutcome:
+        """原子执行限速准入、兑换与失败记账。
+
+        检查、兑换和失败写入由 Store 在同一个 ``BEGIN IMMEDIATE`` 事务内完成，
+        因此同一库上的并发请求与多个 app/连接共享同一额度；限速拒绝发生在
+        读取邀请之前，不会消耗合法邀请。
+        """
+        login_token = _new_token()
+        csrf_token = _csrf_token(login_token)
+        login_id = uuid.uuid4().hex
+        now = self._now()
+        status, identity, retry_after = self._store.redeem_invite_limited(
+            source=str(source)[:256],
+            token_digest=_failure_digest(invite),
+            login_id=login_id,
+            login_token_digest=_digest(login_token),
+            csrf_digest=_digest(csrf_token),
+            now=now,
+            expires_at=now + self.SESSION_ABSOLUTE_SECONDS,
+            window_seconds=self.RATE_LIMIT_WINDOW_SECONDS,
+            max_failures=self.RATE_LIMIT_MAX_FAILURES,
+        )
+        if status == "ok":
+            return ExchangeOutcome(
+                status="ok",
+                session=BrowserSession(login_id, login_token, csrf_token),
+                identity=identity,
+            )
+        return ExchangeOutcome(status=status, retry_after=retry_after)
 
     def authenticate(self, token: str) -> Identity:
         """校验登录；滑动更新 last_seen，但不延长绝对期限。"""

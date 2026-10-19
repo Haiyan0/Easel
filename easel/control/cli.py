@@ -56,7 +56,12 @@ def cmd_admin_invite(args) -> int:
 
 def cmd_serve_control(args) -> int:
     """启动 control HTTP 服务；应用在 lifespan 中管理自己的数据库线程。"""
-    config = ControlConfig(public_origin=args.public_origin)
+    try:
+        # Origin 必须在打开控制库、启动 HTTP 之前校验失败
+        config = ControlConfig(public_origin=args.public_origin)
+    except ValueError:
+        print("错误：invalid_origin", file=sys.stderr)
+        return 2
     store = Store.connect(_control_db(args.control_dir))
     try:
         app = create_app(store=store, auth=AuthService(store), config=config)

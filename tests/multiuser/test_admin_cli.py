@@ -114,3 +114,22 @@ def test_serve_control_wires_app_and_public_origin(tmp_path, monkeypatch):
     with TestClient(app, base_url="https://easel.test") as client:
         assert client.get("/api/health").status_code == 200
         assert app.state.public_origin == "https://easel.test"
+
+
+def test_serve_control_rejects_invalid_origin_before_opening_store(
+        tmp_path, monkeypatch, capsys):
+    from easel.control import cli as control_cli
+
+    started = []
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda *args, **kwargs: started.append(True))
+
+    control_dir = tmp_path / "control"
+    code = main(["serve-control", "--control-dir", str(control_dir),
+                 "--public-origin", "http://easel.test"])
+    captured = capsys.readouterr()
+
+    assert code != 0
+    assert "invalid_origin" in captured.err
+    assert started == [], "非法 Origin 不得启动 HTTP 服务"
+    assert not control_dir.exists(), "非法配置不得创建或打开控制库"

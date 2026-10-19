@@ -279,6 +279,167 @@ def test_rate_limit_is_shared_across_app_instances_and_token_rotation(tmp_path):
         store.close()
 
 
+def test_concurrent_invalid_exchanges_are_atomically_capped(tmp_path):
+    """同一来源 20 个并发错误请求：恰好 10 个 401，其余 429。"""
+    clock = MutableClock()
+    with control_api(tmp_path, clock) as (client, store, auth, admin, member, invite):
+        barrier = threading.Barrier(20, timeout=30)
+        results = []
+        lock = threading.Lock()
+
+        def attempt(index):
+            barrier.wait()
+            response = exchange(client, f"concurrent-http-{index}")
+            with lock:
+                results.append(
+                    (response.status_code, response.headers.get("retry-after")))
+
+        threads = [threading.Thread(target=attempt, args=(index,)) for index in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+
+        statuses = [status for status, _ in results]
+        assert statuses.count(401) == 10
+        assert statuses.count(429) == 10
+        retry_values = [int(value) for status, value in results if status == 429]
+        assert retry_values and all(0 < value <= 600 for value in retry_values)
+        assert store._connection.execute("SELECT COUNT(*) FROM logins").fetchone()[0] == 0
+
+        # 合法邀请在限速期间不得被消耗；窗口过后恢复
+        assert exchange(client, invite).status_code == 429
+        clock.advance(600)
+        assert exchange(client, invite).status_code == 200
+
+
+def test_concurrent_invalid_exchanges_across_two_apps_share_one_cap(tmp_path):
+    """两个 app 连接同一库并发失败请求：共享同一个十次上限。"""
+    clock = MutableClock()
+    path = tmp_path / "control.sqlite3"
+    store = Store.connect(path)
+    try:
+        store.create_user("Owner", "admin")
+        store.create_user("Member")
+        config = ControlConfig(public_origin=ORIGIN)
+        first_app = create_app(
+            store=store, auth=AuthService(store, clock=clock), config=config)
+        second_app = create_app(
+            store=store, auth=AuthService(store, clock=clock), config=config)
+        with TestClient(first_app, base_url=ORIGIN) as first, \
+                TestClient(second_app, base_url=ORIGIN) as second:
+            barrier = threading.Barrier(20, timeout=30)
+            statuses = []
+            lock = threading.Lock()
+
+            def attempt(index):
+                barrier.wait()
+                client = first if index % 2 == 0 else second
+                response = exchange(client, f"two-app-invalid-{index}")
+                with lock:
+                    statuses.append(response.status_code)
+
+            threads = [threading.Thread(target=attempt, args=(index,))
+                       for index in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+                assert not thread.is_alive()
+
+            assert statuses.count(401) == 10
+            assert statuses.count(429) == 10
+    finally:
+        store.close()
+
+
+MALFORMED_BODIES = [
+    pytest.param(b'{"token": "\\ud800"}', id="lone-high-surrogate"),
+    pytest.param(b'{"token": "\\udfff"}', id="lone-low-surrogate"),
+    pytest.param(b'{"token": null}', id="null"),
+    pytest.param(b'{"token": 123}', id="number"),
+    pytest.param(b'{"token": []}', id="array"),
+    pytest.param(b'{"token": {}}', id="object"),
+    pytest.param(b'{"token": ""}', id="empty"),
+    pytest.param(b'{"token": "' + b"x" * 600 + b'"}', id="overlong"),
+]
+
+
+@pytest.mark.parametrize("body", MALFORMED_BODIES)
+def test_malformed_exchange_bodies_are_401_without_side_effects(tmp_path, body):
+    with control_api(tmp_path) as (client, store, auth, admin, member, invite):
+        response = client.post(
+            "/api/auth/exchange", content=body,
+            headers={"Origin": ORIGIN, "Content-Type": "application/json"})
+        assert response.status_code == 401, response.text
+        assert response.json()["code"] == "unauthorized"
+        assert "set-cookie" not in response.headers
+        assert store._connection.execute("SELECT COUNT(*) FROM logins").fetchone()[0] == 0
+        assert exchange(client, invite).status_code == 200, "失败请求不得消耗有效邀请"
+
+
+def test_repeated_malformed_surrogate_is_counted_and_rate_limited(tmp_path):
+    clock = MutableClock()
+    with control_api(tmp_path, clock) as (client, store, auth, admin, member, invite):
+        body = b'{"token": "\\ud800"}'
+        for _ in range(10):
+            response = client.post(
+                "/api/auth/exchange", content=body,
+                headers={"Origin": ORIGIN, "Content-Type": "application/json"})
+            assert response.status_code == 401
+
+        blocked = client.post(
+            "/api/auth/exchange", content=body,
+            headers={"Origin": ORIGIN, "Content-Type": "application/json"})
+        assert blocked.status_code == 429
+        assert int(blocked.headers["retry-after"]) == 600
+        assert exchange(client, invite).status_code == 429
+
+        clock.advance(600)
+        assert exchange(client, invite).status_code == 200
+
+
+# --------------------------------------------------------------------------
+# 公共 Origin 配置
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("origin", [
+    "http://easel.test",
+    "https://",
+    "https:///path",
+    "https://user:pass@easel.test",
+    "https://easel.test/path",
+    "https://easel.test?query=1",
+    "https://easel.test#fragment",
+    " https://easel.test",
+    "https://easel.test ",
+    "https://easel test",
+    "https://easel.test\\path",
+    "https://.easel.test",
+    "https://easel..test",
+    "https://easel.test:notaport",
+    "https://easel.test:70000",
+    "https://easel.test:",
+    "",
+])
+def test_control_config_rejects_invalid_public_origins(origin):
+    with pytest.raises(ValueError):
+        ControlConfig(public_origin=origin)
+
+
+@pytest.mark.parametrize("origin,expected", [
+    ("https://easel.test", "https://easel.test"),
+    ("HTTPS://EASEL.TEST/", "https://easel.test"),
+    ("https://easel.test:443", "https://easel.test"),
+    ("https://easel.test:8443", "https://easel.test:8443"),
+    ("https://127.0.0.1", "https://127.0.0.1"),
+    ("https://[::1]:8443", "https://[::1]:8443"),
+])
+def test_control_config_normalizes_valid_https_origins(origin, expected):
+    assert ControlConfig(public_origin=origin).public_origin == expected
+
+
 # --------------------------------------------------------------------------
 # 公开路由与线程/lifespan
 # --------------------------------------------------------------------------
