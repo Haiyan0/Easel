@@ -12,8 +12,20 @@
 
 import os
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Dict, List, Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "shared" / "scripts"))
+try:
+    from runtime_paths import service_mode, state_path  # noqa: E402
+except ImportError:  # 技能被单独复制/拍平时的 local 兼容；worker 仍会在取路径时失败关闭
+    def service_mode(env=None):
+        values = os.environ if env is None else env
+        return (values.get("EASEL_SERVICE_MODE") or "local").strip().lower()
+
+    def state_path(kind: str, account_id: str = "default") -> Path:
+        raise RuntimeError("worker 缺少 runtime_paths，拒绝回退共享路径")
 
 try:
     import yaml  # pyyaml
@@ -54,10 +66,18 @@ def get_account_name() -> Optional[str]:
 # ============================================================
 
 UNIFIED_CONFIG_NAME = "wechat-publisher.yaml"
+LEGACY_CONFIG_PATH = Path(__file__).parent.parent / UNIFIED_CONFIG_NAME
+
+
+def config_path() -> Path:
+    """当前模式下的配置路径：worker 只写本人 state_root，不回读共享技能目录。"""
+    if service_mode() == "worker":
+        return state_path("wechat-config", "default")
+    return LEGACY_CONFIG_PATH
 
 
 def _config_path() -> Path:
-    return Path(__file__).parent.parent / UNIFIED_CONFIG_NAME
+    return config_path()
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:

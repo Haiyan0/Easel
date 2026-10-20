@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse, json, sys, time
 from pathlib import Path
 
+from browser_state import (browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-PROFILE_DIR = Path.home() / ".easel-browser-profiles" / "ZhihuProfile"
+PROFILE_DIR = browser_profile_dir("zhihu")
 
 def fetch_comments(article_url: str, limit: int = 100):
     """通过访问文章页并拦截评论 API 响应来获取评论。"""
@@ -39,11 +42,14 @@ def fetch_comments(article_url: str, limit: int = 100):
                 print(f"[WARN] 解析响应失败: {e}", file=sys.stderr)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        browser = launch_persistent_locked(
+            PROFILE_DIR,
+            lambda: p.chromium.launch_persistent_context(
+                str(PROFILE_DIR),
+                headless=True,
+                args=["--no-sandbox",
+                      "--disable-blink-features=AutomationControlled"],
+            ))
         page = browser.new_page()
         page.on("response", on_response)
 

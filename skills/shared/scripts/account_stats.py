@@ -20,8 +20,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from output_paths import OUTPUTS_DIR  # noqa: E402
+from browser_state import browser_profile_dir, launch_persistent_locked  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-ANALYTICS_DIR = PROJECT_ROOT / "outputs" / "_analytics"
+ANALYTICS_DIR = OUTPUTS_DIR / "_analytics"
 # 分层保留：近 KEEP_FULL_DAYS 天全部变化一条不丢；90~DAILY_DAYS 天每天≤1条；更老每周≤1条。
 # 既留住 日/周/月/年 对比所需的老基线，又让总量恒定在几百条(几十KB)、用多年不膨胀。
 KEEP_FULL_DAYS = 90
@@ -340,8 +343,7 @@ def record_snapshot(platform: str, snap: dict) -> None:
 # 浏览器
 # --------------------------------------------------------------------------- #
 def _profile_dir(platform: str, base: str | None) -> Path:
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PLATFORMS[platform]["profile"]
+    return browser_profile_dir(platform, base=base)
 
 
 def _proxy(platform: str, explicit: str | None, disable: bool | None) -> str | None:
@@ -628,7 +630,10 @@ def _scrape(platform: str, headed: bool, base: str | None, proxy: str | None) ->
                 kwargs = dict(headless=not headed, locale="zh-CN", args=LAUNCH_ARGS)
                 if proxy:
                     kwargs["proxy"] = {"server": proxy}
-                ctx = p.chromium.launch_persistent_context(str(profile), **kwargs)
+                ctx = launch_persistent_locked(
+                    profile,
+                    lambda: p.chromium.launch_persistent_context(
+                        str(profile), **kwargs))
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
                 if platform == "xiaohongshu":

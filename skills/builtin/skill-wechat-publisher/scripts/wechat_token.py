@@ -10,6 +10,7 @@ access_token 获取与缓存
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -17,6 +18,17 @@ from typing import Dict, Optional, Any
 import requests
 
 from config import get_config
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "shared" / "scripts"))
+try:
+    from runtime_paths import service_mode, state_path  # noqa: E402
+except ImportError:  # 技能被单独复制/拍平时的 local 兼容；worker 仍会失败关闭
+    def service_mode(env=None):
+        values = os.environ if env is None else env
+        return (values.get("EASEL_SERVICE_MODE") or "local").strip().lower()
+
+    def state_path(kind: str, account_id: str = "default") -> Path:
+        raise RuntimeError("worker 缺少 runtime_paths，拒绝回退共享路径")
 
 
 TOKEN_CACHE_DIR = Path(__file__).parent
@@ -29,7 +41,12 @@ _token_caches: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_token_cache_file(account_key: str = "default") -> Path:
-    """获取指定账号的 token 缓存文件路径。"""
+    """获取指定账号的 token 缓存文件路径。
+
+    worker 落在本人 state_root；local 保留技能目录旧位置兼容读取。
+    """
+    if service_mode() == "worker":
+        return state_path("wechat-token", account_key)
     if account_key == "default":
         return TOKEN_CACHE_DIR / ".token_cache.json"
     return TOKEN_CACHE_DIR / f".token_cache_{account_key}.json"
@@ -61,6 +78,7 @@ def _save_token_cache(account_key: str = "default") -> None:
         return
     try:
         cache_file = _get_token_cache_file(account_key)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         # O_CREAT|O_WRONLY|O_TRUNC + mode 0o600 确保权限安全
         fd = os.open(
             str(cache_file),

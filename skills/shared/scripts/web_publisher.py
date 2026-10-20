@@ -43,6 +43,9 @@ import login_transport
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快手已接入，注册表见 _READBACK_VERIFIERS）
 import human_pace  # noqa: E402  人类节奏（提交前双停顿；EASEL_PACE_SKIP=1 跳过）
+from browser_state import (browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 # ── 平台配置注册表 ────────────────────────────────────────────────────
 # 每个步骤：{"action": goto|upload|fill|click|wait|press|waitfor, "selector"?, "value"?}
@@ -326,8 +329,7 @@ def _steps_key_for(cfg: dict, media: str | None) -> str:
 
 
 def _profile_dir(platform: str, base: str | None) -> Path:
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PLATFORMS[platform]["profile"]
+    return browser_profile_dir(platform, base=base)
 
 
 def cmd_platforms(_a) -> int:
@@ -592,9 +594,12 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
     ctx = {"media": a.media or "", "title": a.title or "", "desc": a.desc or "",
            "tags": a.tags or "", "cover": a.cover or ""}
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            str(profile), headless=not headed, args=LAUNCH_ARGS + ["--no-proxy-server"],
-            viewport={"width": 1440, "height": 900})
+        browser = launch_persistent_locked(
+            profile,
+            lambda: p.chromium.launch_persistent_context(
+                str(profile), headless=not headed,
+                args=LAUNCH_ARGS + ["--no-proxy-server"],
+                viewport={"width": 1440, "height": 900}))
         page = browser.pages[0] if browser.pages else browser.new_page()
         if not do_publish:
             page.goto(cfg["login_url"])
@@ -777,7 +782,7 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
                                            snapshot_ids=snapshot_ids)
                 if verdict.outcome != "verified":
                     try:  # 失败留现场，供排错
-                        fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                        fp = OUTPUTS_DIR / "_login" / f"{a.platform}-publish-fail.png"
                         fp.parent.mkdir(parents=True, exist_ok=True)
                         page.screenshot(path=str(fp))
                     except Exception:
@@ -794,7 +799,7 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
             elif chk:
                 if not ui_ok:
                     try:  # 仅失败时截图，供排错（正常成功不截）
-                        fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                        fp = OUTPUTS_DIR / "_login" / f"{a.platform}-publish-fail.png"
                         fp.parent.mkdir(parents=True, exist_ok=True)
                         page.screenshot(path=str(fp))
                     except Exception:
@@ -837,7 +842,7 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
         except PWTimeout as e:
             # 超时（常见：选择器失效 / 上传转码慢）——截图 + dump 当前可见输入控件，便于精修选择器
             try:
-                fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                fp = OUTPUTS_DIR / "_login" / f"{a.platform}-publish-fail.png"
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(fp))
                 print(f"    失败截图：{fp}", file=sys.stderr)
@@ -1330,7 +1335,7 @@ def cmd_login_qr(a) -> int:
         _die(f"未知平台：{a.platform}（支持：{', '.join(PLATFORMS)}）")
     profile = _profile_dir(a.platform, a.profile_base)
     profile.mkdir(parents=True, exist_ok=True)
-    root = Path(__file__).resolve().parents[3] / "outputs" / "_login"
+    root = OUTPUTS_DIR / "_login"
     qr_out = Path(a.qr_out).expanduser() if a.qr_out else root / f"{a.platform}.png"
     sf = a.status_file or str(root / f"{a.platform}.json")
     timeout_s = a.timeout or 180
@@ -1344,9 +1349,11 @@ def cmd_login_qr(a) -> int:
 
         try:
             signal.signal(signal.SIGTERM, stop_login)
-            browser = p.chromium.launch_persistent_context(
-                str(profile), headless=True, locale="zh-CN",
-                args=LAUNCH_ARGS + ["--no-proxy-server"])
+            browser = launch_persistent_locked(
+                profile,
+                lambda: p.chromium.launch_persistent_context(
+                    str(profile), headless=True, locale="zh-CN",
+                    args=LAUNCH_ARGS + ["--no-proxy-server"]))
             page = browser.pages[0] if browser.pages else browser.new_page()
             _block_heavy(browser, a.platform)
             _observe_channels_account(browser, cfg)
@@ -1546,9 +1553,11 @@ def cmd_whoami(a) -> int:
         with sync_playwright() as p:
             profile = _profile_dir(a.platform, a.profile_base)
             profile.mkdir(parents=True, exist_ok=True)
-            browser = p.chromium.launch_persistent_context(
-                str(profile), headless=True, locale="zh-CN",
-                args=LAUNCH_ARGS + ["--no-proxy-server"])
+            browser = launch_persistent_locked(
+                profile,
+                lambda: p.chromium.launch_persistent_context(
+                    str(profile), headless=True, locale="zh-CN",
+                    args=LAUNCH_ARGS + ["--no-proxy-server"]))
             page = browser.pages[0] if browser.pages else browser.new_page()
             try:
                 _block_heavy(browser, a.platform, login_assets=False)

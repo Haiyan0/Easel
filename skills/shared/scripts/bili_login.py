@@ -22,6 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
+from output_paths import OUTPUTS_DIR  # noqa: E402
+from runtime_paths import service_mode, state_path  # noqa: E402
 
 # TV 端 appkey/appsec（公开，biliup-rs 同款）——TV 登录才返回 token_info（app 刷新令牌），
 # 这正是 biliup cookie 文件需要的格式；web 端扫码只有网页 cookie、biliup 不完整认。
@@ -32,8 +34,17 @@ GEN_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code"
 POLL_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/poll"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_QR_OUT = PROJECT_ROOT / "outputs" / "_login" / "bilibili.png"
-DEFAULT_COOKIE = PROJECT_ROOT / "cookies.json"
+DEFAULT_QR_OUT = OUTPUTS_DIR / "_login" / "bilibili.png"
+
+
+def default_cookie_path() -> Path:
+    """worker 使用本人 state_root 的平台 cookie；local 保留项目根兼容路径。"""
+    if service_mode() == "worker":
+        return state_path("platform-cookie", "bilibili-default")
+    return PROJECT_ROOT / "cookies.json"
+
+
+DEFAULT_COOKIE = default_cookie_path()
 
 
 def _die(msg: str, code: int = 1) -> None:

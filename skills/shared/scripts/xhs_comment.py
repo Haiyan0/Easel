@@ -21,6 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import content_guard  # noqa: E402  出站内容安全闸门
+from browser_state import (browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 PROFILE_NAME = "XiaohongshuProfile"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -128,8 +131,7 @@ def _die(msg: str, code: int = 1) -> None:
 
 
 def _profile_dir(base: str | None) -> Path:
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PROFILE_NAME
+    return browser_profile_dir("xiaohongshu", base=base)
 
 
 def _proxy(explicit: str | None, disable: bool) -> str | None:
@@ -150,7 +152,7 @@ def _shot(page, name: str) -> None:
     if not _debug_on():
         return
     try:
-        out = PROJECT_ROOT / "outputs" / "_login" / f"comment-{name}.png"
+        out = OUTPUTS_DIR / "_login" / f"comment-{name}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(out))
     except Exception:
@@ -283,7 +285,9 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     else:
         # 显式直连：Chromium 级屏蔽系统/环境代理（开 VPN 也能用）——同抖音链兜底
         args.append("--no-proxy-server")
-    return p.chromium.launch_persistent_context(str(profile), **kwargs)
+    return launch_persistent_locked(
+        profile,
+        lambda: p.chromium.launch_persistent_context(str(profile), **kwargs))
 
 
 def _open_note(page, note_id: str, token: str):
@@ -567,7 +571,7 @@ def cmd_notes(a) -> int:
             _shot(page, "notes")
             if _debug_on():
                 try:
-                    (PROJECT_ROOT / "outputs" / "_login" / "comment-notes-dom.html").write_text(
+                    (OUTPUTS_DIR / "_login" / "comment-notes-dom.html").write_text(
                         page.content(), encoding="utf-8")
                 except Exception:
                     pass

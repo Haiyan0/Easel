@@ -29,12 +29,14 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import content_guard  # noqa: E402  出站内容安全闸门
+from browser_state import (browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
 
 # PROJECT_ROOT：优先 EASEL_ROOT env（gateway/CLI/web 注入），否则按 __file__ 上溯。
 # ⚠️ 本脚本会被 sync.sh 拍平复制到 workspace/shared/scripts/，那里 parents[3] 会算错根，
 # 相对 content-file 会解析到错误目录——故 env 兜底不可省（与 manifest.py 同款）。
 PROJECT_ROOT = Path(os.environ.get("EASEL_ROOT") or Path(__file__).resolve().parents[3])
-PROFILE_DIR = Path.home() / ".easel-browser-profiles" / "ZhihuProfile"
+PROFILE_DIR = browser_profile_dir("zhihu")
 
 LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -256,12 +258,14 @@ def publish_answer(question_url: str, content: str, headed: bool = False, dry_ru
     result = {"success": False, "url": "", "error": ""}
 
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=not headed,
-            args=LAUNCH_ARGS,
-            viewport={"width": 1280, "height": 900},
-        )
+        ctx = launch_persistent_locked(
+            PROFILE_DIR,
+            lambda: p.chromium.launch_persistent_context(
+                str(PROFILE_DIR),
+                headless=not headed,
+                args=LAUNCH_ARGS,
+                viewport={"width": 1280, "height": 900},
+            ))
         page = ctx.new_page()
 
         # 1. 打开问题页

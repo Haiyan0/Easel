@@ -22,16 +22,15 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
+from browser_state import (ProfileLock, browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
+from output_paths import OUTPUTS_DIR  # noqa: E402
+from runtime_paths import service_mode  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-LOGIN_DIR = PROJECT_ROOT / "outputs" / "_login"
+LOGIN_DIR = OUTPUTS_DIR / "_login"
 PROFILE_NAME = "WeixinMpProfile"
 MP_HOME = "https://mp.weixin.qq.com/"
 LAUNCH_ARGS = [
@@ -56,8 +55,7 @@ def _die(msg, code=1):
 
 
 def _profile_dir(base):
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PROFILE_NAME
+    return browser_profile_dir("wechat-oa", base=base)
 
 
 _IMG_OK = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -79,9 +77,10 @@ def resolve_content_image(src, html_path):
             return None
         if str(parts[0]).startswith(("_", ".")) or str(parts[0]).lower() in {"analytics", "wechat"}:
             return None
-        candidate = (PROJECT_ROOT / "outputs").joinpath(*parts).resolve()
+        root = _outputs_root()
+        candidate = root.joinpath(*parts).resolve()
         try:
-            candidate.relative_to((PROJECT_ROOT / "outputs").resolve())
+            candidate.relative_to(root.resolve())
         except ValueError:
             return None
         if candidate.suffix.lower() in _IMG_OK and candidate.is_file():
@@ -97,44 +96,26 @@ def resolve_content_image(src, html_path):
     return None
 
 
+def _outputs_root() -> Path:
+    """local 兼容测试/拍平布局；worker 固定本人 workspace outputs。"""
+    return OUTPUTS_DIR if service_mode() == "worker" else PROJECT_ROOT / "outputs"
+
+
 def _lock_profile(prof):
-    lock_path = Path(prof) / ".easel.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+b")
+    """兼容旧调用点：失败转换为脚本原有 RuntimeError。"""
+    lock = ProfileLock(prof)
     try:
-        if os.name == "nt":
-            fh.seek(0, os.SEEK_END)
-            if fh.tell() == 0:
-                fh.write(b"0")
-                fh.flush()
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        try:
-            fh.close()
-        except OSError:
-            pass
-        raise RuntimeError("公众号后台会话正被占用，请等当前登录、数据同步或另一篇草稿结束后再试。")
-    return fh
+        lock.acquire(0)
+    except TimeoutError as error:
+        raise RuntimeError(
+            "公众号后台会话正被占用，请等当前登录、数据同步或另一篇草稿结束后再试。"
+        ) from error
+    return lock
 
 
-def _unlock_profile(fh):
-    if fh is None:
-        return
-    try:
-        if os.name == "nt":
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-    try:
-        fh.close()
-    except OSError:
-        pass
+def _unlock_profile(lock):
+    if lock is not None:
+        lock.release()
 
 
 def _proxy(explicit, disable):
@@ -149,28 +130,16 @@ def _proxy(explicit, disable):
 def _launch(p, headed, base, proxy):
     prof = _profile_dir(base)
     prof.mkdir(parents=True, exist_ok=True)
-    lock = _lock_profile(prof)
     kw = dict(headless=not headed, locale="zh-CN", args=LAUNCH_ARGS,
               viewport={"width": 1440, "height": 900})
     # mp 为国内站，直连即可。仅显式 --proxy 时才走代理；否则不传 proxy，
     # 并靠进程环境已清空 http(s)_proxy（见启动命令的 env -u）让 Chromium 直连。
     if proxy:
         kw["proxy"] = {"server": proxy}
-    try:
-        ctx = p.chromium.launch_persistent_context(str(prof), **kw)
-    except Exception:
-        _unlock_profile(lock)
-        raise
-    original_close = ctx.close
-
-    def close(*args, **kwargs):
-        try:
-            return original_close(*args, **kwargs)
-        finally:
-            _unlock_profile(lock)
-
-    ctx.close = close
-    return ctx
+    return launch_persistent_locked(
+        prof,
+        lambda: p.chromium.launch_persistent_context(str(prof), **kw),
+        timeout=1.0)
 
 
 def _now():

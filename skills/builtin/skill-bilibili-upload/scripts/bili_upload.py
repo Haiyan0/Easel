@@ -34,6 +34,14 @@ SHARED_SCRIPTS = Path(__file__).resolve().parents[3] / "shared" / "scripts"
 sys.path.insert(0, str(SHARED_SCRIPTS))
 import content_guard  # noqa: E402
 import platform_readback  # noqa: E402  发布读回对账（B站 reader）
+from runtime_paths import service_mode, state_path  # noqa: E402
+
+
+def _default_cookie() -> str:
+    """worker 使用本人平台 cookie 状态；local 保留当前工作目录 cookies.json。"""
+    if service_mode() == "worker":
+        return str(state_path("platform-cookie", "bilibili-default"))
+    return "cookies.json"
 
 
 def _direct_env() -> dict:
@@ -82,7 +90,7 @@ def resolve_tid(partition: str | None, tid: int | None) -> int:
 
 def build_cmd(a) -> list[str]:
     """构造 biliup upload 命令（纯函数，供测试）。全局选项在子命令前。"""
-    cookie = a.cookie or "cookies.json"
+    cookie = a.cookie or _default_cookie()
     cmd = ["biliup", "-u", cookie]
     if getattr(a, "proxy", None):
         cmd += ["-p", a.proxy]
@@ -121,7 +129,7 @@ def cmd_check(_a) -> int:
 def cmd_login(a) -> int:
     if not _has_biliup():
         _die("未安装 biliup（pip install biliup）", 3)
-    cookie = a.cookie or "cookies.json"
+    cookie = a.cookie or _default_cookie()
     print(f"启动 B站扫码登录，cookie 将保存到 {cookie} ...", file=sys.stderr)
     print("（需终端可显示二维码 + 手机 B站 App 扫码 + 外网）", file=sys.stderr)
     return subprocess.call(["biliup", "-u", cookie, "login"], env=_direct_env())
@@ -151,7 +159,7 @@ def cmd_upload(a) -> int:
         return 0
     if not _has_biliup():
         _die("未安装 biliup", 3)
-    cookie = a.cookie or "cookies.json"
+    cookie = a.cookie or _default_cookie()
     if not Path(cookie).is_file():
         _die(f"cookie 不存在：{cookie}，请先 `login`。")
     content_guard.guard_or_die(

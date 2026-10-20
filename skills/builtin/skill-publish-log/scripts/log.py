@@ -23,12 +23,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "shared" / "scripts"))
 import social_stats as ss  # noqa: E402
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 # PROJECT_ROOT：优先 EASEL_ROOT env，否则按 __file__ 上溯（workspace 拍平副本会算错，
 # 故 env 兜底不可省，见 manifest.py 同款说明）。
 PROJECT_ROOT = Path(os.environ.get("EASEL_ROOT") or Path(__file__).resolve().parents[4])
-DEFAULT_DATA = PROJECT_ROOT / "outputs" / "_analytics" / "publish-log.json"
-LEGACY_DATA = PROJECT_ROOT / "outputs" / "publish-log.json"
+DEFAULT_DATA = OUTPUTS_DIR / "_analytics" / "publish-log.json"
+LEGACY_DATA = OUTPUTS_DIR / "publish-log.json"
 CST = timezone(timedelta(hours=8))
 METRIC_KEYS = ("views", "likes", "comments", "shares")
 

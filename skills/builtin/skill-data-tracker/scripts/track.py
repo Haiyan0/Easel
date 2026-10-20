@@ -25,10 +25,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "shared" / "scripts"))
 import social_stats as ss  # noqa: E402
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SNAP_ROOT = PROJECT_ROOT / "outputs" / "_analytics" / "snapshots"
-LEGACY_SNAP_ROOT = PROJECT_ROOT / "outputs" / "analytics" / "snapshots"
+SNAP_ROOT = OUTPUTS_DIR / "_analytics" / "snapshots"
+LEGACY_SNAP_ROOT = OUTPUTS_DIR / "analytics" / "snapshots"
 
 
 def _safe_segment(value: str, fallback: str) -> str:
@@ -298,7 +299,7 @@ def cmd_export_followers(args) -> None:
 
     rows.sort(key=lambda row: (row["recorded_at"] or "", row["profile"], row["platform"]))
     output = Path(args.output).expanduser() if args.output else \
-        PROJECT_ROOT / "outputs" / "_analytics" / "follower-log.json"
+        OUTPUTS_DIR / "_analytics" / "follower-log.json"
     payload = {"version": "1.0", "snapshots": rows}
     atomic_write(output, payload)
     print(json.dumps({"ok": True, "path": str(output), "snapshots": len(rows)},

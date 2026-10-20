@@ -41,6 +41,9 @@ import login_state  # noqa: E402
 import login_qr
 import login_transport
 import content_guard  # noqa: E402  出站内容安全闸门
+from browser_state import (ProfileLock as _ProfileLockBase,  # noqa: E402
+                           browser_profile_dir)
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 选择器集中维护（小红书改版时单点更新）。REF = xiaohongshu-mcp 对应源。
@@ -89,7 +92,7 @@ SELECTORS = {
 
 PROFILE_NAME = "XiaohongshuProfile"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_QR_OUT = PROJECT_ROOT / "outputs" / "_login" / "xhs-login-qrcode.png"
+DEFAULT_QR_OUT = OUTPUTS_DIR / "_login" / "xhs-login-qrcode.png"
 
 # Chromium 启动性能参数（提速冷启动；勿禁用图片——二维码是图片）
 LAUNCH_ARGS = [
@@ -138,8 +141,7 @@ def _abspaths(csv: str | None) -> list[str]:
 
 
 def _profile_dir(base: str | None) -> Path:
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PROFILE_NAME
+    return browser_profile_dir("xiaohongshu", base=base)
 
 
 def _cloak_executable() -> Path | None:
@@ -158,59 +160,13 @@ def _cloak_executable() -> Path | None:
     return choices[0] if choices else None
 
 
-class _ProfileLock:
-    """同一份 XiaohongshuProfile 不能同时开两个 Cloak：账号页 whoami 和登录会把内核打成 exit 21。"""
-
-    def __init__(self, profile: Path):
-        self.path = profile / ".easel.lock"
-        self.fd: int | None = None
+# 同一份 XiaohongshuProfile 不能同时开两个 Cloak：账号页 whoami 和登录会把内核打成 exit 21。
+# 锁实现统一在 browser_state，所有脚本与 worker 使用同一 .easel.lock 协议。
+class _ProfileLock(_ProfileLockBase):
+    """沿用本模块的 time 计时，兼容既有登录循环的时钟注入测试。"""
 
     def acquire(self, timeout_s: float) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.time() + timeout_s
-        last: OSError | None = None
-        while True:
-            try:
-                self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR)
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                os.write(self.fd, f"{os.getpid()}\n".encode("ascii"))
-                return
-            except OSError as e:
-                last = e
-                if self.fd is not None:
-                    try:
-                        os.close(self.fd)
-                    except OSError:
-                        pass
-                    self.fd = None
-                if time.time() >= deadline:
-                    raise TimeoutError(f"登录目录正被占用：{self.path}") from last
-                time.sleep(0.4)
-
-    def release(self) -> None:
-        if self.fd is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
-        self.fd = None
+        return super().acquire(timeout_s, clock=time.time)
 
 
 def _clear_stale_chrome_locks(profile: Path) -> None:
@@ -892,7 +848,7 @@ def _diag_after_publish(page) -> str:
     shot = ""
     if os.environ.get("EASEL_PUBLISH_DEBUG"):
         try:
-            out = PROJECT_ROOT / "outputs" / "_login" / "xhs-publish-fail.png"
+            out = OUTPUTS_DIR / "_login" / "xhs-publish-fail.png"
             out.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(out))
             shot = f"（调试截图见 {out}）"

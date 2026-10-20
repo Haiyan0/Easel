@@ -298,15 +298,16 @@ if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
 from model_registry import model_group
+from runtime_paths import state_path as private_state_path
 
-BROWSER_PROFILES = Path.home() / ".easel-browser-profiles"
+BROWSER_PROFILES = _RUNTIME_PATHS.home / ".easel-browser-profiles"
 LOGIN_DIR = OUTPUTS_DIR / "_login"
 PUBLISH_DIR = OUTPUTS_DIR / "_publish"   # 异步发布的状态/验证码文件（抖音发布可能触发短信墙）
 PROFILE_BUILD_DIR = OUTPUTS_DIR / "_profile_build"   # 异步画像构建的状态文件（避免长请求被代理超时）
 DEBUG_DIR = OUTPUTS_DIR / "_debug"   # 诊断日志（对话流收尾情况等），_ 前缀不进内容库
 SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结果，供 SSE 连接中断后前端取回
 # 非 _ 前缀的历史系统目录（归因层数据），内容库不展示（真产物一律在项目目录内）
-SYSTEM_TOPLEVEL_DIRS = {"analytics"}
+SYSTEM_TOPLEVEL_DIRS = {"analytics", "wechat"}
 LOGIN_TIMEOUT = 240
 LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 
@@ -316,6 +317,14 @@ _WHOAMI_CACHE: dict[str, tuple[float, dict]] = {}
 _WHOAMI_LOCK = threading.Lock()
 _WHOAMI_TASKS: dict[str, asyncio.Task] = {}
 _LOGIN_START_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _browser_profile_path(platform: str) -> Path | None:
+    """平台持久 profile：worker 用 <platform>/<account>；local 保留旧目录名。"""
+    if _SERVICE_MODE == "worker":
+        return BROWSER_PROFILES / platform / "default"
+    name = (LOGIN_RUNNERS.get(platform) or {}).get("profile")
+    return BROWSER_PROFILES / name if name else None
+
 
 LOGIN_RUNNERS: dict[str, dict] = {
     "xiaohongshu": {"name": "小红书", "backend": "xhs", "profile": "XiaohongshuProfile"},
@@ -338,13 +347,21 @@ WECHAT_CONFIG_YAML = WECHAT_SKILL_DIR / "wechat-publisher.yaml"
 WECHAT_WEB_ACCOUNT = "web"   # web 端配置写入/读取的账号 key
 
 
+def _wechat_config_path() -> Path:
+    """worker 只读写本人 state_root；local 保留技能目录旧配置。"""
+    if _SERVICE_MODE == "worker":
+        return private_state_path("wechat-config", "default")
+    return WECHAT_CONFIG_YAML
+
+
 def _wechat_load_yaml() -> dict:
-    """读 wechat-publisher.yaml（不存在或损坏则返回空 dict）。"""
-    if not WECHAT_CONFIG_YAML.is_file():
+    """读当前模式下的 wechat-publisher.yaml（不存在或损坏则返回空 dict）。"""
+    path = _wechat_config_path()
+    if not path.is_file():
         return {}
     try:
         import yaml
-        data = yaml.safe_load(WECHAT_CONFIG_YAML.read_text(encoding="utf-8"))
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -381,10 +398,11 @@ def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", autho
     cfg["accounts"][WECHAT_WEB_ACCOUNT] = acc
     # web 账号存在即设为默认，方便 CLI 直接用
     cfg.setdefault("default", WECHAT_WEB_ACCOUNT)
-    WECHAT_CONFIG_YAML.parent.mkdir(parents=True, exist_ok=True)
-    tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
+    config_path = _wechat_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    os.replace(tmp, WECHAT_CONFIG_YAML)
+    os.replace(tmp, config_path)
 
 
 def _wechat_clear_credentials() -> None:
@@ -397,13 +415,18 @@ def _wechat_clear_credentials() -> None:
         if cfg.get("default") == WECHAT_WEB_ACCOUNT:
             cfg["default"] = next(iter(accts), "") if accts else ""
         try:
-            tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
+            config_path = _wechat_config_path()
+            tmp = config_path.with_suffix(".yaml.tmp")
             tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-            os.replace(tmp, WECHAT_CONFIG_YAML)
+            os.replace(tmp, config_path)
         except Exception:
             pass
-    for cache in (WECHAT_SKILL_SCRIPTS / f".token_cache_{WECHAT_WEB_ACCOUNT}.json",
-                  WECHAT_SKILL_SCRIPTS / ".token_cache.json"):
+    if _SERVICE_MODE == "worker":
+        caches = (private_state_path("wechat-token", WECHAT_WEB_ACCOUNT),)
+    else:
+        caches = (WECHAT_SKILL_SCRIPTS / f".token_cache_{WECHAT_WEB_ACCOUNT}.json",
+                  WECHAT_SKILL_SCRIPTS / ".token_cache.json")
+    for cache in caches:
         try:
             cache.unlink()
         except OSError:
@@ -1283,12 +1306,36 @@ def get_output_tree() -> list[dict]:
     return sorted(items, key=lambda x: x.get('mtime', 0), reverse=True)
 
 
-def _safe_output_path(rel: str) -> Path:
-    '把相对路径解析到 outputs/ 内，防路径穿越。'
+def _internal_output_path(relative: Path) -> bool:
+    """通用产物接口不得读取顶层下划线/隐藏目录及内部系统目录。"""
+    parts = relative.parts
+    if not parts:
+        return False
+    first = parts[0]
+    return (first.startswith(('.', '_')) or first in PROTECTED_OUTPUTS
+            or first in SYSTEM_TOPLEVEL_DIRS)
+
+
+def _is_login_qr(relative: Path) -> bool:
+    """仅登录二维码图片可按用途读取；其余 _login 内容仍属内部状态。"""
+    return (len(relative.parts) == 2 and relative.parts[0] == "_login"
+            and relative.suffix.lower() == ".png"
+            and relative.stem in set(LOGIN_RUNNERS) | {"wechat-oa-mp"})
+
+
+def _safe_output_path(rel: str, *, allow_login_qr: bool = False) -> Path:
+    '把相对路径解析到 outputs/ 内，防路径穿越与内部状态泄漏。'
     full = (OUTPUTS_DIR / rel).resolve()
     root = OUTPUTS_DIR.resolve()
     if root != full and root not in full.parents:
         raise HTTPException(403, '非法路径')
+    # resolve() 后比较：符号链接/junction 指向内部状态或外部目录都会被识别。
+    if full == root:
+        raise HTTPException(403, '系统状态不可作为通用产物读取')
+    relative = full.relative_to(root)
+    if (_internal_output_path(relative)
+            and not (allow_login_qr and _is_login_qr(relative))):
+        raise HTTPException(403, '系统状态不可作为通用产物读取')
     if not full.is_file():
         raise HTTPException(404, '文件不存在')
     return full
@@ -4263,14 +4310,26 @@ async def api_output(path: str):
         return {"path": path, "content": "", "kind": "binary", "isBinary": True}
 
 
-@app.get("/api/media/{path:path}")
+@app.api_route("/api/media/{path:path}", methods=["GET", "HEAD"])
 async def api_media(path: str):
     """原样输出媒体文件（图片/视频/音频/HTML/PDF），供 <img>/<video>/iframe/下载。"""
-    full = _safe_output_path(path)
+    full = _safe_output_path(path, allow_login_qr=True)
+    suffix = full.suffix.lower()
+    headers: dict[str, str] = {}
     # HTML 预览会在本地被就地重新生成（如 gzh-design 重排/内联图片），必须禁缓存，
     # 否则浏览器/代理按启发式缓存旧版 → 内容库 iframe 打开的是过期预览（复制粘贴带旧图 URL）。
-    headers = ({"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
-               if full.suffix.lower() in {".html", ".htm"} else {})
+    if suffix in {".html", ".htm"}:
+        headers.update({"Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache"})
+    if suffix in {".html", ".htm", ".svg"}:
+        # 直链与预览同权：强制 sandbox，不含 allow-scripts/allow-same-origin/
+        # 顶层跳转许可；nosniff 防止按内容嗅探成可执行文档。
+        headers.update({
+            "Content-Security-Policy":
+                "sandbox; default-src 'none'; img-src data:; "
+                "style-src 'unsafe-inline'",
+            "X-Content-Type-Options": "nosniff",
+        })
     return FileResponse(full, headers=headers)
 
 
@@ -4441,6 +4500,13 @@ def _write_login_marker(platform: str, state: str, message: str = '') -> None:
             pass
 
 
+def _bili_cookie_path() -> Path:
+    """worker 的 B站 cookie 落本人 state_root；local 保留项目根兼容位置。"""
+    if _SERVICE_MODE == "worker":
+        return private_state_path("platform-cookie", "bilibili-default")
+    return PROJECT_ROOT / "cookies.json"
+
+
 def _account_logged_in(platform: str, cfg: dict) -> bool:
     """尽力判断某平台是否已登录。
     浏览器平台的登录态只有启动浏览器才真能知道（profile 里总有 Cookies 文件，存在≠已登录，
@@ -4450,7 +4516,7 @@ def _account_logged_in(platform: str, cfg: dict) -> bool:
     if backend == 'unsupported':
         return False
     if backend == 'biliup':
-        return (PROJECT_ROOT / 'cookies.json').is_file()
+        return _bili_cookie_path().is_file()
     if backend == 'wechat-oa':
         # 发布+数据都走「后台会话」→ 以 mp 后台登录成功为准；AppID 凭证作为兜底（旧配置）
         try:
@@ -4555,7 +4621,7 @@ async def _start_login(platform: str, restart: bool = False):
         # B站：TV 端扫码登录 API 生成二维码 + 写 biliup cookie（biliup login 需真终端，前端用不了）
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'login',
                '--qr-out', str(qr), '--status-file', str(status),
-               '--cookie', str(PROJECT_ROOT / 'cookies.json'), '--timeout', str(LOGIN_TIMEOUT)]
+               '--cookie', str(_bili_cookie_path()), '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'douyin':
         code_file = LOGIN_DIR / f'{platform}.code'
         try:
@@ -4814,7 +4880,7 @@ async def _check_account_whoami(platform: str, force: bool = False):
         return hit[1]
     if backend == 'biliup':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'whoami',
-               '--cookie', str(PROJECT_ROOT / 'cookies.json')]
+               '--cookie', str(_bili_cookie_path())]
     elif backend == 'xhs':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy']
     elif backend == 'wechat-oa':
@@ -4897,7 +4963,7 @@ async def api_logout(platform: str):
             except OSError:
                 pass
         # 4) 删 mp 后台浏览器持久化会话（真正退出登录）
-        mpdir = (BROWSER_PROFILES / 'WeixinMpProfile').resolve()
+        mpdir = (_browser_profile_path(platform) or BROWSER_PROFILES / 'WeixinMpProfile').resolve()
         if BROWSER_PROFILES.resolve() in mpdir.parents and mpdir.is_dir():
             shutil.rmtree(mpdir, ignore_errors=True)
             deleted.append('WeixinMpProfile')
@@ -4913,14 +4979,14 @@ async def api_logout(platform: str):
             await asyncio.to_thread(proc.wait, timeout=5)
         except Exception:
             pass
-    prof_name = cfg.get('profile')
-    if prof_name:
-        pdir = (BROWSER_PROFILES / prof_name).resolve()
+    profile_path = _browser_profile_path(platform)
+    if profile_path is not None:
+        pdir = profile_path.resolve()
         if BROWSER_PROFILES.resolve() in pdir.parents and pdir.is_dir():
             shutil.rmtree(pdir, ignore_errors=True)
-            deleted.append(prof_name)
+            deleted.append(pdir.name)
     if cfg['backend'] == 'biliup':
-        ck = PROJECT_ROOT / 'cookies.json'
+        ck = _bili_cookie_path()
         if ck.is_file():
             ck.unlink()
             deleted.append('cookies.json')
@@ -5006,7 +5072,7 @@ async def _fetch_analytics(platform: str):
     # B站用 cookie 调 API（无浏览器 profile）、公众号走 mp 后台会话（Playwright 拦截数据 XHR，见下），单独分支；其余走 account_stats（Playwright）
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
-               "--cookie", str(PROJECT_ROOT / "cookies.json")]
+               "--cookie", str(_bili_cookie_path())]
     elif platform == "wechat-oa":
         # 公众号数据走「后台网页端」(mp.weixin.qq.com 管理员会话 + Playwright 拦截数据 XHR)：
         # 开发者 datacube 接口需认证+群发+接口权限，多数号取不到；后台端有登录态即可看到发表记录/数据。
@@ -5241,7 +5307,7 @@ async def api_publish(platform: str, req: PublishRequest):
         # B站投稿：直接调 biliup CLI（需 cookies.json，PATH 上有 biliup）。必须视频；
         # tid=36「知识」；B站投稿必须≥1 标签，无则兜底「日常」。
         bili_tag = tags.replace('#', '').replace('，', ',').strip().strip(',') or '日常'
-        cmd = ['biliup', '-u', str(PROJECT_ROOT / 'cookies.json'), 'upload', vids[0],
+        cmd = ['biliup', '-u', str(_bili_cookie_path()), 'upload', vids[0],
                '--title', title[:80], '--tid', '36', '--copyright', '1', '--tag', bili_tag]
         if req.body.strip():
             cmd += ['--desc', req.body[:2000]]

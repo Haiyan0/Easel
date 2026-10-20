@@ -24,12 +24,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "shared" / "scripts"))
 import social_stats as ss  # noqa: E402
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_DATA = PROJECT_ROOT / "outputs" / "_analytics" / "publish-log.json"
-DEFAULT_FOLLOWER = PROJECT_ROOT / "outputs" / "_analytics" / "follower-log.json"
-LEGACY_DATA = PROJECT_ROOT / "outputs" / "publish-log.json"
-LEGACY_FOLLOWER = PROJECT_ROOT / "outputs" / "follower-log.json"
+DEFAULT_DATA = OUTPUTS_DIR / "_analytics" / "publish-log.json"
+DEFAULT_FOLLOWER = OUTPUTS_DIR / "_analytics" / "follower-log.json"
+LEGACY_DATA = OUTPUTS_DIR / "publish-log.json"
+LEGACY_FOLLOWER = OUTPUTS_DIR / "follower-log.json"
 METRIC_KEYS = ("views", "likes", "comments", "shares")
 LOCAL_TZ = timezone(timedelta(hours=8))
 PLATFORM_ALIASES = {

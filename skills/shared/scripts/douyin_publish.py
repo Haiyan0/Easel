@@ -33,6 +33,9 @@ import login_state  # noqa: E402
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快照+列表对账协议）
 import human_pace  # noqa: E402  人类节奏（分档随机停顿）
+from browser_state import (browser_profile_dir,  # noqa: E402
+                           launch_persistent_locked)
+from output_paths import OUTPUTS_DIR  # noqa: E402
 
 HOME_URL = "https://creator.douyin.com/"
 TITLE_MAX = 30  # 抖音作品标题上限（字符）
@@ -75,7 +78,7 @@ SELECTORS = {
 }
 PROFILE_NAME = "DouyinProfile"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_QR_OUT = PROJECT_ROOT / "outputs" / "_login" / "douyin.png"
+DEFAULT_QR_OUT = OUTPUTS_DIR / "_login" / "douyin.png"
 
 # 短信验证墙的多步流程选择器（跨引擎，逐个 query_selector 尝试；真机首次跑后据 dump 校准）。
 # 扫码后先出「验证方式选择屏」→ 选「接收短信验证码」进发码屏 → 点「获取验证码」下发短信。
@@ -136,8 +139,7 @@ def _abspaths(csv: str | None) -> list[str]:
 
 
 def _profile_dir(base: str | None) -> Path:
-    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
-    return root / PROFILE_NAME
+    return browser_profile_dir("douyin", base=base)
 
 
 def _proxy(explicit: str | None, disable: bool) -> str | None:
@@ -160,7 +162,9 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     kwargs = dict(headless=not headed, locale="zh-CN", args=args)
     if proxy:
         kwargs["proxy"] = {"server": proxy}
-    return p.chromium.launch_persistent_context(str(profile), **kwargs)
+    return launch_persistent_locked(
+        profile,
+        lambda: p.chromium.launch_persistent_context(str(profile), **kwargs))
 
 
 def _wait_ready(page, timeout_ms: int = 15000) -> None:
