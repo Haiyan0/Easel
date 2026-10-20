@@ -5,6 +5,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -76,6 +77,8 @@ def install_worker(tmp_path: Path, monkeypatch, *, expires_at: int) -> Path:
     monkeypatch.setattr(web, "_RUNNING_CHAT", {})
     monkeypatch.setattr(web, "_HARNESS_TASKS", set())
     monkeypatch.setattr(web, "_STOPPED_CHAT", set())
+    # 流式 supervisor 会注册到进程级任务集；隔离后不影响后续用例的空闲判断
+    monkeypatch.setattr(web, "_BG_TASKS", set())
     monkeypatch.setenv("EASEL_WORKER_SNAPSHOT_FILE", str(snapshot_path))
     monkeypatch.setenv("EASEL_WORKER_PUBLIC_KEY_FILE", str(public_path))
     monkeypatch.setenv("EASEL_RUN_ID", RUN_ID)
@@ -95,6 +98,12 @@ def install_fake_adapter(monkeypatch) -> FakeAdapter:
 def chat(client: TestClient, session: str):
     return client.post("/api/chat", headers=HEADERS,
                        json={"message": "hello", "sessionId": session})
+
+
+def stream_chat(client: TestClient, session: str, turn: str):
+    return client.post("/api/chat/stream", headers=HEADERS,
+                       json={"message": "hello", "sessionId": session,
+                             "turnId": turn})
 
 
 def worker_client():
@@ -186,3 +195,105 @@ def test_started_execution_completes_across_snapshot_expiry(
     assert response.status_code == 200, response.text
     assert response.json()["response"] == "ok"
     assert len(fake.calls) == 1, "合法启动的在途执行应正常完成"
+
+
+def test_duplicate_stream_request_preserves_original_turn_log(
+        tmp_path, monkeypatch):
+    install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+    fake = install_fake_adapter(monkeypatch)
+
+    with worker_client() as client:
+        first = stream_chat(client, "stream-session", "turn-stream-1")
+        assert first.status_code == 200, first.text
+        event_path = web._job_event_file("turn-stream-1")
+        original = event_path.read_bytes()
+        assert [event["event"] for event in
+                web._read_job_events("turn-stream-1")] == [
+                    "activity", "token", "done"]
+        assert len(fake.calls) == 1
+
+        duplicate = stream_chat(client, "stream-session", "turn-stream-1")
+        assert event_path.read_bytes() == original, \
+            "重复请求不得清空/改写原任务日志"
+        assert duplicate.status_code == 409, duplicate.text
+        assert len(fake.calls) == 1, "重复流式请求不得再次调用 Harness"
+
+        replay = client.get("/api/chat/jobs/turn-stream-1/stream",
+                            headers=HEADERS)
+        assert replay.status_code == 200
+        assert "event: token" in replay.text
+        assert "ok" in replay.text, "原 token 仍应可回放"
+
+
+def test_in_flight_duplicate_stream_does_not_corrupt_original_events(
+        tmp_path, monkeypatch):
+    install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+    fake = install_fake_adapter(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+
+    async def hold():
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+
+    fake.on_run = hold
+    with worker_client() as first_client, worker_client() as second_client:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(stream_chat, first_client,
+                                 "in-flight-stream", "turn-inflight")
+            try:
+                assert started.wait(5), "首个流式执行未启动"
+                duplicate = stream_chat(second_client,
+                                        "in-flight-other", "turn-inflight")
+            finally:
+                release.set()
+            first = future.result(timeout=15)
+
+    assert first.status_code == 200, first.text
+    assert len(fake.calls) == 1
+    events = [event["event"] for event in
+              web._read_job_events("turn-inflight")]
+    assert events == ["activity", "token", "done"], events
+    assert duplicate.status_code == 409, duplicate.text
+
+
+def test_expired_first_stream_does_not_create_event_file(tmp_path, monkeypatch):
+    database = install_worker(tmp_path, monkeypatch,
+                              expires_at=int(time.time()) + 60)
+    fake = install_fake_adapter(monkeypatch)
+    real_time = time.time
+    monkeypatch.setattr(web.time, "time", lambda: real_time() + 7200)
+
+    with worker_client() as client:
+        response = stream_chat(client, "expired-stream", "turn-expired")
+
+    assert response.status_code == 403, response.text
+    assert fake.calls == []
+    assert not web._job_event_file("turn-expired").exists(), \
+        "过期拒绝不得创建本轮事件文件"
+    with sqlite3.connect(database) as connection:
+        state = connection.execute(
+            "SELECT state FROM snapshot_admissions").fetchone()[0]
+    assert state == "accepted", "过期拒绝不应消耗执行认领"
+
+
+@pytest.mark.parametrize("entry", ["stream", "chat"])
+def test_legal_first_request_executes_once_without_double_claim(
+        tmp_path, monkeypatch, entry):
+    install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+    fake = install_fake_adapter(monkeypatch)
+
+    with worker_client() as client:
+        if entry == "stream":
+            response = stream_chat(client, "legal-stream", "turn-legal")
+            assert response.status_code == 200, response.text
+            assert [event["event"] for event in
+                    web._read_job_events("turn-legal")] == [
+                        "activity", "token", "done"]
+        else:
+            response = chat(client, "legal-chat")
+            assert response.status_code == 200, response.text
+            assert response.json()["response"] == "ok"
+
+    assert len(fake.calls) == 1, "合法首次请求只能有一次执行"

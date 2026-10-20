@@ -3100,7 +3100,8 @@ async def _harness_ask(sk: str, questions: list[dict], emit) -> dict:
 
 
 async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: str,
-                            config: dict, emit, timeout: int = TIMEOUT_CHAT, *, interactive=True) -> str:
+                            config: dict, emit, timeout: int = TIMEOUT_CHAT, *,
+                            interactive=True, execution_claimed=False) -> str:
     pk = f"web:{sk}"
     turn_id = req.turnId or uuid.uuid4().hex
     full_text: list[str] = []
@@ -3142,8 +3143,10 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             raise HarnessError("此会话正在另一个窗口运行，请稍后再试")
         if _chat_backend(sk) != runtime:
             raise HarnessError("底座已切换，请使用新对话重试")
-        # worker：真实执行及任何本轮副作用之前，先做持久化原子认领与时效校验
-        _worker_execution_claim()
+        # worker：真实执行及任何本轮副作用之前，先做持久化原子认领与时效校验；
+        # 流式入口已在外层（事件日志副作用之前）认领，此处不得重复认领。
+        if not execution_claimed:
+            _worker_execution_claim()
         record = harness_store.binding(SESSIONS_DIR, sk)
         native_id = record.get("native_id", "")
         harness_store.bind(SESSIONS_DIR, sk, runtime, native_id)
@@ -3398,6 +3401,17 @@ async def api_chat_stream(req: ChatRequest):
             raise HTTPException(409, "此会话属于 API 直连，请新建会话使用 OpenClaw")
         message = _chat_message(req)
 
+    # worker 流式入口：时效校验与唯一原子认领必须早于事件日志的创建/截断/追加，
+    # 重复或过期请求直接返回冲突，不触碰原任务回放日志。认领成功后通过
+    # execution_claimed 告知内层，避免同一请求二次认领。
+    worker_claimed = False
+    if alternate and _WORKER_SNAPSHOT is not None:
+        try:
+            _worker_execution_claim()
+        except _WorkerExecutionRejected as error:
+            raise HTTPException(error.status, error.detail) from error
+        worker_claimed = True
+
     # supervisor（跑 openclaw run）与 forward（转发 SSE 给浏览器）之间的事件通道。
     # 关键：run 跑在独立后台任务里，客户端断开只结束 forward，不取消 supervisor →
     # openclaw 照常跑到底、结果落盘，前端断线后 /api/chat/last 取回。
@@ -3448,7 +3462,8 @@ async def api_chat_stream(req: ChatRequest):
         if alternate:
             try:
                 await _run_harness_chat(req.model_copy(update={"turnId": turn_id}),
-                                        sk, message, runtime, config, to_client)
+                                        sk, message, runtime, config, to_client,
+                                        execution_claimed=worker_claimed)
             finally:
                 to_client("done", sessionKey=sk)
                 client_q.put_nowait(CLIENT_DONE)
