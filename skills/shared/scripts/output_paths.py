@@ -8,23 +8,30 @@ import os
 from pathlib import Path
 
 
+def _helper_workspace_root() -> Path:
+    """脚本侧唯一路径来源；helper 不可用直接失败，不猜宿主目录。"""
+    try:
+        from runtime_paths import resolve_runtime_paths
+    except ImportError as error:
+        raise RuntimeError(
+            "无法加载 runtime_paths，拒绝回退源码/宿主路径") from error
+    return resolve_runtime_paths().workspace_root
+
+
 def _discover_root() -> Path:
-    # 统一走脚本侧路径 helper：worker 用显式 EASEL_WORKSPACE_ROOT，
-    # local 显式 EASEL_ROOT 也走同一入口；无配置时保留原有源码布局扫描。
+    # worker 只认显式路径 helper：导入失败、缺项、非法路径一律失败关闭，
+    # 绝不回退 EASEL_ROOT 或源码扫描。local 保留原有 EASEL_ROOT/扫描行为。
     configured = os.environ.get("EASEL_ROOT", "").strip()
     mode = (os.environ.get("EASEL_SERVICE_MODE") or "local").strip().lower()
-    if mode == "worker" or configured:
+    if mode != "local":
+        return _helper_workspace_root()
+    if configured:
         try:
             from runtime_paths import resolve_runtime_paths
         except ImportError:
-            resolve_runtime_paths = None
-        if resolve_runtime_paths is not None:
-            try:
-                return resolve_runtime_paths().workspace_root
-            except RuntimeError:
-                pass
-    if configured:
-        return Path(configured).expanduser().resolve()
+            # local 兼容：helper 不可用时仍按显式 EASEL_ROOT 工作
+            return Path(configured).expanduser().resolve()
+        return resolve_runtime_paths().workspace_root
     for parent in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
         outputs = parent / "outputs"
         if outputs.exists():

@@ -410,3 +410,42 @@ class SnapshotAdmissionStore:
                     connection.execute("ROLLBACK")
                 raise
         raise DomainError("snapshot_conflict", 409)
+
+    def claim_execution(self, snapshot: WorkerConfigSnapshot) -> dict[str, Any]:
+        """原子认领唯一执行：只有首次 accepted→running 能进入 Harness。
+
+        记录与接纳同库：同进程重复、进程重载和并发请求读到的都是同一条
+        持久状态，已执行的 run/nonce 不得再次启动适配器。
+        """
+        if not snapshot.nonce:
+            raise DomainError("snapshot_invalid", 403)
+        fingerprint = snapshot_fingerprint(snapshot)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT nonce, fingerprint, state FROM snapshot_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (snapshot.workspace_id, snapshot.run_id)).fetchone()
+                if row is None:
+                    raise DomainError("snapshot_not_admitted", 409)
+                if (row["nonce"] != snapshot.nonce
+                        or row["fingerprint"] != fingerprint):
+                    raise DomainError("snapshot_conflict", 409)
+                if row["state"] == "accepted":
+                    connection.execute(
+                        "UPDATE snapshot_admissions SET state = 'running'"
+                        " WHERE workspace_id = ? AND run_id = ?",
+                        (snapshot.workspace_id, snapshot.run_id))
+                    connection.execute("COMMIT")
+                    return {"execute": True, "duplicate": False,
+                            "state": "running", "run_id": snapshot.run_id,
+                            "nonce": snapshot.nonce}
+                connection.execute("COMMIT")
+                return {"execute": False, "duplicate": True,
+                        "state": row["state"], "run_id": snapshot.run_id,
+                        "nonce": snapshot.nonce}
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise

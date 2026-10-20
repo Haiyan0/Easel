@@ -39,17 +39,38 @@ def _absolute(env: Mapping[str, str], name: str) -> Path:
     return path.resolve()
 
 
+def _overlaps(first: Path, second: Path) -> bool:
+    """任一方向包含都算重叠：只读代码根不能落入可写数据根。"""
+    return (first == second
+            or first.is_relative_to(second)
+            or second.is_relative_to(first))
+
+
 def resolve_runtime_paths(
         env: Mapping[str, str] | None = None,
         default_code_root: str | Path | None = None) -> RuntimePaths:
     values = os.environ if env is None else env
     mode = (values.get("EASEL_SERVICE_MODE") or "local").strip().lower()
     if mode == "worker":
-        return RuntimePaths(
-            code_root=_absolute(values, "EASEL_CODE_ROOT"),
-            workspace_root=_absolute(values, "EASEL_WORKSPACE_ROOT"),
-            state_root=_absolute(values, "EASEL_STATE_ROOT"),
-            home=_absolute(values, "HOME"))
+        code_root = _absolute(values, "EASEL_CODE_ROOT")
+        workspace_root = _absolute(values, "EASEL_WORKSPACE_ROOT")
+        state_root = _absolute(values, "EASEL_STATE_ROOT")
+        home = _absolute(values, "HOME")
+        # 与主 resolver 保持一致：代码根只读，不能与任何可写根互相包含。
+        for candidate in (workspace_root, state_root, home):
+            if _overlaps(code_root, candidate):
+                raise RuntimePathError("worker 代码根不能与可写数据根重叠")
+        # EASEL_ROOT 在 worker 只兼容指向本人数据根，不能借此换代码根。
+        legacy_root = values.get("EASEL_ROOT")
+        if legacy_root is not None and str(legacy_root).strip():
+            raw = str(legacy_root)
+            if any(character in raw for character in ("\0", "\n", "\r")):
+                raise RuntimePathError("EASEL_ROOT 包含控制字符")
+            legacy = Path(raw).expanduser()
+            if not legacy.is_absolute() or legacy.resolve() != workspace_root:
+                raise RuntimePathError("worker 的 EASEL_ROOT 必须指向本人数据根")
+        return RuntimePaths(code_root=code_root, workspace_root=workspace_root,
+                            state_root=state_root, home=home)
     if mode != "local":
         raise RuntimePathError(f"未知服务模式：{mode}")
     if default_code_root is not None:

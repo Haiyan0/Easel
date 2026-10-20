@@ -229,3 +229,33 @@ def test_shared_runtime_paths_helper_separates_roots(tmp_path):
         module.resolve_runtime_paths({"EASEL_SERVICE_MODE": "worker"})
     local = module.resolve_runtime_paths({}, default_code_root=tmp_path / "code")
     assert local.workspace_root == (tmp_path / "code").resolve()
+
+
+@pytest.mark.parametrize(("variable", "relative"), [
+    # 代码根落在可写数据根内部
+    ("EASEL_CODE_ROOT", ("workspace", "code")),
+    # 可写数据根落在代码根内部
+    ("EASEL_WORKSPACE_ROOT", ("code", "workspace")),
+    ("EASEL_STATE_ROOT", ("code", "state")),
+    ("HOME", ("code", "home")),
+    # 代码根与数据根相等
+    ("EASEL_WORKSPACE_ROOT", ("code",)),
+    # EASEL_ROOT 别名指向代码根或其它目录
+    ("EASEL_ROOT", ("code",)),
+    ("EASEL_ROOT", ("other",)),
+])
+def test_shared_runtime_paths_helper_applies_worker_path_constraints(
+        tmp_path, variable, relative):
+    module = load_runtime_paths_module()
+    value = tmp_path.joinpath(*relative)
+    with pytest.raises(module.RuntimePathError):
+        module.resolve_runtime_paths(
+            worker_roots(tmp_path, **{variable: str(value)}))
+
+
+def test_shared_runtime_paths_helper_accepts_matching_easel_root_alias(tmp_path):
+    module = load_runtime_paths_module()
+    paths = module.resolve_runtime_paths(worker_roots(
+        tmp_path, EASEL_ROOT=str(tmp_path / "workspace")))
+    assert paths.workspace_root == (tmp_path / "workspace").resolve()
+    assert paths.code_root == (tmp_path / "code").resolve()

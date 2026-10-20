@@ -97,6 +97,49 @@ def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
     return snapshot, admission
 
 
+class _WorkerExecutionRejected(Exception):
+    """worker 执行门禁拒绝：重复 run/nonce 或快照已失效。"""
+
+    def __init__(self, detail: str, status: int) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+
+def _worker_execution_claim() -> None:
+    """真正启动 Harness 前校验快照时效并原子认领本次 run/nonce 执行。
+
+    认领记录与接纳同在 state_root 的持久 SQLite：同进程重复、进程重载和
+    并发请求读到的都是同一条记录，只有首次 accepted→running 能进入适配器。
+    时效只在启动边界检查一次，已合法启动的在途执行可正常完成。
+    """
+    snapshot = _WORKER_SNAPSHOT
+    if snapshot is None:
+        return
+    if not snapshot.nonce:
+        raise _WorkerExecutionRejected("worker 配置快照缺少 nonce", 403)
+    if _WORKER_IDENTITY is not None:
+        expected_run = (os.environ.get("EASEL_RUN_ID") or "").strip()
+        if (snapshot.workspace_id != _WORKER_IDENTITY.workspace_id
+                or (expected_run and snapshot.run_id != expected_run)):
+            raise _WorkerExecutionRejected("worker 配置快照绑定不匹配", 403)
+    if int(snapshot.expires_at) <= int(time.time()):
+        raise _WorkerExecutionRejected(
+            "worker 配置快照已过期，拒绝启动新执行", 403)
+    store = SnapshotAdmissionStore(
+        _RUNTIME_PATHS.state_root / "snapshot_admissions.sqlite3")
+    try:
+        store.admit(snapshot)
+        claim = store.claim_execution(snapshot)
+    except DomainError as error:
+        raise _WorkerExecutionRejected(
+            "worker 执行认领冲突" if error.status == 409
+            else "worker 执行认领失败", error.status) from error
+    if not claim["execute"]:
+        raise _WorkerExecutionRejected(
+            f"该 worker 运行已执行（{claim['state']}），拒绝重复启动", 409)
+
+
 if _SERVICE_MODE == "worker":
     _WORKER_SNAPSHOT, _WORKER_ADMISSION = _load_worker_runtime()
 try:
@@ -3099,6 +3142,8 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             raise HarnessError("此会话正在另一个窗口运行，请稍后再试")
         if _chat_backend(sk) != runtime:
             raise HarnessError("底座已切换，请使用新对话重试")
+        # worker：真实执行及任何本轮副作用之前，先做持久化原子认领与时效校验
+        _worker_execution_claim()
         record = harness_store.binding(SESSIONS_DIR, sk)
         native_id = record.get("native_id", "")
         harness_store.bind(SESSIONS_DIR, sk, runtime, native_id)
@@ -3147,6 +3192,11 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
         reason = "timeout"
         error_message = "Agent 执行超时，已终止本轮进程"
         emit("error", error_message)
+    except _WorkerExecutionRejected as error:
+        # 保留明确的 403/409 给非流式入口；流式入口先收到 error 事件再收尾
+        error_message = _scrub_secrets(error.detail)
+        emit("error", error_message)
+        raise HTTPException(error.status, error_message) from error
     except (HarnessError, HTTPException) as error:
         error_message = _scrub_secrets(str(error.detail if isinstance(error, HTTPException) else error))
         emit("error", error_message)

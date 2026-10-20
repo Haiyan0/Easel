@@ -134,7 +134,8 @@ def test_web_worker_uses_managed_command_and_clean_env(tmp_path, monkeypatch):
          "broker_token": "run-token-sentinel"},
         {"runtime": "acp", "command": list(managed_command),
          "model": "managed-model", "sandbox": "read-only",
-         "codex_auto_approve": False})
+         "codex_auto_approve": False},
+        nonce="managed-nonce", expires_at=int(time.time()) + 3600)
     monkeypatch.setattr(web, "_WORKER_SNAPSHOT", snapshot)
     monkeypatch.setattr(web, "_RUNTIME_PATHS", paths)
     monkeypatch.setattr(web, "SESSIONS_DIR", paths.state_root / "sessions")

@@ -224,6 +224,52 @@ def test_same_run_with_different_nonce_or_payload_conflicts(tmp_path):
         store.admit(changed_payload)
 
 
+def test_execution_claim_is_persistent_and_only_first_runs(tmp_path):
+    database = tmp_path / "admissions.sqlite3"
+    store = SnapshotAdmissionStore(database)
+    snapshot = admitted_snapshot()
+    store.admit(snapshot)
+
+    first = store.claim_execution(snapshot)
+    assert first["execute"] is True
+    assert first["state"] == "running"
+    second = SnapshotAdmissionStore(database).claim_execution(snapshot)
+    assert second["execute"] is False
+    assert second["duplicate"] is True
+    assert second["state"] == "running"
+
+    changed_nonce = WorkerConfigSnapshot(
+        "workspace-a", "run-a", 4,
+        {"broker_token": "run-token"}, {"runtime": "acp"},
+        nonce="nonce-b", expires_at=2000)
+    with pytest.raises(DomainError) as conflict:
+        SnapshotAdmissionStore(database).claim_execution(changed_nonce)
+    assert conflict.value.status == 409
+
+
+def test_concurrent_execution_claim_starts_exactly_once(tmp_path):
+    database = tmp_path / "admissions.sqlite3"
+    snapshot = admitted_snapshot()
+    SnapshotAdmissionStore(database).admit(snapshot)
+    executed: list[int] = []
+
+    def claim_and_execute(index):
+        result = SnapshotAdmissionStore(database).claim_execution(snapshot)
+        if result["execute"]:
+            executed.append(index)
+        return result
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(claim_and_execute, range(8)))
+    assert sum(1 for result in results if result["execute"]) == 1
+    assert sum(1 for result in results if result["duplicate"]) == 7
+    assert len(executed) == 1
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT state FROM snapshot_admissions").fetchone()
+    assert row == ("running",)
+
+
 def test_concurrent_admission_starts_exactly_once(tmp_path):
     database = tmp_path / "admissions.sqlite3"
     SnapshotAdmissionStore(database)  # 建表完成后再并发
