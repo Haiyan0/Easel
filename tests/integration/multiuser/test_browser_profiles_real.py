@@ -99,6 +99,91 @@ def test_actual_skill_navigation_error_closes_browser_and_releases_lock(
         lock.release()
 
 
+def _publish_args(platform: str, keep_open: bool):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        platform=platform, profile_base=None, media=None, title="t",
+        desc="", tags="", cover="", keep_open=keep_open)
+
+
+def _install_test_platform(monkeypatch, web_publisher, platform: str):
+    monkeypatch.setitem(web_publisher.PLATFORMS, platform, {
+        "name": "本地测试", "profile": "Task7TestProfile",
+        "login_url": "data:text/html,<html><body>login</body></html>",
+        "publish_url": "data:text/html,<html><body>publish</body></html>",
+        "login_check": "#missing", "logged_out_selector": "#missing",
+        "steps": [],
+    })
+
+
+@pytest.mark.parametrize("keep_open", [False, True])
+def test_run_browser_precheck_failure_releases_lock_with_keep_open(
+        tmp_path, monkeypatch, keep_open):
+    import web_publisher
+
+    profile = tmp_path / "home" / ".easel-browser-profiles" / "test" / "default"
+    monkeypatch.setattr(web_publisher, "_profile_dir",
+                        lambda platform, base: profile)
+    _install_test_platform(monkeypatch, web_publisher, "task7-precheck")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("precheck failed")
+
+    monkeypatch.setattr(web_publisher, "_resolve_steps", fail)
+
+    with pytest.raises(RuntimeError):
+        web_publisher._run_browser(
+            _publish_args("task7-precheck", keep_open), headed=False,
+            do_publish=True)
+    lock = ProfileLock(profile)
+    lock.acquire(1.0)
+    lock.release()
+
+
+@pytest.mark.parametrize("keep_open", [False, True])
+def test_run_browser_systemexit_precheck_releases_lock_with_keep_open(
+        tmp_path, monkeypatch, keep_open):
+    import web_publisher
+
+    profile = tmp_path / "home" / ".easel-browser-profiles" / "test" / "default"
+    monkeypatch.setattr(web_publisher, "_profile_dir",
+                        lambda platform, base: profile)
+    _install_test_platform(monkeypatch, web_publisher, "task7-exit")
+    monkeypatch.setattr(web_publisher, "_settle_login",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_publisher, "_is_logged_in",
+                        lambda page, cfg: False)
+
+    with pytest.raises(SystemExit):
+        web_publisher._run_browser(
+            _publish_args("task7-exit", keep_open), headed=False,
+            do_publish=True)
+    lock = ProfileLock(profile)
+    lock.acquire(1.0)
+    lock.release()
+
+
+@pytest.mark.parametrize("keep_open", [False, True])
+def test_run_browser_success_releases_lock_with_keep_open(
+        tmp_path, monkeypatch, keep_open):
+    import web_publisher
+
+    profile = tmp_path / "home" / ".easel-browser-profiles" / "test" / "default"
+    monkeypatch.setattr(web_publisher, "_profile_dir",
+                        lambda platform, base: profile)
+    _install_test_platform(monkeypatch, web_publisher, "task7-ok")
+    monkeypatch.setattr(web_publisher, "_settle_login",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_publisher, "_is_logged_in",
+                        lambda page, cfg: True)
+
+    assert web_publisher._run_browser(
+        _publish_args("task7-ok", keep_open), headed=False, do_publish=True) == 0
+    lock = ProfileLock(profile)
+    lock.acquire(1.0)
+    lock.release()
+
+
 def test_xhtml_output_is_sandboxed_in_real_chromium(tmp_path, monkeypatch):
     import uvicorn
     import web.app as web

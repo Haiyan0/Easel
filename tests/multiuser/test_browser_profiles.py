@@ -14,8 +14,9 @@ from fastapi.testclient import TestClient
 
 import web.app as web
 from easel.control.types import WorkspacePaths
-from easel.worker.browser import BrowserProfiles
+from easel.worker.browser import BrowserProfiles, ProfileLock
 from easel.worker.guard import WorkerIdentity
+from browser_state import launch_persistent_locked
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -291,6 +292,36 @@ def test_http_logout_delete_failure_does_not_report_success(
     with BrowserProfiles(paths).persistent_profile(
             "xiaohongshu", "default", timeout=1):
         pass
+
+
+def test_lock_is_not_released_before_context_close_finishes(tmp_path):
+    profile = tmp_path / "home" / ".easel-browser-profiles" / "test" / "default"
+    profile.mkdir(parents=True)
+    started = threading.Event()
+    finished = threading.Event()
+
+    class SlowContext:
+        def close(self):
+            started.set()
+            time.sleep(0.4)
+            finished.set()
+
+    browser = launch_persistent_locked(profile, SlowContext, timeout=1)
+    closer = threading.Thread(target=browser.close)
+    closer.start()
+    try:
+        assert started.wait(2)
+        # close 尚未完成：另一个使用者不能取得锁
+        with pytest.raises(TimeoutError):
+            waited = ProfileLock(profile)
+            waited.acquire(0.1)
+    finally:
+        closer.join(timeout=5)
+    assert finished.is_set()
+    # close 完成后锁可重新获取
+    lock = ProfileLock(profile)
+    lock.acquire(0.5)
+    lock.release()
 
 
 def test_exception_inside_persistent_profile_releases_lock(tmp_path):

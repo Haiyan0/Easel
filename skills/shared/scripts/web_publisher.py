@@ -43,7 +43,7 @@ import login_transport
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快手已接入，注册表见 _READBACK_VERIFIERS）
 import human_pace  # noqa: E402  人类节奏（提交前双停顿；EASEL_PACE_SKIP=1 跳过）
-from browser_state import (browser_profile_dir,  # noqa: E402
+from browser_state import (PlaywrightOwner, browser_profile_dir,  # noqa: E402
                            launch_persistent_locked)
 from output_paths import OUTPUTS_DIR  # noqa: E402
 
@@ -593,13 +593,16 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
     cfg = PLATFORMS[a.platform]
     ctx = {"media": a.media or "", "title": a.title or "", "desc": a.desc or "",
            "tags": a.tags or "", "cover": a.cover or ""}
-    with sync_playwright() as p:
+    with PlaywrightOwner(sync_playwright) as owner:
+        p = owner.p
         browser = launch_persistent_locked(
             profile,
             lambda: p.chromium.launch_persistent_context(
                 str(profile), headless=not headed,
                 args=LAUNCH_ARGS + ["--no-proxy-server"],
                 viewport={"width": 1440, "height": 900}))
+        # keep_open 分支也会 return/异常退出：driver 关闭后再释放账号锁
+        owner.after_exit(browser.release_after_driver_exit)
         page = browser.pages[0] if browser.pages else browser.new_page()
         if not do_publish:
             try:

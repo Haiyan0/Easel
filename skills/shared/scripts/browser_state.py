@@ -122,6 +122,13 @@ class _LockedContext:
             object.__setattr__(self, "_closed", True)
             lock.release()
 
+    def release_after_driver_exit(self) -> None:
+        """Playwright driver 已关闭后释放锁；不重复调用底层 close。"""
+        if object.__getattribute__(self, "_closed"):
+            return
+        object.__setattr__(self, "_closed", True)
+        object.__getattribute__(self, "_lock").release()
+
     def __enter__(self):
         return self
 
@@ -142,7 +149,40 @@ def launch_persistent_locked(profile: str | Path, launch, *,
     return _LockedContext(context, lock)
 
 
+class PlaywrightOwner:
+    """托管 sync_playwright 生命周期，driver 退出后再执行清理回调。
+
+    用于 keep_open 等允许提前 return 的分支：无论正常返回、异常还是
+    SystemExit，都会等 Playwright ``__exit__`` 关闭底层浏览器后才释放锁。
+    """
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._manager = None
+        self.p = None
+        self._callbacks = []
+
+    def __enter__(self):
+        self._manager = self._factory()
+        self.p = self._manager.__enter__()
+        return self
+
+    def after_exit(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def __exit__(self, *exc_info):
+        try:
+            return self._manager.__exit__(*exc_info)
+        finally:
+            for callback in reversed(self._callbacks):
+                try:
+                    callback()
+                except Exception:
+                    pass
+
+
 __all__ = [
-    "LOCK_DIR_NAME", "LOCK_SUFFIX", "ProfileLock", "ProfileLockTimeout",
-    "browser_profile_dir", "launch_persistent_locked", "lock_path_for",
+    "LOCK_DIR_NAME", "LOCK_SUFFIX", "PlaywrightOwner", "ProfileLock",
+    "ProfileLockTimeout", "browser_profile_dir", "launch_persistent_locked",
+    "lock_path_for",
 ]
