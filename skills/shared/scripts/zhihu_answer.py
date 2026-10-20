@@ -266,68 +266,65 @@ def publish_answer(question_url: str, content: str, headed: bool = False, dry_ru
                 args=LAUNCH_ARGS,
                 viewport={"width": 1280, "height": 900},
             ))
-        page = ctx.new_page()
+        try:
+            page = ctx.new_page()
 
-        # 1. 打开问题页
-        print(f"[INFO] 访问问题页: {question_url}", file=sys.stderr)
-        page.goto(question_url, wait_until="networkidle", timeout=40000)
-        page.wait_for_timeout(2000)
+            # 1. 打开问题页
+            print(f"[INFO] 访问问题页: {question_url}", file=sys.stderr)
+            page.goto(question_url, wait_until="networkidle", timeout=40000)
+            page.wait_for_timeout(2000)
 
-        # 检查登录态
-        if page.query_selector(".SignContainer, .Login-content"):
-            result["error"] = "未登录知乎，请先在「账号」页扫码登录"
-            ctx.close()
+            # 检查登录态
+            if page.query_selector(".SignContainer, .Login-content"):
+                result["error"] = "未登录知乎，请先在「账号」页扫码登录"
+                return result
+
+            # 获取问题标题
+            title = ""
+            for sel in ["h1.QuestionHeader-title", "h1"]:
+                el = page.query_selector(sel)
+                if el:
+                    title = el.inner_text().strip()[:60]
+                    break
+            print(f"[INFO] 问题标题: {title}", file=sys.stderr)
+
+            if dry_run:
+                print(f"[DRY-RUN] 将回答问题：{title}", file=sys.stderr)
+                print(f"[DRY-RUN] 回答字数：{len(content)} 字", file=sys.stderr)
+                print(f"[DRY-RUN] 内容预览（前100字）：{content[:100]}...", file=sys.stderr)
+                result["success"] = True
+                result["url"] = question_url
+                result["dry_run"] = True
+                return result
+
+            # 2. 写入回答内容
+            ok = type_into_editor(page, content)
+            if not ok:
+                result["error"] = "无法写入编辑器"
+                return result
+
+            page.wait_for_timeout(1500)
+
+            # 3. 发布
+            published = _click_publish_btn(page)
+            if not published:
+                result["error"] = "未找到或无法点击发布回答按钮"
+                return result
+
+            # 4. 验证：只解析 URL 路径部分判定，不做整串子串匹配（issue #113）
+            current_url = page.url
+            print(f"[INFO] 当前页面 URL: {current_url}", file=sys.stderr)
+            outcome = classify_publish_outcome(question_url, current_url)
+            result["success"] = outcome["success"]
+            result["outcome"] = outcome["outcome"]
+            result["url"] = current_url
+            if outcome["success"]:
+                print(f"[INFO] 发布已验证: {outcome['detail']}", file=sys.stderr)
+            else:
+                result["error"] = outcome["detail"]
             return result
-
-        # 获取问题标题
-        title = ""
-        for sel in ["h1.QuestionHeader-title", "h1"]:
-            el = page.query_selector(sel)
-            if el:
-                title = el.inner_text().strip()[:60]
-                break
-        print(f"[INFO] 问题标题: {title}", file=sys.stderr)
-
-        if dry_run:
-            print(f"[DRY-RUN] 将回答问题：{title}", file=sys.stderr)
-            print(f"[DRY-RUN] 回答字数：{len(content)} 字", file=sys.stderr)
-            print(f"[DRY-RUN] 内容预览（前100字）：{content[:100]}...", file=sys.stderr)
-            result["success"] = True
-            result["url"] = question_url
-            result["dry_run"] = True
+        finally:
             ctx.close()
-            return result
-
-        # 2. 写入回答内容
-        ok = type_into_editor(page, content)
-        if not ok:
-            result["error"] = "无法写入编辑器"
-            ctx.close()
-            return result
-
-        page.wait_for_timeout(1500)
-
-        # 3. 发布
-        published = _click_publish_btn(page)
-        if not published:
-            result["error"] = "未找到或无法点击发布回答按钮"
-            ctx.close()
-            return result
-
-        # 4. 验证：只解析 URL 路径部分判定，不做整串子串匹配（issue #113）
-        current_url = page.url
-        print(f"[INFO] 当前页面 URL: {current_url}", file=sys.stderr)
-        outcome = classify_publish_outcome(question_url, current_url)
-        result["success"] = outcome["success"]
-        result["outcome"] = outcome["outcome"]
-        result["url"] = current_url
-        if outcome["success"]:
-            print(f"[INFO] 发布已验证: {outcome['detail']}", file=sys.stderr)
-        else:
-            result["error"] = outcome["detail"]
-
-        ctx.close()
-        return result
 
 
 def _selftest() -> int:

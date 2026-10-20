@@ -1,8 +1,9 @@
 """worker 持久浏览器 profile：本人 HOME 分区 + 跨进程独占锁。
 
 profile 根固定为 ``<本人 HOME>/.easel-browser-profiles``，按平台/账号分成
-``<platform>/<account_id>``。锁文件与技能脚本侧一致，均为 profile 目录下的
-``.easel.lock``；context manager 在退出时（包括异常/取消）才释放锁。
+``<platform>/<account_id>``。锁文件与技能脚本侧一致，位于 profile 父目录的
+``.locks/<profile 名>.lock``：注销删除 profile 时锁对象仍然存在。context
+manager 在退出时（包括异常/取消）才释放锁。
 
 路径只来自调用方显式传入的 :class:`WorkspacePaths`，不读取宿主 HOME。
 """
@@ -18,7 +19,14 @@ from pathlib import Path
 from easel.control.types import WorkspacePaths
 
 PROFILE_ROOT_NAME = ".easel-browser-profiles"
-LOCK_NAME = ".easel.lock"
+LOCK_DIR_NAME = ".locks"
+LOCK_SUFFIX = ".lock"
+
+
+def lock_path_for(profile: str | Path) -> Path:
+    """账号锁文件；不放在 profile 目录内，注销删除 profile 不会破坏互斥。"""
+    profile = Path(profile)
+    return profile.parent / LOCK_DIR_NAME / f"{profile.name}{LOCK_SUFFIX}"
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -37,7 +45,7 @@ class ProfileLock:
     """与 ``skills/shared/scripts/browser_state.ProfileLock`` 同一锁文件协议。"""
 
     def __init__(self, profile: str | Path):
-        self.path = Path(profile) / LOCK_NAME
+        self.path = lock_path_for(profile)
         self.fd: int | None = None
 
     def acquire(self, timeout: float = 60.0, poll: float = 0.2) -> None:
@@ -117,5 +125,5 @@ class BrowserProfiles:
             lock.release()
 
 
-__all__ = ["BrowserProfileError", "BrowserProfiles", "LOCK_NAME",
-           "PROFILE_ROOT_NAME", "ProfileLock"]
+__all__ = ["BrowserProfileError", "BrowserProfiles", "LOCK_DIR_NAME",
+           "LOCK_SUFFIX", "PROFILE_ROOT_NAME", "ProfileLock", "lock_path_for"]

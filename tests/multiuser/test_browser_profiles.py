@@ -1,6 +1,7 @@
 """Task 7：浏览器 profile 的 workspace 隔离、标识校验与跨进程锁。"""
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -9,9 +10,12 @@ import time
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+import web.app as web
 from easel.control.types import WorkspacePaths
 from easel.worker.browser import BrowserProfiles
+from easel.worker.guard import WorkerIdentity
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -58,7 +62,8 @@ def test_persistent_profile_creates_private_directory_and_releases(tmp_path):
     with manager.persistent_profile("xiaohongshu", "default",
                                     timeout=5) as profile:
         assert profile.is_dir()
-        assert (profile / ".easel.lock").is_file()
+        assert (profile.parent / ".locks"
+                / f"{profile.name}.lock").is_file()
     # 释放后可再次获取
     with manager.persistent_profile("xiaohongshu", "default", timeout=1):
         pass
@@ -125,6 +130,166 @@ def test_waiting_timeout_does_not_release_the_holder_lock(tmp_path):
                                             timeout=0.2):
                 pass
     with manager.persistent_profile("xiaohongshu", "default", timeout=5):
+        pass
+
+
+HEADERS = {"X-Easel-Workspace-Id": "ws-a",
+           "X-Easel-Service-Token": "token-a"}
+
+
+def _logout_env(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    profiles = home / ".easel-browser-profiles"
+    paths = WorkspacePaths(
+        code_root=tmp_path / "code", workspace_root=tmp_path / "workspace",
+        state_root=tmp_path / "state", home=home)
+    monkeypatch.setattr(web, "_SERVICE_MODE", "worker")
+    monkeypatch.setattr(web, "_WORKER_IDENTITY",
+                        WorkerIdentity("ws-a", "token-a"), raising=False)
+    monkeypatch.setattr(web, "BROWSER_PROFILES", profiles)
+    monkeypatch.setattr(web, "LOGIN_DIR", tmp_path / "outputs" / "_login")
+    monkeypatch.setattr(web, "LOGIN_PROCESSES", {})
+    monkeypatch.setattr(web, "_WHOAMI_CACHE", {})
+    return paths, profiles
+
+
+def _start_holder(paths: WorkspacePaths) -> subprocess.Popen:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", HOLDER.format(
+            code=str(paths.code_root), workspace=str(paths.workspace_root),
+            state=str(paths.state_root), home=str(paths.home))],
+        cwd=str(REPO), env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    assert holder.stdout.readline().strip() == "HELD"
+    return holder
+
+
+def test_http_logout_waits_for_profile_lock_and_reports_busy(
+        tmp_path, monkeypatch):
+    paths, profiles = _logout_env(tmp_path, monkeypatch)
+    profile = profiles / "xiaohongshu" / "default"
+    profile.mkdir(parents=True)
+    sentinel = profile / "cookie-sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    other = profiles / "douyin" / "default"
+    other.mkdir(parents=True)
+    other_sentinel = other / "cookie-sentinel.txt"
+    other_sentinel.write_text("other", encoding="utf-8")
+
+    holder = _start_holder(paths)
+    try:
+        with TestClient(web.app, base_url="http://127.0.0.1:7860",
+                        client=("203.0.113.10", 50000)) as client:
+            busy = client.post("/api/logout/xiaohongshu", headers=HEADERS)
+            assert busy.status_code == 409, busy.text
+            assert sentinel.is_file(), "持锁期间不得删除账号 sentinel"
+            assert profile.is_dir()
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+    with TestClient(web.app, base_url="http://127.0.0.1:7860",
+                    client=("203.0.113.10", 50000)) as client:
+        done = client.post("/api/logout/xiaohongshu", headers=HEADERS)
+    assert done.status_code == 200, done.text
+    assert done.json()["ok"] is True
+    assert not profile.exists()
+    assert other_sentinel.is_file(), "A 注销不得影响 B"
+    lock_file = profile.parent / ".locks" / f"{profile.name}.lock"
+    assert lock_file.is_file(), "锁文件必须独立于 profile 目录存活"
+
+
+def test_wechat_logout_waits_for_login_process_exit_before_delete(
+        tmp_path, monkeypatch):
+    _, profiles = _logout_env(tmp_path, monkeypatch)
+    profile = profiles / "wechat-oa" / "default"
+    profile.mkdir(parents=True)
+    (profile / "cookie-sentinel.txt").write_text("keep", encoding="utf-8")
+    events: list[str] = []
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            events.append("wait")
+            return 0
+
+    real_rmtree = web.shutil.rmtree
+
+    def tracked_rmtree(path, *args, **kwargs):
+        events.append("rmtree")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setitem(web.LOGIN_PROCESSES, "wechat-oa-mp", FakeProc())
+    monkeypatch.setattr(web.shutil, "rmtree", tracked_rmtree)
+    monkeypatch.setattr(web, "_wechat_clear_credentials",
+                        lambda: events.append("clear"))
+
+    result = asyncio.run(web.api_logout("wechat-oa"))
+
+    assert result["ok"] is True
+    assert events.index("wait") < events.index("rmtree") < events.index("clear")
+    assert not profile.exists()
+
+
+def test_wechat_logout_process_exit_timeout_does_not_delete(
+        tmp_path, monkeypatch):
+    _, profiles = _logout_env(tmp_path, monkeypatch)
+    profile = profiles / "wechat-oa" / "default"
+    profile.mkdir(parents=True)
+    sentinel = profile / "cookie-sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    cleared: list[int] = []
+
+    class StuckProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise web.subprocess.TimeoutExpired("login", timeout)
+
+    monkeypatch.setitem(web.LOGIN_PROCESSES, "wechat-oa-mp", StuckProc())
+    monkeypatch.setattr(web, "_wechat_clear_credentials",
+                        lambda: cleared.append(1))
+
+    with pytest.raises(web.HTTPException) as error:
+        asyncio.run(web.api_logout("wechat-oa"))
+    assert error.value.status_code == 409
+    assert sentinel.is_file()
+    assert cleared == []
+
+
+def test_http_logout_delete_failure_does_not_report_success(
+        tmp_path, monkeypatch):
+    paths, profiles = _logout_env(tmp_path, monkeypatch)
+    profile = profiles / "xiaohongshu" / "default"
+    profile.mkdir(parents=True)
+    sentinel = profile / "cookie-sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    def failing_rmtree(*args, **kwargs):
+        raise PermissionError("locked file")
+
+    monkeypatch.setattr(web.shutil, "rmtree", failing_rmtree)
+
+    with TestClient(web.app, base_url="http://127.0.0.1:7860",
+                    client=("203.0.113.10", 50000)) as client:
+        response = client.post("/api/logout/xiaohongshu", headers=HEADERS)
+    assert response.status_code >= 400, response.text
+    assert '"ok": true' not in response.text
+    assert sentinel.is_file()
+    # 删除失败也必须释放锁，后续任务可重试
+    with BrowserProfiles(paths).persistent_profile(
+            "xiaohongshu", "default", timeout=1):
         pass
 
 

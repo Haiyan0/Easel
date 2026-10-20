@@ -50,49 +50,50 @@ def fetch_comments(article_url: str, limit: int = 100):
                 args=["--no-sandbox",
                       "--disable-blink-features=AutomationControlled"],
             ))
-        page = browser.new_page()
-        page.on("response", on_response)
-
-        print(f"[INFO] 访问文章: {article_url}", file=sys.stderr)
-        page.goto(article_url, timeout=40000, wait_until="networkidle")
-        time.sleep(3)
-
-        # 滚动页面触发懒加载评论
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-
-        # 如果评论数不够，尝试点击「加载更多」
         try:
-            more = page.locator("text=查看全部评论").or_(page.locator("text=加载更多"))
-            if more.count() > 0:
-                more.first.click(timeout=5000)
-                time.sleep(2)
-        except Exception:
-            pass
+            page = browser.new_page()
+            page.on("response", on_response)
 
-        # 最后 dump 页面里能看到的评论文字作为备用
-        if not captured:
-            print("[WARN] 未拦截到评论 API，尝试从页面 DOM 提取", file=sys.stderr)
-            texts = page.evaluate("""
-            () => {
-                const sel = [
-                    '.CommentContent', '.comment-content', '[class*="CommentItem"] p',
-                    '[data-za-detail-view-element_name="Comment"] p',
-                ];
-                for (const s of sel) {
-                    const els = document.querySelectorAll(s);
-                    if (els.length > 0) return Array.from(els).map(e => e.innerText.trim());
+            print(f"[INFO] 访问文章: {article_url}", file=sys.stderr)
+            page.goto(article_url, timeout=40000, wait_until="networkidle")
+            time.sleep(3)
+
+            # 滚动页面触发懒加载评论
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(2)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(2)
+
+            # 如果评论数不够，尝试点击「加载更多」
+            try:
+                more = page.locator("text=查看全部评论").or_(page.locator("text=加载更多"))
+                if more.count() > 0:
+                    more.first.click(timeout=5000)
+                    time.sleep(2)
+            except Exception:
+                pass
+
+            # 最后 dump 页面里能看到的评论文字作为备用
+            if not captured:
+                print("[WARN] 未拦截到评论 API，尝试从页面 DOM 提取", file=sys.stderr)
+                texts = page.evaluate("""
+                () => {
+                    const sel = [
+                        '.CommentContent', '.comment-content', '[class*="CommentItem"] p',
+                        '[data-za-detail-view-element_name="Comment"] p',
+                    ];
+                    for (const s of sel) {
+                        const els = document.querySelectorAll(s);
+                        if (els.length > 0) return Array.from(els).map(e => e.innerText.trim());
+                    }
+                    return [];
                 }
-                return [];
-            }
-            """)
-            for t in texts:
-                if t:
-                    captured.append({"id": None, "author": "", "content": t, "vote_count": 0, "created_time": 0, "reply_to": ""})
-
-        browser.close()
+                """)
+                for t in texts:
+                    if t:
+                        captured.append({"id": None, "author": "", "content": t, "vote_count": 0, "created_time": 0, "reply_to": ""})
+        finally:
+            browser.close()
     return captured
 
 

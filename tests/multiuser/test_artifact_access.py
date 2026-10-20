@@ -21,6 +21,12 @@ def make_outputs(tmp_path: Path) -> Path:
         "<html><body>ok</body></html>", encoding="utf-8")
     (outputs / "成都文旅" / "预览.SVG").write_text(
         "<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    (outputs / "成都文旅" / "文档.xhtml").write_text(
+        "<html xmlns='http://www.w3.org/1999/xhtml'><body>ok</body></html>",
+        encoding="utf-8")
+    (outputs / "成都文旅" / "文档大写.XHTML").write_text(
+        "<html xmlns='http://www.w3.org/1999/xhtml'><body>ok</body></html>",
+        encoding="utf-8")
     (outputs / "成都文旅" / "封面.png").write_bytes(b"png")
     (outputs / "_login").mkdir()
     (outputs / "_login" / "xiaohongshu.json").write_text(
@@ -108,8 +114,9 @@ def test_path_traversal_and_absolute_paths_are_rejected(
         assert client.get(url).status_code in (403, 404)
 
 
-@pytest.mark.parametrize("name", ["成品.html", "预览.SVG"])
-def test_html_and_svg_previews_are_sandboxed(artifact_client, name):
+@pytest.mark.parametrize("name", ["成品.html", "预览.SVG", "文档.xhtml",
+                                   "文档大写.XHTML"])
+def test_executable_document_previews_are_sandboxed(artifact_client, name):
     client, _ = artifact_client
     response = client.get(f"/api/media/成都文旅/{name}")
     assert response.status_code == 200
@@ -121,12 +128,22 @@ def test_html_and_svg_previews_are_sandboxed(artifact_client, name):
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
-def test_html_head_request_is_also_sandboxed(artifact_client):
+@pytest.mark.parametrize("name", ["成品.html", "文档.xhtml"])
+def test_executable_document_head_request_is_also_sandboxed(
+        artifact_client, name):
     client, _ = artifact_client
-    response = client.head("/api/media/成都文旅/成品.html")
+    response = client.head(f"/api/media/成都文旅/{name}")
     assert response.status_code == 200
     assert "sandbox" in response.headers["content-security-policy"]
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_xhtml_response_media_type_is_explicit(artifact_client):
+    client, _ = artifact_client
+    response = client.get("/api/media/成都文旅/文档.xhtml")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/xhtml+xml")
 
 
 def test_login_qr_png_remains_accessible_but_other_internal_media_does_not(
@@ -176,6 +193,87 @@ def test_windows_junction_escape_is_rejected(artifact_client):
         pytest.skip(f"无法创建 junction：{result.stderr.strip()}")
     assert client.get(
         "/api/media/成都文旅/junction/xiaohongshu.json").status_code == 403
+
+
+def _junction(link: Path, target: Path) -> bool:
+    if os.name != "nt":
+        return False
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return result.returncode == 0
+
+
+def test_output_tree_skips_junction_to_private_and_external_dirs(
+        artifact_client, tmp_path):
+    client, outputs = artifact_client
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "internal-sentinel.txt").write_text("secret", encoding="utf-8")
+    (private / ".easel.json").write_text(
+        '{"title": "PRIVATE_METADATA_SENTINEL"}', encoding="utf-8")
+    if not _junction(outputs / "linked-project", private):
+        pytest.skip("当前环境不允许创建 junction")
+    if not _junction(outputs / "成都文旅" / "nested-link", private):
+        pytest.skip("当前环境不允许创建嵌套 junction")
+
+    response = client.get("/api/outputs")
+    assert response.status_code == 200
+    body = response.text
+    assert "internal-sentinel" not in body
+    assert "PRIVATE_METADATA_SENTINEL" not in body
+    assert "linked-project" not in body
+    assert "nested-link" not in body
+    # 普通项目仍完整
+    assert "成都文旅" in body and "成品.html" in body
+
+
+def test_output_tree_survives_junction_cycle(artifact_client):
+    client, outputs = artifact_client
+    loop = outputs / "成都文旅" / "loop"
+    if not _junction(loop, outputs / "成都文旅"):
+        pytest.skip("当前环境不允许创建 junction")
+    response = client.get("/api/outputs")
+    assert response.status_code == 200
+    data = response.json()
+    assert any(item["name"] == "成都文旅" for item in data)
+
+    def has_expanded_loop(node: dict) -> bool:
+        if str(node.get("path", "")).startswith("成都文旅/loop/"):
+            return True
+        return any(has_expanded_loop(child)
+                   for child in node.get("children", []))
+
+    assert not any(has_expanded_loop(item) for item in data), \
+        "环必须被切断，不得展开 loop/loop/..."
+
+
+def test_output_tree_skips_junction_to_internal_login(artifact_client):
+    client, outputs = artifact_client
+    if not _junction(outputs / "login-link", outputs / "_login"):
+        pytest.skip("当前环境不允许创建 junction")
+    response = client.get("/api/outputs")
+    assert response.status_code == 200
+    assert "login-link" not in response.text
+    assert "xiaohongshu" not in response.text
+
+
+def test_project_metadata_symlink_to_private_is_not_read(
+        artifact_client, tmp_path):
+    client, outputs = artifact_client
+    private = tmp_path / "private-meta.json"
+    private.write_text('{"title": "PRIVATE_METADATA_SENTINEL"}',
+                       encoding="utf-8")
+    link = outputs / "成都文旅" / ".easel.json"
+    if link.exists():
+        return
+    try:
+        os.symlink(private, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("当前环境不允许创建符号链接")
+    response = client.get("/api/outputs")
+    assert response.status_code == 200
+    assert "PRIVATE_METADATA_SENTINEL" not in response.text
 
 
 def test_worker_upload_local_still_denied(tmp_path, monkeypatch):

@@ -1,12 +1,19 @@
 """Task 7 真实 Chromium：临时 context 隔离、持久 profile 保留与锁释放。"""
 from __future__ import annotations
 
+import socket
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from easel.control.types import WorkspacePaths
-from easel.worker.browser import BrowserProfiles
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "skills" / "shared" / "scripts"))
+
+from easel.control.types import WorkspacePaths  # noqa: E402
+from easel.worker.browser import BrowserProfiles, ProfileLock  # noqa: E402
 
 playwright = pytest.importorskip("playwright.sync_api")
 sync_playwright = playwright.sync_playwright
@@ -72,6 +79,64 @@ def test_persistent_profile_keeps_cookie_across_restart(tmp_path):
                 assert cookies.get("persisted") == "yes"
             finally:
                 context.close()
+
+
+def test_actual_skill_navigation_error_closes_browser_and_releases_lock(
+        tmp_path, monkeypatch):
+    import zhihu_comments_fetch
+    import zhihu_answer
+
+    profile = tmp_path / "home" / ".easel-browser-profiles" / "zhihu" / "default"
+    for module in (zhihu_comments_fetch, zhihu_answer):
+        monkeypatch.setattr(module, "PROFILE_DIR", profile, raising=False)
+        with pytest.raises(Exception):
+            if module is zhihu_comments_fetch:
+                module.fetch_comments("bad://invalid")
+            else:
+                module.publish_answer("bad://invalid", "正文", dry_run=True)
+        lock = ProfileLock(profile)
+        lock.acquire(0.5)
+        lock.release()
+
+
+def test_xhtml_output_is_sandboxed_in_real_chromium(tmp_path, monkeypatch):
+    import uvicorn
+    import web.app as web
+
+    outputs = tmp_path / "outputs"
+    (outputs / "project").mkdir(parents=True)
+    (outputs / "project" / "poc.xhtml").write_text(
+        "<?xml version='1.0' encoding='utf-8'?>"
+        "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>SAFE</title>"
+        "</head><body><script>"
+        "document.title='EXECUTED_SENTINEL';window.__executed=true;"
+        "</script></body></html>", encoding="utf-8")
+    monkeypatch.setattr(web, "OUTPUTS_DIR", outputs)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        web.app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.05)
+    assert server.started, "本地 ASGI 服务未启动"
+    try:
+        with sync_playwright() as p:
+            browser = _launch_or_skip(p)
+            try:
+                page = browser.new_page()
+                page.goto(f"http://127.0.0.1:{port}/api/media/project/poc.xhtml",
+                          wait_until="load")
+                assert page.title() == "SAFE"
+                assert page.evaluate("window.__executed") is None
+            finally:
+                browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
 
 
 def test_exception_while_browser_open_releases_profile_lock(tmp_path):

@@ -602,52 +602,54 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
                 viewport={"width": 1440, "height": 900}))
         page = browser.pages[0] if browser.pages else browser.new_page()
         if not do_publish:
-            page.goto(cfg["login_url"])
-            print(f"已打开 {cfg['name']} 登录页，请在浏览器完成登录（扫码等），登录态保存在 {profile}。",
-                  file=sys.stderr)
-            print("登录完成后按 Enter 关闭 ...", file=sys.stderr)
             try:
-                input()
-            except EOFError:
-                pass
-            browser.close()
+                page.goto(cfg["login_url"])
+                print(f"已打开 {cfg['name']} 登录页，请在浏览器完成登录（扫码等），登录态保存在 {profile}。",
+                      file=sys.stderr)
+                print("登录完成后按 Enter 关闭 ...", file=sys.stderr)
+                try:
+                    input()
+                except EOFError:
+                    pass
+            finally:
+                browser.close()
             return 0
         # publish：按媒体类型选步骤——图片且平台有图文流程走 steps_image，否则默认 steps
-        steps = _resolve_steps(a.platform, ctx, _steps_key_for(cfg, a.media))
-        # 发布前登录预检：未登录时发布页会被重定向到落地页，后续 upload 找不到 input 会晦涩超时——提前明确报错
         try:
-            page.goto(cfg["publish_url"], wait_until="domcontentloaded")
-        except Exception:
-            pass
-        # 快手等 SPA 发布页外壳（login_check 选择器）渲染偏慢，实测 5–10s+- 不等；
-        # 单次 _settle_login(7s) 输给渲染会误判未登录（strict 模式下选择器不命中即未登录）→
-        # 重复 settle + 判定数轮，给慢渲染的登录外壳足够时间，绝不因竞态把有效会话判成未登录。
-        logged = False
-        for _i in range(4):
+            steps = _resolve_steps(a.platform, ctx, _steps_key_for(cfg, a.media))
+            # 发布前登录预检：未登录时发布页会被重定向到落地页，后续 upload 找不到 input 会晦涩超时——提前明确报错
             try:
-                _settle_login(page, cfg)  # 等客户端跳转/登录外壳渲染落定
+                page.goto(cfg["publish_url"], wait_until="domcontentloaded")
             except Exception:
                 pass
-            if _is_logged_in(page, cfg):
-                logged = True
-                break
-            try:
-                page.wait_for_timeout(1500)
-            except Exception:
-                break
-        if not logged:
-            _die(f"{cfg['name']}未登录：发布页被重定向到登录/落地页。请先在账号页扫码登录后重试。", 6)
-        # 外壳已登录但发布子系统鉴权可能已失效（快手 onvideo token 短命）→ 提前明确报错，
-        # 避免后续 upload 因发布态失效而晦涩超时。仅明确失效才拦，瞬时错误放行。
-        if cfg.get("login_probe") and _probe_publish_auth(page, cfg) == "expired":
-            _die(f"{cfg['name']}登录态已失效（发布子系统未授权）：外壳虽显示已登录，但发布上传鉴权已过期。请在账号页重新扫码登录后重试。", 6)
-        # 读回平台：发前快照（读回时排除旧作品的硬证据；失败不影响发布）
-        snapshot_ids: set[str] = set()
-        if cfg.get("readback"):
-            snapshot_ids = _readback_capture(a.platform, page)
-        submitted_at_ms: int | None = None   # 「提交动作」时间戳（commit 标记步记录，读回时间窗基准）
-        flow_started_ms = int(time.time() * 1000)
-        try:
+            # 快手等 SPA 发布页外壳（login_check 选择器）渲染偏慢，实测 5–10s+- 不等；
+            # 单次 _settle_login(7s) 输给渲染会误判未登录（strict 模式下选择器不命中即未登录）→
+            # 重复 settle + 判定数轮，给慢渲染的登录外壳足够时间，绝不因竞态把有效会话判成未登录。
+            logged = False
+            for _i in range(4):
+                try:
+                    _settle_login(page, cfg)  # 等客户端跳转/登录外壳渲染落定
+                except Exception:
+                    pass
+                if _is_logged_in(page, cfg):
+                    logged = True
+                    break
+                try:
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    break
+            if not logged:
+                _die(f"{cfg['name']}未登录：发布页被重定向到登录/落地页。请先在账号页扫码登录后重试。", 6)
+            # 外壳已登录但发布子系统鉴权可能已失效（快手 onvideo token 短命）→ 提前明确报错，
+            # 避免后续 upload 因发布态失效而晦涩超时。仅明确失效才拦，瞬时错误放行。
+            if cfg.get("login_probe") and _probe_publish_auth(page, cfg) == "expired":
+                _die(f"{cfg['name']}登录态已失效（发布子系统未授权）：外壳虽显示已登录，但发布上传鉴权已过期。请在账号页重新扫码登录后重试。", 6)
+            # 读回平台：发前快照（读回时排除旧作品的硬证据；失败不影响发布）
+            snapshot_ids: set[str] = set()
+            if cfg.get("readback"):
+                snapshot_ids = _readback_capture(a.platform, page)
+            submitted_at_ms: int | None = None   # 「提交动作」时间戳（commit 标记步记录，读回时间窗基准）
+            flow_started_ms = int(time.time() * 1000)
             if a.platform == "weixin-channels":
                 # 视频号走专用流程（SPA 导航 + iframe 创作器），通用 steps 不适用 → 跳过
                 _publish_weixin_channels(page, ctx)
@@ -1558,8 +1560,8 @@ def cmd_whoami(a) -> int:
                 lambda: p.chromium.launch_persistent_context(
                     str(profile), headless=True, locale="zh-CN",
                     args=LAUNCH_ARGS + ["--no-proxy-server"]))
-            page = browser.pages[0] if browser.pages else browser.new_page()
             try:
+                page = browser.pages[0] if browser.pages else browser.new_page()
                 _block_heavy(browser, a.platform, login_assets=False)
                 _observe_channels_account(browser, cfg)
                 account = _authenticated_account(browser, cfg)

@@ -161,7 +161,7 @@ def _cloak_executable() -> Path | None:
 
 
 # 同一份 XiaohongshuProfile 不能同时开两个 Cloak：账号页 whoami 和登录会把内核打成 exit 21。
-# 锁实现统一在 browser_state，所有脚本与 worker 使用同一 .easel.lock 协议。
+# 锁实现统一在 browser_state，所有脚本与 worker 使用同一 .locks/<profile>.lock 协议。
 class _ProfileLock(_ProfileLockBase):
     """沿用本模块的 time 计时，兼容既有登录循环的时钟注入测试。"""
 

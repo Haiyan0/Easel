@@ -299,6 +299,7 @@ if str(SHARED_SCRIPTS) not in sys.path:
 
 from model_registry import model_group
 from runtime_paths import state_path as private_state_path
+from browser_state import ProfileLock as BrowserProfileLock
 
 BROWSER_PROFILES = _RUNTIME_PATHS.home / ".easel-browser-profiles"
 LOGIN_DIR = OUTPUTS_DIR / "_login"
@@ -318,12 +319,70 @@ _WHOAMI_LOCK = threading.Lock()
 _WHOAMI_TASKS: dict[str, asyncio.Task] = {}
 _LOGIN_START_LOCKS: dict[str, asyncio.Lock] = {}
 
+# 浏览器会作为同源文档执行脚本的媒体类型；按 Content-Type 判定而不是补文件名黑名单。
+EXECUTABLE_DOCUMENT_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "image/svg+xml",
+    "application/xml", "text/xml",
+})
+
+
+def _media_type(path: Path) -> str:
+    guessed = mimetypes.guess_type(path.name)[0]
+    return (guessed or "application/octet-stream").lower()
+
+
+def _is_executable_document(media_type: str) -> bool:
+    value = media_type.split(";", 1)[0].strip().lower()
+    return value in EXECUTABLE_DOCUMENT_TYPES or value.endswith("+xml")
+
 def _browser_profile_path(platform: str) -> Path | None:
     """平台持久 profile：worker 用 <platform>/<account>；local 保留旧目录名。"""
     if _SERVICE_MODE == "worker":
         return BROWSER_PROFILES / platform / "default"
     name = (LOGIN_RUNNERS.get(platform) or {}).get("profile")
     return BROWSER_PROFILES / name if name else None
+
+
+def _delete_profile_locked(profile: Path) -> bool:
+    """持统一账号锁删除 profile；锁文件在 profile 外，删除不破坏互斥。"""
+    lock = BrowserProfileLock(profile)
+    lock.acquire(1.0)
+    try:
+        if not profile.is_dir():
+            return False
+        shutil.rmtree(profile)   # 不使用 ignore_errors：失败必须上抛
+        return True
+    finally:
+        lock.release()
+
+
+async def _logout_delete_profile(profile_path: Path | None) -> bool:
+    if profile_path is None:
+        return False
+    resolved = profile_path.resolve()
+    root = BROWSER_PROFILES.resolve()
+    if (resolved.parent != profile_path.parent.resolve()
+            or resolved.name != profile_path.name
+            or root not in resolved.parents):
+        raise HTTPException(403, '账号目录越界，拒绝删除')
+    try:
+        return await asyncio.to_thread(_delete_profile_locked, resolved)
+    except TimeoutError:
+        raise HTTPException(409, '账号正在使用（登录/发布/统计），请稍后重试注销') from None
+    except OSError as error:
+        raise HTTPException(409, f'账号目录删除失败，请稍后重试：{error}') from None
+
+
+async def _stop_login_process(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        await asyncio.to_thread(proc.wait, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(409, '登录进程仍在退出，请稍后重试注销') from None
+    except OSError:
+        pass
 
 
 LOGIN_RUNNERS: dict[str, dict] = {
@@ -334,7 +393,8 @@ LOGIN_RUNNERS: dict[str, dict] = {
     "bilibili": {"name": "B站", "backend": "biliup"},
     "douyin": {"name": "抖音", "backend": "douyin", "profile": "DouyinProfile"},
     # 微信公众号：扫码登录后台会话（发布+数据都走它），backend=='wechat-oa' 在各处单独分支处理。
-    "wechat-oa": {"name": "微信公众号", "backend": "wechat-oa"},
+    "wechat-oa": {"name": "微信公众号", "backend": "wechat-oa",
+                  "profile": "WeixinMpProfile"},
 }
 
 # ---- 微信公众号（wechat-oa）凭证式接入 ----
@@ -1229,21 +1289,71 @@ def _file_meta(f: Path, rel: str) -> dict:
     return {'name': f.name, 'path': rel, 'kind': _file_kind(f.name), 'mtime': mtime, 'size': size}
 
 
-def _build_output_node(path: Path, rel: str) -> dict:
-    """递归构建产物树节点：文件→file 节点；目录→dir 节点带 children + 递归 fileCount。"""
-    if path.is_dir():
-        children = []
-        for c in sorted(path.iterdir()):
-            if c.name.startswith('.'):   # 嵌套层只跳隐藏文件；_base.mp4 等以 _ 开头的产物要保留
-                continue
-            children.append(_build_output_node(c, f'{rel}/{c.name}'))
-        mtime = max((x['mtime'] for x in children), default=int(path.stat().st_mtime))
-        file_count = sum(x.get('fileCount', 1) if x['type'] == 'dir' else 1 for x in children)
+def _safe_tree_target(path: Path) -> Path | None:
+    """把树节点解析到 outputs 内的真实路径；越界、内部状态或坏 reparse 返回 None。"""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    root = OUTPUTS_DIR.resolve()
+    if resolved == root or root not in resolved.parents:
+        return None
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        return None
+    if _internal_output_path(relative):
+        return None
+    return resolved
+
+
+def _build_output_node(path: Path, rel: str, seen: set[Path]) -> dict | None:
+    """递归构建产物树节点；只沿已解析且仍在 outputs 内的目标遍历，并切断递归环。"""
+    target = _safe_tree_target(path)
+    if target is None:
+        return None
+    if target.is_dir():
+        if target in seen:   # 环：保留节点名但不再展开，避免无限递归
+            return {'name': path.name, 'type': 'dir', 'path': rel, 'mtime': 0,
+                    'children': [], 'fileCount': 0, 'cycle': True}
+        seen.add(target)
+        try:
+            try:
+                entries = sorted(path.iterdir())
+            except OSError:
+                entries = []
+            children = []
+            for c in entries:
+                if c.name.startswith('.'):   # 嵌套层只跳隐藏文件；_base.mp4 等保留
+                    continue
+                node = _build_output_node(c, f'{rel}/{c.name}', seen)
+                if node is not None:
+                    children.append(node)
+        finally:
+            seen.discard(target)
+        try:
+            fallback = int(target.stat().st_mtime)
+        except OSError:
+            fallback = 0
+        mtime = max((x['mtime'] for x in children), default=fallback)
+        file_count = sum(x.get('fileCount', 1) if x['type'] == 'dir' else 1
+                         for x in children)
         return {'name': path.name, 'type': 'dir', 'path': rel, 'mtime': mtime,
                 'children': children, 'fileCount': file_count}
-    m = _file_meta(path, rel)
+    if not target.is_file():
+        return None
+    m = _file_meta(target, rel)
+    m['name'] = path.name
     m['type'] = 'file'
     return m
+
+
+def _project_file(proj: Path, name: str) -> Path | None:
+    """项目内声明的文件；解析后必须仍在 outputs 且不是内部状态。"""
+    if not isinstance(name, str) or not name:
+        return None
+    target = _safe_tree_target(proj / name)
+    return target if target is not None and target.is_file() else None
 
 
 def _read_project_meta(proj: Path) -> dict:
@@ -1252,11 +1362,12 @@ def _read_project_meta(proj: Path) -> dict:
     只取展示相关字段（不含编排 steps）。cover 解析优先级：
     展示头声明的 cover → 首个成品媒体 → 目录内首张图/视频（兜底）。
     """
-    mf = proj / ".easel.json"
-    if not mf.is_file():
+    project = _safe_tree_target(proj)
+    meta_file = _safe_tree_target(proj / ".easel.json")
+    if project is None or meta_file is None or not meta_file.is_file():
         return {}
     try:
-        data = json.loads(mf.read_text(encoding="utf-8"))
+        data = json.loads(meta_file.read_text(encoding="utf-8"))
     except Exception:
         return {}
     meta = {k: data.get(k) for k in
@@ -1265,24 +1376,23 @@ def _read_project_meta(proj: Path) -> dict:
     if not meta:
         return {}
 
-    def _rel_if_exists(name: str) -> str:
-        return f"{proj.name}/{name}" if name and (proj / name).is_file() else ""
-
-    # 封面解析
+    # 封面解析：只接受解析后仍在 outputs 内的真实文件
     cover_rel = ""
     declared = data.get("cover")
-    if declared and (proj / declared).is_file():
+    if isinstance(declared, str) and _project_file(project, declared):
         cover_rel = f"{proj.name}/{declared}"
     if not cover_rel:
         for d in (data.get("deliverables") or []):
-            if _file_kind(d) in ("image", "video") and (proj / d).is_file():
+            if (isinstance(d, str) and _file_kind(d) in ("image", "video")
+                    and _project_file(project, d)):
                 cover_rel = f"{proj.name}/{d}"
                 break
     if cover_rel:
         meta["cover"] = cover_rel
     # 成品路径（前端「成品区」高亮用）：解析为 outputs 相对路径，只留真实存在的
-    meta["deliverablePaths"] = [f"{proj.name}/{d}" for d in (data.get("deliverables") or [])
-                                if (proj / d).is_file()]
+    meta["deliverablePaths"] = [
+        f"{proj.name}/{d}" for d in (data.get("deliverables") or [])
+        if isinstance(d, str) and _project_file(project, d)]
     return meta
 
 
@@ -1290,14 +1400,17 @@ def get_output_tree() -> list[dict]:
     if not OUTPUTS_DIR.is_dir():
         return []
     items = []
+    seen: set[Path] = set()
     for e in sorted(OUTPUTS_DIR.iterdir()):
         # 内容库只展示「项目目录」：跳过系统目录(_login/_publish/...)、隐藏项、
         # 以及根目录散文件（按新规约产物必在项目目录内，根散文件=系统状态/残渣）。
         if e.name.startswith('.') or e.name.startswith('_'):
             continue
-        if not e.is_dir() or e.name in SYSTEM_TOPLEVEL_DIRS:
+        if e.name in SYSTEM_TOPLEVEL_DIRS:
             continue
-        node = _build_output_node(e, e.name)
+        node = _build_output_node(e, e.name, seen)
+        if node is None or node.get('type') != 'dir':
+            continue
         meta = _read_project_meta(e)
         if meta:
             node['meta'] = meta
@@ -4314,14 +4427,14 @@ async def api_output(path: str):
 async def api_media(path: str):
     """原样输出媒体文件（图片/视频/音频/HTML/PDF），供 <img>/<video>/iframe/下载。"""
     full = _safe_output_path(path, allow_login_qr=True)
-    suffix = full.suffix.lower()
+    media_type = _media_type(full)
     headers: dict[str, str] = {}
     # HTML 预览会在本地被就地重新生成（如 gzh-design 重排/内联图片），必须禁缓存，
     # 否则浏览器/代理按启发式缓存旧版 → 内容库 iframe 打开的是过期预览（复制粘贴带旧图 URL）。
-    if suffix in {".html", ".htm"}:
+    if media_type == "text/html":
         headers.update({"Cache-Control": "no-cache, no-store, must-revalidate",
                         "Pragma": "no-cache"})
-    if suffix in {".html", ".htm", ".svg"}:
+    if _is_executable_document(media_type):
         # 直链与预览同权：强制 sandbox，不含 allow-scripts/allow-same-origin/
         # 顶层跳转许可；nosniff 防止按内容嗅探成可执行文档。
         headers.update({
@@ -4330,7 +4443,7 @@ async def api_media(path: str):
                 "style-src 'unsafe-inline'",
             "X-Content-Type-Options": "nosniff",
         })
-    return FileResponse(full, headers=headers)
+    return FileResponse(full, media_type=media_type, headers=headers)
 
 
 # 系统数据目录/文件——不允许从内容库删除（删了会丢登录态/日历/发布记录）
@@ -4942,17 +5055,16 @@ async def api_logout(platform: str):
         raise HTTPException(404, '未知平台')
     deleted = []
     if cfg['backend'] == 'wechat-oa':
-        # 1) 清 AppID 凭证（旧配置兜底）
+        # 1) 停掉后台登录进程，并等待其退出（浏览器关闭）后才碰 profile
+        proc = LOGIN_PROCESSES.pop('wechat-oa-mp', None)
+        await _stop_login_process(proc)
+        # 2) 持统一账号锁删 mp 后台持久化会话；busy/失败直接返回，不动凭证与标记
+        mpdir = _browser_profile_path(platform)
+        if await _logout_delete_profile(mpdir):
+            deleted.append(mpdir.name)
+        # 3) 确认账号目录已释放后，再清 AppID 凭证与登录标记
         _wechat_clear_credentials()
         deleted.append('wechat-publisher.yaml:accounts.web')
-        # 2) 停掉可能仍在跑的后台登录进程（避免它又写回 success 标记）
-        proc = LOGIN_PROCESSES.pop('wechat-oa-mp', None)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        # 3) 删 AppID 标记 + mp 后台会话标记/二维码/日志（登录态判定看的就是 wechat-oa-mp.json）
         for name in (f'{platform}.json', f'{platform}.png',
                      'wechat-oa-mp.json', 'wechat-oa-mp.png', 'wechat-oa-mp.log'):
             f = LOGIN_DIR / name
@@ -4962,29 +5074,16 @@ async def api_logout(platform: str):
                     deleted.append(f.name)
             except OSError:
                 pass
-        # 4) 删 mp 后台浏览器持久化会话（真正退出登录）
-        mpdir = (_browser_profile_path(platform) or BROWSER_PROFILES / 'WeixinMpProfile').resolve()
-        if BROWSER_PROFILES.resolve() in mpdir.parents and mpdir.is_dir():
-            shutil.rmtree(mpdir, ignore_errors=True)
-            deleted.append('WeixinMpProfile')
         with _WHOAMI_LOCK:
             _WHOAMI_CACHE.pop(platform, None)
         return {'ok': True, 'deleted': deleted}
     proc = LOGIN_PROCESSES.pop(platform, None)
-    if proc is not None and proc.poll() is None:
-        # 与上面公众号分支同理：停掉仍在跑的登录进程，否则它会把 success 标记
-        # 又写回 {platform}.json，账号在退出后“复活”成已登录。
-        try:
-            proc.terminate()
-            await asyncio.to_thread(proc.wait, timeout=5)
-        except Exception:
-            pass
+    # 停掉仍在跑的登录进程，否则它会把 success 标记又写回 {platform}.json，
+    # 账号在退出后“复活”成已登录；必须等它退出后才删除 profile。
+    await _stop_login_process(proc)
     profile_path = _browser_profile_path(platform)
-    if profile_path is not None:
-        pdir = profile_path.resolve()
-        if BROWSER_PROFILES.resolve() in pdir.parents and pdir.is_dir():
-            shutil.rmtree(pdir, ignore_errors=True)
-            deleted.append(pdir.name)
+    if await _logout_delete_profile(profile_path):
+        deleted.append(profile_path.resolve().name)
     if cfg['backend'] == 'biliup':
         ck = _bili_cookie_path()
         if ck.is_file():

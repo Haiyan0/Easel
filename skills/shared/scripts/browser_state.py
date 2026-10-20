@@ -2,12 +2,12 @@
 """脚本侧持久浏览器 profile 与跨进程锁。
 
 所有打开持久 profile 的技能脚本都必须经过 :func:`launch_persistent_locked`
-（或显式使用 :class:`ProfileLock`），锁文件统一为 profile 目录下的
-``.easel.lock``。锁覆盖浏览器拥有 profile 的完整生命周期：context 关闭后
+（或显式使用 :class:`ProfileLock`）。锁文件固定在 profile 父目录的
+``.locks/<profile 名>.lock``，不随 profile 目录删除；注销与打开者始终竞争
+同一个互斥对象。锁覆盖浏览器拥有 profile 的完整生命周期：context 关闭后
 才释放；启动失败、异常和取消都不会把锁留给下一个任务。
 
-``easel.worker.browser`` 使用相同的锁文件名与语义，供 worker 内 Python
-调用方使用。
+``easel.worker.browser`` 使用相同的锁文件位置与语义，供 worker 内调用方使用。
 """
 from __future__ import annotations
 
@@ -17,7 +17,14 @@ from pathlib import Path
 
 from runtime_paths import browser_profile_dir
 
-LOCK_NAME = ".easel.lock"
+LOCK_DIR_NAME = ".locks"
+LOCK_SUFFIX = ".lock"
+
+
+def lock_path_for(profile: str | Path) -> Path:
+    """账号锁文件：位于 profile 父目录的 .locks/，删除 profile 不会删除锁。"""
+    profile = Path(profile)
+    return profile.parent / LOCK_DIR_NAME / f"{profile.name}{LOCK_SUFFIX}"
 
 
 class ProfileLockTimeout(TimeoutError):
@@ -28,7 +35,7 @@ class ProfileLock:
     """跨进程独占锁；持锁者退出时由操作系统自动释放。"""
 
     def __init__(self, profile: str | Path):
-        self.path = Path(profile) / LOCK_NAME
+        self.path = lock_path_for(profile)
         self.fd: int | None = None
 
     def acquire(self, timeout: float = 60.0, poll: float = 0.2, *,
@@ -90,11 +97,12 @@ class ProfileLock:
 
 
 class _LockedContext:
-    """代理 Playwright context：close() 完成后再释放 profile 锁。"""
+    """代理 Playwright context：close() 完成后再释放 profile 锁（可重复调用）。"""
 
     def __init__(self, context, lock: ProfileLock):
         object.__setattr__(self, "_context", context)
         object.__setattr__(self, "_lock", lock)
+        object.__setattr__(self, "_closed", False)
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_context"), name)
@@ -103,11 +111,15 @@ class _LockedContext:
         setattr(object.__getattribute__(self, "_context"), name, value)
 
     def close(self, *args, **kwargs):
+        if object.__getattribute__(self, "_closed"):
+            return
         context = object.__getattribute__(self, "_context")
         lock = object.__getattribute__(self, "_lock")
         try:
             return context.close(*args, **kwargs)
         finally:
+            # 底层 close 已返回（或已抛出并完成其清理）后才允许下一个任务进入
+            object.__setattr__(self, "_closed", True)
             lock.release()
 
     def __enter__(self):
@@ -131,6 +143,6 @@ def launch_persistent_locked(profile: str | Path, launch, *,
 
 
 __all__ = [
-    "LOCK_NAME", "ProfileLock", "ProfileLockTimeout", "browser_profile_dir",
-    "launch_persistent_locked",
+    "LOCK_DIR_NAME", "LOCK_SUFFIX", "ProfileLock", "ProfileLockTimeout",
+    "browser_profile_dir", "launch_persistent_locked", "lock_path_for",
 ]
