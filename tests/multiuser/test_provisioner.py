@@ -442,7 +442,10 @@ class FakeDocker:
                  stop_failure: bool = False,
                  rm_failure: bool = False,
                  inspect_error: str | None = None,
-                 instance_inspect_error: str | None = None):
+                 instance_inspect_error: str | None = None,
+                 inspect_stdout: str | None = None,
+                 instance_inspect_stdout: str | None = None,
+                 network_inspect_stdout: str | None = None):
         self.root = root
         self.container = existing
         self.network = network
@@ -452,6 +455,9 @@ class FakeDocker:
         self.rm_failure = rm_failure
         self.inspect_error = inspect_error
         self.instance_inspect_error = instance_inspect_error
+        self.inspect_stdout = inspect_stdout
+        self.instance_inspect_stdout = instance_inspect_stdout
+        self.network_inspect_stdout = network_inspect_stdout
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
         self.removed: list[str] = []
@@ -464,6 +470,8 @@ class FakeDocker:
                 ["container", "inspect"], ["network", "inspect"]):
             return _fail(self.inspect_error)
         if args[:2] == ["network", "inspect"]:
+            if self.network_inspect_stdout is not None:
+                return _ok(self.network_inspect_stdout)
             if self.network is None:
                 name = provisioner.network_name(WORKSPACE)
                 return _fail(
@@ -474,10 +482,15 @@ class FakeDocker:
             return _ok(provisioner.network_name(WORKSPACE) + "\n")
         if args[:2] == ["container", "inspect"]:
             target = args[2]
-            if (self.instance_inspect_error is not None
-                    and len(target) == 64
-                    and all(character in "0123456789abcdef"
-                            for character in target)):
+            is_instance = (len(target) == 64
+                           and all(character in "0123456789abcdef"
+                                   for character in target))
+            if is_instance and self.instance_inspect_stdout is not None:
+                return _ok(self.instance_inspect_stdout)
+            if (not is_instance and target == provisioner.container_name(
+                    WORKSPACE) and self.inspect_stdout is not None):
+                return _ok(self.inspect_stdout)
+            if (self.instance_inspect_error is not None and is_instance):
                 return _fail(self.instance_inspect_error)
             if (self.container is None
                     or (target not in (
@@ -866,6 +879,57 @@ def test_context_not_found_is_not_treated_as_network_absence(
     with pytest.raises(provisioner.ProvisionerError) as rejected:
         asyncio.run(service.ensure(WORKSPACE, 3))
     assert rejected.value.code == "network_inspect_failed"
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+_INVALID_SUCCESS_PAYLOADS = ["[]", "{}", "[null]"]
+
+
+@pytest.mark.parametrize("payload", _INVALID_SUCCESS_PAYLOADS)
+def test_stop_rejects_invalid_successful_container_inspect(tmp_path, payload):
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing, inspect_stdout=payload)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert rejected.value.code == "inspect_invalid"
+    assert fake.container is existing
+    assert fake.stopped == [] and fake.removed == []
+
+
+@pytest.mark.parametrize("payload", _INVALID_SUCCESS_PAYLOADS)
+def test_final_instance_confirmation_rejects_invalid_success(
+        tmp_path, payload):
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing,
+                      instance_inspect_stdout=payload)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert rejected.value.code == "inspect_invalid"
+    assert fake.removed == [existing["Id"]]
+
+
+@pytest.mark.parametrize("payload", _INVALID_SUCCESS_PAYLOADS)
+def test_ensure_rejects_invalid_successful_network_inspect(
+        tmp_path, monkeypatch, payload):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root, network_inspect_stdout=payload)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "network_invalid"
+    assert all(call[1:2] != ["network"] or call[2:3] != ["create"]
+               for call in fake.calls)
     assert all(call[1:2] != ["run"] for call in fake.calls)
 
 

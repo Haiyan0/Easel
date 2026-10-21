@@ -645,6 +645,9 @@ async def main():
             self.fail_stop = False
             self.fail_rm = False
             self.inspect_error = ""
+            self.name_inspect_stdout = None
+            self.id_inspect_stdout = None
+            self.network_inspect_stdout = None
 
         def completed(self, argv, code, stdout="", stderr=""):
             return subprocess.CompletedProcess(
@@ -714,6 +717,9 @@ async def main():
                 return self.completed(
                     argv, 1, stderr=self.inspect_error)
             if args[:2] == ["network", "inspect"]:
+                if self.network_inspect_stdout is not None:
+                    return self.completed(
+                        argv, 0, self.network_inspect_stdout)
                 if self.network is None:
                     return self.completed(
                         argv, 1,
@@ -734,6 +740,18 @@ async def main():
                 return self.completed(argv, 0, "created\n")
             if args[:2] == ["container", "inspect"]:
                 target = args[2]
+                is_instance = (len(target) == 64
+                               and all(character in "0123456789abcdef"
+                                       for character in target))
+                if is_instance and self.id_inspect_stdout is not None:
+                    return self.completed(
+                        argv, 0, self.id_inspect_stdout)
+                if (not is_instance
+                        and target == module.container_name(
+                            self.workspace_id)
+                        and self.name_inspect_stdout is not None):
+                    return self.completed(
+                        argv, 0, self.name_inspect_stdout)
                 if (self.container is None
                         or target not in (
                             self.container["Id"],
@@ -860,6 +878,63 @@ async def main():
         context_calls)
     ensure_docker.inspect_error = ""
 
+    # 退出 0 但结构非法（[] / {} / [null]）不是对象不存在。
+    for payload in ("[]", "{}", "[null]"):
+        recreated = await call({
+            "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
+            "config_version": 1})
+        assert recreated.get("ok") is True, recreated
+        invalid_id = recreated["handle"]["container_id"]
+        ensure_docker.name_inspect_stdout = payload
+        before_invalid = len(ensure_docker.calls)
+        invalid_reply = await call({
+            "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+            "instance_id": invalid_id})
+        assert invalid_reply == {
+            "ok": False, "error": "inspect_invalid"}, invalid_reply
+        assert ensure_docker.container is not None
+        invalid_calls = ensure_docker.calls[before_invalid:]
+        assert not [c for c in invalid_calls
+                    if c[1:2] in (["stop"], ["rm"])], invalid_calls
+        ensure_docker.name_inspect_stdout = None
+        cleaned = await call({
+            "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+            "instance_id": invalid_id})
+        assert cleaned == {"ok": True}, cleaned
+
+    # 最终按实例 ID 确认收到非法成功响应时，即使 stop/rm 已执行也不得
+    # 报告终态已确认。
+    recreated = await call({
+        "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
+        "config_version": 1})
+    assert recreated.get("ok") is True, recreated
+    invalid_id = recreated["handle"]["container_id"]
+    ensure_docker.id_inspect_stdout = "[]"
+    final_invalid = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": invalid_id})
+    assert final_invalid == {
+        "ok": False, "error": "inspect_invalid"}, final_invalid
+    assert ensure_docker.container is None
+    ensure_docker.id_inspect_stdout = None
+
+    # 网络 inspect 成功但结构非法时，不得继续 network create/run。
+    ensure_docker.workspace_id = WORKSPACE
+    ensure_docker.container = None
+    ensure_docker.network = None
+    ensure_docker.network_inspect_stdout = "{}"
+    before_network = len(ensure_docker.calls)
+    network_invalid = await call({
+        "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
+        "config_version": 1})
+    assert network_invalid == {
+        "ok": False, "error": "network_invalid"}, network_invalid
+    network_calls = ensure_docker.calls[before_network:]
+    assert not [c for c in network_calls
+                if c[1:3] in (["network", "create"], ["run"])], (
+        network_calls)
+    ensure_docker.network_inspect_stdout = None
+
     # 真实 Unix 服务 + UnixProvisionerClient + RuntimeManager + Store：
     # stop 失败必须让 drain 报错，数据库不得写 stopped，容器仍在运行。
     from easel.control.runtime import (
@@ -923,6 +998,60 @@ async def main():
             user.workspace_id, 1001, generation=lease.generation,
             expected_state="stopping")
         assert store.get_worker_lease(user.workspace_id).state == "stopped"
+
+        # 初始名称查询成功但结构非法：不写 stopped，容器仍在。
+        name_user = store.create_user("InvalidName")
+        ensure_docker.workspace_id = name_user.workspace_id
+        ensure_docker.network = None
+        ensure_docker.container = None
+        ensure_docker.name_inspect_stdout = None
+        name_handle = await client.ensure(name_user.workspace_id, 1)
+        outcome, name_lease = store.claim_worker_start(
+            name_user.workspace_id, 1, "name-owner", 1000, 60)
+        assert outcome == "started", outcome
+        assert store.complete_worker_start(
+            name_user.workspace_id, "name-owner", name_lease.generation,
+            name_handle, 1000, 60)
+        ensure_docker.name_inspect_stdout = "[]"
+        try:
+            await manager.drain(name_user.workspace_id)
+        except RuntimeUnavailable as error:
+            assert error.code == "inspect_invalid", error.code
+        else:
+            raise AssertionError("非法成功 inspect 不得完成 drain")
+        name_state = store.get_worker_lease(name_user.workspace_id)
+        assert name_state.state == "stopping"
+        assert ensure_docker.container is not None
+        assert ensure_docker.container["State"]["Running"] is True
+        ensure_docker.name_inspect_stdout = None
+        await client.stop(name_user.workspace_id, name_handle.container_id)
+        assert store.stop_worker(
+            name_user.workspace_id, 1001,
+            generation=name_lease.generation, expected_state="stopping")
+
+        # 最终实例 ID 确认结构非法：stop/rm 已执行，但不得写 stopped。
+        final_user = store.create_user("InvalidFinal")
+        ensure_docker.workspace_id = final_user.workspace_id
+        ensure_docker.network = None
+        ensure_docker.container = None
+        final_handle = await client.ensure(final_user.workspace_id, 1)
+        outcome, final_lease = store.claim_worker_start(
+            final_user.workspace_id, 1, "final-owner", 1000, 60)
+        assert outcome == "started", outcome
+        assert store.complete_worker_start(
+            final_user.workspace_id, "final-owner", final_lease.generation,
+            final_handle, 1000, 60)
+        ensure_docker.id_inspect_stdout = "[]"
+        try:
+            await manager.drain(final_user.workspace_id)
+        except RuntimeUnavailable as error:
+            assert error.code == "inspect_invalid", error.code
+        else:
+            raise AssertionError("非法终态确认不得完成 drain")
+        final_state = store.get_worker_lease(final_user.workspace_id)
+        assert final_state.state == "stopping"
+        assert ensure_docker.container is None
+        ensure_docker.id_inspect_stdout = None
     finally:
         store.close()
 

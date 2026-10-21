@@ -121,7 +121,9 @@ python deploy/multiuser/provisioner.py \
   inspect 失败返回 `container_stop_failed`、`container_remove_failed`、
   `docker_inspect_failed`，只有在确认原实例已消失后才回复 `ok=true`。
   只有明确指向本次容器/网络对象的 absent 响应按不存在处理；Docker context、
-  endpoint、daemon、权限或 CLI 初始化错误一律失败关闭。
+  endpoint、daemon、权限或 CLI 初始化错误一律失败关闭。inspect 退出 0
+  但返回空数组、非数组或首项非对象时按 `inspect_invalid` /
+  `network_invalid` 失败，不能当作对象已消失。
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 

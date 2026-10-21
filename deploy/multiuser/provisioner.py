@@ -998,6 +998,18 @@ class Provisioner:
             return False
         return re.fullmatch(pattern, text, re.IGNORECASE) is not None
 
+    @staticmethod
+    def _single_object(stdout: str, error_code: str) -> dict:
+        """成功响应必须是单对象列表；空/非数组/非对象不得当作 absent。"""
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            raise ProvisionerError(error_code) from None
+        if (not isinstance(payload, list) or len(payload) != 1
+                or not isinstance(payload[0], dict)):
+            raise ProvisionerError(error_code)
+        return payload[0]
+
     async def _inspect_raw(self, workspace_id: str) -> dict | None:
         target = container_name(workspace_id)
         result = await self._docker("container", "inspect", target)
@@ -1005,13 +1017,7 @@ class Provisioner:
             if self._not_found(result, kind="container", target=target):
                 return None
             raise ProvisionerError("docker_inspect_failed")
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            raise ProvisionerError("inspect_invalid") from None
-        if not isinstance(payload, list) or not payload:
-            return None
-        return payload[0] if isinstance(payload[0], dict) else None
+        return self._single_object(result.stdout, "inspect_invalid")
 
     async def _inspect_instance(self, instance_id: str) -> dict | None:
         result = await self._docker("container", "inspect", instance_id)
@@ -1020,13 +1026,7 @@ class Provisioner:
                                target=instance_id):
                 return None
             raise ProvisionerError("docker_inspect_failed")
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            raise ProvisionerError("inspect_invalid") from None
-        if not isinstance(payload, list) or not payload:
-            return None
-        return payload[0] if isinstance(payload[0], dict) else None
+        return self._single_object(result.stdout, "inspect_invalid")
 
     async def _network_payload(self, workspace_id: str) -> list | None:
         target = network_name(workspace_id)
@@ -1035,11 +1035,7 @@ class Provisioner:
             if self._not_found(result, kind="network", target=target):
                 return None
             raise ProvisionerError("network_inspect_failed")
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            raise ProvisionerError("network_invalid") from None
-        return payload if isinstance(payload, list) else None
+        return [self._single_object(result.stdout, "network_invalid")]
 
     async def _ensure_network(self, workspace_id: str) -> None:
         """已有网络严格复核；新建后也必须再次复核实际隔离属性。"""
