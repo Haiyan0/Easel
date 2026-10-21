@@ -542,6 +542,7 @@ import pathlib
 import stat
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, "/opt/easel")
 spec = importlib.util.spec_from_file_location("provisioner", "/check/provisioner.py")
@@ -560,7 +561,9 @@ class FakeDocker:
 
     def __call__(self, argv, *, timeout=120.0):
         self.calls.append(list(argv))
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="",
+            stderr=f"Error: No such object: {argv[-1]}\n")
 
 
 async def call(payload):
@@ -633,22 +636,33 @@ async def main():
             self.calls = []
             self.container = None
             self.network = None
+            self.workspace_id = WORKSPACE
+            self.fail_stop = False
+            self.fail_rm = False
+            self.inspect_error = ""
 
-        def completed(self, argv, code, stdout=""):
-            return subprocess.CompletedProcess(argv, code, stdout, "")
+        def completed(self, argv, code, stdout="", stderr=""):
+            return subprocess.CompletedProcess(
+                argv, code, stdout, stderr)
+
+        def not_found(self, argv, target):
+            return self.completed(
+                argv, 1, stderr=f"Error: No such object: {target}\n")
 
         def make_container(self):
-            paths = module.prepare_workspace(pathlib.Path("/work"), WORKSPACE)
+            workspace_id = self.workspace_id
+            paths = module.prepare_workspace(
+                pathlib.Path("/work"), workspace_id)
             return {
                 "Id": "f" * 64,
-                "Name": "/" + module.container_name(WORKSPACE),
+                "Name": "/" + module.container_name(workspace_id),
                 "Config": {
                     "User": "10001:10001",
                     "Image": IMAGE,
                     "Entrypoint": None,
                     "Cmd": ["python", "-m", "easel.worker.lifecycle",
                             "serve", "--host", "0.0.0.0", "--port", "7860"],
-                    "Labels": module.workload_labels(WORKSPACE, 1),
+                    "Labels": module.workload_labels(workspace_id, 1),
                 },
                 "State": {"Running": True, "Health": {"Status": "healthy"}},
                 "HostConfig": {
@@ -661,7 +675,7 @@ async def main():
                     "Memory": 4 * 1024 ** 3,
                     "MemorySwap": 4 * 1024 ** 3,
                     "NanoCpus": 2000000000,
-                    "NetworkMode": module.network_name(WORKSPACE),
+                    "NetworkMode": module.network_name(workspace_id),
                     "PortBindings": {},
                     "PublishAllPorts": False,
                     "Binds": [],
@@ -680,7 +694,7 @@ async def main():
                 "NetworkSettings": {
                     "Ports": {},
                     "Networks": {
-                        module.network_name(WORKSPACE): {
+                        module.network_name(workspace_id): {
                             "IPAddress": "172.30.0.2"},
                     },
                 },
@@ -690,30 +704,60 @@ async def main():
             self.calls.append(list(argv))
             assert argv[0] == "docker", argv
             args = argv[1:]
+            if self.inspect_error and args[:2] in (
+                    ["network", "inspect"], ["container", "inspect"]):
+                return self.completed(
+                    argv, 1, stderr=self.inspect_error)
             if args[:2] == ["network", "inspect"]:
                 if self.network is None:
-                    return self.completed(argv, 1)
+                    return self.not_found(argv, args[2])
                 return self.completed(argv, 0, json.dumps([self.network]))
             if args[:2] == ["network", "create"]:
                 self.network = {
-                    "Name": module.network_name(WORKSPACE),
+                    "Name": module.network_name(self.workspace_id),
                     "Driver": "bridge",
                     "Internal": True,
                     "EnableIPv6": False,
                     "Labels": {
                         "easel.managed": "true",
-                        "easel.workspace-id": WORKSPACE,
+                        "easel.workspace-id": self.workspace_id,
                     },
                 }
                 return self.completed(argv, 0, "created\n")
             if args[:2] == ["container", "inspect"]:
-                if self.container is None:
-                    return self.completed(argv, 1)
+                target = args[2]
+                if (self.container is None
+                        or target not in (
+                            self.container["Id"],
+                            module.container_name(self.workspace_id))):
+                    return self.not_found(argv, target)
                 return self.completed(argv, 0, json.dumps([self.container]))
             if args[:1] == ["run"]:
                 self.container = self.make_container()
                 return self.completed(argv, 0, "fake-container\n")
-            if args[:1] in (["rm"], ["stop"]):
+            if args[:1] == ["stop"]:
+                target = args[-1]
+                if self.fail_stop:
+                    return self.completed(
+                        argv, 1,
+                        stderr="Error response from daemon: stop failed\n")
+                if (self.container is None
+                        or self.container["Id"] != target):
+                    return self.not_found(argv, target)
+                self.container["State"] = {
+                    "Running": False, "Status": "exited"}
+                return self.completed(argv, 0)
+            if args[:1] == ["rm"]:
+                target = args[-1]
+                if self.fail_rm:
+                    return self.completed(
+                        argv, 1,
+                        stderr="Error response from daemon: rm failed\n")
+                if (self.container is None
+                        or target not in (
+                            self.container["Id"],
+                            module.container_name(self.workspace_id))):
+                    return self.not_found(argv, target)
                 self.container = None
                 return self.completed(argv, 0)
             raise AssertionError(f"unexpected docker 调用: {argv}")
@@ -746,6 +790,104 @@ async def main():
         "instance_id": "f" * 64})
     assert right_stop == {"ok": True}, right_stop
     assert ensure_docker.container is None
+
+    # 重新创建一个实例，逐项验证 Docker 非零退出不会被报告成功。
+    recreated = await call({
+        "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
+        "config_version": 1})
+    assert recreated.get("ok") is True, recreated
+    instance_id = recreated["handle"]["container_id"]
+    assert ensure_docker.container is not None
+
+    ensure_docker.fail_stop = True
+    failed_stop = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert failed_stop == {"ok": False, "error": "container_stop_failed"}, (
+        failed_stop)
+    assert ensure_docker.container is not None
+    assert ensure_docker.container["State"]["Running"] is True
+
+    ensure_docker.fail_stop = False
+    ensure_docker.fail_rm = True
+    failed_rm = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert failed_rm == {"ok": False, "error": "container_remove_failed"}, (
+        failed_rm)
+    assert ensure_docker.container is not None
+
+    ensure_docker.fail_rm = False
+    cleaned = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert cleaned == {"ok": True}, cleaned
+    assert ensure_docker.container is None
+
+    # 已确认不存在：幂等成功，不触发 stop/rm。
+    idempotent = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert idempotent == {"ok": True}, idempotent
+
+    # Docker inspect 失败不能当作“不存在”。
+    ensure_docker.inspect_error = (
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+    inspect_failed = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert inspect_failed == {
+        "ok": False, "error": "docker_inspect_failed"}, inspect_failed
+    ensure_docker.inspect_error = ""
+
+    # 真实 Unix 服务 + UnixProvisionerClient + RuntimeManager + Store：
+    # stop 失败必须让 drain 报错，数据库不得写 stopped，容器仍在运行。
+    from easel.control.runtime import (
+        RuntimeManager, RuntimeUnavailable, UnixProvisionerClient)
+    from easel.control.store import Store
+
+    database = pathlib.Path(tempfile.mkdtemp()) / "control.sqlite3"
+    store = Store.connect(database)
+    try:
+        user = store.create_user("Runtime")
+        ensure_docker.workspace_id = user.workspace_id
+        ensure_docker.network = None
+        ensure_docker.container = None
+        ensure_docker.fail_stop = False
+        ensure_docker.fail_rm = False
+        client = UnixProvisionerClient(SOCKET)
+        handle = await client.ensure(user.workspace_id, 1)
+        now = 1000
+        outcome, lease = store.claim_worker_start(
+            user.workspace_id, 1, "runtime-owner", now, 60)
+        assert outcome == "started", outcome
+        assert store.complete_worker_start(
+            user.workspace_id, "runtime-owner", lease.generation, handle,
+            now, 60)
+        manager = RuntimeManager(
+            store, client, clock=lambda: 1000, poll_interval=0.01,
+            drain_timeout=1)
+        ensure_docker.fail_stop = True
+        try:
+            await manager.drain(user.workspace_id)
+        except RuntimeUnavailable as error:
+            assert error.code == "container_stop_failed", error.code
+        else:
+            raise AssertionError("stop 失败时 drain 不得成功")
+        failed_lease = store.get_worker_lease(user.workspace_id)
+        assert failed_lease.state == "stopping", failed_lease.state
+        assert ensure_docker.container is not None
+        assert ensure_docker.container["State"]["Running"] is True
+
+        # 恢复后按同一实例 ID 幂等清理。
+        ensure_docker.fail_stop = False
+        await client.stop(user.workspace_id, handle.container_id)
+        assert store.stop_worker(
+            user.workspace_id, 1001, generation=lease.generation,
+            expected_state="stopping")
+        assert store.get_worker_lease(user.workspace_id).state == "stopped"
+    finally:
+        store.close()
 
     task.cancel()
     try:

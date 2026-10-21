@@ -544,7 +544,9 @@ class Store:
         * ``wait``：另一个管理进程正在启动，调用方等待其完成；
         * ``upgrade``：配置版本变化且当前无活跃任务，可安全重建；
         * ``config_busy``：配置版本变化但仍有活跃任务，禁止覆盖；
-        * ``draining``：正在 drain，拒绝新任务。
+        * ``draining``：正在 drain，拒绝新任务；
+        * ``recover_stop``：停止认领已过期，必须先按原实例 ID 完成停止，
+          才能创建新代次，避免同一物理实例被旧 stop 与新一代同时使用。
         """
         workspace_id = _text(workspace_id)
         owner_id = _text(owner_id)
@@ -588,12 +590,10 @@ class Store:
             if lease.state == "stopping":
                 if lease.lease_expires_at > now:
                     return "draining", lease
-                # 停止中的旧管理者已过期：允许按新代次恢复。真实
-                # provisioner 会按 workspace 串行 stop/run，旧 stop 未返回
-                # 前不会创建新容器；旧回复写回仍受 generation CAS 约束。
-                self._claim_new_generation(workspace_id, config_version,
-                                           owner_id, now, lease_seconds)
-                return "started", self._worker_lease_row(workspace_id)
+                # 停止承诺必须先被消解。调用方按旧实例 ID 实际 stop 并
+                # CAS 写回 stopped 后，才能重新认领新代次；不能直接复用
+                # 一个可能仍有旧 stop 在途的物理实例。
+                return "recover_stop", lease
 
             # absent / stopped / failed：可以安全创建新代次
             self._claim_new_generation(workspace_id, config_version,

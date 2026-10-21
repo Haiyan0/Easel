@@ -359,8 +359,12 @@ def _ok(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess([], 0, stdout, "")
 
 
-def _fail() -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess([], 1, "", "")
+def _fail(stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], 1, "", stderr)
+
+
+def _not_found(target: str) -> subprocess.CompletedProcess:
+    return _fail(f"Error: No such object: {target}\n")
 
 
 def _valid_container(root: pathlib.Path, config_version: int = 3,
@@ -434,29 +438,43 @@ class FakeDocker:
     def __init__(self, root: pathlib.Path, *, existing: dict | None = None,
                  network: dict | None = None,
                  after_run: dict | None = None,
-                 run_returncode: int = 0):
+                 run_returncode: int = 0,
+                 stop_failure: bool = False,
+                 rm_failure: bool = False,
+                 inspect_error: str | None = None):
         self.root = root
         self.container = existing
         self.network = network
         self.after_run = after_run
         self.run_returncode = run_returncode
+        self.stop_failure = stop_failure
+        self.rm_failure = rm_failure
+        self.inspect_error = inspect_error
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
+        self.removed: list[str] = []
 
     def __call__(self, argv, *, timeout=120.0):
         self.calls.append(list(argv))
         assert argv[0] == "docker", argv
         args = argv[1:]
+        if self.inspect_error is not None and args[:2] in (
+                ["container", "inspect"], ["network", "inspect"]):
+            return _fail(self.inspect_error)
         if args[:2] == ["network", "inspect"]:
             if self.network is None:
-                return _fail()
+                return _not_found("network")
             return _ok(json.dumps([self.network]))
         if args[:2] == ["network", "create"]:
             self.network = _valid_network()
             return _ok(provisioner.network_name(WORKSPACE) + "\n")
         if args[:2] == ["container", "inspect"]:
-            if self.container is None:
-                return _fail()
+            target = args[2]
+            if (self.container is None
+                    or (target not in (
+                        provisioner.container_name(WORKSPACE),
+                        self.container.get("Id")))):
+                return _not_found(target)
             return _ok(json.dumps([self.container]))
         if args[:1] == ["run"]:
             if self.run_returncode != 0:
@@ -465,9 +483,25 @@ class FakeDocker:
             self.container = self.after_run or _valid_container(self.root)
             return _ok("fake-container-id\n")
         if args[:1] == ["stop"]:
-            self.stopped.append(args[-1])
+            target = args[-1]
+            self.stopped.append(target)
+            if self.stop_failure:
+                return _fail("Error response from daemon: stop failed\n")
+            if self.container is None or self.container.get("Id") != target:
+                return _not_found(target)
+            self.container["State"] = {
+                "Running": False, "Status": "exited"}
             return _ok()
         if args[:1] == ["rm"]:
+            target = args[-1]
+            self.removed.append(target)
+            if self.rm_failure:
+                return _fail("Error response from daemon: rm failed\n")
+            if (self.container is None
+                    or target not in (
+                        provisioner.container_name(WORKSPACE),
+                        self.container.get("Id"))):
+                return _not_found(target)
             self.container = None
             return _ok()
         raise AssertionError(f"unexpected docker 调用：{argv}")
@@ -766,6 +800,63 @@ def test_stop_requires_the_exact_instance_identity(tmp_path):
     asyncio.run(service.stop(WORKSPACE, existing["Id"]))
     assert fake.stopped == [existing["Id"]]
     assert fake.container is None
+
+
+@pytest.mark.parametrize("stop_failure,rm_failure,code", [
+    (True, False, "container_stop_failed"),
+    (False, True, "container_remove_failed"),
+    (True, True, "container_stop_failed"),
+])
+def test_stop_command_failures_are_not_reported_success(
+        tmp_path, stop_failure, rm_failure, code):
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing,
+                      stop_failure=stop_failure, rm_failure=rm_failure)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert rejected.value.code == code
+    assert fake.container is existing, "失败时不得假定实例已消失"
+    if stop_failure:
+        assert fake.removed == []
+
+
+def test_stop_reports_docker_inspect_failure_instead_of_absent(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(
+        root, inspect_error="Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, "f" * 64))
+    assert rejected.value.code == "docker_inspect_failed"
+    assert fake.stopped == [] and fake.removed == []
+
+
+def test_stop_of_already_absent_instance_is_idempotent(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    asyncio.run(service.stop(WORKSPACE, "f" * 64))
+    assert fake.stopped == [] and fake.removed == []
+
+
+def test_inspect_action_reports_docker_daemon_errors(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(
+        root, inspect_error="permission denied while trying to connect to Docker")
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.inspect(WORKSPACE))
+    assert rejected.value.code == "docker_inspect_failed"
 
 
 def test_stop_request_requires_a_pinned_instance_identity():

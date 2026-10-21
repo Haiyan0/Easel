@@ -28,11 +28,16 @@ class FakeProvisioner:
 
     def __init__(self, *, delay: float = 0.0, fail: Exception | None = None,
                  block: asyncio.Event | None = None,
-                 stop_gate: asyncio.Event | None = None):
+                 stop_gate: asyncio.Event | None = None,
+                 stop_gate_calls: int | None = None,
+                 stop_error: Exception | None = None):
         self.delay = delay
         self.fail = fail
         self.block = block
         self.stop_gate = stop_gate
+        self.stop_gate_calls = stop_gate_calls
+        self.stop_error = stop_error
+        self._stop_seen = 0
         self.starts = 0
         self.stops = 0
         self.inspects = 0
@@ -79,13 +84,18 @@ class FakeProvisioner:
         # 解析当前实例；传入了与当前实例不符的身份时拒绝且不删除。
         target = self.handles.get(workspace_id)
         self.stops += 1
+        self._stop_seen += 1
         self.stop_calls.append(workspace_id)
         self.stop_requests.append((workspace_id, instance_id))
         self.stop_targets.append(
             target.container_id if target is not None else "")
         self.stop_entered.set()
-        if self.stop_gate is not None:
+        if (self.stop_gate is not None
+                and (self.stop_gate_calls is None
+                     or self._stop_seen <= self.stop_gate_calls)):
             await self.stop_gate.wait()
+        if self.stop_error is not None:
+            raise self.stop_error
         if (instance_id is not None and target is not None
                 and target.container_id != instance_id):
             self.stop_rejected += 1
@@ -652,7 +662,8 @@ def test_late_drain_reply_cannot_overwrite_new_generation(tmp_path):
             user = first_store.create_user("A")
             clock = Clock()
             gate = asyncio.Event()
-            provisioner = FakeProvisioner(stop_gate=gate)
+            provisioner = FakeProvisioner(stop_gate=gate,
+                                          stop_gate_calls=1)
             first = RuntimeManager(first_store, provisioner, clock=clock,
                                    lease_seconds=1, poll_interval=0.01,
                                    drain_timeout=5)
@@ -822,6 +833,68 @@ def test_upgrade_stop_after_takeover_cannot_remove_new_instance(tmp_path):
             current = second_store.get_worker_lease(user.workspace_id)
             assert current.state == "ready"
             assert current.container_id == new.container_id
+    run(scenario())
+
+
+def test_stop_failure_does_not_write_stopped(tmp_path):
+    """provisioner 停止失败时，drain/空闲/升级都保留可恢复状态。"""
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            clock = Clock()
+            provisioner = FakeProvisioner(stop_error=RuntimeUnavailable(
+                "container_stop_failed", 503, retry_after=5))
+            manager = RuntimeManager(store, provisioner, clock=clock,
+                                     lease_seconds=120, idle_seconds=900,
+                                     poll_interval=0.01, drain_timeout=1)
+            await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+
+            with pytest.raises(RuntimeUnavailable) as error:
+                await manager.drain(user.workspace_id)
+            assert error.value.code == "container_stop_failed"
+            failed = store.get_worker_lease(user.workspace_id)
+            assert failed.state == "stopping"
+            assert failed.container_id == lease.container_id
+
+            # 从 stopping 恢复为可再尝试的 drained/ready 路径由新 ensure
+            # 的 recover_stop 负责；这里确认不会伪写 stopped。
+            assert failed.state != "stopped"
+            assert provisioner.handles[user.workspace_id].container_id == (
+                lease.container_id)
+    run(scenario())
+
+
+def test_idle_and_upgrade_stop_failure_preserve_state(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            clock = Clock()
+            provisioner = FakeProvisioner(stop_error=RuntimeUnavailable(
+                "container_stop_failed", 503, retry_after=5))
+            manager = RuntimeManager(store, provisioner, clock=clock,
+                                     lease_seconds=120, idle_seconds=0,
+                                     poll_interval=0.01, drain_timeout=1)
+            await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
+            clock.value = 1000
+            assert await manager.collect_idle(clock.value) == []
+            after_idle = store.get_worker_lease(user.workspace_id)
+            assert after_idle.state == "stopping"
+            assert provisioner.handles[user.workspace_id].container_id == (
+                lease.container_id)
+
+            # 直接构造 ready 的另一个 workspace 验证升级失败。
+            other = store.create_user("B")
+            await manager.ensure_ready(other.workspace_id, 1)
+            with pytest.raises(RuntimeUnavailable):
+                await manager.ensure_ready(other.workspace_id, 2)
+            updated = store.get_worker_lease(other.workspace_id)
+            assert updated.state == "stopping"
+            assert updated.config_version == 1
     run(scenario())
 
 

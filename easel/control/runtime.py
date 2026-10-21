@@ -120,6 +120,9 @@ class RuntimeManager:
             if outcome == "upgrade":
                 await self._upgrade(workspace_id, lease, deadline)
                 continue
+            if outcome == "recover_stop":
+                await self._recover_stop(workspace_id, lease, deadline)
+                continue
             if outcome == "wait":
                 await self._sleep_or_timeout(deadline, "worker_start_timeout")
                 continue
@@ -334,6 +337,36 @@ class RuntimeManager:
                 generation=lease.generation):
             return
         await self._provisioner.stop(workspace_id, lease.container_id)
+        await self._db(self._store.stop_worker, workspace_id, self._now(),
+                       generation=lease.generation,
+                       expected_state="stopping")
+
+    async def _recover_stop(self, workspace_id: str, lease: WorkerLease | None,
+                            deadline: float) -> None:
+        """停止认领过期后，先按原实例 ID 完成停止，再允许新代次。
+
+        旧 stop 可能仍在途中；在物理实例被确认删除前创建/复用新代次，
+        会让旧动作删除新一代正在使用的同一容器。这里复用同一条 ID 约束
+        的 stop；目标已不存在时 provisioner 幂等成功。
+        """
+        if lease is None or lease.state != "stopping":
+            raise RuntimeUnavailable("worker_unavailable", 503)
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise RuntimeUnavailable("worker_start_timeout", 503,
+                                     retry_after=5)
+        try:
+            await asyncio.wait_for(
+                self._provisioner.stop(workspace_id, lease.container_id),
+                timeout=remaining)
+        except asyncio.TimeoutError:
+            raise RuntimeUnavailable("worker_stop_timeout", 503,
+                                     retry_after=5) from None
+        except Exception as error:
+            raise RuntimeUnavailable("worker_stop_failed", 503,
+                                     retry_after=5) from error
+        # 只有成功确认物理实例已消失/停止后才写 stopped。CAS 失败说明另一
+        # 管理者已消解停止承诺，回到认领循环读取新状态即可。
         await self._db(self._store.stop_worker, workspace_id, self._now(),
                        generation=lease.generation,
                        expected_state="stopping")

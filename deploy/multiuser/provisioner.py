@@ -970,11 +970,36 @@ class Provisioner:
         argv = [self.settings.docker, *args]
         return await asyncio.to_thread(self._runner, argv, timeout=timeout)
 
+    @staticmethod
+    def _not_found(result: subprocess.CompletedProcess) -> bool:
+        """只把 Docker 明确的“不存在”当作 absent，daemon/权限错误必须失败。"""
+        text = f"{getattr(result, 'stderr', '')}\n{getattr(result, 'stdout', '')}"
+        lowered = text.lower()
+        return any(marker in lowered for marker in (
+            "no such object", "no such container", "no such network",
+            "not found"))
+
     async def _inspect_raw(self, workspace_id: str) -> dict | None:
         result = await self._docker("container", "inspect",
                                     container_name(workspace_id))
         if result.returncode != 0:
+            if self._not_found(result):
+                return None
+            raise ProvisionerError("docker_inspect_failed")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise ProvisionerError("inspect_invalid") from None
+        if not isinstance(payload, list) or not payload:
             return None
+        return payload[0] if isinstance(payload[0], dict) else None
+
+    async def _inspect_instance(self, instance_id: str) -> dict | None:
+        result = await self._docker("container", "inspect", instance_id)
+        if result.returncode != 0:
+            if self._not_found(result):
+                return None
+            raise ProvisionerError("docker_inspect_failed")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError:
@@ -987,7 +1012,9 @@ class Provisioner:
         result = await self._docker("network", "inspect",
                                     network_name(workspace_id))
         if result.returncode != 0:
-            return None
+            if self._not_found(result):
+                return None
+            raise ProvisionerError("network_inspect_failed")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError:
@@ -1127,9 +1154,30 @@ class Provisioner:
             if (not isinstance(raw.get("Id"), str)
                     or raw.get("Id") != instance_id):
                 raise ProvisionerError("container_conflict")
-            await self._docker("stop", "--time", "30", instance_id,
-                               timeout=60.0)
-            await self._docker("rm", "-f", instance_id, timeout=60.0)
+
+            stopped = await self._docker("stop", "--time", "30", instance_id,
+                                         timeout=60.0)
+            if stopped.returncode != 0:
+                # 旧管理者可能已先删除；按实例 ID 确认终态，不能仅凭
+                # 非零退出码报告成功或失败。
+                current = await self._inspect_instance(instance_id)
+                if current is None:
+                    return
+                state = current.get("State") or {}
+                if state.get("Running") is True:
+                    raise ProvisionerError("container_stop_failed")
+
+            removed = await self._docker("rm", "-f", instance_id,
+                                         timeout=60.0)
+            if removed.returncode != 0:
+                if await self._inspect_instance(instance_id) is None:
+                    return
+                raise ProvisionerError("container_remove_failed")
+
+            # 命令成功不等于实例已消失；最终确认原实例确实不存在，避免
+            # 把仍存活的容器报告为已停止。
+            if await self._inspect_instance(instance_id) is not None:
+                raise ProvisionerError("container_remove_failed")
 
     async def inspect(self, workspace_id: str) -> dict:
         parse_request({"version": PROTOCOL_VERSION, "action": "inspect",

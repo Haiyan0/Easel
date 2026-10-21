@@ -117,7 +117,9 @@ python deploy/multiuser/provisioner.py \
   - `{"version":1,"action":"stop","workspace_id":"<32hex>","instance_id":"<64hex>"}`
   - `{"version":1,"action":"inspect","workspace_id":"<32hex>"}`
 - `stop` 的 `instance_id` 是 Docker 容器不可复用 ID；provisioner 在 stop/rm
-  前核对实际 ID，旧 stop 不会作用于同名新代次。
+  前核对实际 ID，旧 stop 不会作用于同名新代次。Docker stop/rm 非零或
+  inspect 失败返回 `container_stop_failed`、`container_remove_failed`、
+  `docker_inspect_failed`，只有在确认原实例已消失后才回复 `ok=true`。
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 
@@ -176,6 +178,12 @@ docker run -d --name easel-worker-<uuid> \
   不直接跨线程使用 SQLite 连接。
 - drain 的 mark/stop/写回都携带取得的 generation；等待后复核同一实例，
   stop 认领失败即放弃，迟到回复不能改写或停止新代次。
+- 停止认领过期后，新代次必须先按原实例 ID 完成停止并 CAS 写回 stopped，
+  之后才允许创建/复用实例；不会直接复用仍可能有旧 stop 在途的同一物理
+  容器。
+- `docker stop`/`rm` 非零、Docker inspect 不可用或无法确认原实例消失时，
+  provisioner 明确返回错误；RuntimeManager 不写 stopped，状态保留
+  `stopping`，等待后续按同实例幂等恢复。已确认不存在的目标按成功处理。
 - 就绪期限 60 秒；失败/超时返回 `503` 明确错误码与 `Retry-After`，不路由到
   其他 workspace。
 - 配置版本升级只在没有活跃 Run/请求时进行；旧版本句柄不会被当作新版本。
