@@ -96,6 +96,31 @@ class WorkerHandle:
 
 
 @dataclass(frozen=True)
+class WorkerLease:
+    """持久生命周期租约；服务凭证与上游地址不进入默认 repr。
+
+    ``generation`` 每次重新认领都会递增。旧持有者只有在
+    ``(owner_id, generation)`` 仍匹配时才能推进状态，避免延迟返回覆盖
+    新一代实例。
+    """
+
+    workspace_id: str
+    container_id: str
+    config_version: int
+    state: str
+    heartbeat_at: int
+    started_at: int
+    owner_id: str
+    generation: int
+    lease_expires_at: int
+    updated_at: int
+    last_activity_at: int
+    active_requests: int
+    upstream: str = field(repr=False, default="")
+    service_token: str = field(repr=False, default="")
+
+
+@dataclass(frozen=True)
 class WorkspacePaths:
     """代码根、工作区数据根、运行状态根与本人 HOME 三类位置。"""
 

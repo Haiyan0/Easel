@@ -30,6 +30,7 @@ from ..providers.openai import BROKER_ROUTE_TABLE
 from .auth import AuthService
 from .config import ConfigService
 from .policy import authorize, public_route
+from .runtime import RuntimeManager
 from .store import Store
 from .types import DomainError, Identity
 
@@ -320,16 +321,21 @@ async def _guard_request(request: Request, call_next):
 def create_app(*, store: Store, auth: AuthService,
                config: ControlConfig | None = None,
                config_service: ConfigService | None = None,
-               runtime=None, broker=None) -> FastAPI:
+               runtime=None, broker=None, provisioner=None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
     传入的 ``store`` 提供控制库位置；应用在 lifespan 中用专用数据库线程打开
     自己的连接并在退出时关闭，以保持 SQLite 的线程归属。未提供 ``config`` 时
     Origin 校验失败关闭；未提供 ``config_service`` 时配置业务明确 503。
+
+    ``provisioner`` 是受限 provisioner 的客户端；提供时在 lifespan 内用应用
+    自己的数据库连接构造 ``RuntimeManager``，避免跨线程复用启动前的连接。
     """
     control_path = Path(store.path).absolute()
     if broker is not None and config_service is None:
         raise ValueError("broker requires config_service")
+    if provisioner is not None and runtime is not None:
+        raise ValueError("runtime and provisioner are mutually exclusive")
     public_origin = config.public_origin if config is not None else None
     if public_origin is not None:
         # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
@@ -342,10 +348,14 @@ def create_app(*, store: Store, auth: AuthService,
         loop = asyncio.get_running_loop()
         app.state.db_executor = executor
         app.state.public_origin = public_origin
-        app.state.runtime = runtime
         try:
             app.state.control_store = await loop.run_in_executor(
                 executor, Store.connect, control_path)
+            if provisioner is not None:
+                app.state.runtime = RuntimeManager(
+                    app.state.control_store, provisioner)
+            else:
+                app.state.runtime = runtime
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)
             if config_service is not None:
                 # with_store 会读取并校验已有密文，必须在数据库专用线程执行

@@ -1,0 +1,47 @@
+# 构建上下文白名单：镜像只允许可运行代码、依赖声明与受管只读配置。
+# 开发者 .env、outputs、profiles、浏览器 HOME、控制密钥、审计与任务文档
+# 一律不得进入镜像。
+
+.git
+.gitignore
+.env
+.env.*
+**/.env
+**/.env.*
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+outputs/
+profiles/
+workspace/
+workspaces/
+data/
+logs/
+_deps/
+.scratch/
+.superpowers/
+.claude/
+.agents/
+
+docs/superpowers/audits/
+docs/superpowers/tasks/
+docs/superpowers/plans/
+docs/superpowers/specs/
+tests/
+
+PSScriptAnalyzerSettings.psd1

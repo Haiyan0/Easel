@@ -26,9 +26,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Literal
 
-from .types import ConversationRecord, DomainError, Identity, RunRecord
+from .types import (ConversationRecord, DomainError, Identity, RunRecord,
+                    WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -55,6 +56,11 @@ _WAL_RETRY_SECONDS = 0.05
 """冷库并发首次打开时，WAL 转换会短暂失败；有限重试而不是永久等待。"""
 
 _IDENTITY_COLUMNS = "users.id, users.display_name, users.role, workspaces.id AS workspace_id"
+
+_WORKER_LEASE_COLUMNS = (
+    "workspace_id, container_id, config_version, state, heartbeat_at,"
+    " started_at, owner_id, generation, lease_expires_at, updated_at,"
+    " last_activity_at, active_requests, upstream, service_token")
 
 
 def _now() -> int:
@@ -267,6 +273,22 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         CREATE INDEX broker_leases_expiry_idx ON broker_leases (expires_at)
         """,
     ),
+    # 版本 5：worker 生命周期租约的所有者/代次、心跳期限与就绪句柄；
+    # 只追加，不改写历史迁移。旧库的已有租约按空所有者、0 代次升级。
+    (
+        "ALTER TABLE worker_leases ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE worker_leases ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_leases ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_leases ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_leases ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_leases ADD COLUMN active_requests INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_leases ADD COLUMN upstream TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE worker_leases ADD COLUMN service_token TEXT NOT NULL DEFAULT ''",
+        """
+        CREATE INDEX worker_leases_state_idx
+            ON worker_leases (state, lease_expires_at)
+        """,
+    ),
 )
 
 
@@ -452,6 +474,338 @@ class Store:
     def _workspace_exists(self, workspace_id: str) -> bool:
         return self._connection.execute(
             "SELECT 1 FROM workspaces WHERE id = ?", (workspace_id,)).fetchone() is not None
+
+    # ------------------------------------------------------------------
+    # worker 生命周期租约
+    # ------------------------------------------------------------------
+
+    def get_worker_lease(self, workspace_id: str) -> WorkerLease | None:
+        """读取单个 workspace 的持久生命周期租约。"""
+        return self._worker_lease_row(_text(workspace_id))
+
+    def list_worker_leases(self) -> list[WorkerLease]:
+        rows = self._connection.execute(
+            f"SELECT {_WORKER_LEASE_COLUMNS} FROM worker_leases"
+            " ORDER BY workspace_id").fetchall()
+        return [lease for lease in (_worker_lease(row) for row in rows)
+                if lease is not None]
+
+    def claim_worker_start(self, workspace_id: str, config_version: int,
+                           owner_id: str, now: int,
+                           lease_seconds: int) -> tuple[str, WorkerLease | None]:
+        """原子认领一次启动，或返回可复用的就绪状态。
+
+        返回值：
+
+        * ``started``：调用方取得启动权，必须在租约期限内完成并携带
+          ``(owner_id, generation)`` 回写；旧持有者不匹配时不能覆盖新代次；
+        * ``ready``：同一配置版本的存活实例可直接复用；
+        * ``reconcile``：租约已过期，调用方必须先 inspect 实际容器；
+        * ``wait``：另一个管理进程正在启动，调用方等待其完成；
+        * ``upgrade``：配置版本变化且当前无活跃任务，可安全重建；
+        * ``config_busy``：配置版本变化但仍有活跃任务，禁止覆盖；
+        * ``draining``：正在 drain，拒绝新任务。
+        """
+        workspace_id = _text(workspace_id)
+        owner_id = _text(owner_id)
+        if type(config_version) is not int or config_version < 0:
+            raise DomainError("invalid_argument", 400)
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            self._require_ready_workspace(workspace_id)
+            lease = self._worker_lease_row(workspace_id)
+            if lease is None:
+                self._claim_new_generation(workspace_id, config_version,
+                                           owner_id, now, lease_seconds)
+                return "started", self._worker_lease_row(workspace_id)
+
+            if lease.state == "ready":
+                if lease.config_version == config_version:
+                    if lease.lease_expires_at > now:
+                        self._connection.execute(
+                            "UPDATE worker_leases SET heartbeat_at = ?,"
+                            " lease_expires_at = ?, updated_at = ?,"
+                            " last_activity_at = ? WHERE workspace_id = ?",
+                            (now, now + lease_seconds, now, now, workspace_id))
+                        return "ready", self._worker_lease_row(workspace_id)
+                    # 心跳过期：不能直接相信旧句柄，必须核对真实容器身份
+                    return "reconcile", lease
+                if self._has_active_workload(workspace_id, lease):
+                    return "config_busy", lease
+                return "upgrade", lease
+
+            if lease.state == "starting":
+                if lease.lease_expires_at > now:
+                    return "wait", lease
+                self._claim_new_generation(workspace_id, config_version,
+                                           owner_id, now, lease_seconds)
+                return "started", self._worker_lease_row(workspace_id)
+
+            if lease.state == "draining":
+                return "draining", lease
+
+            # absent / stopped / failed：可以安全创建新代次
+            self._claim_new_generation(workspace_id, config_version,
+                                       owner_id, now, lease_seconds)
+            return "started", self._worker_lease_row(workspace_id)
+
+    def complete_worker_start(self, workspace_id: str, owner_id: str,
+                              generation: int, handle: WorkerHandle,
+                              now: int, lease_seconds: int) -> bool:
+        """仅当仍是本次认领的所有者/代次时写入 ready。"""
+        workspace_id = _text(workspace_id)
+        owner_id = _text(owner_id)
+        if handle.workspace_id != workspace_id:
+            raise DomainError("invalid_argument", 400)
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready', container_id = ?,"
+                " upstream = ?, service_token = ?, config_version = ?,"
+                " heartbeat_at = ?, lease_expires_at = ?, updated_at = ?,"
+                " last_activity_at = ?, active_requests = 0"
+                " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
+                " AND state = 'starting'",
+                (handle.container_id, handle.upstream, handle.service_token,
+                 int(handle.config_version), now, now + lease_seconds, now,
+                 now, workspace_id, owner_id, int(generation)))
+        return cursor.rowcount == 1
+
+    def fail_worker_start(self, workspace_id: str, owner_id: str,
+                          generation: int, now: int) -> bool:
+        """标记本次启动失败，并把无法继续的残留任务转为 interrupted。
+
+        只有仍持有当前代次时才允许改写；被新代次接管的旧启动返回 False，
+        不会覆盖新状态。
+        """
+        workspace_id = _text(workspace_id)
+        owner_id = _text(owner_id)
+        now = int(now)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'failed', container_id = '',"
+                " upstream = '', service_token = '', active_requests = 0,"
+                " lease_expires_at = 0, updated_at = ?"
+                " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
+                " AND state = 'starting'",
+                (now, workspace_id, owner_id, int(generation)))
+            if cursor.rowcount != 1:
+                return False
+            self._interrupt_active_runs_locked(workspace_id, now)
+        return True
+
+    def fail_worker_state(self, workspace_id: str, now: int, *,
+                          expected_state: str | None = None,
+                          generation: int | None = None) -> bool:
+        """对账发现容器不可信时失败关闭；不接管、不缓存旧句柄。
+
+        ``generation`` 用于防止过期的对账者失败掉另一个管理进程刚接管的新
+        代次。只清可再建句柄，不触碰持久挂载。
+        """
+        workspace_id = _text(workspace_id)
+        now = int(now)
+        where = "workspace_id = ?"
+        values: list[object] = [workspace_id]
+        if expected_state is not None:
+            where += " AND state = ?"
+            values.append(expected_state)
+        if generation is not None:
+            where += " AND generation = ?"
+            values.append(int(generation))
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'failed', container_id = '',"
+                " upstream = '', service_token = '', active_requests = 0,"
+                " lease_expires_at = 0, updated_at = ? WHERE " + where,
+                (now, *values))
+            if cursor.rowcount != 1:
+                return False
+            self._interrupt_active_runs_locked(workspace_id, now)
+        return True
+
+    def mark_worker_draining(self, workspace_id: str, now: int, *,
+                             generation: int | None = None) -> bool:
+        """从 ready 原子进入 draining；并发认领不会在此时创建新实例。"""
+        where = "workspace_id = ? AND state = 'ready'"
+        values: list[object] = [int(now), _text(workspace_id)]
+        if generation is not None:
+            where += " AND generation = ?"
+            values.append(int(generation))
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'draining', updated_at = ?"
+                " WHERE " + where, (*values,))
+        return cursor.rowcount == 1
+
+    def resume_worker_ready(self, workspace_id: str, now: int, *,
+                            generation: int | None = None) -> bool:
+        """draining 认领后发现有活跃工作：回滚为 ready。
+
+        空闲回收与发布/权限等待并发时，不能让 workspace 永久停在 draining；
+        恢复后仍受心跳过期与后续空闲检查约束。
+        """
+        where = "workspace_id = ? AND state = 'draining'"
+        values: list[object] = [int(now), _text(workspace_id)]
+        if generation is not None:
+            where += " AND generation = ?"
+            values.append(int(generation))
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready', updated_at = ?"
+                " WHERE " + where, (*values,))
+        return cursor.rowcount == 1
+
+    def stop_worker(self, workspace_id: str, now: int, *,
+                    generation: int | None = None,
+                    state: str = "stopped") -> bool:
+        """容器已回收后写入终态；只清可再建句柄，不触碰持久数据。"""
+        if state not in ("stopped", "failed"):
+            raise DomainError("invalid_state", 400)
+        workspace_id = _text(workspace_id)
+        where = "workspace_id = ?"
+        values: list[object] = [workspace_id]
+        if generation is not None:
+            where += " AND generation = ?"
+            values.append(int(generation))
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = ?, container_id = '',"
+                " upstream = '', service_token = '', active_requests = 0,"
+                " lease_expires_at = 0, updated_at = ? WHERE " + where,
+                (state, int(now), *values))
+        return cursor.rowcount == 1
+
+    def heartbeat_worker(self, workspace_id: str, generation: int, now: int,
+                         lease_seconds: int,
+                         active_requests: int | None = None) -> bool:
+        """续期存活租约；只有活跃请求才刷新 last_activity_at。
+
+        空闲回收必须区分“进程仍在心跳”和“确有请求/任务在运行”。仅续期而
+        不刷新活动时间，才能让无任务实例在 900 秒后真正进入回收。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        if active_requests is not None and (
+                type(active_requests) is not int or active_requests < 0):
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            if active_requests is None:
+                cursor = self._connection.execute(
+                    "UPDATE worker_leases SET heartbeat_at = ?,"
+                    " lease_expires_at = ?, updated_at = ?"
+                    " WHERE workspace_id = ? AND generation = ?"
+                    " AND state IN ('ready', 'draining')",
+                    (now, now + lease_seconds, now, _text(workspace_id),
+                     int(generation)))
+            else:
+                last_activity = now if active_requests > 0 else None
+                cursor = self._connection.execute(
+                    "UPDATE worker_leases SET heartbeat_at = ?,"
+                    " lease_expires_at = ?, updated_at = ?,"
+                    " active_requests = ?,"
+                    " last_activity_at = COALESCE(?, last_activity_at)"
+                    " WHERE workspace_id = ? AND generation = ?"
+                    " AND state IN ('ready', 'draining')",
+                    (now, now + lease_seconds, now, active_requests,
+                     last_activity, _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
+    def adopt_worker_ready(self, workspace_id: str, generation: int,
+                           owner_id: str, now: int, lease_seconds: int) -> bool:
+        """inspect 确认身份后接管旧实例并续期。
+
+        接管会递增代次：两个管理进程同时 reconcile 时，只有一个能接管成功，
+        另一个回到认领循环读取新的存活租约，避免两个所有者继续续期同一实例。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready', owner_id = ?,"
+                " generation = generation + 1, heartbeat_at = ?,"
+                " lease_expires_at = ?, updated_at = ?, last_activity_at = ?"
+                " WHERE workspace_id = ? AND generation = ? AND state = 'ready'",
+                (_text(owner_id), now, now + lease_seconds, now, now,
+                 _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
+    def list_idle_workers(self, now: int, idle_seconds: int) -> list[WorkerLease]:
+        """返回可回收实例：心跳存活、无活跃任务/请求且空闲已超阈值。"""
+        if type(idle_seconds) is not int or idle_seconds < 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        rows = self._connection.execute(
+            f"SELECT {_WORKER_LEASE_COLUMNS} FROM worker_leases AS lease"
+            " WHERE lease.state = 'ready' AND lease.lease_expires_at > ?"
+            " AND lease.active_requests = 0 AND lease.last_activity_at <= ?"
+            " AND NOT EXISTS (SELECT 1 FROM runs AS run"
+            "  WHERE run.workspace_id = lease.workspace_id"
+            f"  AND run.status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)}))"
+            " ORDER BY lease.workspace_id",
+            (now, now - int(idle_seconds), *TERMINAL_RUN_STATUSES)).fetchall()
+        return [lease for lease in (_worker_lease(row) for row in rows)
+                if lease is not None]
+
+    def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS total FROM runs WHERE workspace_id = ?"
+            f" AND status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)})",
+            (_text(workspace_id), *TERMINAL_RUN_STATUSES)).fetchone()
+        return int(row["total"])
+
+    def interrupt_active_runs(self, workspace_id: str, now: int) -> int:
+        """把崩溃/回收后的残留任务标为 interrupted；不自动重发。"""
+        with self._transaction():
+            return self._interrupt_active_runs_locked(
+                _text(workspace_id), int(now))
+
+    def _has_active_workload(self, workspace_id: str,
+                             lease: WorkerLease) -> bool:
+        return (lease.active_requests > 0
+                or self.count_active_runs_for_workspace(workspace_id) > 0)
+
+    def _claim_new_generation(self, workspace_id: str, config_version: int,
+                              owner_id: str, now: int,
+                              lease_seconds: int) -> None:
+        self._connection.execute(
+            "INSERT INTO worker_leases"
+            " (workspace_id, container_id, config_version, state, heartbeat_at,"
+            "  started_at, owner_id, generation, lease_expires_at, updated_at,"
+            "  last_activity_at, active_requests, upstream, service_token)"
+            " VALUES (?, '', ?, 'starting', ?, ?, ?, 1, ?, ?, ?, 0, '', '')"
+            " ON CONFLICT(workspace_id) DO UPDATE SET"
+            "  container_id = '', config_version = excluded.config_version,"
+            "  state = 'starting', heartbeat_at = excluded.heartbeat_at,"
+            "  started_at = excluded.started_at, owner_id = excluded.owner_id,"
+            "  generation = worker_leases.generation + 1,"
+            "  lease_expires_at = excluded.lease_expires_at,"
+            "  updated_at = excluded.updated_at,"
+            "  last_activity_at = excluded.last_activity_at,"
+            "  active_requests = 0, upstream = '', service_token = ''",
+            (workspace_id, int(config_version), now, now, owner_id,
+             now + lease_seconds, now, now))
+
+    def _interrupt_active_runs_locked(self, workspace_id: str,
+                                      now: int) -> int:
+        cursor = self._connection.execute(
+            "UPDATE runs SET status = 'interrupted', finished_at = ?,"
+            " capacity_released_at = ?, release_count = release_count + 1"
+            " WHERE workspace_id = ? AND status NOT IN"
+            f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+            (now, now, workspace_id, *TERMINAL_RUN_STATUSES))
+        return cursor.rowcount
+
+    def _worker_lease_row(self, workspace_id: str) -> WorkerLease | None:
+        row = self._connection.execute(
+            f"SELECT {_WORKER_LEASE_COLUMNS} FROM worker_leases"
+            " WHERE workspace_id = ?", (workspace_id,)).fetchone()
+        return _worker_lease(row)
 
     # ------------------------------------------------------------------
     # 认证：本地引导、邀请与登录
@@ -1292,6 +1646,28 @@ class Store:
             raise
         else:
             self._connection.execute("COMMIT")
+
+
+def _worker_lease(row: sqlite3.Row | None) -> WorkerLease | None:
+    """把租约行映射为不可变类型；凭证字段只在内存中使用，不进入 repr。"""
+    if row is None:
+        return None
+    return WorkerLease(
+        workspace_id=row["workspace_id"],
+        container_id=row["container_id"],
+        config_version=int(row["config_version"]),
+        state=row["state"],
+        heartbeat_at=int(row["heartbeat_at"]),
+        started_at=int(row["started_at"]),
+        owner_id=row["owner_id"],
+        generation=int(row["generation"]),
+        lease_expires_at=int(row["lease_expires_at"]),
+        updated_at=int(row["updated_at"]),
+        last_activity_at=int(row["last_activity_at"]),
+        active_requests=int(row["active_requests"]),
+        upstream=row["upstream"],
+        service_token=row["service_token"],
+    )
 
 
 def _is_lock_contention(error: sqlite3.OperationalError) -> bool:

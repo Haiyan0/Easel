@@ -127,6 +127,29 @@ def test_serve_control_wires_app_and_public_origin(tmp_path, monkeypatch):
     with TestClient(app, base_url="https://easel.test") as client:
         assert client.get("/api/health").status_code == 200
         assert app.state.public_origin == "https://easel.test"
+        assert app.state.runtime is None, "未配置 provisioner 时不得伪造运行时"
+
+
+def test_serve_control_refuses_missing_provisioner_socket_before_serving(
+        tmp_path, monkeypatch, capsys):
+    """受限 provisioner 不可用时失败关闭，不回退到无隔离运行时。"""
+    from easel.control import cli as control_cli
+
+    started = []
+    monkeypatch.setattr(control_cli.uvicorn, "run",
+                        lambda *args, **kwargs: started.append(True))
+    key_file = write_key(tmp_path)
+
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", "https://easel.test",
+                 "--master-key-file", str(key_file),
+                 "--provisioner-socket", str(tmp_path / "missing.sock")])
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "provisioner_unavailable" in captured.err
+    assert started == []
+    assert not (tmp_path / "control").exists()
 
 
 def test_serve_control_rejects_invalid_origin_before_opening_store(

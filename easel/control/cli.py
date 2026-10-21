@@ -15,6 +15,7 @@ from .auth import AuthService
 from .broker import BrokerService
 from .config import ConfigService, load_master_key
 from .egress import EgressGateway, load_policy
+from .runtime import UnixProvisionerClient
 from .store import Store
 from .types import DomainError
 
@@ -93,6 +94,16 @@ def cmd_serve_control(args) -> int:
         print("错误：egress_proxy_invalid", file=sys.stderr)
         return 2
 
+    # 受限 provisioner 必须可达才启动多人运行时；缺失时失败关闭，
+    # 不回退到进程内 Docker 或“无隔离”模式。
+    provisioner = None
+    provisioner_socket = getattr(args, "provisioner_socket", None)
+    if provisioner_socket:
+        if not Path(provisioner_socket).exists():
+            print("错误：provisioner_unavailable", file=sys.stderr)
+            return 2
+        provisioner = UnixProvisionerClient(provisioner_socket)
+
     store = Store.connect(_control_db(args.control_dir))
     try:
         try:
@@ -104,7 +115,8 @@ def cmd_serve_control(args) -> int:
             return 2
         broker = BrokerService(store, config_service, egress=egress)
         app = create_app(store=store, auth=AuthService(store), config=config,
-                         config_service=config_service, broker=broker)
+                         config_service=config_service, broker=broker,
+                         provisioner=provisioner)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
         store.close()

@@ -1,0 +1,111 @@
+# Task 8 worker 镜像。
+#
+# 构建链：base（最小生命周期）→ chromium（真实浏览器）→ runtime（最终）。
+# 未指定 --target 时构建最终 runtime；缺少固定的 Harness commit 或经验证的
+# ACP profile 会构建失败，绝不产出“看起来能跑”的未固定镜像。
+#
+#   docker build -f deploy/multiuser/Dockerfile.worker \
+#     --build-arg DSH_COMMIT=<已验收 commit> -t easel-worker:<tag> .
+#
+# 隔离集成测试只需生命周期入口，可显式构建 base：
+#   docker build -f deploy/multiuser/Dockerfile.worker --target base \
+#     -t easel-worker-test:base .
+
+ARG PYTHON_VERSION=3.11.12
+FROM python:${PYTHON_VERSION}-slim-bookworm AS base
+
+ARG FASTAPI_VERSION=0.115.6
+ARG UVICORN_VERSION=0.32.1
+ARG HTTPX_VERSION=0.28.1
+ARG PYDANTIC_VERSION=2.10.4
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    EASEL_SERVICE_MODE=worker \
+    EASEL_CODE_ROOT=/opt/easel \
+    EASEL_WORKSPACE_ROOT=/workspace \
+    EASEL_STATE_ROOT=/workspace/state \
+    HOME=/home/easel
+
+# uid/gid 10001 固定；provisioner 在宿主把持久目录 chown 给该 uid。
+RUN groupadd --gid 10001 easel \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/easel \
+            --create-home --shell /usr/sbin/nologin easel \
+ && mkdir -p /opt/easel /workspace \
+ && chown easel:easel /workspace
+
+WORKDIR /opt/easel
+COPY pyproject.toml README.md ./
+COPY easel ./easel
+RUN pip install --no-cache-dir \
+      "fastapi==${FASTAPI_VERSION}" \
+      "uvicorn==${UVICORN_VERSION}" \
+      "httpx==${HTTPX_VERSION}" \
+      "pydantic==${PYDANTIC_VERSION}" \
+ && chown -R root:root /opt/easel \
+ && chmod -R a-w /opt/easel
+
+USER 10001:10001
+# 仅声明容器内端口；provisioner 不发布宿主端口。
+EXPOSE 7860
+CMD ["python", "-m", "easel.worker.lifecycle", "serve", \
+     "--host", "0.0.0.0", "--port", "7860"]
+
+
+# Chromium 是 worker 执行技能的必需依赖。浏览器与 Playwright 在本阶段
+# 安装；启动阶段禁止联网安装。不得用 --no-sandbox 或额外 capabilities
+# 换取“能启动”：沙箱不可用时真实浏览器门槛按未通过处理。
+FROM base AS chromium
+
+ARG PLAYWRIGHT_VERSION=1.49.1
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates fonts-liberation fonts-noto-cjk \
+      libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
+      libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 \
+      libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxfixes3 \
+      libxkbcommon0 libxrandr2 xdg-utils \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir "playwright==${PLAYWRIGHT_VERSION}" \
+ && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+      playwright install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/* \
+ && chmod -R a+rX,go-w /opt/playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+USER 10001:10001
+
+
+# 最终阶段：锁定管理员受管的 DeepSeek Harness commit 与已验收 ACP profile。
+# managed/acp-profile.json 必须由管理员按实际验收结果提供；仓库不伪造。
+FROM chromium AS runtime
+
+ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
+ARG DSH_COMMIT=""
+
+USER root
+COPY deploy/multiuser/managed /opt/easel/managed
+RUN test -n "${DSH_COMMIT}" \
+      || { echo "DSH_COMMIT 必须固定为已验收的 Harness commit" >&2; exit 1; } \
+ && test -f /opt/easel/managed/acp-profile.json \
+      || { echo "缺少经验证的 managed/acp-profile.json" >&2; exit 1; }
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git nodejs npm \
+ && rm -rf /var/lib/apt/lists/*
+RUN git init /opt/dsh \
+ && git -C /opt/dsh remote add origin "${DSH_REPOSITORY}" \
+ && git -C /opt/dsh fetch --depth 1 origin "${DSH_COMMIT}" \
+ && git -C /opt/dsh checkout --detach FETCH_HEAD \
+ && test "$(git -C /opt/dsh rev-parse HEAD)" = "${DSH_COMMIT}"
+# 依赖只允许在构建时安装；运行阶段不做在线 npm/pip 安装。
+RUN cd /opt/dsh \
+ && if [ -f package-lock.json ]; then npm ci --omit=dev; \
+    elif [ -f pnpm-lock.yaml ]; then corepack enable \
+      && pnpm install --frozen-lockfile --prod; \
+    else npm install --omit=dev; fi
+RUN chmod -R a-w /opt/dsh /opt/easel/managed
+
+USER 10001:10001

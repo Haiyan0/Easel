@@ -1,0 +1,90 @@
+# Task 8 多人部署参考编排：控制面 + 受控出口代理。
+#
+# 关键边界：
+# * worker 不是本文件的 service。每个 workspace 由宿主机上的受限 provisioner
+#   动态创建，使用独立 `--internal` 网络，不发布宿主端口。
+# * provisioner 必须以宿主机进程运行：它需要宿主 Docker socket，且 bind
+#   源路径必须是宿主真实路径。不要把 /var/run/docker.sock 挂进 control、
+#   egress 或 worker；也不要把 provisioner.sock 挂进 worker。
+# * control 通过只读挂载的 Unix socket 调用 provisioner；启动顺序必须先启动
+#   provisioner，再启动 control，否则 control 会失败关闭。
+# * worker 的网络只允许生命周期入口被宿主机探测；出站一律拒绝。broker/受限
+#   公网出口的允许路径尚未接线，见 egress-policy.md。
+
+name: easel-multiuser
+
+services:
+  control:
+    image: ${EASEL_CONTROL_IMAGE:?必须提供包含 easel 代码的控制面镜像}
+    user: "${EASEL_CONTROL_UID:?控制面 UID，需与 provisioner --allowed-uid 一致}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    command:
+      - python
+      - -m
+      - easel
+      - serve-control
+      - --control-dir
+      - /srv/easel/control
+      - --public-origin
+      - ${EASEL_PUBLIC_ORIGIN:?公共 Origin，例如 https://easel.example.com}
+      - --master-key-file
+      - /run/secrets/easel-master.key
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7861"
+      - --egress-proxy
+      - http://egress:8899
+      - --egress-policy
+      - /etc/easel/egress-policy.json
+      - --provisioner-socket
+      - /run/easel/provisioner.sock
+    volumes:
+      - ${EASEL_CONTROL_DIR:?控制目录}:/srv/easel/control
+      - ${EASEL_MASTER_KEY_FILE:?32 字节 master key 文件}:/run/secrets/easel-master.key:ro
+      - ${EASEL_PROVISIONER_SOCKET:?provisioner Unix socket}:/run/easel/provisioner.sock:ro
+      - ${EASEL_EGRESS_POLICY_FILE:?管理员出口策略 JSON}:/etc/easel/egress-policy.json:ro
+    ports:
+      # 默认仅本机；公网入口应经 TLS 反向代理。Docker 发布端口会绕过 UFW，
+      # 公网部署必须另配 DOCKER-USER 防火墙规则。
+      - "${EASEL_CONTROL_BIND:-127.0.0.1}:7861:7861"
+    networks:
+      - control
+    restart: unless-stopped
+
+  egress:
+    # 仅控制面 broker 的受控出口；不挂 Docker socket，不连接 worker 网络。
+    profiles: ["egress"]
+    image: ${EASEL_CONTROL_IMAGE:?必须提供包含 easel 代码的控制面镜像}
+    user: "${EASEL_CONTROL_UID:?}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    command:
+      - python
+      - deploy/multiuser/egress_proxy.py
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "8899"
+      - --policy
+      - /etc/easel/egress-policy.json
+    volumes:
+      - ${EASEL_EGRESS_POLICY_FILE:?管理员出口策略 JSON}:/etc/easel/egress-policy.json:ro
+    networks:
+      - control
+    restart: unless-stopped
+
+networks:
+  control:
+    name: easel-control
