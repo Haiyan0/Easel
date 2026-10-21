@@ -441,7 +441,8 @@ class FakeDocker:
                  run_returncode: int = 0,
                  stop_failure: bool = False,
                  rm_failure: bool = False,
-                 inspect_error: str | None = None):
+                 inspect_error: str | None = None,
+                 instance_inspect_error: str | None = None):
         self.root = root
         self.container = existing
         self.network = network
@@ -450,6 +451,7 @@ class FakeDocker:
         self.stop_failure = stop_failure
         self.rm_failure = rm_failure
         self.inspect_error = inspect_error
+        self.instance_inspect_error = instance_inspect_error
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
         self.removed: list[str] = []
@@ -463,13 +465,20 @@ class FakeDocker:
             return _fail(self.inspect_error)
         if args[:2] == ["network", "inspect"]:
             if self.network is None:
-                return _not_found("network")
+                name = provisioner.network_name(WORKSPACE)
+                return _fail(
+                    f"Error response from daemon: network {name} not found\n")
             return _ok(json.dumps([self.network]))
         if args[:2] == ["network", "create"]:
             self.network = _valid_network()
             return _ok(provisioner.network_name(WORKSPACE) + "\n")
         if args[:2] == ["container", "inspect"]:
             target = args[2]
+            if (self.instance_inspect_error is not None
+                    and len(target) == 64
+                    and all(character in "0123456789abcdef"
+                            for character in target)):
+                return _fail(self.instance_inspect_error)
             if (self.container is None
                     or (target not in (
                         provisioner.container_name(WORKSPACE),
@@ -822,6 +831,57 @@ def test_stop_command_failures_are_not_reported_success(
     assert fake.container is existing, "失败时不得假定实例已消失"
     if stop_failure:
         assert fake.removed == []
+
+
+_CONTEXT_NOT_FOUND = (
+    'Failed to initialize: unable to resolve docker endpoint: '
+    'context "codex-review-absent-context-20261021": context not found:\n'
+    'open C:\\Users\\review\\.docker\\contexts\\meta\\meta.json: '
+    "The system cannot find the path specified.")
+
+
+def test_context_not_found_is_not_treated_as_container_absence(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing,
+                      inspect_error=_CONTEXT_NOT_FOUND)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert rejected.value.code == "docker_inspect_failed"
+    assert fake.container is existing
+    assert fake.stopped == [] and fake.removed == []
+
+
+def test_context_not_found_is_not_treated_as_network_absence(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root, inspect_error=_CONTEXT_NOT_FOUND)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "network_inspect_failed"
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_final_instance_confirmation_rejects_context_error(tmp_path):
+    """stop/rm 退出 0 但最终 inspect 不可用时不得报告已消失。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing,
+                      instance_inspect_error=_CONTEXT_NOT_FOUND)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert rejected.value.code == "docker_inspect_failed"
+    assert fake.removed == [existing["Id"]]
 
 
 def test_stop_reports_docker_inspect_failure_instead_of_absent(tmp_path):

@@ -130,7 +130,10 @@ class FakeDocker:
         args = argv[1:]
         if args[:2] == ["network", "inspect"]:
             if self.network is None:
-                return self._not_found("network")
+                return subprocess.CompletedProcess(
+                    [], 1, "",
+                    ("Error response from daemon: network "
+                     f"{args[2]} not found\n"))
             return self._ok(json.dumps([self.network]))
         if args[:2] == ["network", "create"]:
             name = provisioner.network_name(self.workspace_id)

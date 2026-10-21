@@ -553,6 +553,11 @@ spec.loader.exec_module(module)
 WORKSPACE = "a" * 32
 SOCKET = "/run/easel/provisioner.sock"
 IMAGE = "sha256:" + "b" * 64
+CONTEXT_NOT_FOUND = (
+    "Failed to initialize: unable to resolve docker endpoint: "
+    'context "codex-review-absent-context-20261021": context not found:\n'
+    "open /root/.docker/contexts/meta/meta.json: "
+    "The system cannot find the path specified.")
 
 
 class FakeDocker:
@@ -710,7 +715,10 @@ async def main():
                     argv, 1, stderr=self.inspect_error)
             if args[:2] == ["network", "inspect"]:
                 if self.network is None:
-                    return self.not_found(argv, args[2])
+                    return self.completed(
+                        argv, 1,
+                        stderr=("Error response from daemon: network "
+                                f"{args[2]} not found\n"))
                 return self.completed(argv, 0, json.dumps([self.network]))
             if args[:2] == ["network", "create"]:
                 self.network = {
@@ -838,6 +846,18 @@ async def main():
         "instance_id": instance_id})
     assert inspect_failed == {
         "ok": False, "error": "docker_inspect_failed"}, inspect_failed
+
+    # Docker context 不存在不是“目标容器不存在”；不得执行 stop/rm。
+    before_context = len(ensure_docker.calls)
+    ensure_docker.inspect_error = CONTEXT_NOT_FOUND
+    context_failed = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": instance_id})
+    assert context_failed == {
+        "ok": False, "error": "docker_inspect_failed"}, context_failed
+    context_calls = ensure_docker.calls[before_context:]
+    assert not [c for c in context_calls if c[1:2] in (["stop"], ["rm"])], (
+        context_calls)
     ensure_docker.inspect_error = ""
 
     # 真实 Unix 服务 + UnixProvisionerClient + RuntimeManager + Store：
@@ -878,6 +898,23 @@ async def main():
         assert failed_lease.state == "stopping", failed_lease.state
         assert ensure_docker.container is not None
         assert ensure_docker.container["State"]["Running"] is True
+
+        # context not found 同样不能消解停止承诺或写 stopped。
+        ensure_docker.inspect_error = CONTEXT_NOT_FOUND
+        recovering = RuntimeManager(
+            store, client, clock=lambda: 2000, poll_interval=0.01,
+            drain_timeout=1)
+        try:
+            await recovering.ensure_ready(user.workspace_id, 1)
+        except RuntimeUnavailable as error:
+            assert error.code == "worker_stop_failed", error.code
+        else:
+            raise AssertionError("context not found 不得消解停止承诺")
+        assert store.get_worker_lease(
+            user.workspace_id).state == "stopping"
+        assert ensure_docker.container is not None
+        assert ensure_docker.container["State"]["Running"] is True
+        ensure_docker.inspect_error = ""
 
         # 恢复后按同一实例 ID 幂等清理。
         ensure_docker.fail_stop = False

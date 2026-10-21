@@ -971,19 +971,38 @@ class Provisioner:
         return await asyncio.to_thread(self._runner, argv, timeout=timeout)
 
     @staticmethod
-    def _not_found(result: subprocess.CompletedProcess) -> bool:
-        """只把 Docker 明确的“不存在”当作 absent，daemon/权限错误必须失败。"""
-        text = f"{getattr(result, 'stderr', '')}\n{getattr(result, 'stdout', '')}"
-        lowered = text.lower()
-        return any(marker in lowered for marker in (
-            "no such object", "no such container", "no such network",
-            "not found"))
+    def _not_found(result: subprocess.CompletedProcess, *, kind: str,
+                   target: str) -> bool:
+        """只把明确指向本次目标对象的 Docker absent 响应当作不存在。
+
+        ``context not found``、endpoint/daemon/权限/CLI 初始化错误以及任何
+        未知文本都必须失败关闭；不能再用任意 ``not found`` 子串判断。
+        """
+        if result.returncode == 0:
+            return False
+        stdout = str(getattr(result, "stdout", "") or "").strip()
+        if stdout not in ("", "[]"):
+            return False
+        text = str(getattr(result, "stderr", "") or "").strip()
+        escaped = re.escape(target)
+        if kind == "container":
+            pattern = (
+                rf"(?:Error(?: response from daemon)?:\s*)?"
+                rf"No such (?:container|object):\s*{escaped}")
+        elif kind == "network":
+            pattern = (
+                rf"(?:Error(?: response from daemon)?:\s*)?"
+                rf"(?:No such network:\s*{escaped}"
+                rf"|network\s+{escaped}\s+not found)")
+        else:
+            return False
+        return re.fullmatch(pattern, text, re.IGNORECASE) is not None
 
     async def _inspect_raw(self, workspace_id: str) -> dict | None:
-        result = await self._docker("container", "inspect",
-                                    container_name(workspace_id))
+        target = container_name(workspace_id)
+        result = await self._docker("container", "inspect", target)
         if result.returncode != 0:
-            if self._not_found(result):
+            if self._not_found(result, kind="container", target=target):
                 return None
             raise ProvisionerError("docker_inspect_failed")
         try:
@@ -997,7 +1016,8 @@ class Provisioner:
     async def _inspect_instance(self, instance_id: str) -> dict | None:
         result = await self._docker("container", "inspect", instance_id)
         if result.returncode != 0:
-            if self._not_found(result):
+            if self._not_found(result, kind="container",
+                               target=instance_id):
                 return None
             raise ProvisionerError("docker_inspect_failed")
         try:
@@ -1009,10 +1029,10 @@ class Provisioner:
         return payload[0] if isinstance(payload[0], dict) else None
 
     async def _network_payload(self, workspace_id: str) -> list | None:
-        result = await self._docker("network", "inspect",
-                                    network_name(workspace_id))
+        target = network_name(workspace_id)
+        result = await self._docker("network", "inspect", target)
         if result.returncode != 0:
-            if self._not_found(result):
+            if self._not_found(result, kind="network", target=target):
                 return None
             raise ProvisionerError("network_inspect_failed")
         try:
