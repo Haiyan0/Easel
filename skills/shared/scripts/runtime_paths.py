@@ -141,6 +141,18 @@ def chromium_launch_args(args=(), env: Mapping[str, str] | None = None):
     return filtered
 
 
+def chromium_sandbox_options(env: Mapping[str, str] | None = None) -> dict:
+    """Playwright 启动选项：worker 显式开启内置沙箱。
+
+    Playwright 在 ``chromiumSandbox`` 不为 true 时会自行注入
+    ``--no-sandbox``；仅从自传 args 中删除禁用项并不等于启用沙箱。local
+    保留 Playwright 默认值，兼容旧开发机。
+    """
+    if service_mode(env) == "worker":
+        return {"chromium_sandbox": True}
+    return {}
+
+
 def safe_segment(value: str, label: str = "account_id") -> str:
     """账号/平台标识只能是不含分隔符、点段和控制字符的单个安全段。"""
     if not isinstance(value, str) or not _SEGMENT.fullmatch(value):

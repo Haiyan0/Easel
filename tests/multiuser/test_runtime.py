@@ -39,6 +39,8 @@ class FakeProvisioner:
         self.ensure_calls: list[tuple[str, int]] = []
         self.stop_calls: list[str] = []
         self.stop_targets: list[str] = []
+        self.stop_requests: list[tuple[str, str | None]] = []
+        self.stop_rejected = 0
         self.handles: dict[str, WorkerHandle] = {}
         self.entered = asyncio.Event()
         self.stop_entered = asyncio.Event()
@@ -71,17 +73,24 @@ class FakeProvisioner:
         self.handles[workspace_id] = handle
         return handle
 
-    async def stop(self, workspace_id: str) -> None:
-        # 记录调用时实际指向的物理实例；迟到的 stop 不能作用于其后新建
-        # 的同名容器。
+    async def stop(self, workspace_id: str,
+                   instance_id: str | None = None) -> None:
+        # 生产 provisioner 按不可复用的实例身份停止。fake 同样在调用时
+        # 解析当前实例；传入了与当前实例不符的身份时拒绝且不删除。
         target = self.handles.get(workspace_id)
         self.stops += 1
         self.stop_calls.append(workspace_id)
+        self.stop_requests.append((workspace_id, instance_id))
         self.stop_targets.append(
             target.container_id if target is not None else "")
         self.stop_entered.set()
         if self.stop_gate is not None:
             await self.stop_gate.wait()
+        if (instance_id is not None and target is not None
+                and target.container_id != instance_id):
+            self.stop_rejected += 1
+            raise RuntimeUnavailable("container_conflict", 503,
+                                     retry_after=5)
         if target is not None and self.handles.get(workspace_id) is target:
             self.handles.pop(workspace_id, None)
 
@@ -92,12 +101,13 @@ class FakeProvisioner:
         handle = self.handles.get(workspace_id)
         if handle is None:
             return {"workspace_id": workspace_id, "container_id": "",
-                    "config_version": 0, "ready": False, "managed": False,
-                    "labels": {}}
+                    "instance_id": "", "config_version": 0, "ready": False,
+                    "managed": False, "labels": {}}
         label_workspace = self.inspect_labels_workspace or workspace_id
         return {
             "workspace_id": self.inspect_workspace or workspace_id,
-            "container_id": self.inspect_container_id or handle.container_id,
+            "container_id": handle.container_id,
+            "instance_id": handle.container_id,
             "config_version": (self.inspect_config_version
                                if self.inspect_config_version is not None
                                else handle.config_version),
@@ -266,11 +276,13 @@ def test_active_run_prevents_idle_collection_until_finished(tmp_path):
             manager = RuntimeManager(store, provisioner, clock=clock,
                                      idle_seconds=900, lease_seconds=120)
             await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
             active = _running(store, user)
 
             clock.value = 1901
-            assert await manager.heartbeat(user.workspace_id,
-                                           active_requests=0)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
             assert await manager.collect_idle(clock.value) == []
             assert store.get_worker_lease(user.workspace_id).state == "ready"
 
@@ -291,15 +303,18 @@ def test_active_request_prevents_idle_collection(tmp_path):
             manager = RuntimeManager(store, provisioner, clock=clock,
                                      idle_seconds=900, lease_seconds=120)
             await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
 
             clock.value = 1901
-            assert await manager.heartbeat(user.workspace_id,
-                                           active_requests=1)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=1)
             assert await manager.collect_idle(clock.value) == []
 
             clock.value = 2802
-            assert await manager.heartbeat(user.workspace_id,
-                                           active_requests=0)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
             assert await manager.collect_idle(clock.value) == [
                 user.workspace_id]
     run(scenario())
@@ -316,9 +331,11 @@ def test_idle_collection_resumes_ready_if_work_starts_during_claim(
             manager = RuntimeManager(store, provisioner, clock=clock,
                                      idle_seconds=900, lease_seconds=120)
             await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
             clock.value = 1901
-            assert await manager.heartbeat(user.workspace_id,
-                                           active_requests=0)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
 
             original = store.mark_worker_draining
 
@@ -400,12 +417,15 @@ def test_idle_collection_never_deletes_persistent_data(tmp_path):
             manager = RuntimeManager(store, provisioner, clock=clock,
                                      idle_seconds=900, lease_seconds=120)
             await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
             sentinel = tmp_path / "workspaces" / user.workspace_id / "outputs"
             sentinel.mkdir(parents=True)
             (sentinel / "keep.txt").write_text("keep", encoding="utf-8")
 
             clock.value = 1901
-            await manager.heartbeat(user.workspace_id, active_requests=0)
+            await manager.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
             assert await manager.collect_idle(clock.value) == [
                 user.workspace_id]
             assert (sentinel / "keep.txt").read_text(encoding="utf-8") == "keep"
@@ -666,6 +686,204 @@ def test_late_drain_reply_cannot_overwrite_new_generation(tmp_path):
     run(scenario())
 
 
+class GatedBeginStop:
+    """在 begin_worker_stop 已提交、尚未返回 drain 调用方时暂停。"""
+
+    def __init__(self, entered: asyncio.Event, gate: asyncio.Event):
+        self.entered = entered
+        self.gate = gate
+
+    async def __call__(self, function, *args, **kwargs):
+        result = function(*args, **kwargs)
+        if (getattr(function, "__name__", "") == "begin_worker_stop"
+                and result):
+            self.entered.set()
+            await self.gate.wait()
+        return result
+
+
+def test_stop_arriving_after_takeover_cannot_remove_new_instance(tmp_path):
+    """停止认领已提交但 stop 尚未送达时，新代次实例不得被旧 stop 删除。"""
+    async def scenario():
+        with Store.open(tmp_path / "db") as first_store, \
+                Store.open(tmp_path / "db") as second_store:
+            user = first_store.create_user("A")
+            clock = Clock()
+            gate = asyncio.Event()
+            entered = asyncio.Event()
+            provisioner = FakeProvisioner()
+            first = RuntimeManager(
+                first_store, provisioner, clock=clock, lease_seconds=1,
+                poll_interval=0.01, drain_timeout=5,
+                db_runner=GatedBeginStop(entered, gate))
+            second = RuntimeManager(second_store, provisioner, clock=clock,
+                                    lease_seconds=1, poll_interval=0.01)
+
+            old = await first.ensure_ready(user.workspace_id, 1)
+            drain = asyncio.create_task(first.drain(user.workspace_id))
+            await asyncio.wait_for(entered.wait(), 1)
+            paused = first_store.get_worker_lease(user.workspace_id)
+            assert paused.state == "stopping"
+            assert provisioner.stops == 0, "旧 stop 尚未送达"
+
+            clock.value = 1002
+            new = await second.ensure_ready(user.workspace_id, 1)
+            assert new.container_id != old.container_id
+
+            gate.set()
+            with pytest.raises(RuntimeUnavailable):
+                await asyncio.wait_for(drain, 2)
+
+            lease = second_store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == new.container_id
+            assert provisioner.handles[user.workspace_id].container_id == (
+                new.container_id)
+            assert provisioner.stop_requests[-1] == (
+                user.workspace_id, old.container_id)
+            assert provisioner.stop_rejected == 1
+    run(scenario())
+
+
+def test_idle_stop_after_takeover_cannot_remove_new_instance(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first_store, \
+                Store.open(tmp_path / "db") as second_store:
+            user = first_store.create_user("A")
+            clock = Clock()
+            gate = asyncio.Event()
+            entered = asyncio.Event()
+            provisioner = FakeProvisioner()
+            first = RuntimeManager(
+                first_store, provisioner, clock=clock, lease_seconds=1,
+                idle_seconds=0, poll_interval=0.01,
+                db_runner=GatedBeginStop(entered, gate))
+            second = RuntimeManager(second_store, provisioner, clock=clock,
+                                    lease_seconds=1, poll_interval=0.01)
+
+            old = await first.ensure_ready(user.workspace_id, 1)
+            lease = first_store.get_worker_lease(user.workspace_id)
+            assert await first.heartbeat(
+                user.workspace_id, generation=lease.generation,
+                instance_id=lease.container_id, active_requests=0)
+            collecting = asyncio.create_task(first.collect_idle(1000))
+            await asyncio.wait_for(entered.wait(), 1)
+            assert provisioner.stops == 0
+
+            clock.value = 1002
+            new = await second.ensure_ready(user.workspace_id, 1)
+            gate.set()
+            assert await asyncio.wait_for(collecting, 2) == []
+
+            assert provisioner.handles[user.workspace_id].container_id == (
+                new.container_id)
+            assert provisioner.stop_requests[-1] == (
+                user.workspace_id, old.container_id)
+            assert provisioner.stop_rejected == 1
+            current = second_store.get_worker_lease(user.workspace_id)
+            assert current.state == "ready"
+            assert current.container_id == new.container_id
+    run(scenario())
+
+
+def test_upgrade_stop_after_takeover_cannot_remove_new_instance(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first_store, \
+                Store.open(tmp_path / "db") as second_store:
+            user = first_store.create_user("A")
+            clock = Clock()
+            gate = asyncio.Event()
+            entered = asyncio.Event()
+            provisioner = FakeProvisioner()
+            first = RuntimeManager(
+                first_store, provisioner, clock=clock, lease_seconds=1,
+                poll_interval=0.01, drain_timeout=5,
+                db_runner=GatedBeginStop(entered, gate))
+            second = RuntimeManager(second_store, provisioner, clock=clock,
+                                    lease_seconds=1, poll_interval=0.01)
+
+            old = await first.ensure_ready(user.workspace_id, 1)
+            upgrading = asyncio.create_task(
+                first.ensure_ready(user.workspace_id, 2))
+            await asyncio.wait_for(entered.wait(), 1)
+            assert provisioner.stops == 0
+
+            clock.value = 1002
+            new = await second.ensure_ready(user.workspace_id, 1)
+            gate.set()
+            with pytest.raises(RuntimeUnavailable):
+                await asyncio.wait_for(upgrading, 2)
+
+            assert provisioner.handles[user.workspace_id].container_id == (
+                new.container_id)
+            assert provisioner.stop_requests[-1] == (
+                user.workspace_id, old.container_id)
+            assert provisioner.stop_rejected == 1
+            current = second_store.get_worker_lease(user.workspace_id)
+            assert current.state == "ready"
+            assert current.container_id == new.container_id
+    run(scenario())
+
+
+def test_old_holder_heartbeat_cannot_touch_new_generation(tmp_path):
+    """心跳必须携带调用者已持有的 generation/实例身份。"""
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            clock = Clock()
+            provisioner = FakeProvisioner()
+            manager = RuntimeManager(store, provisioner, clock=clock,
+                                     lease_seconds=1)
+            old = await manager.ensure_ready(user.workspace_id, 1)
+            old_lease = store.get_worker_lease(user.workspace_id)
+            assert await manager.heartbeat(
+                user.workspace_id, generation=old_lease.generation,
+                instance_id=old_lease.container_id, active_requests=7)
+
+            assert store.mark_worker_draining(
+                user.workspace_id, 1001,
+                generation=old_lease.generation)
+            assert store.begin_worker_stop(
+                user.workspace_id, 1001,
+                generation=old_lease.generation)
+            assert store.stop_worker(
+                user.workspace_id, 1001,
+                generation=old_lease.generation,
+                expected_state="stopping")
+            outcome, claimed = store.claim_worker_start(
+                user.workspace_id, 1, "new-owner", 1002, 60)
+            assert outcome == "started"
+            new_handle = WorkerHandle(
+                user.workspace_id, "new-instance", "http://10.0.0.9:7860",
+                "new-token", 1)
+            assert store.complete_worker_start(
+                user.workspace_id, "new-owner", claimed.generation,
+                new_handle, 1002, 60)
+            assert store.heartbeat_worker(
+                user.workspace_id, claimed.generation, 1003, 60, 7,
+                instance_id=new_handle.container_id)
+
+            clock.value = 1003
+            before = store.get_worker_lease(user.workspace_id)
+            assert not await manager.heartbeat(
+                user.workspace_id, generation=old_lease.generation,
+                instance_id=old.container_id, active_requests=0)
+            after = store.get_worker_lease(user.workspace_id)
+            assert after.generation == before.generation
+            assert after.owner_id == before.owner_id == "new-owner"
+            assert after.active_requests == before.active_requests == 7
+            assert after.heartbeat_at == before.heartbeat_at
+            assert after.lease_expires_at == before.lease_expires_at
+
+            assert await manager.heartbeat(
+                user.workspace_id, generation=claimed.generation,
+                instance_id=new_handle.container_id, active_requests=0)
+            renewed = store.get_worker_lease(user.workspace_id)
+            assert renewed.active_requests == 0
+            assert renewed.heartbeat_at == 1003
+    run(scenario())
+
+
 def test_drain_cas_failure_before_stop_does_not_call_provisioner(
         tmp_path, monkeypatch):
     """认领后被新代次接管时，旧 drain 必须在调用 stop 前放弃。"""
@@ -750,10 +968,15 @@ def test_control_app_runtime_methods_use_the_app_database_thread(tmp_path):
                 assert client.get("/api/auth/me").status_code == 200
             handle = task.result(timeout=10)
             assert handle.workspace_id == member.workspace_id
+            handle_lease = call_db(control_store.get_worker_lease,
+                                   member.workspace_id)
 
             assert client.portal.start_task_soon(
-                functools.partial(runtime.heartbeat, member.workspace_id,
-                                  active_requests=0)).result(timeout=10)
+                functools.partial(
+                    runtime.heartbeat, member.workspace_id,
+                    generation=handle_lease.generation,
+                    instance_id=handle.container_id,
+                    active_requests=0)).result(timeout=10)
             assert client.portal.start_task_soon(
                 runtime.collect_idle, time.time()).result(timeout=10) == []
             client.portal.start_task_soon(

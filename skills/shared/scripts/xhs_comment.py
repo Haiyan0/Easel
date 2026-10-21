@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 import content_guard  # noqa: E402  出站内容安全闸门
 from browser_state import (browser_profile_dir,  # noqa: E402
                            launch_persistent_locked)
@@ -281,7 +282,8 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     profile.mkdir(parents=True, exist_ok=True)
     args = list(LAUNCH_ARGS)
     kwargs = dict(headless=not headed, locale="zh-CN",
-                  args=chromium_launch_args(args))
+                  args=chromium_launch_args(args),
+                  **chromium_sandbox_options())
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     else:

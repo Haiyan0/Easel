@@ -24,6 +24,9 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_paths import chromium_sandbox_options  # noqa: E402
+
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -73,7 +76,8 @@ def _render_png(html_path: Path, png_path: Path) -> bool:
         return False
     try:
         with sync_playwright() as p:
-            b = p.chromium.launch(headless=True)
+            b = p.chromium.launch(headless=True,
+                                  **chromium_sandbox_options())
             page = b.new_page(viewport={"width": 1600, "height": 1000},
                               device_scale_factor=2)
             page.goto(html_path.as_uri(), wait_until="networkidle", timeout=30000)

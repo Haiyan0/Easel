@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from browser_state import (browser_profile_dir,  # noqa: E402
                            launch_persistent_locked)
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PROFILE_DIR = browser_profile_dir("zhihu")
@@ -52,6 +53,7 @@ def fetch_comments(article_url: str, limit: int = 100):
                 args=chromium_launch_args([
                     "--no-sandbox",
                     "--disable-blink-features=AutomationControlled"]),
+                **chromium_sandbox_options(),
             ))
         try:
             page = browser.new_page()

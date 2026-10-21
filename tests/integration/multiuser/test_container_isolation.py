@@ -161,7 +161,7 @@ def worker_image() -> str:
     return image_id
 
 
-EXECUTION_TAG = "easel-worker-execution-test:task8-r1"
+EXECUTION_TAG = "easel-worker-execution-test:task8-r2"
 
 
 @pytest.fixture(scope="session")
@@ -187,12 +187,69 @@ from playwright.sync_api import sync_playwright
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(
-        headless=True, args=["--disable-dev-shm-usage"])
+        headless=True, chromium_sandbox=True,
+        args=["--disable-dev-shm-usage"])
     page = browser.new_page()
     page.set_content("<h1>sandbox-ok</h1>")
     print("CHROMIUM_SANDBOX_OK", page.text_content("h1"))
     browser.close()
 '''
+
+_FINAL_DRIVER_ARGS_CODE = r'''
+import os
+import pathlib
+import stat
+from playwright.sync_api import sync_playwright
+
+fake = pathlib.Path("/tmp/fake-browser")
+fake.write_text("""#!/bin/sh
+printf '%s\\n' "$@" > "$FAKE_BROWSER_OUT"
+exit 1
+""", encoding="utf-8")
+fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+def capture(name, enabled):
+    out = pathlib.Path(f"/tmp/{name}.args")
+    os.environ["FAKE_BROWSER_OUT"] = str(out)
+    try:
+        with sync_playwright() as playwright:
+            playwright.chromium.launch(
+                executable_path=str(fake), headless=True,
+                chromium_sandbox=enabled,
+                args=["--disable-dev-shm-usage"])
+    except Exception:
+        pass
+    return out.read_text(encoding="utf-8").splitlines()
+
+enabled_args = capture("sandbox-enabled", True)
+disabled_args = capture("sandbox-disabled", False)
+assert not any(arg.split("=", 1)[0] in (
+    "--no-sandbox", "--disable-setuid-sandbox") for arg in enabled_args), (
+        enabled_args)
+assert any(arg.split("=", 1)[0] in (
+    "--no-sandbox", "--disable-setuid-sandbox") for arg in disabled_args), (
+        disabled_args)
+print("FINAL_DRIVER_ARGS_OK")
+'''
+
+
+def test_final_playwright_driver_args_do_not_disable_sandbox(
+        execution_image):
+    """检查驱动最终命令行：chromium_sandbox=True 时不得出现禁用项。"""
+    result = _docker(
+        "run", "--rm",
+        "--user", "10001:10001",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m",
+        "-e", "HOME=/tmp",
+        "-e", "MPLCONFIGDIR=/tmp/.mpl",
+        "-e", "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright",
+        execution_image, "python", "-c", _FINAL_DRIVER_ARGS_CODE,
+        timeout=120, check=False)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "FINAL_DRIVER_ARGS_OK" in result.stdout
 
 
 def test_chromium_keeps_builtin_sandbox_in_hardened_container(execution_image):
@@ -459,9 +516,14 @@ def test_abnormal_exit_and_rebuild_preserve_persistent_data(workers):
     _exec_python(worker.name,
                  "open('/workspace/keep.txt','w').write('persisted')")
     _docker("kill", worker.name, check=False)
-    stopped = _docker("inspect", worker.name).stdout
-    report = provisioner.sanitize_inspect(json.loads(stopped)[0])
+    raw_exited = json.loads(_docker("inspect", worker.name).stdout)[0]
+    report = provisioner.sanitize_inspect(raw_exited)
     assert report["ready"] is False
+    # 已退出实例没有运行时健康，但静态安全配置仍应通过验收。
+    assert provisioner.verify_worker_inspect(
+        raw_exited, workspace_id=worker.workspace_id,
+        config_version=worker.config_version, image=worker.image,
+        paths=worker.paths) is True
 
     _docker("rm", "-f", worker.name, check=False)
     _run_worker(worker)
@@ -667,10 +729,23 @@ async def main():
         "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
         "config_version": 1})
     assert ensured.get("ok") is True, ensured
-    assert ensured["handle"]["container_id"] == module.container_name(WORKSPACE)
+    assert ensured["handle"]["container_id"] == "f" * 64
     run_calls = [c for c in ensure_docker.calls if c[1:2] == ["run"]]
     assert run_calls and run_calls[0][:3] == ["docker", "run", "-d"], (
         run_calls[:1])
+
+    # 停止必须携带实例身份；同名但身份不符时不得 stop/rm。
+    wrong_stop = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": "e" * 64})
+    assert wrong_stop == {"ok": False, "error": "container_conflict"}, (
+        wrong_stop)
+    assert ensure_docker.container is not None
+    right_stop = await call({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": "f" * 64})
+    assert right_stop == {"ok": True}, right_stop
+    assert ensure_docker.container is None
 
     task.cancel()
     try:

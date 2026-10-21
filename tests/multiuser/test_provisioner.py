@@ -49,11 +49,14 @@ def test_parse_request_accepts_only_the_structured_actions():
     assert parsed.action == "ensure"
     assert parsed.workspace_id == WORKSPACE
     assert parsed.config_version == 3
-    for action in ("stop", "inspect"):
-        request = provisioner.parse_request({
-            "version": 1, "action": action, "workspace_id": WORKSPACE})
-        assert request.action == action
-        assert request.config_version == 0
+    stop = provisioner.parse_request({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": "f" * 64})
+    assert stop.action == "stop" and stop.instance_id == "f" * 64
+    inspect = provisioner.parse_request({
+        "version": 1, "action": "inspect", "workspace_id": WORKSPACE})
+    assert inspect.action == "inspect"
+    assert inspect.config_version == 0
 
 
 @pytest.mark.parametrize("field", [
@@ -506,7 +509,7 @@ def test_ensure_uses_full_run_argv_and_returns_after_real_health_chain(
     assert run_argv[:3] == ["docker", "run", "-d"], run_argv[:5]
     assert run_argv[-1] == "7860"
     assert handle.workspace_id == WORKSPACE
-    assert handle.container_id == provisioner.container_name(WORKSPACE)
+    assert handle.container_id == "f" * 64
     assert handle.upstream == "http://172.30.0.2:7860"
     assert handle.service_token
 
@@ -542,6 +545,7 @@ def test_ensure_rejects_container_with_insecure_actual_config(
 _TAMPER_NAMES = [
     "root_user", "privileged", "writable_rootfs", "wrong_image",
     "extra_network", "published_port", "cap_add", "missing_nnp",
+    "nnp_false", "nnp_substring", "nnp_conflict",
     "wrong_memory", "wrong_pids", "wrong_cpu", "extra_mount",
     "writable_workspace_mount", "foreign_command", "docker_socket_mount",
 ]
@@ -567,6 +571,13 @@ def _tampered(name: str, root: pathlib.Path) -> dict:
         raw["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
     elif name == "missing_nnp":
         raw["HostConfig"]["SecurityOpt"] = []
+    elif name == "nnp_false":
+        raw["HostConfig"]["SecurityOpt"] = ["no-new-privileges:false"]
+    elif name == "nnp_substring":
+        raw["HostConfig"]["SecurityOpt"] = ["not-no-new-privileges:true"]
+    elif name == "nnp_conflict":
+        raw["HostConfig"]["SecurityOpt"] = [
+            "no-new-privileges:true", "no-new-privileges:false"]
     elif name == "wrong_memory":
         raw["HostConfig"]["Memory"] = 8 * 1024 ** 3
     elif name == "wrong_pids":
@@ -611,7 +622,73 @@ def test_ensure_reuses_fully_valid_existing_container(tmp_path, monkeypatch):
     service = provisioner.Provisioner(_settings(tmp_path), run=fake)
 
     handle = asyncio.run(service.ensure(WORKSPACE, 3))
-    assert handle.container_id == provisioner.container_name(WORKSPACE)
+    assert handle.container_id == "f" * 64
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_ensure_accepts_docker_bare_no_new_privileges_form(tmp_path,
+                                                          monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    existing["HostConfig"]["SecurityOpt"] = ["no-new-privileges"]
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 3))
+    assert handle.container_id == existing["Id"]
+
+
+def test_ensure_replaces_safely_exited_container_without_runtime_ip(
+        tmp_path, monkeypatch):
+    """安全配置仍合法的已退出实例应被回收重建，而不是拒绝。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    exited = _valid_container(root)
+    exited["State"] = {"Running": False, "Status": "exited"}
+    exited["NetworkSettings"]["Networks"][
+        provisioner.network_name(WORKSPACE)]["IPAddress"] = ""
+    fake = FakeDocker(root, existing=exited)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 3))
+    assert handle.container_id == "f" * 64
+    assert any(call[1:2] == ["run"] for call in fake.calls)
+
+
+def test_inspect_accepts_safely_exited_container_as_not_ready(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    exited = _valid_container(root)
+    exited["State"] = {"Running": False, "Status": "exited"}
+    exited["NetworkSettings"]["Networks"][
+        provisioner.network_name(WORKSPACE)]["IPAddress"] = ""
+    fake = FakeDocker(root, existing=exited, network=_valid_network())
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    report = asyncio.run(service.inspect(WORKSPACE))
+    assert report["managed"] is True
+    assert report["ready"] is False
+    assert report["upstream"] == ""
+
+
+def test_ensure_still_rejects_exited_container_with_insecure_config(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    exited = _tampered("privileged", root)
+    exited["State"] = {"Running": False, "Status": "exited"}
+    fake = FakeDocker(root, existing=exited)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "container_conflict"
     assert all(call[1:2] != ["run"] for call in fake.calls)
 
 
@@ -671,6 +748,39 @@ def test_ensure_rejects_insecure_container_created_during_health_loop(
     with pytest.raises(provisioner.ProvisionerError):
         asyncio.run(service.ensure(WORKSPACE, 3))
     assert fake.stopped == []
+
+
+def test_stop_requires_the_exact_instance_identity(tmp_path):
+    """stop 只能作用于调用时取得的容器实例，不能按当前同名容器停止。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(service.stop(WORKSPACE, "e" * 64))
+    assert fake.stopped == []
+    assert fake.container is existing
+
+    asyncio.run(service.stop(WORKSPACE, existing["Id"]))
+    assert fake.stopped == [existing["Id"]]
+    assert fake.container is None
+
+
+def test_stop_request_requires_a_pinned_instance_identity():
+    request = provisioner.parse_request({
+        "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": "f" * 64})
+    assert request.instance_id == "f" * 64
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        provisioner.parse_request({
+            "version": 1, "action": "stop", "workspace_id": WORKSPACE})
+    assert rejected.value.code == "invalid_instance"
+    with pytest.raises(provisioner.ProvisionerError):
+        provisioner.parse_request({
+            "version": 1, "action": "stop", "workspace_id": WORKSPACE,
+            "instance_id": "not-an-id"})
 
 
 def test_inspect_rejects_tampered_actual_config(tmp_path, monkeypatch):

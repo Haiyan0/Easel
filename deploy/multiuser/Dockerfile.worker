@@ -89,6 +89,9 @@ RUN pip install --no-cache-dir -r /tmp/requirements-worker.txt \
  && rm -f /tmp/requirements-worker.txt
 COPY web ./web
 COPY skills ./skills
+# ACPAdapter.harness_instructions 强制要求公开共享工作区规则；
+# 缺少 agents/workspace/AGENTS.md 会在发送 prompt 前失败。
+COPY agents ./agents
 COPY deploy/multiuser/smoke_worker.py ./deploy/multiuser/smoke_worker.py
 RUN chown -R root:root /opt/easel \
  && chmod -R a-w /opt/easel

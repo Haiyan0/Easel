@@ -86,7 +86,11 @@ class EffectiveRoute:
 
 @dataclass(frozen=True)
 class WorkerHandle:
-    """已就绪 worker 的句柄；内部服务凭证不进入默认 repr。"""
+    """已就绪 worker 的句柄；内部服务凭证不进入默认 repr。
+
+    ``container_id`` 是 Docker 容器的不可复用 ID（不是名称）；停止、心跳
+    与对账都以它绑定具体实例。
+    """
 
     workspace_id: str
     container_id: str

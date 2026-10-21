@@ -38,6 +38,15 @@ def test_local_keeps_existing_compatibility_flags(monkeypatch):
     assert runtime_paths.chromium_launch_args(original) == original
 
 
+def test_worker_explicitly_enables_playwright_sandbox(monkeypatch):
+    """Playwright 默认会注入 --no-sandbox，必须显式 chromium_sandbox=True。"""
+    monkeypatch.setenv("EASEL_SERVICE_MODE", "worker")
+    assert runtime_paths.chromium_sandbox_options() == {
+        "chromium_sandbox": True}
+    monkeypatch.setenv("EASEL_SERVICE_MODE", "local")
+    assert runtime_paths.chromium_sandbox_options() == {}
+
+
 class _FakeChromium:
     def __init__(self, *, fail: Exception | None = None):
         self.kwargs = None
@@ -77,6 +86,7 @@ def test_actual_worker_launch_kwargs_drop_sandbox_flags(monkeypatch, tmp_path):
     _launch(module, chromium)
     assert chromium.kwargs is not None
     args = chromium.kwargs["args"]
+    assert chromium.kwargs["chromium_sandbox"] is True
     assert "--no-sandbox" not in args
     assert "--disable-setuid-sandbox" not in args
     assert all(not str(value).startswith("--no-sandbox")
@@ -87,6 +97,7 @@ def test_actual_local_launch_kwargs_keep_compatibility(monkeypatch, tmp_path):
     module, chromium = _launch_setup(monkeypatch, tmp_path, mode="local")
     _launch(module, chromium)
     assert "--no-sandbox" in chromium.kwargs["args"]
+    assert "chromium_sandbox" not in chromium.kwargs
 
 
 def test_missing_sandbox_capability_fails_instead_of_falling_back(
@@ -99,15 +110,20 @@ def test_missing_sandbox_capability_fails_instead_of_falling_back(
     with pytest.raises(RuntimeError, match="No usable sandbox"):
         _launch(module, chromium)
     assert chromium.kwargs is not None
+    assert chromium.kwargs["chromium_sandbox"] is True
     assert "--no-sandbox" not in chromium.kwargs["args"]
 
 
-def test_every_script_with_no_sandbox_routes_through_the_mode_filter():
+def test_every_chromium_launch_routes_through_the_mode_filters():
     offenders = []
     for path in (ROOT / "skills").rglob("*.py"):
         if path.name == "runtime_paths.py" or "__pycache__" in path.parts:
             continue
         text = path.read_text(encoding="utf-8")
+        launches = ("chromium.launch(" in text
+                    or "launch_persistent_context(" in text)
+        if launches and "chromium_sandbox_options(" not in text:
+            offenders.append(f"未显式启用沙箱: {path.relative_to(ROOT)}")
         if "--no-sandbox" in text and "chromium_launch_args(" not in text:
-            offenders.append(str(path.relative_to(ROOT)))
-    assert offenders == [], f"未按服务模式过滤沙箱参数：{offenders}"
+            offenders.append(f"未过滤禁用参数: {path.relative_to(ROOT)}")
+    assert offenders == [], offenders

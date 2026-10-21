@@ -2,8 +2,9 @@
 
 本目录实现单台 Linux 上每 workspace 一个隔离 worker 的运行时边界。控制面
 只通过受限 Unix socket 请求容器操作；worker 不持有 Docker socket，也不获得
-provisioner socket。Task 8 不包含完整 relay/任务分发（Task 10），不要据此
-宣称多用户已正式发布。
+provisioner socket。**Task 8 仍未完成**：worker→broker/受限出口的允许路径
+尚未接线，浏览器真实沙箱门槛在本机未通过，最终 Harness 与目标宿主门槛也
+未执行。不得把允许路径未经批准顺延为 Task 10 或据此宣称多用户已发布。
 
 ## 组件与信任边界
 
@@ -31,10 +32,12 @@ docker build -f deploy/multiuser/Dockerfile.worker \
   `deploy/multiuser/managed/acp-profile.json` 时构建失败。
 - 构建阶段职责：`base`（生命周期入口）→ `chromium`（固定浏览器）→
   `execution`（Web/ACP/技能代码与受管依赖）→ `runtime`（真实 Harness）。
-- `execution` 复制 `web/`、`skills/`，安装
+- `execution` 复制 `web/`、`skills/`、公开 `agents/workspace/`，安装
   `deploy/multiuser/requirements-worker.txt` 中全部固定版本依赖，并实际
-  执行 `smoke_worker.py --check-files`：检查文件/模块、worker 沙箱参数与
-  最小假 Harness 子进程。该冒烟代替不了真实 Harness 验证。
+  执行 `smoke_worker.py --check-files`：检查文件/模块、worker 沙箱参数、
+  worker Web 入口加载合法测试签名快照，并通过受管假 ACP 完成
+  initialize/session/new/session/prompt 与共享规则/技能/路径/环境校验。
+  该冒烟代替不了真实 DSH/供应商 Harness 验证。
 - 依赖只在构建阶段安装；运行阶段不做在线 npm/pip 安装。
 - Python/Node/Playwright/Chromium 版本在 Dockerfile 与 requirements 中固定；
   `/opt/easel`、`/opt/dsh`、`/opt/easel/managed` 构建后只读。
@@ -111,8 +114,10 @@ python deploy/multiuser/provisioner.py \
   只允许 provisioner 自身 UID。
 - 单行 JSON 协议，最大 8 KiB，10 秒请求超时：
   - `{"version":1,"action":"ensure","workspace_id":"<32hex>","config_version":N}`
-  - `{"version":1,"action":"stop","workspace_id":"<32hex>"}`
+  - `{"version":1,"action":"stop","workspace_id":"<32hex>","instance_id":"<64hex>"}`
   - `{"version":1,"action":"inspect","workspace_id":"<32hex>"}`
+- `stop` 的 `instance_id` 是 Docker 容器不可复用 ID；provisioner 在 stop/rm
+  前核对实际 ID，旧 stop 不会作用于同名新代次。
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 
@@ -164,10 +169,11 @@ docker run -d --name easel-worker-<uuid> \
 `failed`。`stopping` 是 drain 的停止认领状态，防止两个管理者同时调用
 `docker stop`。
 
-- 控制面认领写入数据库租约（owner_id + generation），跨连接/跨管理进程
-  单飞；旧代次不能覆盖新代次。Docker/网络调用不在 SQLite 事务或线程绑定
-  连接上等待。真实 control 的短数据库步骤经 lifespan 专用线程执行，
-  RuntimeManager 不直接跨线程使用 SQLite 连接。
+- 控制面认领写入数据库租约（owner_id + generation + Docker 实例 ID），跨
+  连接/跨管理进程单飞；旧代次不能覆盖新代次，也不能按当前 generation 给
+  旧持有者续心跳。Docker/网络调用不在 SQLite 事务或线程绑定连接上等待。
+  真实 control 的短数据库步骤经 lifespan 专用线程执行，RuntimeManager
+  不直接跨线程使用 SQLite 连接。
 - drain 的 mark/stop/写回都携带取得的 generation；等待后复核同一实例，
   stop 认领失败即放弃，迟到回复不能改写或停止新代次。
 - 就绪期限 60 秒；失败/超时返回 `503` 明确错误码与 `Retry-After`，不路由到
@@ -176,8 +182,11 @@ docker run -d --name easel-worker-<uuid> \
 - 空闲阈值 900 秒，且必须无活跃 Run、无活跃请求；权限等待、发布中均不回收。
 - `drain`：拒绝新任务，等待现有工作结束后停止容器；超时返回
   `worker_drain_timeout` 并保持 draining，不 delete 持久目录。
-- 停止只 `docker stop` + `rm`；`<root>/<uuid>/{workspace,home,state}` 保留。
-- control 重启后通过 inspect 的受管标签、容器名、workspace/配置版本、健康
+- 停止只按 Docker 实例 ID 执行 `docker stop` + `rm`；同名新容器不会成为
+  旧 stop 目标，`<root>/<uuid>/{workspace,home,state}` 保留。
+- 静态安全配置仍合法但已退出的实例（运行时 IP 为空）可被回收重建；未知或
+  不安全实例继续拒绝，不会误接管。
+- control 重启后通过 inspect 的受管标签、配置版本、不可复用实例 ID 与健康
   身份响应接管原实例；不重复执行 Task 6 已认领的任务。
 
 资源、网络与浏览器边界详见 `egress-policy.md`。
@@ -196,9 +205,11 @@ python -m pytest tests/integration/multiuser/test_container_isolation.py -q
 ```
 
 集成覆盖实际 `Provisioner.ensure` 的 Unix socket 服务入口、Linux fd 绑定
-chown 对 symlink 替换的拒绝、严格 inspect/网络验收、执行阶段镜像冒烟，以及
-在 worker 同等权限边界内不带 `--no-sandbox` 启动 Chromium。镜像构建依赖
-Debian/Playwright 下载，网络不可用时按未执行记录。
+chown 对 symlink 替换的拒绝、严格 inspect/网络验收、执行阶段镜像的文件/
+签名快照/ACP 指令装配冒烟，以及 Playwright 最终驱动参数与硬化容器
+Chromium 沙箱门槛。本机 Docker Desktop 上最终驱动参数正确，但硬化容器内
+Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通过**。
+镜像构建依赖 Debian/Playwright 下载，网络不可用时按未执行记录。
 
 测试只创建随机 UUID 命名的临时容器/网络，清理前核对受管标签；不删除开发者
 容器、workspace、outputs、profile 或浏览器状态。
@@ -219,16 +230,19 @@ Debian/Playwright 下载，网络不可用时按未执行记录。
   `managed/acp-profile.json`，未构建 Harness/Chromium 最终镜像。`execution`
   阶段构建冒烟只证明文件/依赖/worker 参数/子进程启动，不证明真实 DSH
   可用。
-- **worker 内真实 Chromium**：本机 Docker Desktop linux/amd64 上，在
-  `10001:10001`、只读 rootfs、`cap-drop=ALL`、`no-new-privileges`、
-  256 PIDs、4 GiB、`/tmp` noexec tmpfs 的边界内，以不带
-  `--no-sandbox` 的参数成功启动 Chromium。目标内核/宿主仍需复验；若沙箱
-  不可用，门槛按未通过记录，不允许用 `--no-sandbox` 或额外 capabilities
-  绕过。
+- **worker 内真实 Chromium（未通过）**：代码已在 worker 模式同时
+  `chromium_sandbox=True` 并移除自传禁用项，最终 Playwright 驱动参数已
+  实测不含 `--no-sandbox`。但本机 Docker Desktop linux/amd64 的硬化容器
+  （`10001:10001`、只读 rootfs、`cap-drop=ALL`、`no-new-privileges`、
+  256 PIDs、4 GiB、`/tmp` noexec tmpfs）启动 Chromium 时明确失败：
+  `No usable sandbox!`。目标内核需支持可用的用户命名空间/suid 沙箱；
+  在此之前**浏览器隔离门槛不通过**，不得用 `--no-sandbox`、额外
+  capabilities 或 privileged 绕过。
 - **技能 Chromium 参数**：worker 模式已统一经
   `runtime_paths.chromium_launch_args()` 移除 `--no-sandbox` /
-  `--disable-setuid-sandbox`；local 保留旧兼容参数。测试捕获真实
-  `launch_persistent_context` kwargs，并验证沙箱缺失时异常向上传播。
+  `--disable-setuid-sandbox`，并显式传入 `chromium_sandbox=True`；local
+  保留旧兼容参数。测试捕获真实 launch kwargs，并验证沙箱缺失时异常向上
+  传播。
 - **宿主防火墙/DOCKER-USER 规则**：仓库只定义矩阵，未自动安装或验证规则。
-- **broker/受限公网出口到 worker 的允许路径**：尚未接线（Task 10）；当前
-  worker 全拒绝出站。
+- **broker/受限公网出口到 worker 的允许路径**：尚未接线；这是 Task 8
+  未完成的门槛，不能未经批准顺延到 Task 10。当前 worker 全拒绝出站。

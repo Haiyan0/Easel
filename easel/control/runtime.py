@@ -56,8 +56,8 @@ class Provisioner(Protocol):
                      config_version: int) -> WorkerHandle:
         """幂等确保该 workspace 的容器已启动；失败必须自行清理半成品。"""
 
-    async def stop(self, workspace_id: str) -> None:
-        """停止并移除可再建容器；不得删除持久挂载。"""
+    async def stop(self, workspace_id: str, instance_id: str) -> None:
+        """只停止该实例 ID；不得按同名容器停止新代次或删除持久挂载。"""
 
     async def inspect(self, workspace_id: str) -> dict:
         """返回实际容器身份；不含秘密，``container_id`` 为空表示不存在。"""
@@ -168,7 +168,7 @@ class RuntimeManager:
                 self._store.begin_worker_stop, workspace_id, self._now(),
                 generation=lease.generation):
             return
-        await self._provisioner.stop(workspace_id)
+        await self._provisioner.stop(workspace_id, lease.container_id)
         await self._db(self._store.stop_worker, workspace_id, self._now(),
                        generation=lease.generation,
                        expected_state="stopping")
@@ -198,7 +198,8 @@ class RuntimeManager:
                     stamp, generation=lease.generation):
                 continue
             try:
-                await self._provisioner.stop(lease.workspace_id)
+                await self._provisioner.stop(lease.workspace_id,
+                                             lease.container_id)
             except Exception:
                 # 失败关闭：无法确认容器已停止时不写 stopped
                 continue
@@ -208,22 +209,23 @@ class RuntimeManager:
             collected.append(lease.workspace_id)
         return collected
 
-    async def heartbeat(self, workspace_id: str, *,
+    async def heartbeat(self, workspace_id: str, *, generation: int,
+                        instance_id: str,
                         active_requests: int | None = None) -> bool:
-        """续期存活租约；``active_requests`` 用于空闲判定。
+        """续期调用者已持有的代次/实例；绝不读取“当前租约”代旧持有者授权。
 
-        空闲实例仍会续期（进程还活着），但不刷新 ``last_activity_at``，
-        因此超过 900 秒无请求、无 Run 时仍可被回收。
+        ``active_requests`` 用于空闲判定。空闲实例仍会续期（进程还活着），
+        但不刷新 ``last_activity_at``，因此超过 900 秒无请求、无 Run 时仍
+        可被回收。
         """
         self._text(workspace_id)
-        lease = await self._db(self._store.get_worker_lease, workspace_id)
-        if lease is None:
-            return False
-        # 只续期刚刚读取的精确代次；绝不在 await 后重新读取“当前代次”，
-        # 否则旧持有者可能替新租约续命。
+        self._text(instance_id)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("generation")
         return await self._db(
-            self._store.heartbeat_worker, workspace_id, lease.generation,
-            self._now(), self._lease_seconds, active_requests)
+            self._store.heartbeat_worker, workspace_id, generation,
+            self._now(), self._lease_seconds, active_requests,
+            instance_id=instance_id)
 
     # ------------------------------------------------------------------
     # 启动 / 对账 / 升级
@@ -331,7 +333,7 @@ class RuntimeManager:
                 self._store.begin_worker_stop, workspace_id, self._now(),
                 generation=lease.generation):
             return
-        await self._provisioner.stop(workspace_id)
+        await self._provisioner.stop(workspace_id, lease.container_id)
         await self._db(self._store.stop_worker, workspace_id, self._now(),
                        generation=lease.generation,
                        expected_state="stopping")
@@ -384,7 +386,7 @@ class RuntimeManager:
             return False
         if report.get("config_version") != config_version:
             return False
-        if report.get("container_id") != lease.container_id:
+        if report.get("instance_id") != lease.container_id:
             return False
         if report.get("upstream") != lease.upstream:
             return False
@@ -530,10 +532,10 @@ class UnixProvisionerClient:
             "config_version": config_version}, self.ENSURE_TIMEOUT)
         return self._decode_ensure(response)
 
-    async def stop(self, workspace_id: str) -> None:
+    async def stop(self, workspace_id: str, instance_id: str) -> None:
         response = await self._call({
-            "version": 1, "action": "stop", "workspace_id": workspace_id},
-            self.STOP_TIMEOUT)
+            "version": 1, "action": "stop", "workspace_id": workspace_id,
+            "instance_id": instance_id}, self.STOP_TIMEOUT)
         if response.get("ok") is not True:
             raise RuntimeUnavailable(
                 _safe_error_code(response.get("error")), 503, retry_after=5)

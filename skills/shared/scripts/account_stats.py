@@ -22,7 +22,8 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from output_paths import OUTPUTS_DIR  # noqa: E402
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 from browser_state import browser_profile_dir, launch_persistent_locked  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -630,7 +631,8 @@ def _scrape(platform: str, headed: bool, base: str | None, proxy: str | None) ->
                 ctx = _xhs_launch(p, headed, base, proxy, login_assets=False)
             else:
                 kwargs = dict(headless=not headed, locale="zh-CN",
-                              args=chromium_launch_args(LAUNCH_ARGS))
+                              args=chromium_launch_args(LAUNCH_ARGS),
+                              **chromium_sandbox_options())
                 if proxy:
                     kwargs["proxy"] = {"server": proxy}
                 ctx = launch_persistent_locked(

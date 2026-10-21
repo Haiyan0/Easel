@@ -29,7 +29,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 import login_state  # noqa: E402
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快照+列表对账协议）
@@ -161,7 +162,8 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
         #（国内平台发布/登录必须直连；web 侧 _proxy_env 可能注入代理变量，这里兜底）
         args.append("--no-proxy-server")
     kwargs = dict(headless=not headed, locale="zh-CN",
-                  args=chromium_launch_args(args))
+                  args=chromium_launch_args(args),
+                  **chromium_sandbox_options())
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     return launch_persistent_locked(

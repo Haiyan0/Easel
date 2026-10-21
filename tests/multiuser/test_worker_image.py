@@ -20,6 +20,7 @@ def test_final_image_contains_worker_execution_code_and_skills():
     assert "FROM execution AS runtime" in text
     assert "COPY web ./web" in text
     assert "COPY skills ./skills" in text
+    assert "COPY agents ./agents" in text
     assert "COPY deploy/multiuser/managed /opt/easel/managed" in text
     assert "requirements-worker.txt" in text
     assert "smoke_worker.py --check-files" in text
@@ -51,13 +52,18 @@ def test_build_smoke_checks_files_modules_worker_mode_and_fake_harness():
     text = _text(SMOKE)
     assert "REQUIRED_FILES" in text
     assert "web/app.py" in text
+    assert "agents/workspace/AGENTS.md" in text
     assert "skills/shared/scripts/runtime_paths.py" in text
     assert "REQUIRED_MODULES" in text
     assert "chromium_launch_args" in text
+    assert "chromium_sandbox_options" in text
+    assert "sign_worker_snapshot" in text
+    assert "load_worker_snapshot" in text
+    assert "ACPAdapter" in text
+    assert "session/prompt" in text
     assert "FORBIDDEN_FILE_NAMES" in text
     assert "镜像包含开发者私有文件" in text
-    assert "FAKE_HARNESS_FLAG" in text
-    assert "假 Harness" in text
+    assert "FAKE_ACP_FLAG" in text
     assert "--require-dsh" in text
     assert "acp-profile.json" in text
 

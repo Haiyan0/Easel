@@ -15,7 +15,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]
                        / "shared" / "scripts"))
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 
 
 THEMES: dict[str, dict[str, Any]] = {
@@ -625,9 +626,11 @@ async def render(plan_path: Path, plan: dict[str, Any], out_dir: Path, html_path
     width, height = SIZES[plan["size"]]
     report: dict[str, Any] = {"plan": str(plan_path), "size": plan["size"], "slides": []}
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=chromium_launch_args([
-            "--no-sandbox", "--disable-dev-shm-usage",
-            "--font-render-hinting=none"]))
+        browser = await pw.chromium.launch(
+            args=chromium_launch_args([
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--font-render-hinting=none"]),
+            **chromium_sandbox_options())
         page = await browser.new_page(viewport={"width": width, "height": height}, device_scale_factor=1)
         await page.goto(html_path.as_uri(), wait_until="load", timeout=20000)
         try:

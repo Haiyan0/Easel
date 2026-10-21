@@ -67,6 +67,7 @@ ACTIONS = ("ensure", "stop", "inspect")
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PINNED_IMAGE = re.compile(
     r"^(?:[A-Za-z0-9][A-Za-z0-9._/:@+-]*@)?sha256:[0-9a-f]{64}$")
+_CONTAINER_INSTANCE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -90,6 +91,7 @@ class WorkerRequest:
     action: str
     workspace_id: str
     config_version: int = 0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,8 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     allowed = {"version", "action", "workspace_id"}
     if action == "ensure":
         allowed.add("config_version")
+    elif action == "stop":
+        allowed.add("instance_id")
     unknown = {key for key in data if key not in allowed}
     if unknown:
         # 明确拒绝所有镜像/命令/挂载/网络/环境注入尝试
@@ -162,7 +166,14 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
         raise _reject("invalid_config_version")
     if not _valid_config_version(config_version):
         raise _reject("invalid_config_version")
-    return WorkerRequest(action, workspace_id, config_version)
+
+    instance_id = ""
+    if action == "stop":
+        instance_id = data.get("instance_id")
+        if (not isinstance(instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
+            raise _reject("invalid_instance")
+    return WorkerRequest(action, workspace_id, config_version, instance_id)
 
 
 def _valid_config_version(value: object) -> bool:
@@ -515,6 +526,7 @@ def sanitize_inspect(raw: dict | None) -> dict:
     empty = {
         "workspace_id": "",
         "container_id": "",
+        "instance_id": "",
         "config_version": 0,
         "ready": False,
         "managed": False,
@@ -575,6 +587,7 @@ def sanitize_inspect(raw: dict | None) -> dict:
     return {
         "workspace_id": workspace_id,
         "container_id": name,
+        "instance_id": str(raw.get("Id") or ""),
         "config_version": config_version,
         "ready": ready,
         "managed": True,
@@ -582,6 +595,26 @@ def sanitize_inspect(raw: dict | None) -> dict:
         "upstream": (f"http://{address}:{WORKER_PORT}" if address else ""),
         "security": security,
     }
+
+
+def _no_new_privileges_enabled(options: object) -> bool:
+    """只接受 Docker 的规范启用形式；false/伪造包含/冲突一律不启用。
+
+    Docker 合法写法为 ``no-new-privileges`` 或
+    ``no-new-privileges:true``。子串匹配会把
+    ``not-no-new-privileges:true`` 或 ``no-new-privileges:false`` 误判为
+    已启用，因此逐项按规范值解析并要求恰好一个启用项。
+    """
+    if not isinstance(options, (list, tuple)):
+        return False
+    values: list[bool] = []
+    for option in options:
+        text = str(option)
+        if text in ("no-new-privileges", "no-new-privileges:true"):
+            values.append(True)
+        elif text.startswith("no-new-privileges"):
+            values.append(False)
+    return values == [True]
 
 
 def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
@@ -593,6 +626,10 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     任何字段缺失、类型异常或与批准值不一致都返回 False。
     """
     if not isinstance(raw, dict):
+        return False
+    instance_id = raw.get("Id")
+    if (not isinstance(instance_id, str)
+            or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
         return False
     report = sanitize_inspect(raw)
     if not report["managed"] or report["config_version"] != config_version:
@@ -620,8 +657,7 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     if host.get("CapAdd") not in (None, []):
         return False
     security_options = host.get("SecurityOpt") or []
-    if not any("no-new-privileges" in str(option)
-               for option in security_options):
+    if not _no_new_privileges_enabled(security_options):
         return False
     if any("unconfined" in str(option) for option in security_options):
         return False
@@ -683,8 +719,9 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     approved = network_name(workspace_id)
     if not isinstance(networks, dict) or set(networks) != {approved}:
         return False
-    entry = networks.get(approved)
-    if not isinstance(entry, dict) or not entry.get("IPAddress"):
+    # 静态安全验收不要求运行时 IP：已退出容器没有活动 endpoint。
+    # 是否可复用由调用方结合 ready/upstream 与健康探测判断。
+    if not isinstance(networks.get(approved), dict):
         return False
     ports = network_settings.get("Ports") or {}
     if not isinstance(ports, dict) or any(
@@ -1030,7 +1067,7 @@ class Provisioner:
                 raise ProvisionerError("container_conflict")
             if report["ready"] and await self._probe(
                     workspace_id, config_version, report["upstream"], token):
-                return WorkerHandle(workspace_id, report["container_id"],
+                return WorkerHandle(workspace_id, report["instance_id"],
                                     report["upstream"], token, config_version)
             await self._remove_container(workspace_id)
 
@@ -1060,7 +1097,7 @@ class Provisioner:
                 if (report["ready"]
                         and await self._probe(workspace_id, config_version,
                                               report["upstream"], token)):
-                    return WorkerHandle(workspace_id, report["container_id"],
+                    return WorkerHandle(workspace_id, report["instance_id"],
                                         report["upstream"], token,
                                         config_version)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
@@ -1070,9 +1107,15 @@ class Provisioner:
         await self._remove_container(workspace_id)
         raise ProvisionerError("worker_not_ready")
 
-    async def stop(self, workspace_id: str) -> None:
+    async def stop(self, workspace_id: str, instance_id: str) -> None:
+        """只停止调用方取得的那个物理实例；同名新容器绝不受影响。
+
+        物理动作使用 Docker 不可复用的容器 ID，而不是当前同名容器名。
+        即使旧 stop 在租约被新代次接管后才送达，ID 不匹配即拒绝。
+        """
         parse_request({"version": PROTOCOL_VERSION, "action": "stop",
-                       "workspace_id": workspace_id})
+                       "workspace_id": workspace_id,
+                       "instance_id": instance_id})
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
             raw = await self._inspect_raw(workspace_id)
@@ -1081,9 +1124,12 @@ class Provisioner:
             report = sanitize_inspect(raw)
             if not report["managed"]:
                 raise ProvisionerError("container_conflict")
-            await self._docker("stop", "--time", "30",
-                               container_name(workspace_id), timeout=60.0)
-            await self._remove_container(workspace_id)
+            if (not isinstance(raw.get("Id"), str)
+                    or raw.get("Id") != instance_id):
+                raise ProvisionerError("container_conflict")
+            await self._docker("stop", "--time", "30", instance_id,
+                               timeout=60.0)
+            await self._docker("rm", "-f", instance_id, timeout=60.0)
 
     async def inspect(self, workspace_id: str) -> dict:
         parse_request({"version": PROTOCOL_VERSION, "action": "inspect",
@@ -1223,7 +1269,7 @@ class Provisioner:
                 "config_version": handle.config_version,
             }}
         if request.action == "stop":
-            await self.stop(request.workspace_id)
+            await self.stop(request.workspace_id, request.instance_id)
             return {"ok": True}
         report = await self.inspect(request.workspace_id)
         return {"ok": True, "report": report}

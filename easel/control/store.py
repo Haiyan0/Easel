@@ -753,27 +753,32 @@ class Store:
 
     def heartbeat_worker(self, workspace_id: str, generation: int, now: int,
                          lease_seconds: int,
-                         active_requests: int | None = None) -> bool:
-        """续期存活租约；只有活跃请求才刷新 last_activity_at。
+                         active_requests: int | None = None, *,
+                         instance_id: str) -> bool:
+        """按调用者持有的代次与实例身份续期，原子拒绝旧持有者。
 
         空闲回收必须区分“进程仍在心跳”和“确有请求/任务在运行”。仅续期而
         不刷新活动时间，才能让无任务实例在 900 秒后真正进入回收。
         """
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise DomainError("invalid_argument", 400)
+        if type(generation) is not int or generation < 0:
+            raise DomainError("invalid_argument", 400)
         if active_requests is not None and (
                 type(active_requests) is not int or active_requests < 0):
             raise DomainError("invalid_argument", 400)
+        instance_id = _text(instance_id)
         now = int(now)
+        where = (
+            " WHERE workspace_id = ? AND generation = ?"
+            " AND container_id = ? AND state IN ('ready', 'draining')")
+        identity = (_text(workspace_id), int(generation), instance_id)
         with self._transaction():
             if active_requests is None:
                 cursor = self._connection.execute(
                     "UPDATE worker_leases SET heartbeat_at = ?,"
-                    " lease_expires_at = ?, updated_at = ?"
-                    " WHERE workspace_id = ? AND generation = ?"
-                    " AND state IN ('ready', 'draining')",
-                    (now, now + lease_seconds, now, _text(workspace_id),
-                     int(generation)))
+                    " lease_expires_at = ?, updated_at = ?" + where,
+                    (now, now + lease_seconds, now, *identity))
             else:
                 last_activity = now if active_requests > 0 else None
                 cursor = self._connection.execute(
@@ -781,10 +786,9 @@ class Store:
                     " lease_expires_at = ?, updated_at = ?,"
                     " active_requests = ?,"
                     " last_activity_at = COALESCE(?, last_activity_at)"
-                    " WHERE workspace_id = ? AND generation = ?"
-                    " AND state IN ('ready', 'draining')",
+                    + where,
                     (now, now + lease_seconds, now, active_requests,
-                     last_activity, _text(workspace_id), int(generation)))
+                     last_activity, *identity))
         return cursor.rowcount == 1
 
     def adopt_worker_ready(self, workspace_id: str, generation: int,

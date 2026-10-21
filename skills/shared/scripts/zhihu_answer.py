@@ -28,7 +28,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime_paths import chromium_launch_args  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options)
 import content_guard  # noqa: E402  出站内容安全闸门
 from browser_state import (browser_profile_dir,  # noqa: E402
                            launch_persistent_locked)
@@ -265,6 +266,7 @@ def publish_answer(question_url: str, content: str, headed: bool = False, dry_ru
                 str(PROFILE_DIR),
                 headless=not headed,
                 args=chromium_launch_args(LAUNCH_ARGS),
+                **chromium_sandbox_options(),
                 viewport={"width": 1280, "height": 900},
             ))
         try:

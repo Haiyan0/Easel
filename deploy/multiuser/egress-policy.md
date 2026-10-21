@@ -29,8 +29,8 @@ Engine 上的输出为准。
 | worker → 云元数据（169.254.169.254） | 拒绝 | `--internal` 无外部/链路本地路由 | 本机实测通过 |
 | worker → 公网 IPv4 | 拒绝 | `--internal` 禁止外部连通 | 本机实测通过（1.1.1.1:53 失败） |
 | worker → 公网 IPv6 | 拒绝 | 内部桥默认未启用 IPv6，无 IPv6 地址/默认路由 | 本机实测通过（检查地址/路由并实际连接失败） |
-| worker → 必要入口 / provider broker | **允许**（业务目标） | **尚未接线**：Task 10 relay 之前不暴露 worker 业务入口；broker 属 control 侧 | 未启用 |
-| worker → 受控公网出口（egress sidecar） | **允许**（业务目标） | **尚未接线**：本轮不创建 sidecar，worker 保持零出站 | 未启用 |
+| worker → 必要入口 / provider broker | **允许**（业务目标） | **尚未接线**：Task 8 未完成，不得顺延到 Task 10；broker 属 control 侧 | 未启用（Task 8 未完成） |
+| worker → 受控公网出口（egress sidecar） | **允许**（业务目标） | **尚未接线**：本轮不创建 sidecar，worker 保持零出站 | 未启用（Task 8 未完成） |
 | 宿主 provisioner → worker lifecycle | 允许（仅健康探测） | 宿主经内部桥访问容器 IP:7860，带身份/token 校验 | 待 Linux 集成实测 |
 
 “允许”的两行是明确的后续接线点，不是当前能力。在接线前，worker 处于
@@ -82,13 +82,16 @@ worker 镜像包含固定版本 Chromium/Playwright。Chromium 必须使用内�
 不得降低容器安全配置来迁就。
 
 **参数层已修复：** 所有实际 Chromium 启动点统一调用
-`runtime_paths.chromium_launch_args()`。worker 模式会移除
-`--no-sandbox` 与 `--disable-setuid-sandbox`（含 `=value` 形式）；local
-仅为开发机兼容保留原参数。测试捕获真实 `launch_persistent_context`
-kwargs，并验证缺少沙箱能力时异常向上传播，不会静默回退。
+`runtime_paths.chromium_launch_args()` 和
+`runtime_paths.chromium_sandbox_options()`。worker 模式会移除
+`--no-sandbox` / `--disable-setuid-sandbox`（含 `=value` 形式），并显式
+传入 Playwright `chromium_sandbox=True`，避免驱动默认重新注入
+`--no-sandbox`。local 仅为开发机兼容保留原参数。测试捕获真实 launch
+kwargs 与最终驱动命令行，并验证缺少沙箱能力时异常向上传播，不会静默
+回退。
 
-**仍未实测：** 尚未在只读 rootfs、`cap-drop=ALL`、
-`no-new-privileges` 的 hardened worker 容器内启动真实 Chromium。目标内核
-若不允许 Chromium 内置沙箱，浏览器门槛按未通过记录；不得以关闭沙箱、
-`--privileged` 或恢复 capabilities 的方式迁就。参数修复不等于真实容器
-沙箱已通过。
+**真实门槛未通过：** 本机 Docker Desktop linux/amd64 的硬化容器内，
+`chromium_sandbox=True` 启动明确失败：`No usable sandbox!`。因此当前
+**浏览器隔离门槛不通过**，不得开放多人执行。目标 Linux 内核需提供可用的
+用户命名空间或 suid 沙箱；不得以关闭沙箱、`--privileged` 或恢复
+capabilities 的方式迁就。

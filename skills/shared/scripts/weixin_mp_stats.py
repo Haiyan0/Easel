@@ -27,7 +27,8 @@ import login_state  # noqa: E402
 from browser_state import (ProfileLock, browser_profile_dir,  # noqa: E402
                            launch_persistent_locked)
 from output_paths import OUTPUTS_DIR  # noqa: E402
-from runtime_paths import chromium_launch_args, service_mode  # noqa: E402
+from runtime_paths import (chromium_launch_args,  # noqa: E402
+                           chromium_sandbox_options, service_mode)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 LOGIN_DIR = OUTPUTS_DIR / "_login"
@@ -132,6 +133,7 @@ def _launch(p, headed, base, proxy):
     prof.mkdir(parents=True, exist_ok=True)
     kw = dict(headless=not headed, locale="zh-CN",
               args=chromium_launch_args(LAUNCH_ARGS),
+              **chromium_sandbox_options(),
               viewport={"width": 1440, "height": 900})
     # mp 为国内站，直连即可。仅显式 --proxy 时才走代理；否则不传 proxy，
     # 并靠进程环境已清空 http(s)_proxy（见启动命令的 env -u）让 Chromium 直连。
