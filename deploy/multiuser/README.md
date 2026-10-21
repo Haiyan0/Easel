@@ -194,6 +194,13 @@ python -m pytest tests/integration/multiuser/test_container_isolation.py -q
 - **worker 内真实 Chromium**：未在只读 rootfs + cap-drop + no-new-privileges
   的容器内启动浏览器；沙箱不可用即门槛不通过，不允许用 `--no-sandbox`
   或额外 capabilities 绕过。
+- **已有技能的 Chromium 参数（阻塞项）**：检查发现
+  `skills/builtin/paper-explainer/scripts/render_slides.py` 与
+  `skills/shared/scripts/{account_stats,douyin_publish,render_card,web_publisher,weixin_mp_stats,xhs_comment,xhs_publish,zhihu_answer}.py`
+  仍硬编码 `--no-sandbox`（另有 zhihu 参考命令文档）。这些属于本地兼容
+  路径，但 worker 模式执行时会关闭浏览器沙箱；Task 8 未改写这些技能，
+  因此**浏览器隔离门槛未通过**，在按服务模式区分并移除 worker 的
+  `--no-sandbox` 之前不得开放多人执行。
 - **宿主防火墙/DOCKER-USER 规则**：仓库只定义矩阵，未自动安装或验证规则。
 - **broker/受限公网出口到 worker 的允许路径**：尚未接线（Task 10）；当前
   worker 全拒绝出站。

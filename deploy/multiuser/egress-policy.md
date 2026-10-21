@@ -76,3 +76,10 @@ worker 镜像包含固定版本 Chromium/Playwright。Chromium 必须使用内�
 在只读 rootfs、`cap-drop=ALL`、`no-new-privileges` 下浏览器沙箱是否可用，
 必须在目标 Linux 内核上实际启动浏览器验证；不可用即视为浏览器门槛未通过，
 不得降低容器安全配置来迁就。
+
+**当前阻塞项：** 检查发现已有技能脚本（`skills/shared/scripts/` 下
+`account_stats`、`douyin_publish`、`render_card`、`web_publisher`、
+`weixin_mp_stats`、`xhs_comment`、`xhs_publish`、`zhihu_answer`，以及
+`skills/builtin/paper-explainer/scripts/render_slides.py`）硬编码
+`--no-sandbox`。worker 模式执行这些技能会绕过沙箱；在按服务模式区分并
+移除 worker 侧该参数之前，浏览器门槛视为未通过，不开放多人执行。
