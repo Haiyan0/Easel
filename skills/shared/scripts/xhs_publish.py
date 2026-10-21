@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_paths import chromium_launch_args  # noqa: E402
 import login_state  # noqa: E402
 import login_qr
 import login_transport
@@ -965,6 +966,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
     else:
         # 显式直连：Chromium 级屏蔽系统/环境代理（开 VPN 也能用）——同抖音链兜底
         args.append("--no-proxy-server")
+    kwargs["args"] = chromium_launch_args(args)
     cloak = _cloak_executable()
     if cloak:
         kwargs["executable_path"] = str(cloak)

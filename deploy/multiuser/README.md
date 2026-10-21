@@ -29,11 +29,18 @@ docker build -f deploy/multiuser/Dockerfile.worker \
 
 - `DSH_COMMIT` 为空、clone 后 `rev-parse` 不匹配、或缺少
   `deploy/multiuser/managed/acp-profile.json` 时构建失败。
+- 构建阶段职责：`base`（生命周期入口）→ `chromium`（固定浏览器）→
+  `execution`（Web/ACP/技能代码与受管依赖）→ `runtime`（真实 Harness）。
+- `execution` 复制 `web/`、`skills/`，安装
+  `deploy/multiuser/requirements-worker.txt` 中全部固定版本依赖，并实际
+  执行 `smoke_worker.py --check-files`：检查文件/模块、worker 沙箱参数与
+  最小假 Harness 子进程。该冒烟代替不了真实 Harness 验证。
 - 依赖只在构建阶段安装；运行阶段不做在线 npm/pip 安装。
-- Python/Node/Playwright/Chromium 版本在 Dockerfile 中固定；`/opt/easel`、
-  `/opt/dsh`、`/opt/easel/managed` 构建后只读。
+- Python/Node/Playwright/Chromium 版本在 Dockerfile 与 requirements 中固定；
+  `/opt/easel`、`/opt/dsh`、`/opt/easel/managed` 构建后只读。
 - `.dockerignore` 排除 `.env*`、outputs、profiles、浏览器状态、数据库、
-  HOME、审计/任务文档与 tests；构建上下文不含开发者数据。
+  HOME、审计/任务文档、tests，以及补 COPY `skills/` 后可能带入的旧公众号
+  YAML、token、Cookie、缓存；构建上下文不含开发者数据。
 - 禁止 COPY 任何 master key、服务 token、模型 Key、Cookie。
 
 构建后取摘要并部署，禁止用可变 tag 启动：
@@ -48,6 +55,15 @@ docker image inspect --format '{{.Id}}' easel-worker:<tag>
 ```bash
 docker build -f deploy/multiuser/Dockerfile.worker --target base \
   -t easel-worker-test:base .
+```
+
+执行阶段（无真实 Harness）可单独构建并运行冒烟：
+
+```bash
+docker build -f deploy/multiuser/Dockerfile.worker --target execution \
+  -t easel-worker-execution:test .
+docker run --rm easel-worker-execution:test \
+  python deploy/multiuser/smoke_worker.py --check-files
 ```
 
 ## 2. 持久区与配额
@@ -144,11 +160,16 @@ docker run -d --name easel-worker-<uuid> \
 
 ## 6. 生命周期与回收
 
-状态：`absent → starting → ready → draining → stopped`，另有 `failed`。
+状态：`absent → starting → ready → draining → stopping → stopped`，另有
+`failed`。`stopping` 是 drain 的停止认领状态，防止两个管理者同时调用
+`docker stop`。
 
 - 控制面认领写入数据库租约（owner_id + generation），跨连接/跨管理进程
   单飞；旧代次不能覆盖新代次。Docker/网络调用不在 SQLite 事务或线程绑定
-  连接上等待。
+  连接上等待。真实 control 的短数据库步骤经 lifespan 专用线程执行，
+  RuntimeManager 不直接跨线程使用 SQLite 连接。
+- drain 的 mark/stop/写回都携带取得的 generation；等待后复核同一实例，
+  stop 认领失败即放弃，迟到回复不能改写或停止新代次。
 - 就绪期限 60 秒；失败/超时返回 `503` 明确错误码与 `Retry-After`，不路由到
   其他 workspace。
 - 配置版本升级只在没有活跃 Run/请求时进行；旧版本句柄不会被当作新版本。
@@ -174,6 +195,11 @@ EASEL_RUN_CONTAINER_TESTS=1 \
 python -m pytest tests/integration/multiuser/test_container_isolation.py -q
 ```
 
+集成覆盖实际 `Provisioner.ensure` 的 Unix socket 服务入口、Linux fd 绑定
+chown 对 symlink 替换的拒绝、严格 inspect/网络验收、执行阶段镜像冒烟，以及
+在 worker 同等权限边界内不带 `--no-sandbox` 启动 Chromium。镜像构建依赖
+Debian/Playwright 下载，网络不可用时按未执行记录。
+
 测试只创建随机 UUID 命名的临时容器/网络，清理前核对受管标签；不删除开发者
 容器、workspace、outputs、profile 或浏览器状态。
 
@@ -190,17 +216,19 @@ python -m pytest tests/integration/multiuser/test_container_isolation.py -q
 - **宿主 provisioner → 容器 IP 健康探测**：集成测试经 `docker exec` 从容器
   内探测；Docker Desktop 的 VM 网络不提供宿主直达容器 IP 的等价路径。
 - **最终 runtime 镜像**：缺少管理员已验收的 `DSH_COMMIT` 与
-  `managed/acp-profile.json`，未构建 Harness/Chromium 最终镜像。
-- **worker 内真实 Chromium**：未在只读 rootfs + cap-drop + no-new-privileges
-  的容器内启动浏览器；沙箱不可用即门槛不通过，不允许用 `--no-sandbox`
-  或额外 capabilities 绕过。
-- **已有技能的 Chromium 参数（阻塞项）**：检查发现
-  `skills/builtin/paper-explainer/scripts/render_slides.py` 与
-  `skills/shared/scripts/{account_stats,douyin_publish,render_card,web_publisher,weixin_mp_stats,xhs_comment,xhs_publish,zhihu_answer}.py`
-  仍硬编码 `--no-sandbox`（另有 zhihu 参考命令文档）。这些属于本地兼容
-  路径，但 worker 模式执行时会关闭浏览器沙箱；Task 8 未改写这些技能，
-  因此**浏览器隔离门槛未通过**，在按服务模式区分并移除 worker 的
-  `--no-sandbox` 之前不得开放多人执行。
+  `managed/acp-profile.json`，未构建 Harness/Chromium 最终镜像。`execution`
+  阶段构建冒烟只证明文件/依赖/worker 参数/子进程启动，不证明真实 DSH
+  可用。
+- **worker 内真实 Chromium**：本机 Docker Desktop linux/amd64 上，在
+  `10001:10001`、只读 rootfs、`cap-drop=ALL`、`no-new-privileges`、
+  256 PIDs、4 GiB、`/tmp` noexec tmpfs 的边界内，以不带
+  `--no-sandbox` 的参数成功启动 Chromium。目标内核/宿主仍需复验；若沙箱
+  不可用，门槛按未通过记录，不允许用 `--no-sandbox` 或额外 capabilities
+  绕过。
+- **技能 Chromium 参数**：worker 模式已统一经
+  `runtime_paths.chromium_launch_args()` 移除 `--no-sandbox` /
+  `--disable-setuid-sandbox`；local 保留旧兼容参数。测试捕获真实
+  `launch_persistent_context` kwargs，并验证沙箱缺失时异常向上传播。
 - **宿主防火墙/DOCKER-USER 规则**：仓库只定义矩阵，未自动安装或验证规则。
 - **broker/受限公网出口到 worker 的允许路径**：尚未接线（Task 10）；当前
   worker 全拒绝出站。

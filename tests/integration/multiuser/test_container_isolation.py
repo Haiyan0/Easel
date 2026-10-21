@@ -161,6 +161,62 @@ def worker_image() -> str:
     return image_id
 
 
+EXECUTION_TAG = "easel-worker-execution-test:task8-r1"
+
+
+@pytest.fixture(scope="session")
+def execution_image() -> str:
+    """构建不含真实 Harness 的执行阶段；冒烟在构建期与运行期各执行一次。"""
+    _docker(
+        "build", "-f", str(DOCKERFILE), "--target", "execution",
+        "-t", EXECUTION_TAG, str(ROOT), timeout=1800)
+    return EXECUTION_TAG
+
+
+def test_execution_image_contains_web_skills_and_fake_harness(execution_image):
+    result = _docker(
+        "run", "--rm", execution_image,
+        "python", "deploy/multiuser/smoke_worker.py", "--check-files",
+        timeout=120, check=False)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "WORKER_SMOKE_OK" in result.stdout
+
+
+_CHROMIUM_SANDBOX_CODE = r'''
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(
+        headless=True, args=["--disable-dev-shm-usage"])
+    page = browser.new_page()
+    page.set_content("<h1>sandbox-ok</h1>")
+    print("CHROMIUM_SANDBOX_OK", page.text_content("h1"))
+    browser.close()
+'''
+
+
+def test_chromium_keeps_builtin_sandbox_in_hardened_container(execution_image):
+    """与 worker 相同的权限边界内启动 Chromium；失败即门槛未通过。"""
+    result = _docker(
+        "run", "--rm",
+        "--user", "10001:10001",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--pids-limit=256",
+        "--memory=4g",
+        "--memory-swap=4g",
+        "--cpus=2",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=1g",
+        "-e", "HOME=/tmp",
+        "-e", "MPLCONFIGDIR=/tmp/.mpl",
+        "-e", "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright",
+        execution_image, "python", "-c", _CHROMIUM_SANDBOX_CODE,
+        timeout=120, check=False)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "CHROMIUM_SANDBOX_OK sandbox-ok" in result.stdout
+
+
 @dataclass
 class Worker:
     workspace_id: str
@@ -299,6 +355,16 @@ def test_container_security_and_resource_boundaries(workers, worker_image):
     assert report["security"]["no_new_privileges"] is True
     assert worker.token() not in json.dumps(report)
 
+    # 严格验收必须与真实 Docker inspect 一致；不能只测手工 fixture。
+    assert provisioner.verify_worker_inspect(
+        raw, workspace_id=worker.workspace_id,
+        config_version=worker.config_version, image=worker.image,
+        paths=worker.paths) is True
+    network_raw = json.loads(_docker("network", "inspect",
+                                     worker.network).stdout)
+    assert provisioner.verify_network_inspect(
+        network_raw, worker.workspace_id) is True
+
 
 def test_lifecycle_requires_workspace_credentials(workers):
     worker = _first(workers)
@@ -360,6 +426,15 @@ def test_cross_workspace_and_management_network_are_denied(workers):
     assert public_v6.returncode != 0, (
         f"worker 不应有可用 IPv6 公网出口：{public_v6.stdout}")
     assert "CONNECTED" not in public_v6.stdout
+
+    ipv4_probe = (
+        "import socket;s=socket.socket();s.settimeout(3);"
+        "s.connect(('1.1.1.1',53));print('CONNECTED')")
+    public_v4 = _docker("exec", a.name, "python", "-c", ipv4_probe,
+                        check=False)
+    assert public_v4.returncode != 0, (
+        f"worker 不应有可用 IPv4 公网出口：{public_v4.stdout}")
+    assert "CONNECTED" not in public_v4.stdout
 
     gateway = _docker(
         "inspect", "--format",
@@ -489,6 +564,114 @@ async def main():
     assert "unauthorized" in out.decode("utf-8", "replace")
     assert len(fake.calls) == 2, "未授权请求不得触达 Docker"
 
+    # 实际受限服务入口的新建调用：ensure 必须经 _docker 携带完整
+    # docker run argv，健康核验后返回受管句柄。
+    class EnsureDocker:
+        def __init__(self):
+            self.calls = []
+            self.container = None
+            self.network = None
+
+        def completed(self, argv, code, stdout=""):
+            return subprocess.CompletedProcess(argv, code, stdout, "")
+
+        def make_container(self):
+            paths = module.prepare_workspace(pathlib.Path("/work"), WORKSPACE)
+            return {
+                "Id": "f" * 64,
+                "Name": "/" + module.container_name(WORKSPACE),
+                "Config": {
+                    "User": "10001:10001",
+                    "Image": IMAGE,
+                    "Entrypoint": None,
+                    "Cmd": ["python", "-m", "easel.worker.lifecycle",
+                            "serve", "--host", "0.0.0.0", "--port", "7860"],
+                    "Labels": module.workload_labels(WORKSPACE, 1),
+                },
+                "State": {"Running": True, "Health": {"Status": "healthy"}},
+                "HostConfig": {
+                    "ReadonlyRootfs": True,
+                    "Privileged": False,
+                    "CapDrop": ["ALL"],
+                    "CapAdd": [],
+                    "SecurityOpt": ["no-new-privileges:true"],
+                    "PidsLimit": 256,
+                    "Memory": 4 * 1024 ** 3,
+                    "MemorySwap": 4 * 1024 ** 3,
+                    "NanoCpus": 2000000000,
+                    "NetworkMode": module.network_name(WORKSPACE),
+                    "PortBindings": {},
+                    "PublishAllPorts": False,
+                    "Binds": [],
+                    "Devices": [],
+                    "PidMode": "",
+                    "IpcMode": "private",
+                    "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=1g"},
+                    "RestartPolicy": {"Name": "no"},
+                },
+                "Mounts": [
+                    {"Type": "bind", "Source": str(paths.workspace),
+                     "Destination": "/workspace", "RW": True},
+                    {"Type": "bind", "Source": str(paths.home),
+                     "Destination": "/home/easel", "RW": True},
+                ],
+                "NetworkSettings": {
+                    "Ports": {},
+                    "Networks": {
+                        module.network_name(WORKSPACE): {
+                            "IPAddress": "172.30.0.2"},
+                    },
+                },
+            }
+
+        def __call__(self, argv, *, timeout=120.0):
+            self.calls.append(list(argv))
+            assert argv[0] == "docker", argv
+            args = argv[1:]
+            if args[:2] == ["network", "inspect"]:
+                if self.network is None:
+                    return self.completed(argv, 1)
+                return self.completed(argv, 0, json.dumps([self.network]))
+            if args[:2] == ["network", "create"]:
+                self.network = {
+                    "Name": module.network_name(WORKSPACE),
+                    "Driver": "bridge",
+                    "Internal": True,
+                    "EnableIPv6": False,
+                    "Labels": {
+                        "easel.managed": "true",
+                        "easel.workspace-id": WORKSPACE,
+                    },
+                }
+                return self.completed(argv, 0, "created\n")
+            if args[:2] == ["container", "inspect"]:
+                if self.container is None:
+                    return self.completed(argv, 1)
+                return self.completed(argv, 0, json.dumps([self.container]))
+            if args[:1] == ["run"]:
+                self.container = self.make_container()
+                return self.completed(argv, 0, "fake-container\n")
+            if args[:1] in (["rm"], ["stop"]):
+                self.container = None
+                return self.completed(argv, 0)
+            raise AssertionError(f"unexpected docker 调用: {argv}")
+
+    ensure_docker = EnsureDocker()
+    service._runner = ensure_docker
+
+    async def always_probe(*args, **kwargs):
+        return True
+
+    service._probe = always_probe
+    ensured = await call({
+        "version": 1, "action": "ensure", "workspace_id": WORKSPACE,
+        "config_version": 1})
+    assert ensured.get("ok") is True, ensured
+    assert ensured["handle"]["container_id"] == module.container_name(WORKSPACE)
+    run_calls = [c for c in ensure_docker.calls if c[1:2] == ["run"]]
+    assert run_calls and run_calls[0][:3] == ["docker", "run", "-d"], (
+        run_calls[:1])
+
     task.cancel()
     try:
         await task
@@ -519,6 +702,85 @@ while not data.endswith(b"\n"):
     data += chunk
 print(data.decode("utf-8"))
 '''
+
+
+_OWNERSHIP_CHECK = r'''
+import importlib.util
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+
+sys.path.insert(0, "/opt/easel")
+spec = importlib.util.spec_from_file_location("provisioner", "/check/provisioner.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules["provisioner"] = module
+spec.loader.exec_module(module)
+
+root = pathlib.Path(tempfile.mkdtemp(prefix="easel-ownership-"))
+
+# 合法目录：fd 绑定 fchown 真正生效。
+valid = module.prepare_workspace(root, "b" * 32)
+module.ensure_worker_ownership(valid)
+for directory in (valid.workspace, valid.home, valid.state):
+    info = os.stat(directory)
+    assert info.st_uid == 10001, (directory, info.st_uid)
+    assert info.st_gid == 10001, (directory, info.st_gid)
+
+# 受控替换：worker 在 prepare 后把 state 换成指向外部的 symlink。
+outside = pathlib.Path(tempfile.mkdtemp(prefix="easel-outside-"))
+sentinel = outside / "sentinel.txt"
+sentinel.write_text("unchanged", encoding="utf-8")
+os.chmod(sentinel, 0o640)
+before_dir = os.stat(outside)
+before_file = os.stat(sentinel)
+before_content = sentinel.read_text(encoding="utf-8")
+
+paths = module.prepare_workspace(root, "a" * 32)
+saved = paths.state.with_name("saved-state")
+paths.state.rename(saved)
+paths.state.symlink_to(outside, target_is_directory=True)
+try:
+    module._capture_directory_ids(paths.root)
+except module.ProvisionerError as error:
+    print("CAPTURE_REJECTED", error.code)
+else:
+    raise AssertionError("身份捕获不得跟随被替换的 state")
+try:
+    module.ensure_worker_ownership(paths)
+except module.ProvisionerError as error:
+    print("REJECTED", error.code)
+else:
+    raise AssertionError("被替换的 state 未被拒绝")
+
+after_dir = os.stat(outside)
+after_file = os.stat(sentinel)
+assert stat.S_IMODE(after_dir.st_mode) == stat.S_IMODE(before_dir.st_mode)
+assert stat.S_IMODE(after_file.st_mode) == stat.S_IMODE(before_file.st_mode)
+assert (after_dir.st_uid, after_dir.st_gid) == (before_dir.st_uid, before_dir.st_gid)
+assert (after_file.st_uid, after_file.st_gid) == (before_file.st_uid, before_file.st_gid)
+assert sentinel.read_text(encoding="utf-8") == before_content
+assert not (outside / "state").exists()
+print("OWNERSHIP_CHECK_OK")
+'''
+
+
+def test_privileged_ownership_binds_to_verified_directory(worker_image,
+                                                          tmp_path):
+    """真实 Linux symlink：拒绝替换后的 state，外部 sentinel 不变。"""
+    script = tmp_path / "ownership_check.py"
+    script.write_text(_OWNERSHIP_CHECK, encoding="utf-8")
+    result = _docker(
+        "run", "--rm", "--user", "0",
+        "-v", f"{MODULE_PATH}:/check/provisioner.py:ro",
+        "-v", f"{script}:/check/ownership.py:ro",
+        worker_image, "python", "/check/ownership.py",
+        timeout=120, check=False)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "CAPTURE_REJECTED workspace_owner_failed" in result.stdout
+    assert "REJECTED workspace_owner_failed" in result.stdout
+    assert "OWNERSHIP_CHECK_OK" in result.stdout
 
 
 def test_unix_socket_protocol_and_peer_authorization(worker_image, tmp_path):

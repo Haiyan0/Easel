@@ -44,4 +44,22 @@ docs/superpowers/plans/
 docs/superpowers/specs/
 tests/
 
+# 补 COPY skills 后不得带入开发者私有状态/凭证/缓存。仅保留运行代码与
+# 公开规则；旧公众号 YAML、token、Cookie、profile 与缓存全部排除。
+skills/**/tests/
+skills/**/test/
+skills/**/__tests__/
+skills/**/.github/
+skills/**/wechat-publisher.yaml
+skills/**/wechat_publisher.yaml
+skills/**/cookies.json
+skills/**/cookies-*.json
+skills/**/*.token
+skills/**/*.secret
+skills/**/.cache/
+skills/**/cache/
+skills/**/profiles/
+skills/**/.pytest_cache/
+**/*.log
+
 PSScriptAnalyzerSettings.psd1

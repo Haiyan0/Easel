@@ -22,19 +22,23 @@ Engine 上的输出为准。
 
 | 源 → 目标 | 期望 | 当前实现/依据 | 本轮验证状态 |
 |---|---|---|---|
-| worker → 其他 worker | 拒绝 | 每个 workspace 独立 `--internal` 网络；Docker 网络间默认由隔离链阻断 | 待 Linux 集成实测（A 访问 B 的容器 IP:7860） |
-| worker → 宿主管理面（docker0/宿主 IP 的 7861、2375、2376 等） | 拒绝 | `--internal` 不提供外部路由；provisioner 不发布控制端口或 Docker API | 待 Linux 集成实测 |
-| worker → control 管理监听 | 拒绝 | control 不加入任何 worker 网络；worker 无默认路由 | 待 Linux 集成实测 |
-| worker → provisioner Unix socket | 拒绝 | socket 位于宿主私有目录，不挂载进容器 | argv 与 inspect 断言 |
-| worker → 云元数据（169.254.169.254） | 拒绝 | `--internal` 无外部/链路本地路由 | 待 Linux 集成实测 |
-| worker → 公网 IPv4 | 拒绝 | `--internal` 禁止外部连通 | 待 Linux 集成实测 |
-| worker → 公网 IPv6 | 拒绝 | 内部桥默认未启用 IPv6，无 IPv6 地址/默认路由 | 待 Linux 集成实测（检查地址与路由） |
+| worker → 其他 worker | 拒绝 | 每个 workspace 独立 `--internal` 网络；Docker 网络间默认由隔离链阻断 | 本机 Docker Desktop linux/amd64 实测通过（A 访问 B 的容器 IP:7860 失败） |
+| worker → 宿主管理面（docker0/宿主 IP 的 7861、2375、2376 等） | 拒绝 | `--internal` 不提供外部路由；provisioner 不发布控制端口或 Docker API | 本机实测通过（网关 7861/2375 连接失败） |
+| worker → control 管理监听 | 拒绝 | control 不加入任何 worker 网络；worker 无默认路由 | 本机实测通过（无 IPv4 默认路由） |
+| worker → provisioner Unix socket | 拒绝 | socket 位于宿主私有目录，不挂载进容器 | 严格 inspect 实测仅两个批准挂载；无 socket |
+| worker → 云元数据（169.254.169.254） | 拒绝 | `--internal` 无外部/链路本地路由 | 本机实测通过 |
+| worker → 公网 IPv4 | 拒绝 | `--internal` 禁止外部连通 | 本机实测通过（1.1.1.1:53 失败） |
+| worker → 公网 IPv6 | 拒绝 | 内部桥默认未启用 IPv6，无 IPv6 地址/默认路由 | 本机实测通过（检查地址/路由并实际连接失败） |
 | worker → 必要入口 / provider broker | **允许**（业务目标） | **尚未接线**：Task 10 relay 之前不暴露 worker 业务入口；broker 属 control 侧 | 未启用 |
 | worker → 受控公网出口（egress sidecar） | **允许**（业务目标） | **尚未接线**：本轮不创建 sidecar，worker 保持零出站 | 未启用 |
 | 宿主 provisioner → worker lifecycle | 允许（仅健康探测） | 宿主经内部桥访问容器 IP:7860，带身份/token 校验 | 待 Linux 集成实测 |
 
 “允许”的两行是明确的后续接线点，不是当前能力。在接线前，worker 处于
 全拒绝（fail-closed）状态；技能执行若需要外网，会明确失败，不会静默直连。
+
+上表“本机实测”来自 Docker Desktop 29.2.1 / linux-amd64 容器网络，不能
+替代目标 Linux 宿主（含 Docker IPv6、宿主防火墙与 DOCKER-USER 规则）的
+复验；部署方仍须按本文矩阵逐行实测。
 
 ### 后续接线的约束（实现前必须逐项验证）
 
@@ -77,9 +81,14 @@ worker 镜像包含固定版本 Chromium/Playwright。Chromium 必须使用内�
 必须在目标 Linux 内核上实际启动浏览器验证；不可用即视为浏览器门槛未通过，
 不得降低容器安全配置来迁就。
 
-**当前阻塞项：** 检查发现已有技能脚本（`skills/shared/scripts/` 下
-`account_stats`、`douyin_publish`、`render_card`、`web_publisher`、
-`weixin_mp_stats`、`xhs_comment`、`xhs_publish`、`zhihu_answer`，以及
-`skills/builtin/paper-explainer/scripts/render_slides.py`）硬编码
-`--no-sandbox`。worker 模式执行这些技能会绕过沙箱；在按服务模式区分并
-移除 worker 侧该参数之前，浏览器门槛视为未通过，不开放多人执行。
+**参数层已修复：** 所有实际 Chromium 启动点统一调用
+`runtime_paths.chromium_launch_args()`。worker 模式会移除
+`--no-sandbox` 与 `--disable-setuid-sandbox`（含 `=value` 形式）；local
+仅为开发机兼容保留原参数。测试捕获真实 `launch_persistent_context`
+kwargs，并验证缺少沙箱能力时异常向上传播，不会静默回退。
+
+**仍未实测：** 尚未在只读 rootfs、`cap-drop=ALL`、
+`no-new-privileges` 的 hardened worker 容器内启动真实 Chromium。目标内核
+若不允许 Chromium 内置沙箱，浏览器门槛按未通过记录；不得以关闭沙箱、
+`--privileged` 或恢复 capabilities 的方式迁就。参数修复不等于真实容器
+沙箱已通过。

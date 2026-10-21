@@ -78,9 +78,28 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 USER 10001:10001
 
 
+# 执行阶段：worker 实际运行的 Web/ACP/技能代码与受管依赖。
+# base 只负责生命周期入口，chromium 只负责浏览器；最终 runtime 在此基础上
+# 固定管理员已验收的 Harness commit/profile。
+FROM chromium AS execution
+
+USER root
+COPY deploy/multiuser/requirements-worker.txt /tmp/requirements-worker.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-worker.txt \
+ && rm -f /tmp/requirements-worker.txt
+COPY web ./web
+COPY skills ./skills
+COPY deploy/multiuser/smoke_worker.py ./deploy/multiuser/smoke_worker.py
+RUN chown -R root:root /opt/easel \
+ && chmod -R a-w /opt/easel
+# 构建期实际校验文件、模块、worker 沙箱参数和假 Harness 子进程；
+# 不以 base 的 lifecycle health 代替最终执行代码冒烟。
+USER 10001:10001
+RUN python deploy/multiuser/smoke_worker.py --check-files
+
 # 最终阶段：锁定管理员受管的 DeepSeek Harness commit 与已验收 ACP profile。
 # managed/acp-profile.json 必须由管理员按实际验收结果提供；仓库不伪造。
-FROM chromium AS runtime
+FROM execution AS runtime
 
 ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
 ARG DSH_COMMIT=""
@@ -109,3 +128,6 @@ RUN cd /opt/dsh \
 RUN chmod -R a-w /opt/dsh /opt/easel/managed
 
 USER 10001:10001
+# 真实 Harness 门槛：只验证固定 checkout/profile 与实际文件权限；
+# 没有管理员提供的 commit/profile 时构建在本阶段之前即失败。
+RUN python deploy/multiuser/smoke_worker.py --check-files --require-dsh

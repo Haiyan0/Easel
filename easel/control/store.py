@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -284,6 +284,46 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "ALTER TABLE worker_leases ADD COLUMN active_requests INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE worker_leases ADD COLUMN upstream TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE worker_leases ADD COLUMN service_token TEXT NOT NULL DEFAULT ''",
+        """
+        CREATE INDEX worker_leases_state_idx
+            ON worker_leases (state, lease_expires_at)
+        """,
+    ),
+    # 版本 6：drain 的 stop 认领需要 transient stopping 状态；SQLite 不能
+    # 原地修改 CHECK，因此按既有列重建表并保留所有行。
+    (
+        "ALTER TABLE worker_leases RENAME TO worker_leases_v5",
+        """
+        CREATE TABLE worker_leases (
+            workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE RESTRICT,
+            container_id TEXT NOT NULL,
+            config_version INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'absent', 'starting', 'ready', 'draining', 'stopping',
+                'stopped', 'failed')),
+            heartbeat_at INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            owner_id TEXT NOT NULL DEFAULT '',
+            generation INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            last_activity_at INTEGER NOT NULL DEFAULT 0,
+            active_requests INTEGER NOT NULL DEFAULT 0,
+            upstream TEXT NOT NULL DEFAULT '',
+            service_token TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        """
+        INSERT INTO worker_leases (
+            workspace_id, container_id, config_version, state, heartbeat_at,
+            started_at, owner_id, generation, lease_expires_at, updated_at,
+            last_activity_at, active_requests, upstream, service_token)
+        SELECT workspace_id, container_id, config_version, state, heartbeat_at,
+            started_at, owner_id, generation, lease_expires_at, updated_at,
+            last_activity_at, active_requests, upstream, service_token
+        FROM worker_leases_v5
+        """,
+        "DROP TABLE worker_leases_v5",
         """
         CREATE INDEX worker_leases_state_idx
             ON worker_leases (state, lease_expires_at)
@@ -545,6 +585,15 @@ class Store:
 
             if lease.state == "draining":
                 return "draining", lease
+            if lease.state == "stopping":
+                if lease.lease_expires_at > now:
+                    return "draining", lease
+                # 停止中的旧管理者已过期：允许按新代次恢复。真实
+                # provisioner 会按 workspace 串行 stop/run，旧 stop 未返回
+                # 前不会创建新容器；旧回复写回仍受 generation CAS 约束。
+                self._claim_new_generation(workspace_id, config_version,
+                                           owner_id, now, lease_seconds)
+                return "started", self._worker_lease_row(workspace_id)
 
             # absent / stopped / failed：可以安全创建新代次
             self._claim_new_generation(workspace_id, config_version,
@@ -641,6 +690,21 @@ class Store:
                 " WHERE " + where, (*values,))
         return cursor.rowcount == 1
 
+    def begin_worker_stop(self, workspace_id: str, now: int, *,
+                          generation: int) -> bool:
+        """从 draining 原子认领停止动作；并发 drain 只有一个能调用 stop。
+
+        ``stopping`` 在旧租约到期前让新 ensure 继续等待，确保旧 stop 的
+        物理动作与其写回绑定到同一实例/代次。
+        """
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'stopping', updated_at = ?"
+                " WHERE workspace_id = ? AND state = 'draining'"
+                " AND generation = ?",
+                (int(now), _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
     def resume_worker_ready(self, workspace_id: str, now: int, *,
                             generation: int | None = None) -> bool:
         """draining 认领后发现有活跃工作：回滚为 ready。
@@ -661,8 +725,13 @@ class Store:
 
     def stop_worker(self, workspace_id: str, now: int, *,
                     generation: int | None = None,
-                    state: str = "stopped") -> bool:
-        """容器已回收后写入终态；只清可再建句柄，不触碰持久数据。"""
+                    state: str = "stopped",
+                    expected_state: str | None = None) -> bool:
+        """容器已回收后写入终态；只清可再建句柄，不触碰持久数据。
+
+        ``expected_state`` 让 drain/回收写回与认领的 ``stopping`` 状态绑定；
+        迟到的旧回复不能覆盖已接管的新代次。
+        """
         if state not in ("stopped", "failed"):
             raise DomainError("invalid_state", 400)
         workspace_id = _text(workspace_id)
@@ -671,6 +740,9 @@ class Store:
         if generation is not None:
             where += " AND generation = ?"
             values.append(int(generation))
+        if expected_state is not None:
+            where += " AND state = ?"
+            values.append(expected_state)
         with self._transaction():
             cursor = self._connection.execute(
                 "UPDATE worker_leases SET state = ?, container_id = '',"

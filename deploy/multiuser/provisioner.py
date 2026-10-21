@@ -52,6 +52,14 @@ WORKER_PORT = 7860
 WORKER_USER = "10001:10001"
 WORKER_UID = 10001
 WORKER_GID = 10001
+WORKER_PIDS_LIMIT = 256
+WORKER_MEMORY_BYTES = 4 * 1024 ** 3
+WORKER_NANO_CPUS = 2_000_000_000
+WORKER_TMPFS = "/tmp:rw,noexec,nosuid,nodev,size=1g"
+WORKER_COMMAND = (
+    "python", "-m", "easel.worker.lifecycle",
+    "serve", "--host", "0.0.0.0", "--port", str(WORKER_PORT),
+)
 DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
 
 ACTIONS = ("ensure", "stop", "inspect")
@@ -86,12 +94,18 @@ class WorkerRequest:
 
 @dataclass(frozen=True)
 class RuntimePaths:
-    """单个 workspace 的持久目录；root 是其私有根。"""
+    """单个 workspace 的持久目录；root 是其私有根。
+
+    ``directory_ids`` 是 prepare 时对 workspace/home/state 捕获的
+    ``(st_dev, st_ino)``。后续特权 chown 必须重新核对同一身份，不能只信
+    路径——worker 拥有这些目录本身，可在两阶段之间替换路径。
+    """
 
     root: Path
     workspace: Path
     home: Path
     state: Path
+    directory_ids: tuple[tuple[int, int], ...] = ()
 
 
 # ----------------------------------------------------------------------
@@ -223,31 +237,222 @@ def prepare_workspace(workspace_root: Path, workspace_id: str) -> RuntimePaths:
     resolved_state = state.resolve(strict=True)
     if resolved_state.parent != workspace:
         raise _reject("workspace_escape")
+    directory_ids = _capture_directory_ids(resolved_base)
     return RuntimePaths(resolved_base, workspace, children["home"],
-                        resolved_state)
+                        resolved_state, directory_ids)
+
+
+def existing_runtime_paths(workspace_root: Path, workspace_id: str
+                           ) -> RuntimePaths:
+    """只解析已存在的持久目录，不创建；inspect/接管不得有写副作用。"""
+    container_name(workspace_id)  # 复用 UUID 校验
+    try:
+        root = Path(workspace_root).resolve(strict=True)
+        base = (root / workspace_id).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise _reject("workspace_unavailable") from None
+    if base.parent != root:
+        raise _reject("workspace_escape")
+    resolved: dict[str, Path] = {}
+    for name in ("workspace", "home"):
+        try:
+            directory = (base / name).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise _reject("workspace_unavailable") from None
+        if directory.parent != base or not directory.is_dir():
+            raise _reject("workspace_escape")
+        resolved[name] = directory
+    try:
+        state = (resolved["workspace"] / "state").resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise _reject("workspace_unavailable") from None
+    if state.parent != resolved["workspace"] or not state.is_dir():
+        raise _reject("workspace_escape")
+    directory_ids = _capture_directory_ids(base)
+    return RuntimePaths(base, resolved["workspace"], resolved["home"], state,
+                        directory_ids)
+
+
+def _stat_directory(path: Path) -> os.stat_result:
+    """单独封装，便于测试在受控 gate 中模拟身份变化。"""
+    return os.stat(path)
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    info = _stat_directory(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise _reject("workspace_escape")
+    return (int(info.st_dev), int(info.st_ino))
+
+
+def _verify_directory(path: Path,
+                      expected: tuple[int, int]) -> os.stat_result:
+    """按身份核对目录；路径被替换/链接到别处时拒绝。"""
+    try:
+        info = _stat_directory(path)
+    except OSError:
+        raise _reject("workspace_owner_failed") from None
+    if (not stat.S_ISDIR(info.st_mode)
+            or (int(info.st_dev), int(info.st_ino)) != expected):
+        raise _reject("workspace_escape")
+    return info
+
+
+def _directory_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
+
+
+def _supports_fd_traversal() -> bool:
+    """生产 provisioner 只支持 Linux；其他平台仅做身份降级核对。"""
+    return (os.name == "posix" and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "fchown"))
+
+
+def _openat_directory(parent_fd: int, name: str,
+                      expected: tuple[int, int] | None = None) -> int:
+    """相对可信父目录打开子目录，不跟随最终链接并核对身份。"""
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError:
+        raise _reject("workspace_owner_failed") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise _reject("workspace_escape")
+        if expected is not None and (
+                int(info.st_dev), int(info.st_ino)) != expected:
+            raise _reject("workspace_escape")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _capture_directory_ids(base: Path) -> tuple[tuple[int, int], ...]:
+    """捕获 workspace/home/state 身份。
+
+    POSIX 从 base 的 fd 逐级 openat，避免在 resolve 与 stat 之间被 worker
+    用 symlink 替换任意中间目录；非 POSIX 使用路径 stat 降级（无生产承诺）。
+    """
+    if not _supports_fd_traversal():
+        return (
+            _directory_identity(base / "workspace"),
+            _directory_identity(base / "home"),
+            _directory_identity(base / "workspace" / "state"),
+        )
+    try:
+        base_fd = os.open(base, _directory_flags())
+    except OSError:
+        raise _reject("workspace_owner_failed") from None
+    workspace_fd = home_fd = state_fd = None
+    try:
+        workspace_fd = _openat_directory(base_fd, "workspace")
+        home_fd = _openat_directory(base_fd, "home")
+        state_fd = _openat_directory(workspace_fd, "state")
+        return tuple(
+            (int(os.fstat(descriptor).st_dev),
+             int(os.fstat(descriptor).st_ino))
+            for descriptor in (workspace_fd, home_fd, state_fd))
+    finally:
+        for descriptor in (state_fd, home_fd, workspace_fd, base_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _open_verified_tree(paths: RuntimePaths) -> tuple[int, int, int, int]:
+    """打开 base/workspace/home/state 并核对身份；返回 fd，调用方负责关闭。"""
+    identities = paths.directory_ids
+    if len(identities) != 3:
+        raise _reject("workspace_escape")
+    try:
+        base_fd = os.open(paths.workspace.parent, _directory_flags())
+    except OSError:
+        raise _reject("workspace_owner_failed") from None
+    workspace_fd = home_fd = state_fd = None
+    try:
+        workspace_fd = _openat_directory(base_fd, "workspace",
+                                         identities[0])
+        home_fd = _openat_directory(base_fd, "home", identities[1])
+        state_fd = _openat_directory(workspace_fd, "state", identities[2])
+        return base_fd, workspace_fd, home_fd, state_fd
+    except BaseException:
+        for descriptor in (state_fd, home_fd, workspace_fd, base_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        raise
+
+
+def _close_tree(fds: tuple[int, int, int, int]) -> None:
+    for descriptor in reversed(fds):
+        os.close(descriptor)
 
 
 def ensure_worker_ownership(paths: RuntimePaths) -> None:
     """让容器内的 uid 10001 能写持久目录。
 
-    provisioner 以 root 运行时显式 chown；以普通用户运行时无法 chown，
-    因此要求目录已属于 10001 或显式组/其他可写，否则失败关闭，避免容器
-    以非 root 启动后处处只读。
+    关键约束：worker 已拥有这些目录的写权限，prepare 之后可替换
+    workspace/state。因此这里从 base 的 fd 逐级 openat，核对 prepare 时
+    捕获的 ``(st_dev, st_ino)``；POSIX 上对已核对 fd 执行 ``fchown``，
+    不再按路径 chown，彻底避免跟随替换后的链接。
     """
     if not hasattr(os, "geteuid"):
         return
     directories = (paths.workspace, paths.home, paths.state)
+    identities = paths.directory_ids
+    if len(identities) != len(directories):
+        raise _reject("workspace_escape")
     if os.geteuid() == 0:
-        try:
-            for directory in directories:
+        if _supports_fd_traversal():
+            fds = _open_verified_tree(paths)
+            try:
+                for descriptor in fds[1:]:
+                    try:
+                        os.fchown(descriptor, WORKER_UID, WORKER_GID)
+                    except OSError:
+                        raise _reject("workspace_owner_failed") from None
+            finally:
+                _close_tree(fds)
+            return
+        # 非 POSIX 降级：先核对全部身份，再执行路径 chown。
+        for directory, identity in zip(directories, identities):
+            _verify_directory(directory, identity)
+        for directory in directories:
+            try:
                 os.chown(directory, WORKER_UID, WORKER_GID)
-        except OSError:
-            raise _reject("workspace_owner_failed") from None
+            except OSError:
+                raise _reject("workspace_owner_failed") from None
         return
-    for directory in directories:
-        info = directory.stat()
+    if _supports_fd_traversal():
+        fds = _open_verified_tree(paths)
+        try:
+            for descriptor in fds[1:]:
+                info = os.fstat(descriptor)
+                if (info.st_uid != WORKER_UID
+                        and not (info.st_mode & 0o002)):
+                    raise _reject("workspace_owner_mismatch")
+        finally:
+            _close_tree(fds)
+        return
+    for directory, identity in zip(directories, identities):
+        info = _verify_directory(directory, identity)
         if info.st_uid != WORKER_UID and not (info.st_mode & 0o002):
             raise _reject("workspace_owner_mismatch")
+
+
+def verify_prepared_paths(paths: RuntimePaths) -> None:
+    """挂载/启动前再次核对身份；base 由 root 拥有，挂载源不可被替换。"""
+    if not _supports_fd_traversal():
+        directories = (paths.workspace, paths.home, paths.state)
+        if len(paths.directory_ids) != len(directories):
+            raise _reject("workspace_escape")
+        for directory, identity in zip(directories, paths.directory_ids):
+            _verify_directory(directory, identity)
+        return
+    fds = _open_verified_tree(paths)
+    _close_tree(fds)
 
 
 def _safe_path_text(path: Path) -> str:
@@ -286,7 +491,7 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
         "--memory=4g",
         "--memory-swap=4g",
         "--pids-limit=256",
-        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=1g",
+        "--tmpfs", WORKER_TMPFS,
         "--network", network_name(workspace_id),
         "--mount",
         f"type=bind,src={_safe_path_text(paths.workspace)},dst=/workspace",
@@ -377,6 +582,133 @@ def sanitize_inspect(raw: dict | None) -> dict:
         "upstream": (f"http://{address}:{WORKER_PORT}" if address else ""),
         "security": security,
     }
+
+
+def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
+                          config_version: int, image: str,
+                          paths: RuntimePaths) -> bool:
+    """严格核对实际容器配置；复用、接管、inspect 与健康循环共用同一门槛。
+
+    标签只表示归属，不能证明镜像、权限、资源、挂载或网络仍是批准配置。
+    任何字段缺失、类型异常或与批准值不一致都返回 False。
+    """
+    if not isinstance(raw, dict):
+        return False
+    report = sanitize_inspect(raw)
+    if not report["managed"] or report["config_version"] != config_version:
+        return False
+
+    config = raw.get("Config")
+    host = raw.get("HostConfig")
+    if not isinstance(config, dict) or not isinstance(host, dict):
+        return False
+    if config.get("Image") != image:
+        return False
+    if config.get("User") != WORKER_USER:
+        return False
+    if config.get("Entrypoint") not in (None, []):
+        return False
+    if config.get("Cmd") != list(WORKER_COMMAND):
+        return False
+
+    if host.get("ReadonlyRootfs") is not True:
+        return False
+    if host.get("Privileged") is not False:
+        return False
+    if set(host.get("CapDrop") or []) != {"ALL"}:
+        return False
+    if host.get("CapAdd") not in (None, []):
+        return False
+    security_options = host.get("SecurityOpt") or []
+    if not any("no-new-privileges" in str(option)
+               for option in security_options):
+        return False
+    if any("unconfined" in str(option) for option in security_options):
+        return False
+    if host.get("PidsLimit") != WORKER_PIDS_LIMIT:
+        return False
+    if host.get("Memory") != WORKER_MEMORY_BYTES:
+        return False
+    if host.get("MemorySwap") != WORKER_MEMORY_BYTES:
+        return False
+    if host.get("NanoCpus") != WORKER_NANO_CPUS:
+        return False
+    if host.get("NetworkMode") != network_name(workspace_id):
+        return False
+    if host.get("Binds") not in (None, []):
+        return False
+    if host.get("Devices") not in (None, []):
+        return False
+    if host.get("PidMode") not in (None, ""):
+        return False
+    if host.get("IpcMode") == "host":
+        return False
+    if host.get("PublishAllPorts") not in (None, False):
+        return False
+    if any(bool(bindings)
+           for bindings in (host.get("PortBindings") or {}).values()):
+        return False
+    tmpfs = host.get("Tmpfs") or {}
+    tmp_options = str(tmpfs.get("/tmp") or "").split(",")
+    required = {"rw", "noexec", "nosuid", "nodev", "size=1g"}
+    if not required.issubset(set(tmp_options)):
+        return False
+
+    mounts = raw.get("Mounts")
+    if not isinstance(mounts, list) or len(mounts) != 2:
+        return False
+    expected_mounts = {
+        "/workspace": str(paths.workspace),
+        "/home/easel": str(paths.home),
+    }
+    seen: dict[str, str] = {}
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            return False
+        destination = mount.get("Destination")
+        source = mount.get("Source")
+        if (mount.get("Type") != "bind" or mount.get("RW") is not True
+                or destination not in expected_mounts
+                or source != expected_mounts[destination]
+                or "docker.sock" in str(source)):
+            return False
+        seen[destination] = str(source)
+    if set(seen) != set(expected_mounts):
+        return False
+
+    network_settings = raw.get("NetworkSettings")
+    if not isinstance(network_settings, dict):
+        return False
+    networks = network_settings.get("Networks")
+    approved = network_name(workspace_id)
+    if not isinstance(networks, dict) or set(networks) != {approved}:
+        return False
+    entry = networks.get(approved)
+    if not isinstance(entry, dict) or not entry.get("IPAddress"):
+        return False
+    ports = network_settings.get("Ports") or {}
+    if not isinstance(ports, dict) or any(
+            bool(bindings) for bindings in ports.values()):
+        return False
+    return True
+
+
+def verify_network_inspect(payload: object, workspace_id: str) -> bool:
+    """已有的受管网络必须仍具备 internal、IPv4-only、bridge 驱动。"""
+    if not isinstance(payload, list) or len(payload) != 1:
+        return False
+    entry = payload[0]
+    if not isinstance(entry, dict):
+        return False
+    labels = entry.get("Labels")
+    return (
+        entry.get("Name") == network_name(workspace_id)
+        and entry.get("Driver") == "bridge"
+        and entry.get("Internal") is True
+        and entry.get("EnableIPv6") is False
+        and isinstance(labels, dict)
+        and labels.get("easel.managed") == "true"
+        and labels.get("easel.workspace-id") == workspace_id)
 
 
 # ----------------------------------------------------------------------
@@ -614,19 +946,23 @@ class Provisioner:
             return None
         return payload[0] if isinstance(payload[0], dict) else None
 
+    async def _network_payload(self, workspace_id: str) -> list | None:
+        result = await self._docker("network", "inspect",
+                                    network_name(workspace_id))
+        if result.returncode != 0:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise ProvisionerError("network_invalid") from None
+        return payload if isinstance(payload, list) else None
+
     async def _ensure_network(self, workspace_id: str) -> None:
+        """已有网络严格复核；新建后也必须再次复核实际隔离属性。"""
         name = network_name(workspace_id)
-        result = await self._docker("network", "inspect", name)
-        if result.returncode == 0:
-            try:
-                payload = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                raise ProvisionerError("network_invalid") from None
-            labels = ((payload[0].get("Labels") or {})
-                      if isinstance(payload, list) and payload else {})
-            if (not isinstance(labels, dict)
-                    or labels.get("easel.managed") != "true"
-                    or labels.get("easel.workspace-id") != workspace_id):
+        payload = await self._network_payload(workspace_id)
+        if payload is not None:
+            if not verify_network_inspect(payload, workspace_id):
                 raise ProvisionerError("network_conflict")
             return
         result = await self._docker(
@@ -636,6 +972,16 @@ class Provisioner:
             name)
         if result.returncode != 0:
             raise ProvisionerError("network_create_failed")
+        payload = await self._network_payload(workspace_id)
+        if payload is None or not verify_network_inspect(payload,
+                                                         workspace_id):
+            raise ProvisionerError("network_conflict")
+
+    async def _require_existing_network(self, workspace_id: str) -> None:
+        payload = await self._network_payload(workspace_id)
+        if payload is None or not verify_network_inspect(payload,
+                                                         workspace_id):
+            raise ProvisionerError("network_conflict")
 
     async def _remove_container(self, workspace_id: str) -> None:
         await self._docker("rm", "-f", container_name(workspace_id))
@@ -675,16 +1021,26 @@ class Provisioner:
                 raise ProvisionerError("container_conflict")
             if report["config_version"] != config_version:
                 raise ProvisionerError("config_version_conflict")
+            # 标签与健康响应不能证明安全配置；不符时失败关闭，不自动
+            # 删除来源不明的容器，交部署方核查。
+            if not verify_worker_inspect(
+                    existing, workspace_id=workspace_id,
+                    config_version=config_version,
+                    image=self.settings.image, paths=paths):
+                raise ProvisionerError("container_conflict")
             if report["ready"] and await self._probe(
                     workspace_id, config_version, report["upstream"], token):
                 return WorkerHandle(workspace_id, report["container_id"],
                                     report["upstream"], token, config_version)
             await self._remove_container(workspace_id)
 
+        await asyncio.to_thread(verify_prepared_paths, paths)
         argv = build_run_argv(
             image=self.settings.image, workspace_id=workspace_id,
             config_version=config_version, paths=paths, env_file=env_file)
-        result = await self._docker(*argv[1:], timeout=60.0)
+        # build_run_argv 以 run 开头；_docker 自行添加 docker 可执行程序，
+        # 必须传完整 argv，不能丢弃 run。
+        result = await self._docker(*argv, timeout=60.0)
         if result.returncode != 0:
             await self._remove_container(workspace_id)
             raise ProvisionerError("worker_start_failed")
@@ -693,17 +1049,20 @@ class Provisioner:
         try:
             while time.monotonic() < deadline:
                 raw = await self._inspect_raw(workspace_id)
+                if raw is None:
+                    break
+                if not verify_worker_inspect(
+                        raw, workspace_id=workspace_id,
+                        config_version=config_version,
+                        image=self.settings.image, paths=paths):
+                    raise ProvisionerError("container_conflict")
                 report = sanitize_inspect(raw)
-                if (report["managed"]
-                        and report["config_version"] == config_version
-                        and report["ready"]
+                if (report["ready"]
                         and await self._probe(workspace_id, config_version,
                                               report["upstream"], token)):
                     return WorkerHandle(workspace_id, report["container_id"],
                                         report["upstream"], token,
                                         config_version)
-                if raw is None:
-                    break
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
         except BaseException:
             await self._remove_container(workspace_id)
@@ -742,7 +1101,22 @@ class Provisioner:
                 "security": {},
             }
         report = sanitize_inspect(raw)
-        if report["managed"] and report["ready"]:
+        if not report["managed"]:
+            return report
+        try:
+            paths = await asyncio.to_thread(
+                existing_runtime_paths, self.settings.workspace_root,
+                workspace_id)
+        except ProvisionerError:
+            raise ProvisionerError("container_conflict") from None
+        if not verify_worker_inspect(
+                raw, workspace_id=workspace_id,
+                config_version=report["config_version"],
+                image=self.settings.image, paths=paths):
+            raise ProvisionerError("container_conflict")
+        # 接管前复核实际网络的 internal/IPv4-only/bridge 属性。
+        await self._require_existing_network(workspace_id)
+        if report["ready"]:
             try:
                 token = _load_or_create_token(
                     self.settings.workspace_root, workspace_id)

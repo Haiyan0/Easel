@@ -18,7 +18,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import Awaitable, Callable, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from .store import Store
@@ -73,7 +73,8 @@ class RuntimeManager:
                  ready_timeout: float = READY_TIMEOUT_SECONDS,
                  poll_interval: float = POLL_INTERVAL_SECONDS,
                  idle_seconds: int = IDLE_SECONDS,
-                 drain_timeout: float = DRAIN_TIMEOUT_SECONDS):
+                 drain_timeout: float = DRAIN_TIMEOUT_SECONDS,
+                 db_runner: Callable[..., Awaitable[object]] | None = None):
         self._store = store
         self._provisioner = provisioner
         self._clock = clock or time.time
@@ -83,6 +84,16 @@ class RuntimeManager:
         self._poll_interval = max(0.001, float(poll_interval))
         self._idle_seconds = int(idle_seconds)
         self._drain_timeout = float(drain_timeout)
+        # SQLite 连接有线程归属。真实 control 在 lifespan 用专用线程打开
+        # Store，因此所有短数据库步骤都必须调度回该线程；容器/网络等待
+        # 保持在异步层，不能占用数据库线程或事务。
+        self._db_runner = db_runner
+
+    async def _db(self, function, *args, **kwargs):
+        """在 Store 所属线程执行一个短同步数据库步骤。"""
+        if self._db_runner is None:
+            return function(*args, **kwargs)
+        return await self._db_runner(function, *args, **kwargs)
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -94,7 +105,7 @@ class RuntimeManager:
         self._validate_request(workspace_id, config_version)
         deadline = self._clock() + self._ready_timeout
         while True:
-            outcome, lease = self._claim(workspace_id, config_version)
+            outcome, lease = await self._claim(workspace_id, config_version)
             if outcome == "ready":
                 return self._handle_from_lease(lease, config_version)
             if outcome == "started":
@@ -120,49 +131,80 @@ class RuntimeManager:
             raise RuntimeUnavailable("worker_unavailable", 503)
 
     async def drain(self, workspace_id: str) -> None:
-        """拒绝新任务，等活动任务与请求归零后停止容器；超时保留 draining。"""
+        """拒绝新任务，等活动任务与请求归零后停止容器；超时保留 draining。
+
+        认领、停止与写回都绑定读取到的租约代次。等待或停止期间若新代次
+        已接管，旧动作在调用 stop 前放弃，迟到回复也不能写回新租约。
+        """
         self._text(workspace_id)
-        lease = self._store.get_worker_lease(workspace_id)
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
         if lease is None or lease.state in ("absent", "stopped", "failed"):
             return
         if lease.state == "starting":
             # 启动中的实例无法安全判定归属，拒绝而不是停止一个可能属于新代次的容器
             raise RuntimeUnavailable("worker_starting", 503, retry_after=1)
+        if lease.state == "stopping":
+            # 另一个 drain 已取得停止认领；不重复调用 stop。
+            return
         if lease.state == "ready":
-            self._store.mark_worker_draining(workspace_id, self._now())
+            if not await self._db(
+                    self._store.mark_worker_draining, workspace_id,
+                    self._now(), generation=lease.generation):
+                return
+        elif lease.state != "draining":
+            return
         deadline = self._clock() + self._drain_timeout
-        while self._has_active_workload(workspace_id):
+        while await self._has_active_workload(workspace_id):
             if self._clock() >= deadline:
                 raise RuntimeUnavailable("worker_drain_timeout", 503,
                                          retry_after=5)
             await asyncio.sleep(self._poll_interval)
+        # await 之后复核仍是同一实例/代次的 draining，然后原子认领停止。
+        current = await self._db(self._store.get_worker_lease, workspace_id)
+        if (current is None or current.generation != lease.generation
+                or current.state != "draining"):
+            return
+        if not await self._db(
+                self._store.begin_worker_stop, workspace_id, self._now(),
+                generation=lease.generation):
+            return
         await self._provisioner.stop(workspace_id)
-        self._store.stop_worker(workspace_id, self._now())
+        await self._db(self._store.stop_worker, workspace_id, self._now(),
+                       generation=lease.generation,
+                       expected_state="stopping")
 
     async def collect_idle(self, now: float) -> list[str]:
         """回收超过空闲阈值且无任务/请求的实例，返回真正停止的 workspace。
 
         只回收心跳存活、无活跃 Run、无活跃请求的 ready 实例。停止失败不伪报
-        成功，状态保留 draining 等待人工或后续对账处理。
+        成功，状态保留 stopping/draining 等待租约到期后的后续对账处理。
         """
         stamp = int(now)
         collected: list[str] = []
-        for lease in self._store.list_idle_workers(stamp, self._idle_seconds):
-            if not self._store.mark_worker_draining(
-                    lease.workspace_id, stamp, generation=lease.generation):
+        for lease in await self._db(
+                self._store.list_idle_workers, stamp, self._idle_seconds):
+            if not await self._db(
+                    self._store.mark_worker_draining, lease.workspace_id,
+                    stamp, generation=lease.generation):
                 continue
-            if self._has_active_workload(lease.workspace_id):
+            if await self._has_active_workload(lease.workspace_id):
                 # 刚进入 draining 又出现任务：回滚 ready，待其结束后再回收。
-                self._store.resume_worker_ready(
-                    lease.workspace_id, stamp, generation=lease.generation)
+                await self._db(
+                    self._store.resume_worker_ready, lease.workspace_id,
+                    stamp, generation=lease.generation)
+                continue
+            if not await self._db(
+                    self._store.begin_worker_stop, lease.workspace_id,
+                    stamp, generation=lease.generation):
                 continue
             try:
                 await self._provisioner.stop(lease.workspace_id)
             except Exception:
                 # 失败关闭：无法确认容器已停止时不写 stopped
                 continue
-            self._store.stop_worker(lease.workspace_id, self._now(),
-                                    generation=lease.generation)
+            await self._db(self._store.stop_worker, lease.workspace_id,
+                           self._now(), generation=lease.generation,
+                           expected_state="stopping")
             collected.append(lease.workspace_id)
         return collected
 
@@ -174,20 +216,23 @@ class RuntimeManager:
         因此超过 900 秒无请求、无 Run 时仍可被回收。
         """
         self._text(workspace_id)
-        lease = self._store.get_worker_lease(workspace_id)
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
         if lease is None:
             return False
-        return self._store.heartbeat_worker(
-            workspace_id, lease.generation, self._now(), self._lease_seconds,
-            active_requests)
+        # 只续期刚刚读取的精确代次；绝不在 await 后重新读取“当前代次”，
+        # 否则旧持有者可能替新租约续命。
+        return await self._db(
+            self._store.heartbeat_worker, workspace_id, lease.generation,
+            self._now(), self._lease_seconds, active_requests)
 
     # ------------------------------------------------------------------
     # 启动 / 对账 / 升级
     # ------------------------------------------------------------------
 
-    def _claim(self, workspace_id: str,
-               config_version: int) -> tuple[str, WorkerLease | None]:
-        return self._store.claim_worker_start(
+    async def _claim(self, workspace_id: str,
+                     config_version: int) -> tuple[str, WorkerLease | None]:
+        return await self._db(
+            self._store.claim_worker_start,
             workspace_id, config_version, self.owner_id, self._now(),
             self._lease_seconds)
 
@@ -198,30 +243,31 @@ class RuntimeManager:
             raise RuntimeUnavailable("worker_unavailable", 503)
         remaining = deadline - self._clock()
         if remaining <= 0:
-            self._fail_start(workspace_id, lease)
+            await self._fail_start(workspace_id, lease)
             raise RuntimeUnavailable("worker_start_timeout", 503, retry_after=5)
         try:
             handle = await asyncio.wait_for(
                 self._provisioner.ensure(workspace_id, config_version),
                 timeout=remaining)
         except asyncio.TimeoutError:
-            self._fail_start(workspace_id, lease)
+            await self._fail_start(workspace_id, lease)
             raise RuntimeUnavailable("worker_start_timeout", 503,
                                      retry_after=5) from None
         except asyncio.CancelledError:
             # 调用方取消也要释放认领，避免遗留 starting 阻塞后续启动
-            self._fail_start(workspace_id, lease)
+            await self._fail_start(workspace_id, lease)
             raise
         except Exception as error:
-            self._fail_start(workspace_id, lease)
+            await self._fail_start(workspace_id, lease)
             raise RuntimeUnavailable("worker_start_failed", 503,
                                      retry_after=5) from error
 
         problem = self._handle_problem(handle, workspace_id, config_version)
         if problem is not None:
-            self._fail_start(workspace_id, lease)
+            await self._fail_start(workspace_id, lease)
             raise RuntimeUnavailable(problem, 503, retry_after=5)
-        if not self._store.complete_worker_start(
+        if not await self._db(
+                self._store.complete_worker_start,
                 workspace_id, self.owner_id, lease.generation, handle,
                 self._now(), self._lease_seconds):
             # 迟到返回：新代次已接管，绝不覆盖
@@ -235,27 +281,29 @@ class RuntimeManager:
         if lease is None:
             raise RuntimeUnavailable("worker_unavailable", 503)
         if not self._valid_lease_handle(lease):
-            self._fail_ready(workspace_id, lease)
+            await self._fail_ready(workspace_id, lease)
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
         try:
             report = await self._provisioner.inspect(workspace_id)
         except Exception as error:
-            self._fail_ready(workspace_id, lease)
+            await self._fail_ready(workspace_id, lease)
             raise RuntimeUnavailable("worker_inspect_failed", 503,
                                      retry_after=5) from error
         if not self._report_matches(report, workspace_id, config_version,
                                     lease):
-            self._fail_ready(workspace_id, lease)
+            await self._fail_ready(workspace_id, lease)
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
-        adopted = self._store.adopt_worker_ready(
+        adopted = await self._db(
+            self._store.adopt_worker_ready,
             workspace_id, lease.generation, self.owner_id, self._now(),
             self._lease_seconds)
         if not adopted:
             # 另一个管理进程先接管：重新认领读取新代次
             return None
-        refreshed = self._store.get_worker_lease(workspace_id)
+        refreshed = await self._db(
+            self._store.get_worker_lease, workspace_id)
         return self._handle_from_lease(refreshed, config_version)
 
     async def _upgrade(self, workspace_id: str, lease: WorkerLease,
@@ -265,18 +313,28 @@ class RuntimeManager:
         认领可能已发生一段时间，必须携带代次，避免把另一个进程刚建立的
         新代次误标为 draining。
         """
-        if not self._store.mark_worker_draining(
-                workspace_id, self._now(), generation=lease.generation):
+        if not await self._db(
+                self._store.mark_worker_draining, workspace_id, self._now(),
+                generation=lease.generation):
             return
         drain_deadline = self._clock() + self._drain_timeout
-        while self._has_active_workload(workspace_id):
+        while await self._has_active_workload(workspace_id):
             if self._clock() >= drain_deadline:
                 raise RuntimeUnavailable("worker_drain_timeout", 503,
                                          retry_after=5)
             await asyncio.sleep(self._poll_interval)
+        current = await self._db(self._store.get_worker_lease, workspace_id)
+        if (current is None or current.generation != lease.generation
+                or current.state != "draining"):
+            return
+        if not await self._db(
+                self._store.begin_worker_stop, workspace_id, self._now(),
+                generation=lease.generation):
+            return
         await self._provisioner.stop(workspace_id)
-        self._store.stop_worker(workspace_id, self._now(),
-                                generation=lease.generation)
+        await self._db(self._store.stop_worker, workspace_id, self._now(),
+                       generation=lease.generation,
+                       expected_state="stopping")
 
     # ------------------------------------------------------------------
     # 校验与辅助
@@ -350,20 +408,23 @@ class RuntimeManager:
                             lease.upstream, lease.service_token,
                             lease.config_version)
 
-    def _has_active_workload(self, workspace_id: str) -> bool:
-        lease = self._store.get_worker_lease(workspace_id)
+    async def _has_active_workload(self, workspace_id: str) -> bool:
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
         if lease is not None and lease.active_requests > 0:
             return True
-        return self._store.count_active_runs_for_workspace(workspace_id) > 0
+        return await self._db(
+            self._store.count_active_runs_for_workspace, workspace_id) > 0
 
-    def _fail_start(self, workspace_id: str, lease: WorkerLease) -> None:
-        self._store.fail_worker_start(workspace_id, self.owner_id,
-                                      lease.generation, self._now())
+    async def _fail_start(self, workspace_id: str,
+                          lease: WorkerLease) -> None:
+        await self._db(self._store.fail_worker_start, workspace_id,
+                       self.owner_id, lease.generation, self._now())
 
-    def _fail_ready(self, workspace_id: str, lease: WorkerLease) -> None:
-        self._store.fail_worker_state(workspace_id, self._now(),
-                                      expected_state="ready",
-                                      generation=lease.generation)
+    async def _fail_ready(self, workspace_id: str,
+                          lease: WorkerLease) -> None:
+        await self._db(self._store.fail_worker_state, workspace_id,
+                       self._now(), expected_state="ready",
+                       generation=lease.generation)
 
     async def _sleep_or_timeout(self, deadline: float, code: str) -> None:
         if self._clock() >= deadline:

@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_paths import chromium_launch_args  # noqa: E402
 import login_state  # noqa: E402
 import login_qr
 import login_transport
@@ -599,7 +600,8 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
             profile,
             lambda: p.chromium.launch_persistent_context(
                 str(profile), headless=not headed,
-                args=LAUNCH_ARGS + ["--no-proxy-server"],
+                args=chromium_launch_args(
+                    LAUNCH_ARGS + ["--no-proxy-server"]),
                 viewport={"width": 1440, "height": 900}))
         # keep_open 分支也会 return/异常退出：driver 关闭后再释放账号锁
         owner.after_exit(browser.release_after_driver_exit)
@@ -1358,7 +1360,8 @@ def cmd_login_qr(a) -> int:
                 profile,
                 lambda: p.chromium.launch_persistent_context(
                     str(profile), headless=True, locale="zh-CN",
-                    args=LAUNCH_ARGS + ["--no-proxy-server"]))
+                    args=chromium_launch_args(
+                    LAUNCH_ARGS + ["--no-proxy-server"])))
             page = browser.pages[0] if browser.pages else browser.new_page()
             _block_heavy(browser, a.platform)
             _observe_channels_account(browser, cfg)
@@ -1562,7 +1565,8 @@ def cmd_whoami(a) -> int:
                 profile,
                 lambda: p.chromium.launch_persistent_context(
                     str(profile), headless=True, locale="zh-CN",
-                    args=LAUNCH_ARGS + ["--no-proxy-server"]))
+                    args=chromium_launch_args(
+                    LAUNCH_ARGS + ["--no-proxy-server"])))
             try:
                 page = browser.pages[0] if browser.pages else browser.new_page()
                 _block_heavy(browser, a.platform, login_assets=False)

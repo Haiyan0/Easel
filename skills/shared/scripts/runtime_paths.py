@@ -114,6 +114,33 @@ def service_mode(env: Mapping[str, str] | None = None) -> str:
     return mode
 
 
+# worker 容器内禁止以关闭 Chromium 沙箱的方式换取可运行。local 为兼容
+# 旧开发机（内核/用户命名空间限制）保留原参数。
+SANDBOX_DISABLING_FLAGS = (
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+)
+
+
+def chromium_launch_args(args=(), env: Mapping[str, str] | None = None):
+    """按服务模式过滤 Chromium 启动参数。
+
+    worker 模式必须使用 Chromium 内置沙箱：任何 ``--no-sandbox`` /
+    ``--disable-setuid-sandbox``（含 ``=value`` 形式）都会被移除。local
+    保持原参数，避免改坏开发机兼容路径。沙箱不可用时由 Playwright 启动
+    失败向上传播，不在此静默回退。
+    """
+    values = list(args)
+    if service_mode(env) != "worker":
+        return values
+    filtered = []
+    for value in values:
+        flag = str(value).split("=", 1)[0]
+        if flag not in SANDBOX_DISABLING_FLAGS:
+            filtered.append(value)
+    return filtered
+
+
 def safe_segment(value: str, label: str = "account_id") -> str:
     """账号/平台标识只能是不含分隔符、点段和控制字符的单个安全段。"""
     if not isinstance(value, str) or not _SEGMENT.fullmatch(value):

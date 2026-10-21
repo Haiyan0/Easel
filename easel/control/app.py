@@ -351,9 +351,17 @@ def create_app(*, store: Store, auth: AuthService,
         try:
             app.state.control_store = await loop.run_in_executor(
                 executor, Store.connect, control_path)
+
+            def control_db_runner(function, *args, **kwargs):
+                # SQLite 连接只在 lifespan 的专用线程打开，所有短数据库
+                # 步骤都必须回到该线程；网络/容器等待不得占用它。
+                return loop.run_in_executor(
+                    executor, functools.partial(function, *args, **kwargs))
+
             if provisioner is not None:
                 app.state.runtime = RuntimeManager(
-                    app.state.control_store, provisioner)
+                    app.state.control_store, provisioner,
+                    db_runner=control_db_runner)
             else:
                 app.state.runtime = runtime
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)
@@ -365,12 +373,9 @@ def create_app(*, store: Store, auth: AuthService,
                 app.state.config_service = None
             if broker is not None:
                 # 阻塞数据库调用仍走专用线程；流式释放也要走同一线程
-                def broker_db_runner(function, *args):
-                    return loop.run_in_executor(
-                        executor, functools.partial(function, *args))
                 app.state.broker = broker.with_store(
                     app.state.control_store, app.state.config_service,
-                    db_runner=broker_db_runner)
+                    db_runner=control_db_runner)
             else:
                 app.state.broker = None
             yield

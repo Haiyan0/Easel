@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sqlite3
+import time
 
 import pytest
 
@@ -25,17 +27,21 @@ class FakeProvisioner:
     """明确、可观察的 fake；不模拟 Docker，只记录控制面调用。"""
 
     def __init__(self, *, delay: float = 0.0, fail: Exception | None = None,
-                 block: asyncio.Event | None = None):
+                 block: asyncio.Event | None = None,
+                 stop_gate: asyncio.Event | None = None):
         self.delay = delay
         self.fail = fail
         self.block = block
+        self.stop_gate = stop_gate
         self.starts = 0
         self.stops = 0
         self.inspects = 0
         self.ensure_calls: list[tuple[str, int]] = []
         self.stop_calls: list[str] = []
+        self.stop_targets: list[str] = []
         self.handles: dict[str, WorkerHandle] = {}
         self.entered = asyncio.Event()
+        self.stop_entered = asyncio.Event()
         self.force_workspace: str | None = None
         self.force_config_version: int | None = None
         self.inspect_workspace: str | None = None
@@ -57,7 +63,7 @@ class FakeProvisioner:
             raise self.fail
         handle = WorkerHandle(
             self.force_workspace or workspace_id,
-            f"container-{workspace_id[:8]}",
+            f"container-{workspace_id[:8]}-{self.starts}",
             f"http://10.0.0.{len(self.handles) + 2}:7860",
             f"service-token-{workspace_id[:8]}",
             (self.force_config_version
@@ -66,9 +72,18 @@ class FakeProvisioner:
         return handle
 
     async def stop(self, workspace_id: str) -> None:
+        # 记录调用时实际指向的物理实例；迟到的 stop 不能作用于其后新建
+        # 的同名容器。
+        target = self.handles.get(workspace_id)
         self.stops += 1
         self.stop_calls.append(workspace_id)
-        self.handles.pop(workspace_id, None)
+        self.stop_targets.append(
+            target.container_id if target is not None else "")
+        self.stop_entered.set()
+        if self.stop_gate is not None:
+            await self.stop_gate.wait()
+        if target is not None and self.handles.get(workspace_id) is target:
+            self.handles.pop(workspace_id, None)
 
     async def inspect(self, workspace_id: str) -> dict:
         self.inspects += 1
@@ -342,6 +357,40 @@ def test_stale_generation_cannot_mark_newer_lease_draining(tmp_path):
         assert store.get_worker_lease(user.workspace_id).state == "draining"
 
 
+def test_stop_claim_is_generation_and_state_bound(tmp_path):
+    with Store.open(tmp_path / "db") as store:
+        user = store.create_user("A")
+        outcome, lease = store.claim_worker_start(
+            user.workspace_id, 1, "owner", 1000, 60)
+        assert outcome == "started"
+        assert store.complete_worker_start(
+            user.workspace_id, "owner", lease.generation,
+            WorkerHandle(user.workspace_id, "container-1",
+                         "http://10.0.0.2:7860", "service-token", 1),
+            1000, 60)
+        assert store.mark_worker_draining(
+            user.workspace_id, 1001, generation=lease.generation)
+
+        assert not store.begin_worker_stop(
+            user.workspace_id, 1001, generation=lease.generation + 1)
+        assert store.get_worker_lease(user.workspace_id).state == "draining"
+        assert store.begin_worker_stop(
+            user.workspace_id, 1001, generation=lease.generation)
+        assert store.get_worker_lease(user.workspace_id).state == "stopping"
+
+        # 停止期间新 ensure 被拒绝；只有代次/状态都匹配的写回才成功。
+        outcome, _ = store.claim_worker_start(
+            user.workspace_id, 1, "other", 1001, 60)
+        assert outcome == "draining"
+        assert not store.stop_worker(
+            user.workspace_id, 1002, generation=lease.generation,
+            expected_state="draining")
+        assert store.stop_worker(
+            user.workspace_id, 1002, generation=lease.generation,
+            expected_state="stopping")
+        assert store.get_worker_lease(user.workspace_id).state == "stopped"
+
+
 def test_idle_collection_never_deletes_persistent_data(tmp_path):
     async def scenario():
         with Store.open(tmp_path / "db") as store:
@@ -573,6 +622,149 @@ def test_unix_client_decodes_only_strict_protocol_responses(tmp_path):
         "service_token": "t", "config_version": 1}})
     assert handle.workspace_id == "a" * 32
     assert handle.service_token == "t"
+
+
+def test_late_drain_reply_cannot_overwrite_new_generation(tmp_path):
+    """旧 drain 的 stop 已发生但回复暂停；新代次就绪后旧回复不得改写。"""
+    async def scenario():
+        with Store.open(tmp_path / "db") as first_store, \
+                Store.open(tmp_path / "db") as second_store:
+            user = first_store.create_user("A")
+            clock = Clock()
+            gate = asyncio.Event()
+            provisioner = FakeProvisioner(stop_gate=gate)
+            first = RuntimeManager(first_store, provisioner, clock=clock,
+                                   lease_seconds=1, poll_interval=0.01,
+                                   drain_timeout=5)
+            second = RuntimeManager(second_store, provisioner, clock=clock,
+                                    lease_seconds=1, poll_interval=0.01)
+
+            old = await first.ensure_ready(user.workspace_id, 1)
+            drain = asyncio.create_task(first.drain(user.workspace_id))
+            await asyncio.wait_for(provisioner.stop_entered.wait(), 1)
+
+            # stop 的物理效果已经作用在旧实例上，仅回复被暂停；租约到期
+            # 后另一管理者可接管并建立新代次。
+            clock.value = 1002
+            new = await second.ensure_ready(user.workspace_id, 1)
+            assert new.container_id != old.container_id
+            before_reply = second_store.get_worker_lease(user.workspace_id)
+            assert before_reply.state == "ready"
+            assert before_reply.generation > 1
+
+            gate.set()
+            await asyncio.wait_for(drain, 2)
+
+            after_reply = second_store.get_worker_lease(user.workspace_id)
+            assert after_reply.state == "ready"
+            assert after_reply.container_id == new.container_id
+            assert after_reply.generation == before_reply.generation
+            assert provisioner.handles[user.workspace_id].container_id == (
+                new.container_id)
+            assert old.container_id in provisioner.stop_targets
+            assert new.container_id not in provisioner.stop_targets
+    run(scenario())
+
+
+def test_drain_cas_failure_before_stop_does_not_call_provisioner(
+        tmp_path, monkeypatch):
+    """认领后被新代次接管时，旧 drain 必须在调用 stop 前放弃。"""
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            clock = Clock()
+            provisioner = FakeProvisioner()
+            manager = RuntimeManager(store, provisioner, clock=clock,
+                                     lease_seconds=1, poll_interval=0.01,
+                                     drain_timeout=0.5)
+            await manager.ensure_ready(user.workspace_id, 1)
+
+            async def no_workload(workspace_id):
+                # 模拟等待期间另一管理者接管：直接建立新代次。
+                lease = store.get_worker_lease(workspace_id)
+                store.mark_worker_draining(
+                    workspace_id, 1000, generation=lease.generation)
+                store.stop_worker(workspace_id, 1000,
+                                  generation=lease.generation)
+                outcome, new_lease = store.claim_worker_start(
+                    workspace_id, 1, "other-owner", 1000, 60)
+                assert outcome == "started"
+                store.complete_worker_start(
+                    workspace_id, "other-owner", new_lease.generation,
+                    WorkerHandle(workspace_id, "other-container",
+                                 "http://10.0.0.9:7860", "other-token", 1),
+                    1000, 60)
+                return False
+
+            monkeypatch.setattr(manager, "_has_active_workload", no_workload)
+            await manager.drain(user.workspace_id)
+
+            assert provisioner.stops == 0, "已被接管的旧 drain 不得停止新实例"
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == "other-container"
+    run(scenario())
+
+
+def test_control_app_runtime_methods_use_the_app_database_thread(tmp_path):
+    """真实 lifespan 装配：runtime 的短数据库步骤必须在连接所属线程执行。"""
+    from fastapi.testclient import TestClient
+
+    from easel.control.app import ControlConfig, create_app
+    from easel.control.auth import AuthService
+
+    origin = "https://easel.test"
+    startup_store = Store.connect(tmp_path / "control.sqlite3")
+    provisioner = FakeProvisioner(delay=0.05)
+    app = create_app(
+        store=startup_store, auth=AuthService(startup_store),
+        config=ControlConfig(public_origin=origin),
+        provisioner=provisioner)
+    try:
+        with TestClient(app, base_url=origin) as client:
+            control_store = app.state.control_store
+            runtime = app.state.runtime
+
+            def call_db(function, *args):
+                async def runner():
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(
+                        app.state.db_executor,
+                        functools.partial(function, *args))
+                return client.portal.call(runner)
+
+            admin = call_db(control_store.create_user, "Owner", "admin")
+            member = call_db(control_store.create_user, "Member")
+            invite = call_db(app.state.auth.create_invite,
+                             admin, member.user_id)
+            exchanged = client.post(
+                "/api/auth/exchange", json={"token": invite},
+                headers={"Origin": origin})
+            assert exchanged.status_code == 200
+
+            task = client.portal.start_task_soon(
+                runtime.ensure_ready, member.workspace_id, 1)
+            # 容器启动期间并发走真实认证中间件与数据库线程。
+            for _ in range(3):
+                assert client.get("/api/health").status_code == 200
+                assert client.get("/api/auth/me").status_code == 200
+            handle = task.result(timeout=10)
+            assert handle.workspace_id == member.workspace_id
+
+            assert client.portal.start_task_soon(
+                functools.partial(runtime.heartbeat, member.workspace_id,
+                                  active_requests=0)).result(timeout=10)
+            assert client.portal.start_task_soon(
+                runtime.collect_idle, time.time()).result(timeout=10) == []
+            client.portal.start_task_soon(
+                runtime.drain, member.workspace_id).result(timeout=10)
+
+            lease = call_db(control_store.get_worker_lease,
+                            member.workspace_id)
+            assert lease.state == "stopped"
+            assert client.get("/api/auth/me").status_code == 200
+    finally:
+        startup_store.close()
 
 
 def test_v4_database_upgrade_adds_lifecycle_columns_and_keeps_lease(tmp_path):

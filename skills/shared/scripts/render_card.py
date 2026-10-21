@@ -27,6 +27,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_paths import chromium_launch_args  # noqa: E402
+
 _LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -59,7 +62,7 @@ async def _render(args) -> int:
 
     fmt = args.format
     proxy = args.proxy or _env_proxy()
-    launch_kwargs: dict = {"args": _LAUNCH_ARGS}
+    launch_kwargs: dict = {"args": chromium_launch_args(_LAUNCH_ARGS)}
     if proxy:
         launch_kwargs["proxy"] = {"server": proxy}
     async with async_playwright() as p:

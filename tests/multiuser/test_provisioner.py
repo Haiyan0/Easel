@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import pathlib
@@ -170,12 +171,19 @@ def test_workspace_ownership_fails_closed_when_not_chownable(tmp_path,
                                                              monkeypatch):
     paths = provisioner.prepare_workspace(tmp_path / "root", WORKSPACE)
     monkeypatch.setattr(provisioner.os, "geteuid", lambda: 1234, raising=False)
+    identities = dict(zip(
+        (paths.workspace, paths.home, paths.state), paths.directory_ids))
 
     class Foreign:
         st_uid = 1234
-        st_mode = 0o700
+        st_mode = 0o040700
 
-    monkeypatch.setattr(provisioner.Path, "stat", lambda self: Foreign())
+        def __init__(self, identity):
+            self.st_dev, self.st_ino = identity
+
+    monkeypatch.setattr(
+        provisioner, "_stat_directory",
+        lambda path: Foreign(identities[path]))
     with pytest.raises(provisioner.ProvisionerError) as rejected:
         provisioner.ensure_worker_ownership(paths)
     assert rejected.value.code == "workspace_owner_mismatch"
@@ -338,3 +346,381 @@ def test_quota_disabled_requires_explicit_opt_in(tmp_path):
     provisioner.ensure_quota(
         tmp_path, WORKSPACE, mode="none", limit_bytes=10 * 1024 ** 3,
         allow_unquotaed=True, run=lambda argv: 0)
+
+
+# ----------------------------------------------------------------------
+# R1：实际 ensure 调用链、目录身份与旧实例严格验收
+# ----------------------------------------------------------------------
+
+def _ok(stdout: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], 0, stdout, "")
+
+
+def _fail() -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], 1, "", "")
+
+
+def _valid_container(root: pathlib.Path, config_version: int = 3,
+                     image: str = IMAGE) -> dict:
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    return {
+        "Id": "f" * 64,
+        "Name": "/" + provisioner.container_name(WORKSPACE),
+        "Config": {
+            "User": "10001:10001",
+            "Image": image,
+            "Entrypoint": None,
+            "Cmd": ["python", "-m", "easel.worker.lifecycle",
+                    "serve", "--host", "0.0.0.0", "--port", "7860"],
+            "Env": ["EASEL_SERVICE_TOKEN=super-secret"],
+            "Labels": provisioner.workload_labels(WORKSPACE, config_version),
+        },
+        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "CapAdd": [],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "PidsLimit": 256,
+            "Memory": 4 * 1024 ** 3,
+            "MemorySwap": 4 * 1024 ** 3,
+            "NanoCpus": 2_000_000_000,
+            "NetworkMode": provisioner.network_name(WORKSPACE),
+            "PortBindings": {},
+            "PublishAllPorts": False,
+            "Binds": [],
+            "Devices": [],
+            "PidMode": "",
+            "IpcMode": "private",
+            "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=1g"},
+            "RestartPolicy": {"Name": "no"},
+        },
+        "Mounts": [
+            {"Type": "bind", "Source": str(paths.workspace),
+             "Destination": "/workspace", "RW": True},
+            {"Type": "bind", "Source": str(paths.home),
+             "Destination": "/home/easel", "RW": True},
+        ],
+        "NetworkSettings": {
+            "Ports": {},
+            "Networks": {
+                provisioner.network_name(WORKSPACE): {
+                    "IPAddress": "172.30.0.2"},
+            },
+        },
+    }
+
+
+def _valid_network() -> dict:
+    return {
+        "Name": provisioner.network_name(WORKSPACE),
+        "Driver": "bridge",
+        "Internal": True,
+        "EnableIPv6": False,
+        "Labels": {
+            "easel.managed": "true",
+            "easel.workspace-id": WORKSPACE,
+        },
+    }
+
+
+class FakeDocker:
+    """模拟 Docker 外部边界；记录实际 argv 并返回可配置的 inspect。"""
+
+    def __init__(self, root: pathlib.Path, *, existing: dict | None = None,
+                 network: dict | None = None,
+                 after_run: dict | None = None,
+                 run_returncode: int = 0):
+        self.root = root
+        self.container = existing
+        self.network = network
+        self.after_run = after_run
+        self.run_returncode = run_returncode
+        self.calls: list[list[str]] = []
+        self.stopped: list[str] = []
+
+    def __call__(self, argv, *, timeout=120.0):
+        self.calls.append(list(argv))
+        assert argv[0] == "docker", argv
+        args = argv[1:]
+        if args[:2] == ["network", "inspect"]:
+            if self.network is None:
+                return _fail()
+            return _ok(json.dumps([self.network]))
+        if args[:2] == ["network", "create"]:
+            self.network = _valid_network()
+            return _ok(provisioner.network_name(WORKSPACE) + "\n")
+        if args[:2] == ["container", "inspect"]:
+            if self.container is None:
+                return _fail()
+            return _ok(json.dumps([self.container]))
+        if args[:1] == ["run"]:
+            if self.run_returncode != 0:
+                return subprocess.CompletedProcess(argv, self.run_returncode,
+                                                   "", "")
+            self.container = self.after_run or _valid_container(self.root)
+            return _ok("fake-container-id\n")
+        if args[:1] == ["stop"]:
+            self.stopped.append(args[-1])
+            return _ok()
+        if args[:1] == ["rm"]:
+            self.container = None
+            return _ok()
+        raise AssertionError(f"unexpected docker 调用：{argv}")
+
+    def run_argv(self) -> list[str]:
+        return next(call for call in self.calls if call[1:2] == ["run"])
+
+
+def _settings(tmp_path: pathlib.Path) -> object:
+    return provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True)
+
+
+def _fake_health(monkeypatch):
+    def fake_get(host, port, path, headers, timeout):
+        return {
+            "workspace_id": WORKSPACE,
+            "config_version": 3,
+            "container_id": provisioner.container_name(WORKSPACE),
+            "ready": True,
+        }
+    monkeypatch.setattr(provisioner, "_http_get_json", fake_get)
+
+
+def test_ensure_uses_full_run_argv_and_returns_after_real_health_chain(
+        tmp_path, monkeypatch):
+    """实际 ensure→_docker→runner 链必须携带 docker run，而不是从 -d 开始。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+    _fake_health(monkeypatch)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 3))
+
+    run_argv = fake.run_argv()
+    assert run_argv[:3] == ["docker", "run", "-d"], run_argv[:5]
+    assert run_argv[-1] == "7860"
+    assert handle.workspace_id == WORKSPACE
+    assert handle.container_id == provisioner.container_name(WORKSPACE)
+    assert handle.upstream == "http://172.30.0.2:7860"
+    assert handle.service_token
+
+
+def test_ensure_rejects_container_with_insecure_actual_config(
+        tmp_path, monkeypatch):
+    """旧容器即使标签和健康响应合法，安全配置不符也不得接管。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+
+    def tamper(raw):
+        raw["Config"]["User"] = "0:0"
+        raw["HostConfig"]["Privileged"] = True
+        raw["HostConfig"]["ReadonlyRootfs"] = False
+        raw["Config"]["Image"] = "easel-worker:latest"
+        raw["NetworkSettings"]["Networks"]["bridge"] = {
+            "IPAddress": "172.17.0.2"}
+        raw["HostConfig"]["PortBindings"] = {"7860/tcp": [
+            {"HostIp": "0.0.0.0", "HostPort": "7860"}]}
+        return raw
+
+    existing = tamper(_valid_container(root))
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "container_conflict"
+    assert all(call[1:2] != ["run"] for call in fake.calls), fake.calls
+
+
+_TAMPER_NAMES = [
+    "root_user", "privileged", "writable_rootfs", "wrong_image",
+    "extra_network", "published_port", "cap_add", "missing_nnp",
+    "wrong_memory", "wrong_pids", "wrong_cpu", "extra_mount",
+    "writable_workspace_mount", "foreign_command", "docker_socket_mount",
+]
+
+
+def _tampered(name: str, root: pathlib.Path) -> dict:
+    raw = _valid_container(root)
+    if name == "root_user":
+        raw["Config"]["User"] = "0:0"
+    elif name == "privileged":
+        raw["HostConfig"]["Privileged"] = True
+    elif name == "writable_rootfs":
+        raw["HostConfig"]["ReadonlyRootfs"] = False
+    elif name == "wrong_image":
+        raw["Config"]["Image"] = "sha256:" + "e" * 64
+    elif name == "extra_network":
+        raw["NetworkSettings"]["Networks"]["bridge"] = {
+            "IPAddress": "172.17.0.2"}
+    elif name == "published_port":
+        raw["HostConfig"]["PortBindings"] = {"7860/tcp": [
+            {"HostIp": "0.0.0.0", "HostPort": "7860"}]}
+    elif name == "cap_add":
+        raw["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
+    elif name == "missing_nnp":
+        raw["HostConfig"]["SecurityOpt"] = []
+    elif name == "wrong_memory":
+        raw["HostConfig"]["Memory"] = 8 * 1024 ** 3
+    elif name == "wrong_pids":
+        raw["HostConfig"]["PidsLimit"] = 0
+    elif name == "wrong_cpu":
+        raw["HostConfig"]["NanoCpus"] = 0
+    elif name == "extra_mount":
+        raw["Mounts"].append({
+            "Type": "bind", "Source": "/etc", "Destination": "/host-etc",
+            "RW": True})
+    elif name == "writable_workspace_mount":
+        raw["Mounts"][0]["RW"] = False
+    elif name == "foreign_command":
+        raw["Config"]["Cmd"] = ["sh", "-c", "id"]
+    elif name == "docker_socket_mount":
+        raw["Mounts"].append({
+            "Type": "bind", "Source": "/var/run/docker.sock",
+            "Destination": "/var/run/docker.sock", "RW": True})
+    return raw
+
+
+@pytest.mark.parametrize("name", _TAMPER_NAMES)
+def test_ensure_rejects_each_tampered_inspect_fixture(tmp_path, monkeypatch,
+                                                      name):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root, existing=_tampered(name, root))
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "container_conflict"
+    assert all(call[1:2] != ["run"] for call in fake.calls), name
+
+
+def test_ensure_reuses_fully_valid_existing_container(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root, existing=_valid_container(root))
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 3))
+    assert handle.container_id == provisioner.container_name(WORKSPACE)
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+@pytest.mark.parametrize("updates", [
+    {"Internal": False},
+    {"EnableIPv6": True},
+    {"Driver": "host"},
+    {"Name": "other-network"},
+])
+def test_ensure_rejects_network_missing_isolation_properties(
+        tmp_path, monkeypatch, updates):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    network = _valid_network()
+    network.update(updates)
+    fake = FakeDocker(root, network=network)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_ensure_validates_newly_created_network_before_starting(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root)
+    original = fake.__call__
+
+    def create_insecure(argv, *, timeout=120.0):
+        result = original(argv, timeout=timeout)
+        if argv[1:3] == ["network", "create"]:
+            fake.network = _valid_network()
+            fake.network["Internal"] = False
+        return result
+
+    service = provisioner.Provisioner(_settings(tmp_path),
+                                      run=create_insecure)
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_ensure_rejects_insecure_container_created_during_health_loop(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    bad = _valid_container(root)
+    bad["HostConfig"]["Privileged"] = True
+    fake = FakeDocker(root, after_run=bad)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert fake.stopped == []
+
+
+def test_inspect_rejects_tampered_actual_config(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    fake = FakeDocker(root, existing=_tampered("privileged", root),
+                      network=_valid_network())
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.inspect(WORKSPACE))
+    assert rejected.value.code == "container_conflict"
+
+
+def _replace_state_with_outside_link(paths, outside: pathlib.Path) -> None:
+    saved = paths.state.with_name("saved-state")
+    paths.state.rename(saved)
+    try:
+        paths.state.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(paths.state), str(outside)],
+            capture_output=True)
+        if created.returncode != 0:
+            pytest.skip("当前环境不允许创建目录链接/junction")
+
+
+def test_ownership_rejects_state_replaced_after_prepare(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    _replace_state_with_outside_link(paths, outside)
+
+    monkeypatch.setattr(provisioner.os, "geteuid", lambda: 0, raising=False)
+    recorded = []
+    monkeypatch.setattr(
+        provisioner.os, "fchown",
+        lambda fd, uid, gid: recorded.append((fd, uid, gid)), raising=False)
+    monkeypatch.setattr(
+        provisioner.os, "chown",
+        lambda path, uid, gid: recorded.append((path, uid, gid)),
+        raising=False)
+
+    with pytest.raises(provisioner.ProvisionerError):
+        provisioner.ensure_worker_ownership(paths)
+    assert recorded == [], "不得对已替换路径执行特权 chown"
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert outside.is_dir() and not (outside / "state").exists()

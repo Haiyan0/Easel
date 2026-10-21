@@ -1,0 +1,22 @@
+# worker 执行阶段受管 Python 依赖（全部固定版本）。
+#
+# base 阶段已安装 FastAPI/uvicorn/httpx/pydantic；本文件补齐 web 入口、
+# gateway/SSE、文档/图片与技能脚本实际导入的依赖。只在构建期安装，
+# 运行阶段禁止联网安装。
+# FastAPI 0.115.6 要求 starlette<0.42；固定兼容版本，避免 pip 解析
+# sse-starlette 时把 starlette 升到不兼容的新主版本。
+starlette==0.41.3
+sse-starlette==2.1.3
+python-multipart==0.0.26
+cryptography==48.0.0
+requests==2.33.1
+beautifulsoup4==4.15.0
+websocket-client==1.9.0
+segno==1.6.6
+Markdown==3.10.3
+Pillow==12.2.0
+numpy==2.2.6
+pandas==2.3.3
+matplotlib==3.10.0
+opencv-python-headless==4.11.0.86
+jieba==0.42.1
