@@ -21,6 +21,8 @@ def test_final_image_contains_worker_execution_code_and_skills():
     assert "COPY web ./web" in text
     assert "COPY skills ./skills" in text
     assert "COPY agents ./agents" in text
+    assert "COPY deploy/multiuser/worker_sidecar.py" in text
+    assert "COPY deploy/multiuser/egress_proxy.py" in text
     assert "COPY deploy/multiuser/managed /opt/easel/managed" in text
     assert "requirements-worker.txt" in text
     assert "smoke_worker.py --check-files" in text
@@ -53,6 +55,8 @@ def test_build_smoke_checks_files_modules_worker_mode_and_fake_harness():
     assert "REQUIRED_FILES" in text
     assert "web/app.py" in text
     assert "agents/workspace/AGENTS.md" in text
+    assert "worker_sidecar.py" in text
+    assert "egress_proxy.py" in text
     assert "skills/shared/scripts/runtime_paths.py" in text
     assert "REQUIRED_MODULES" in text
     assert "chromium_launch_args" in text

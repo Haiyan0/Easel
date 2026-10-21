@@ -2,9 +2,10 @@
 
 本目录实现单台 Linux 上每 workspace 一个隔离 worker 的运行时边界。控制面
 只通过受限 Unix socket 请求容器操作；worker 不持有 Docker socket，也不获得
-provisioner socket。**Task 8 仍未完成**：worker→broker/受限出口的允许路径
-尚未接线，浏览器真实沙箱门槛在本机未通过，最终 Harness 与目标宿主门槛也
-未执行。不得把允许路径未经批准顺延为 Task 10 或据此宣称多用户已发布。
+provisioner socket。**Task 8 仍未完成**：每空间 sidecar 的
+worker→broker/受限出口允许路径已实现并有本机 Docker 接线证据，但目标 Linux
+防火墙/IPv6、真实公网出口、浏览器沙箱、最终 Harness 与配额门槛仍未全部
+通过。不得据此宣称多用户已发布或把剩余门槛顺延到 Task 10。
 
 ## 组件与信任边界
 
@@ -106,8 +107,16 @@ python deploy/multiuser/provisioner.py \
   --workspace-root /srv/easel/workspaces \
   --image sha256:<64hex> \
   --allowed-uid <control UID> \
-  --quota-mode project --quota-bytes 10737418240
+  --quota-mode project --quota-bytes 10737418240 \
+  --sidecar-network easel-control \
+  --sidecar-policy /etc/easel/egress-policy.json \
+  --broker-upstream control:7861
 ```
+
+`--sidecar-network` 必须是已存在、非 internal 的受控出站网络；三项 sidecar
+参数必须同时提供，否则 provisioner 拒绝启动，避免把“未接线”误当允许路径。
+`--broker-upstream` 指向 control 的 broker 监听，sidecar 只转发
+`/internal/broker/<channel>/<relative>` 白名单路由，不暴露其他管理接口。
 
 - socket 由 provisioner 创建，权限 `0660`；父目录 `0750`。
 - 只接受建立连接时 `SO_PEERCRED` UID 在 `--allowed-uid` 中的调用；未配置时
@@ -168,6 +177,34 @@ docker run -d --name easel-worker-<uuid> \
 - 服务 token 只在 0600 env 文件与数据库中，不进入 argv。
 - `docker inspect` 经 provisioner 输出前只保留白名单字段；Env、宿主路径和
   未知标签被丢弃。
+
+### 每空间 sidecar
+
+启用 sidecar 后，provisioner 为每个 workspace 创建
+`easel-sidecar-<uuid>`，同样非 root、只读 rootfs、`cap-drop=ALL`、
+`no-new-privileges`、1 CPU/512 MiB/128 PIDs，并只挂载管理员策略文件：
+
+```text
+docker run -d --name easel-sidecar-<uuid> \
+  --network easel-ws-<uuid> \
+  --mount type=bind,src=<policy>,dst=/etc/easel/egress-policy.json,readonly \
+  <pinned-image> python deploy/multiuser/worker_sidecar.py \
+    --broker-port 8899 --egress-port 8898 \
+    --broker-upstream control:7861 --policy /etc/easel/egress-policy.json
+docker network connect easel-control easel-sidecar-<uuid>
+```
+
+- worker 只在 `easel-ws-<uuid>`（internal）内，经固定 sidecar 名访问：
+  - `http://easel-sidecar-<uuid>:8899`：仅白名单 broker 路由；
+  - `http://easel-sidecar-<uuid>:8898`：Task 5 CONNECT 出口。
+- sidecar 额外接入已存在的受控出站网络；worker 自身没有默认路由，不能
+  直连 control、broker、其他 workspace 或公网。
+- worker env 注入 `EASEL_BROKER_URL`、`EASEL_EGRESS_PROXY` 及
+  `HTTP(S)_PROXY`，`NO_PROXY` 排除 sidecar 自身。环境代理只是客户端指向，
+  真正的网络边界仍是 internal 网络 + sidecar。Task 9 的签名快照若包含
+  `broker_url`，必须指向同一个 sidecar broker 名，不能回指 control 管理地址。
+- sidecar 创建/复用/停止均要求严格 inspect：固定镜像、权限、资源、唯一
+  策略挂载、恰好两条批准网络；停止失败明确报错，不写 stopped。
 
 ## 6. 生命周期与回收
 
@@ -256,5 +293,7 @@ Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通
   保留旧兼容参数。测试捕获真实 launch kwargs，并验证沙箱缺失时异常向上
   传播。
 - **宿主防火墙/DOCKER-USER 规则**：仓库只定义矩阵，未自动安装或验证规则。
-- **broker/受限公网出口到 worker 的允许路径**：尚未接线；这是 Task 8
-  未完成的门槛，不能未经批准顺延到 Task 10。当前 worker 全拒绝出站。
+- **broker/受限公网出口到 worker 的允许路径**：代码与 sidecar 接线已完成，
+  并用本机 Docker 真实网络验证 broker 白名单路由、批准出口与拒绝路径。
+  目标 Linux 宿主防火墙/IPv6、真实公网出口与 Task 5 live 出口门槛仍需
+  复验；不能把本机结果外推为生产网络矩阵已通过。

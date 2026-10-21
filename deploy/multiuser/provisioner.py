@@ -56,6 +56,13 @@ WORKER_PIDS_LIMIT = 256
 WORKER_MEMORY_BYTES = 4 * 1024 ** 3
 WORKER_NANO_CPUS = 2_000_000_000
 WORKER_TMPFS = "/tmp:rw,noexec,nosuid,nodev,size=1g"
+SIDECAR_BROKER_PORT = 8899
+SIDECAR_EGRESS_PORT = 8898
+SIDECAR_PIDS_LIMIT = 128
+SIDECAR_MEMORY_BYTES = 512 * 1024 ** 2
+SIDECAR_NANO_CPUS = 1_000_000_000
+SIDECAR_TMPFS = "/tmp:rw,noexec,nosuid,nodev,size=64m"
+SIDECAR_POLICY_CONTAINER_PATH = "/etc/easel/egress-policy.json"
 WORKER_COMMAND = (
     "python", "-m", "easel.worker.lifecycle",
     "serve", "--host", "0.0.0.0", "--port", str(WORKER_PORT),
@@ -200,6 +207,31 @@ def workload_labels(workspace_id: str, config_version: int) -> dict[str, str]:
         "easel.workspace-id": workspace_id,
         "easel.config-version": str(config_version),
     }
+
+
+def sidecar_container_name(workspace_id: str) -> str:
+    if _WORKSPACE_ID.fullmatch(workspace_id) is None:
+        raise _reject("invalid_workspace")
+    return f"easel-sidecar-{workspace_id}"
+
+
+def sidecar_labels(workspace_id: str) -> dict[str, str]:
+    return {
+        "easel.managed": "true",
+        "easel.workspace-id": workspace_id,
+        "easel.role": "sidecar",
+    }
+
+
+def sidecar_command(broker_upstream: str) -> tuple[str, ...]:
+    return (
+        "python", "deploy/multiuser/worker_sidecar.py",
+        "--listen", "0.0.0.0",
+        "--broker-port", str(SIDECAR_BROKER_PORT),
+        "--egress-port", str(SIDECAR_EGRESS_PORT),
+        "--broker-upstream", broker_upstream,
+        "--policy", SIDECAR_POLICY_CONTAINER_PATH,
+    )
 
 
 def credentials_dir(workspace_root: Path) -> Path:
@@ -521,6 +553,81 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
     return argv
 
 
+_HOST_PORT = re.compile(r"^[A-Za-z0-9._-]{1,253}:[0-9]{1,5}$")
+
+
+def validate_sidecar_settings(settings: "ProvisionerSettings"
+                              ) -> tuple[str, Path, str] | None:
+    """sidecar 配置必须三件套齐全；其余情况按未接线零出口处理。"""
+    network = (settings.sidecar_network or "").strip()
+    policy = settings.sidecar_policy
+    upstream = (settings.broker_upstream or "").strip()
+    if not any((network, policy, upstream)):
+        return None
+    if not (network and policy is not None and upstream):
+        raise _reject("sidecar_config_incomplete")
+    if _SAFE_IDENTIFIER.fullmatch(network) is None:
+        raise _reject("sidecar_network_invalid")
+    if _HOST_PORT.fullmatch(upstream) is None:
+        raise _reject("broker_upstream_invalid")
+    try:
+        port = int(upstream.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        raise _reject("broker_upstream_invalid") from None
+    if not 1 <= port <= 65535:
+        raise _reject("broker_upstream_invalid")
+    try:
+        resolved_policy = Path(policy).resolve(strict=True)
+    except OSError:
+        raise _reject("sidecar_policy_unavailable") from None
+    if not resolved_policy.is_file():
+        raise _reject("sidecar_policy_unavailable")
+    return network, resolved_policy, upstream
+
+
+def build_sidecar_run_argv(*, image: str, workspace_id: str,
+                           policy_file: Path,
+                           broker_upstream: str) -> list[str]:
+    """受控 sidecar 的唯一 argv；worker 网络 + 受控出站网络由后续 connect 加入。"""
+    if not isinstance(image, str) or _PINNED_IMAGE.fullmatch(image) is None:
+        raise _reject("invalid_image")
+    name = sidecar_container_name(workspace_id)
+    argv = ["run", "-d", "--name", name]
+    for key, value in sidecar_labels(workspace_id).items():
+        argv.extend(["--label", f"{key}={value}"])
+    argv.extend([
+        "--user", WORKER_USER,
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--cpus=1",
+        "--memory=512m",
+        "--memory-swap=512m",
+        "--pids-limit=128",
+        "--tmpfs", SIDECAR_TMPFS,
+        "--network", network_name(workspace_id),
+        "--mount",
+        ("type=bind,src=" + _safe_path_text(policy_file)
+         + ",dst=" + SIDECAR_POLICY_CONTAINER_PATH + ",readonly"),
+        "--restart=no",
+        "--stop-timeout=15",
+        "--log-driver=local",
+        "--log-opt=max-size=10m",
+        "--log-opt=max-file=2",
+        "--health-cmd",
+        ("python -c \"import urllib.request;"
+         f"urllib.request.urlopen('http://127.0.0.1:{SIDECAR_BROKER_PORT}"
+         "/healthz',timeout=2)\""),
+        "--health-interval=2s",
+        "--health-timeout=2s",
+        "--health-retries=15",
+        "--health-start-period=1s",
+        image,
+        *sidecar_command(broker_upstream),
+    ])
+    return argv
+
+
 def sanitize_inspect(raw: dict | None) -> dict:
     """把 docker inspect 压成白名单字段；Env、宿主路径与未知标签全部丢弃。"""
     empty = {
@@ -730,6 +837,110 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     return True
 
 
+def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
+                           image: str, policy_file: Path,
+                           sidecar_network: str,
+                           broker_upstream: str) -> bool:
+    """严格验收受控 sidecar：固定镜像、权限、资源、挂载与两条批准网络。"""
+    if not isinstance(raw, dict):
+        return False
+    instance_id = raw.get("Id")
+    if (not isinstance(instance_id, str)
+            or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
+        return False
+    if str(raw.get("Name") or "").lstrip("/") != sidecar_container_name(
+            workspace_id):
+        return False
+    config = raw.get("Config")
+    host = raw.get("HostConfig")
+    if not isinstance(config, dict) or not isinstance(host, dict):
+        return False
+    if config.get("Labels") != sidecar_labels(workspace_id):
+        return False
+    if config.get("Image") != image or config.get("User") != WORKER_USER:
+        return False
+    if config.get("Entrypoint") not in (None, []):
+        return False
+    if list(config.get("Cmd") or []) != list(
+            sidecar_command(broker_upstream)):
+        return False
+    healthcheck = config.get("Healthcheck") or {}
+    health_test = healthcheck.get("Test") or []
+    if (not isinstance(health_test, list)
+            or not any("healthz" in str(part) for part in health_test)):
+        return False
+    if host.get("ReadonlyRootfs") is not True:
+        return False
+    if host.get("Privileged") is not False:
+        return False
+    if set(host.get("CapDrop") or []) != {"ALL"}:
+        return False
+    if host.get("CapAdd") not in (None, []):
+        return False
+    options = host.get("SecurityOpt") or []
+    if not _no_new_privileges_enabled(options):
+        return False
+    if any("unconfined" in str(option) for option in options):
+        return False
+    if host.get("PidsLimit") != SIDECAR_PIDS_LIMIT:
+        return False
+    if host.get("Memory") != SIDECAR_MEMORY_BYTES:
+        return False
+    if host.get("MemorySwap") != SIDECAR_MEMORY_BYTES:
+        return False
+    if host.get("NanoCpus") != SIDECAR_NANO_CPUS:
+        return False
+    if host.get("NetworkMode") != network_name(workspace_id):
+        return False
+    if host.get("Binds") not in (None, []):
+        return False
+    if host.get("Devices") not in (None, []):
+        return False
+    if host.get("PidMode") not in (None, ""):
+        return False
+    if host.get("IpcMode") == "host":
+        return False
+    if host.get("PublishAllPorts") not in (None, False):
+        return False
+    if any(bool(bindings)
+           for bindings in (host.get("PortBindings") or {}).values()):
+        return False
+    tmpfs = host.get("Tmpfs") or {}
+    required_tmpfs = {"rw", "noexec", "nosuid", "nodev", "size=64m"}
+    if not required_tmpfs.issubset(
+            set(str(tmpfs.get("/tmp") or "").split(","))):
+        return False
+    mounts = raw.get("Mounts")
+    if not isinstance(mounts, list) or len(mounts) != 1:
+        return False
+    mount = mounts[0]
+    if not isinstance(mount, dict):
+        return False
+    if (mount.get("Type") != "bind"
+            or mount.get("Source") != str(policy_file)
+            or mount.get("Destination") != SIDECAR_POLICY_CONTAINER_PATH
+            or mount.get("RW") is not False):
+        return False
+    network_settings = raw.get("NetworkSettings")
+    if not isinstance(network_settings, dict):
+        return False
+    networks = network_settings.get("Networks")
+    expected = {network_name(workspace_id), sidecar_network}
+    if not isinstance(networks, dict) or set(networks) != expected:
+        return False
+    if any(not isinstance(networks[name], dict)
+           or not networks[name].get("IPAddress") for name in expected):
+        return False
+    if any(bool(bindings)
+           for bindings in (network_settings.get("Ports") or {}).values()):
+        return False
+    state = raw.get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True:
+        return False
+    health = (state.get("Health") or {}).get("Status")
+    return health == "healthy"
+
+
 def verify_network_inspect(payload: object, workspace_id: str) -> bool:
     """已有的受管网络必须仍具备 internal、IPv4-only、bridge 驱动。"""
     if not isinstance(payload, list) or len(payload) != 1:
@@ -894,7 +1105,8 @@ def _load_or_create_token(workspace_root: Path, workspace_id: str) -> str:
 
 def write_env_file(workspace_root: Path, workspace_id: str,
                    config_version: int, token: str,
-                   paths: RuntimePaths) -> Path:
+                   paths: RuntimePaths, *,
+                   sidecar_host: str | None = None) -> Path:
     """原子写入 0600 env 文件；argv 与日志不含 token。"""
     if not token or not token.isascii() or any(
             character in token for character in ("\n", "\r", "\0")):
@@ -904,7 +1116,7 @@ def write_env_file(workspace_root: Path, workspace_id: str,
     target = directory / f"{workspace_id}.env"
     if target.is_symlink():
         raise _reject("credentials_escape")
-    content = "\n".join((
+    lines = [
         "EASEL_SERVICE_MODE=worker",
         f"EASEL_WORKSPACE_ID={workspace_id}",
         f"EASEL_SERVICE_TOKEN={token}",
@@ -915,7 +1127,18 @@ def write_env_file(workspace_root: Path, workspace_id: str,
         "EASEL_STATE_ROOT=/workspace/state",
         "HOME=/home/easel",
         "PYTHONDONTWRITEBYTECODE=1",
-    )) + "\n"
+    ]
+    if sidecar_host is not None:
+        broker_url = f"http://{sidecar_host}:{SIDECAR_BROKER_PORT}"
+        egress_url = f"http://{sidecar_host}:{SIDECAR_EGRESS_PORT}"
+        lines.extend((
+            f"EASEL_BROKER_URL={broker_url}",
+            f"EASEL_EGRESS_PROXY={egress_url}",
+            f"HTTPS_PROXY={egress_url}",
+            f"HTTP_PROXY={egress_url}",
+            f"NO_PROXY=127.0.0.1,localhost,{sidecar_host}",
+        ))
+    content = "\n".join(lines) + "\n"
     temporary = directory / f".{workspace_id}.env.{secrets.token_hex(8)}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -946,6 +1169,9 @@ class ProvisionerSettings:
     allowed_uids: frozenset[int] = frozenset()
     health_timeout: float = HEALTH_TIMEOUT_SECONDS
     docker: str = "docker"
+    sidecar_network: str = ""
+    sidecar_policy: Path | None = None
+    broker_upstream: str = ""
 
 
 class Provisioner:
@@ -956,6 +1182,7 @@ class Provisioner:
         self.settings = settings
         self._runner = run or self._subprocess_run
         self._locks: dict[str, asyncio.Lock] = {}
+        self._sidecar = validate_sidecar_settings(settings)
 
     # -- Docker 调用 ---------------------------------------------------
 
@@ -1010,14 +1237,16 @@ class Provisioner:
             raise ProvisionerError(error_code)
         return payload[0]
 
-    async def _inspect_raw(self, workspace_id: str) -> dict | None:
-        target = container_name(workspace_id)
+    async def _inspect_name(self, target: str) -> dict | None:
         result = await self._docker("container", "inspect", target)
         if result.returncode != 0:
             if self._not_found(result, kind="container", target=target):
                 return None
             raise ProvisionerError("docker_inspect_failed")
         return self._single_object(result.stdout, "inspect_invalid")
+
+    async def _inspect_raw(self, workspace_id: str) -> dict | None:
+        return await self._inspect_name(container_name(workspace_id))
 
     async def _inspect_instance(self, instance_id: str) -> dict | None:
         result = await self._docker("container", "inspect", instance_id)
@@ -1066,6 +1295,141 @@ class Provisioner:
     async def _remove_container(self, workspace_id: str) -> None:
         await self._docker("rm", "-f", container_name(workspace_id))
 
+    # -- 受控 sidecar ----------------------------------------------------
+
+    async def _require_sidecar_network(self, network: str) -> None:
+        result = await self._docker("network", "inspect", network)
+        if result.returncode != 0:
+            if self._not_found(result, kind="network", target=network):
+                raise ProvisionerError("sidecar_network_missing")
+            raise ProvisionerError("docker_inspect_failed")
+        payload = self._single_object(result.stdout, "network_invalid")
+        if (payload.get("Name") != network
+                or payload.get("Driver") != "bridge"
+                or payload.get("Internal") is not False
+                or payload.get("EnableIPv6") is not False):
+            raise ProvisionerError("sidecar_network_invalid")
+
+    def _sidecar_verified(self, raw: dict | None, workspace_id: str) -> bool:
+        if self._sidecar is None:
+            return False
+        network, policy, upstream = self._sidecar
+        return verify_sidecar_inspect(
+            raw, workspace_id=workspace_id, image=self.settings.image,
+            policy_file=policy, sidecar_network=network,
+            broker_upstream=upstream)
+
+    async def _remove_sidecar_instance(self, workspace_id: str) -> None:
+        name = sidecar_container_name(workspace_id)
+        raw = await self._inspect_name(name)
+        if raw is None:
+            return
+        labels = (raw.get("Config") or {}).get("Labels") or {}
+        if (labels.get("easel.managed") != "true"
+                or labels.get("easel.workspace-id") != workspace_id
+                or labels.get("easel.role") != "sidecar"):
+            raise ProvisionerError("sidecar_conflict")
+        instance_id = raw.get("Id")
+        if (not isinstance(instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
+            raise ProvisionerError("sidecar_conflict")
+        result = await self._docker("rm", "-f", instance_id, timeout=60.0)
+        if result.returncode != 0:
+            if await self._inspect_instance(instance_id) is None:
+                return
+            raise ProvisionerError("sidecar_remove_failed")
+        if await self._inspect_instance(instance_id) is not None:
+            raise ProvisionerError("sidecar_remove_failed")
+
+    async def _ensure_sidecar(self, workspace_id: str) -> None:
+        """确保本空间 sidecar 存在且仅连接批准的 internal/出站网络。"""
+        if self._sidecar is None:
+            return
+        network, policy, upstream = self._sidecar
+        await self._require_sidecar_network(network)
+        existing = await self._inspect_name(
+            sidecar_container_name(workspace_id))
+        if existing is not None:
+            labels = (existing.get("Config") or {}).get("Labels") or {}
+            if (labels.get("easel.managed") != "true"
+                    or labels.get("easel.workspace-id") != workspace_id
+                    or labels.get("easel.role") != "sidecar"):
+                raise ProvisionerError("sidecar_conflict")
+            if self._sidecar_verified(existing, workspace_id):
+                return
+            await self._remove_sidecar_instance(workspace_id)
+
+        argv = build_sidecar_run_argv(
+            image=self.settings.image, workspace_id=workspace_id,
+            policy_file=policy, broker_upstream=upstream)
+        try:
+            result = await self._docker(*argv, timeout=60.0)
+            if result.returncode != 0:
+                raise ProvisionerError("sidecar_start_failed")
+            attached = await self._docker(
+                "network", "connect", network,
+                sidecar_container_name(workspace_id), timeout=30.0)
+            if attached.returncode != 0:
+                raise ProvisionerError("sidecar_network_failed")
+            deadline = time.monotonic() + min(
+                self.settings.health_timeout, 30.0)
+            while time.monotonic() < deadline:
+                raw = await self._inspect_name(
+                    sidecar_container_name(workspace_id))
+                if raw is None:
+                    raise ProvisionerError("sidecar_not_ready")
+                if self._sidecar_verified(raw, workspace_id):
+                    return
+                await asyncio.sleep(HEALTH_POLL_SECONDS)
+            raise ProvisionerError("sidecar_not_ready")
+        except BaseException:
+            try:
+                await self._remove_sidecar_instance(workspace_id)
+            except ProvisionerError:
+                pass
+            raise
+
+    async def _cleanup_failed_start(self, workspace_id: str) -> None:
+        """worker 启动失败时移除半成品 worker 与已无使用者的 sidecar。"""
+        await self._remove_container(workspace_id)
+        try:
+            await self._stop_sidecar(workspace_id)
+        except ProvisionerError:
+            pass
+
+    async def _stop_sidecar(self, workspace_id: str) -> None:
+        """停止并确认删除本空间 sidecar；已不存在按幂等成功处理。"""
+        if self._sidecar is None:
+            return
+        name = sidecar_container_name(workspace_id)
+        raw = await self._inspect_name(name)
+        if raw is None:
+            return
+        labels = (raw.get("Config") or {}).get("Labels") or {}
+        if (labels.get("easel.managed") != "true"
+                or labels.get("easel.workspace-id") != workspace_id
+                or labels.get("easel.role") != "sidecar"):
+            raise ProvisionerError("sidecar_conflict")
+        instance_id = raw.get("Id")
+        if (not isinstance(instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
+            raise ProvisionerError("sidecar_conflict")
+        stopped = await self._docker("stop", "--time", "15", instance_id,
+                                     timeout=40.0)
+        if stopped.returncode != 0:
+            current = await self._inspect_instance(instance_id)
+            if current is None:
+                return
+            if (current.get("State") or {}).get("Running") is True:
+                raise ProvisionerError("sidecar_stop_failed")
+        removed = await self._docker("rm", "-f", instance_id, timeout=40.0)
+        if removed.returncode != 0:
+            if await self._inspect_instance(instance_id) is None:
+                return
+            raise ProvisionerError("sidecar_remove_failed")
+        if await self._inspect_instance(instance_id) is not None:
+            raise ProvisionerError("sidecar_remove_failed")
+
     # -- 对外动作 ------------------------------------------------------
 
     async def ensure(self, workspace_id: str,
@@ -1089,10 +1453,13 @@ class Provisioner:
             allow_unquotaed=self.settings.allow_unquotaed)
         token = await asyncio.to_thread(
             _load_or_create_token, self.settings.workspace_root, workspace_id)
+        sidecar_host = (sidecar_container_name(workspace_id)
+                        if self._sidecar is not None else None)
         env_file = await asyncio.to_thread(
             write_env_file, self.settings.workspace_root, workspace_id,
-            config_version, token, paths)
+            config_version, token, paths, sidecar_host=sidecar_host)
         await self._ensure_network(workspace_id)
+        await self._ensure_sidecar(workspace_id)
 
         existing = await self._inspect_raw(workspace_id)
         if existing is not None:
@@ -1122,7 +1489,7 @@ class Provisioner:
         # 必须传完整 argv，不能丢弃 run。
         result = await self._docker(*argv, timeout=60.0)
         if result.returncode != 0:
-            await self._remove_container(workspace_id)
+            await self._cleanup_failed_start(workspace_id)
             raise ProvisionerError("worker_start_failed")
 
         deadline = time.monotonic() + self.settings.health_timeout
@@ -1145,9 +1512,9 @@ class Provisioner:
                                         config_version)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
         except BaseException:
-            await self._remove_container(workspace_id)
+            await self._cleanup_failed_start(workspace_id)
             raise
-        await self._remove_container(workspace_id)
+        await self._cleanup_failed_start(workspace_id)
         raise ProvisionerError("worker_not_ready")
 
     async def stop(self, workspace_id: str, instance_id: str) -> None:
@@ -1162,38 +1529,37 @@ class Provisioner:
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
             raw = await self._inspect_raw(workspace_id)
-            if raw is None:
-                return
-            report = sanitize_inspect(raw)
-            if not report["managed"]:
-                raise ProvisionerError("container_conflict")
-            if (not isinstance(raw.get("Id"), str)
-                    or raw.get("Id") != instance_id):
-                raise ProvisionerError("container_conflict")
+            if raw is not None:
+                report = sanitize_inspect(raw)
+                if not report["managed"]:
+                    raise ProvisionerError("container_conflict")
+                if (not isinstance(raw.get("Id"), str)
+                        or raw.get("Id") != instance_id):
+                    raise ProvisionerError("container_conflict")
 
-            stopped = await self._docker("stop", "--time", "30", instance_id,
-                                         timeout=60.0)
-            if stopped.returncode != 0:
-                # 旧管理者可能已先删除；按实例 ID 确认终态，不能仅凭
-                # 非零退出码报告成功或失败。
-                current = await self._inspect_instance(instance_id)
-                if current is None:
-                    return
-                state = current.get("State") or {}
-                if state.get("Running") is True:
-                    raise ProvisionerError("container_stop_failed")
+                stopped = await self._docker(
+                    "stop", "--time", "30", instance_id, timeout=60.0)
+                if stopped.returncode != 0:
+                    # 旧管理者可能已先删除；按实例 ID 确认终态。
+                    current = await self._inspect_instance(instance_id)
+                    if (current is not None
+                            and (current.get("State") or {}).get(
+                                "Running") is True):
+                        raise ProvisionerError("container_stop_failed")
 
-            removed = await self._docker("rm", "-f", instance_id,
-                                         timeout=60.0)
-            if removed.returncode != 0:
-                if await self._inspect_instance(instance_id) is None:
-                    return
-                raise ProvisionerError("container_remove_failed")
+                removed = await self._docker("rm", "-f", instance_id,
+                                             timeout=60.0)
+                if (removed.returncode != 0
+                        and await self._inspect_instance(instance_id)
+                        is not None):
+                    raise ProvisionerError("container_remove_failed")
+                # 命令成功不等于实例已消失；最终确认原实例确实不存在。
+                if await self._inspect_instance(instance_id) is not None:
+                    raise ProvisionerError("container_remove_failed")
 
-            # 命令成功不等于实例已消失；最终确认原实例确实不存在，避免
-            # 把仍存活的容器报告为已停止。
-            if await self._inspect_instance(instance_id) is not None:
-                raise ProvisionerError("container_remove_failed")
+            # worker 已确认删除（或本就不存在）后，sidecar 也必须清理；
+            # worker 存在但 ID 不符时已在上面拒绝，不会误停新代次 sidecar。
+            await self._stop_sidecar(workspace_id)
 
     async def inspect(self, workspace_id: str) -> dict:
         parse_request({"version": PROTOCOL_VERSION, "action": "inspect",
@@ -1409,6 +1775,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-unquotaed", action="store_true",
                         help="仅测试用：显式关闭配额（会记录警告）")
     parser.add_argument("--docker", default="docker")
+    parser.add_argument("--sidecar-network", default="",
+                        help="sidecar 受控出站网络（已存在、非 internal）")
+    parser.add_argument("--sidecar-policy", default="",
+                        help="宿主侧管理员 egress policy JSON 路径")
+    parser.add_argument("--broker-upstream", default="",
+                        help="sidecar 转发的 control broker host:port")
     args = parser.parse_args(argv)
 
     if _PINNED_IMAGE.fullmatch(args.image) is None:
@@ -1430,8 +1802,16 @@ def main(argv: list[str] | None = None) -> int:
         allow_unquotaed=args.allow_unquotaed,
         allowed_uids=_allowed_uids(args.allowed_uid),
         docker=args.docker,
+        sidecar_network=args.sidecar_network,
+        sidecar_policy=(Path(args.sidecar_policy)
+                        if args.sidecar_policy else None),
+        broker_upstream=args.broker_upstream,
     )
-    provisioner = Provisioner(settings)
+    try:
+        provisioner = Provisioner(settings)
+    except ProvisionerError as error:
+        print(f"错误：{error.code}", file=sys.stderr)
+        return 2
     try:
         asyncio.run(provisioner.serve())
     except KeyboardInterrupt:

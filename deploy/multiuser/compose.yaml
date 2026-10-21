@@ -8,8 +8,9 @@
 #   egress 或 worker；也不要把 provisioner.sock 挂进 worker。
 # * control 通过只读挂载的 Unix socket 调用 provisioner；启动顺序必须先启动
 #   provisioner，再启动 control，否则 control 会失败关闭。
-# * worker 的网络只允许生命周期入口被宿主机探测；出站一律拒绝。broker/受限
-#   公网出口的允许路径尚未接线，见 egress-policy.md。
+# * 每 workspace 由 provisioner 创建 sidecar，接入独立 internal 网络和
+#   `easel-control` 受控出站网络；worker 只能经 sidecar 的 broker 白名单
+#   路由与 CONNECT 出口访问外部。worker 自身仍无默认路由。
 
 name: easel-multiuser
 

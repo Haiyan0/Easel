@@ -30,6 +30,8 @@ REQUIRED_FILES = (
     "skills/shared/scripts/browser_state.py",
     "skills/builtin/paper-explainer/SKILL.md",
     "skills/builtin/paper-explainer/scripts/render_slides.py",
+    "deploy/multiuser/worker_sidecar.py",
+    "deploy/multiuser/egress_proxy.py",
 )
 
 FORBIDDEN_FILE_NAMES = {

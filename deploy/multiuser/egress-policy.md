@@ -14,9 +14,12 @@ Engine 上的输出为准。
 - 每空间独立 `--internal` 桥，不共享默认 `bridge`；
 - 不发布任何宿主端口（argv 中无 `-p`/`--publish`）；
 - 不挂载 Docker socket，不挂载 provisioner socket；
-- 只有两个 bind：`/workspace` 与 `/home/easel`，来源在固定工作区根内；
+- worker 只有两个 bind：`/workspace` 与 `/home/easel`，来源在固定工作区根内；
 - 唯一入站用途是宿主机 provisioner 对容器 IP:7860 的
-  `/internal/lifecycle/health` 探测（带 workspace 身份头与服务 token）。
+  `/internal/lifecycle/health` 探测（带 workspace 身份头与服务 token）；
+- 启用 sidecar 时，provisioner 另建同权限边界的
+  `easel-sidecar-<uuid>`，同时接入 `easel-ws-<uuid>`（internal）和已存在
+  的非 internal 受控出站网络；worker 不加入出站网络。
 
 ## 访问矩阵
 
@@ -29,28 +32,31 @@ Engine 上的输出为准。
 | worker → 云元数据（169.254.169.254） | 拒绝 | `--internal` 无外部/链路本地路由 | 本机实测通过 |
 | worker → 公网 IPv4 | 拒绝 | `--internal` 禁止外部连通 | 本机实测通过（1.1.1.1:53 失败） |
 | worker → 公网 IPv6 | 拒绝 | 内部桥默认未启用 IPv6，无 IPv6 地址/默认路由 | 本机实测通过（检查地址/路由并实际连接失败） |
-| worker → 必要入口 / provider broker | **允许**（业务目标） | **尚未接线**：Task 8 未完成，不得顺延到 Task 10；broker 属 control 侧 | 未启用（Task 8 未完成） |
-| worker → 受控公网出口（egress sidecar） | **允许**（业务目标） | **尚未接线**：本轮不创建 sidecar，worker 保持零出站 | 未启用（Task 8 未完成） |
+| worker → 必要入口 / provider broker | **允许**（仅白名单路由） | worker 仅经 sidecar:8899 的 `/internal/broker/<channel>/<relative>` 精确路由表转发到 control broker | 本机 Docker 真实网络接线通过（fake broker；真实 control broker 联调未执行） |
+| worker → 受控公网出口（egress sidecar） | **允许**（仅策略批准目标） | worker 仅经 sidecar:8898 CONNECT，复用 Task 5 解析后固定 IP/拒绝私网/策略例外 | 本机 Docker 接线通过（批准测试网段与私网拒绝；真实公网出口未执行） |
+| worker → sidecar broker 入口的非白名单路径/方法 | 拒绝 | sidecar 只转发 `BROKER_ROUTE_TABLE` 精确 route；其余 404，不转发 control 管理接口 | 单测与真实接线测试通过 |
 | 宿主 provisioner → worker lifecycle | 允许（仅健康探测） | 宿主经内部桥访问容器 IP:7860，带身份/token 校验 | 待 Linux 集成实测 |
 
-“允许”的两行是明确的后续接线点，不是当前能力。在接线前，worker 处于
-全拒绝（fail-closed）状态；技能执行若需要外网，会明确失败，不会静默直连。
+允许路径通过每空间 sidecar 实现：sidecar 同时接入 internal workspace 网络
+和受控出站网络，worker 自身仍无默认路由。broker 入口只接受精确白名单路由，
+出口使用 Task 5 的连接层策略；环境变量只用于客户端指向 sidecar，不代替
+网络规则。
 
 上表“本机实测”来自 Docker Desktop 29.2.1 / linux-amd64 容器网络，不能
 替代目标 Linux 宿主（含 Docker IPv6、宿主防火墙与 DOCKER-USER 规则）的
 复验；部署方仍须按本文矩阵逐行实测。
 
-### 后续接线的约束（实现前必须逐项验证）
+### sidecar 接线的固定约束
 
-若要让 worker 访问 broker 或受限公网出口，必须采用独立 egress sidecar：
-
-1. sidecar 同时接入 `easel-ws-<uuid>`（internal）和一条受控出站网络；
-2. 只允许 sidecar 出站，worker 自身仍不得获得默认路由；
+1. sidecar 同时接入 `easel-ws-<uuid>`（internal）和一条已存在、非 internal
+   的受控出站网络；worker 不加入后者。
+2. 只允许 sidecar 出站，worker 自身仍不得获得默认路由。
 3. 出口使用 Task 5 的真实 CONNECT 代理与管理员策略文件，不用
-   `http_proxy`/`https_proxy` 环境变量代替网络规则；
-4. broker 的受限入口不得顺带暴露 control 管理监听；
+   `http_proxy`/`https_proxy` 环境变量代替网络规则。
+4. broker 的受限入口只暴露精确 broker route；不能顺带暴露 control 管理
+   监听。worker 只能访问 sidecar 的固定端口。
 5. 宿主机 `DOCKER-USER` 链显式拒绝 worker 源地址访问管理网段，并覆盖
-   IPv6；Docker 的发布端口会绕过 UFW，不能只依赖 UFW；
+   IPv6；Docker 的发布端口会绕过 UFW，不能只依赖 UFW。
 6. DNS 重绑定必须沿用 Task 5 的“连接阶段解析、校验全部地址、按已校验 IP
    连接”机制，不做二次解析。
 

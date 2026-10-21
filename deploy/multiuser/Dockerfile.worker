@@ -93,6 +93,8 @@ COPY skills ./skills
 # 缺少 agents/workspace/AGENTS.md 会在发送 prompt 前失败。
 COPY agents ./agents
 COPY deploy/multiuser/smoke_worker.py ./deploy/multiuser/smoke_worker.py
+COPY deploy/multiuser/worker_sidecar.py ./deploy/multiuser/worker_sidecar.py
+COPY deploy/multiuser/egress_proxy.py ./deploy/multiuser/egress_proxy.py
 RUN chown -R root:root /opt/easel \
  && chmod -R a-w /opt/easel
 # 构建期实际校验文件、模块、worker 沙箱参数和假 Harness 子进程；
