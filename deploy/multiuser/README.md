@@ -269,6 +269,18 @@ docker network connect easel-control easel-sidecar-<uuid>
 python -m pytest tests/multiuser/test_sidecar_broker_control.py -q
 ```
 
+真实 Docker 拓扑：worker 容器→sidecar 容器→真实 control broker（供应商传输
+仍为 fake；可选 `EASEL_WORKER_IMAGE` 指向已固定摘要的执行阶段镜像）：
+
+```bash
+EASEL_RUN_CONTAINER_TESTS=1 \
+python -m pytest tests/integration/multiuser/test_control_broker_topology.py -q
+```
+
+该测试验证合法 token 经真实 broker 到达 fake provider，错误/跨 workspace/
+run token 被拒绝，管理路径在 sidecar 入口 404；不证明真实供应商、真实公网
+或目标宿主防火墙。
+
 真实容器隔离（Linux Docker Engine；显式选择，失败就如实记录）：
 
 ```bash
@@ -286,12 +298,13 @@ Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通
 测试只创建随机 UUID 命名的临时容器/网络，清理前核对受管标签；不删除开发者
 容器、workspace、outputs、profile 或浏览器状态。
 
-## 8. 当前未执行门槛
+## 8. 当前未关闭门槛
 
-以下项目在本轮 Windows + Docker Desktop 环境无法真实验证，不得表述为通过：
+以下项目不得表述为全部通过；本机已执行证据与目标环境门槛分开记录：
 
 - **XFS 项目配额**：Docker Desktop 使用 overlayfs，无 XFS prjquota；仅有
-  `xfs_quota` 不可用时的失败关闭与注入测试，未验证真实限额生效。
+  `xfs_quota` 不可用时的失败关闭与注入测试，未验证真实限额生效。本机 WSL
+  盘点有 XFS 内核支持但无 `mkfs.xfs`/`xfs_quota`，且不是已授权目标宿主。
 - **Windows 宿主上的 control→socket 端到端**：Windows Python 无
   `socket.AF_UNIX`。本轮的 Linux 容器测试已覆盖 socket 权限、注入拒绝、
   `SO_PEERCRED` 未授权拒绝与 `UnixProvisionerClient` 解码；尚未在 Windows
@@ -320,7 +333,10 @@ Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通
   并用本机 Docker 真实网络验证 broker 白名单路由、批准出口与拒绝路径。
   另一组装配测试启动真实 `create_app`/Auth/Config/Broker 与独立 sidecar
   进程，经实际 sidecar socket 验证合法 token 到达 broker、错误/跨
-  workspace/run token 被真实 broker 拒绝，管理路径在 sidecar 入口 404；
-  供应商传输仍为 fake，未使用真实供应商凭证。目标 Linux 宿主防火墙/IPv6、
-  真实公网出口、真实 control broker 在 Docker 拓扑中的联调与 Task 5 live
-  出口门槛仍需复验；不能把本机结果外推为生产网络矩阵已通过。
+  workspace/run token 被真实 broker 拒绝，管理路径在 sidecar 入口 404。
+  本机 Docker 拓扑测试已实际启动 worker 容器、sidecar 容器和真实 control
+  broker（供应商传输为 fake），验证同一授权矩阵；这不等于目标 Linux 宿主
+  防火墙/IPv6、真实公网出口、真实供应商或 Task 5 live 出口已通过。
+- **目标 Linux 宿主网络与配额**：未提供已授权目标连接信息；本机 WSL 仅用于
+  只读环境盘点，不作为目标宿主证据。宿主防火墙/DOCKER-USER、IPv4/IPv6
+  矩阵、XFS 真实限额与宿主 provisioner→worker 健康链仍需目标环境实测。
