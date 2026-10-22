@@ -188,6 +188,20 @@ def _wait_healthy(name: str, deadline: float) -> None:
     pytest.fail(f"{name} 未在期限内 healthy：{logs.stderr[-2000:]}")
 
 
+def _prepare_container_access(tmp_path: pathlib.Path, *,
+                              writable: tuple[pathlib.Path, ...] = ()) -> None:
+    """让容器内固定 UID 10001 能读取测试目录，写 SQLite 及其 WAL/SHM。
+
+    原生 Linux 上 pytest 临时目录通常属于宿主用户且为 0700；绑定挂载后
+    容器 UID 10001 无法遍历或写库。这里只放宽本次测试自建的临时路径：
+    目录 0777，普通输入文件 0644，SQLite 数据库 0666；不改仓库或开发者目录。
+    """
+    os.chmod(tmp_path, 0o777)
+    for path in tmp_path.iterdir():
+        if path.is_file():
+            os.chmod(path, 0o666 if path in writable else 0o644)
+
+
 def _seed_control_database(tmp_path):
     database = tmp_path / "control.sqlite3"
     with Store.open(database) as store:
@@ -223,6 +237,7 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     outbound_network = f"easel-topo-out-{suffix}"
     control = f"easel-topo-control-{suffix}"
     sidecar = f"easel-topo-sidecar-{suffix}"
+    worker = f"easel-topo-worker-{suffix}"
     policy = tmp_path / "policy.json"
     policy.write_text("{}", encoding="utf-8")
     token, member, other, run = _seed_control_database(tmp_path)
@@ -232,6 +247,10 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     control_script.write_text(_CONTROL_APP, encoding="utf-8")
     client_script = tmp_path / "client.py"
     client_script.write_text(_CLIENT, encoding="utf-8")
+    _prepare_container_access(
+        tmp_path, writable=tuple(
+            path for path in tmp_path.iterdir()
+            if path.name.startswith("control.sqlite3")))
     control_env = {
         "CONTROL_DB": "/srv/easel/control.sqlite3",
         "MASTER_KEY_FILE": "/srv/easel/master.key",
@@ -295,7 +314,8 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "RUN_ID": run.id,
         }
         worker_args = [
-            "run", "--rm", "--network", workspace_network,
+            "run", "--rm", "--name", worker,
+            "--network", workspace_network,
             "--user", "10001:10001", "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
@@ -309,6 +329,9 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
         assert result.returncode == 0, result.stderr[-3000:]
         assert "CONTROL_BROKER_TOPOLOGY_OK" in result.stdout
     finally:
+        # 客户端固定命名：docker run CLI 超时后仍可按名字清理，不能依赖
+        # 匿名容器随 CLI 返回或 --rm 自动消失。
+        _docker("rm", "-f", worker, check=False)
         _docker("rm", "-f", sidecar, check=False)
         _docker("rm", "-f", control, check=False)
         _docker("network", "rm", workspace_network, check=False)
