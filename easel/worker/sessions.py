@@ -35,7 +35,7 @@ MESSAGE_FORMAT_VERSION = 1
 _MESSAGE_FIELDS = frozenset({
     "format", "version", "workspace_id", "session_id", "message"})
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
-MAX_ATTACHMENTS = 20
+MAX_ATTACHMENTS = 100  # 单条消息与 worker 单次上传共享的附件上限
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
 _ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -333,9 +333,13 @@ class WorkspaceSessionStore:
                 record["cwd"] = cwd
             _atomic_write(self.binding_path(session_id), record)
 
+    def validate_message(self, message: dict) -> None:
+        """纯输入校验：不建目录、不读写历史，供 Run 认领前调用。"""
+        _validate_message(message)
+
     def append_message(self, session_id: str, message: dict) -> None:
         _session_id(session_id)
-        _validate_message(message)
+        self.validate_message(message)
         session_dir = self._session_dir(session_id)
         with self._locked(session_dir):
             if self._read_binding_locked(session_id) is None:

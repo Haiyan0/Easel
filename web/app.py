@@ -60,7 +60,7 @@ from easel.worker.config import (SnapshotAdmissionStore, WorkerConfigSnapshot,
                                  build_run_env, load_worker_snapshot)
 from easel.worker.context import resolve_paths, service_mode
 from easel.worker.guard import load_worker_identity, verify_worker_request
-from easel.worker.sessions import WorkspaceSessionStore
+from easel.worker.sessions import MAX_ATTACHMENTS, WorkspaceSessionStore
 
 # worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
 _WORKER_IDENTITY = load_worker_identity()
@@ -166,6 +166,28 @@ def _append_session_message(session_id: str, message: dict) -> None:
         store.append_message(session_id, message)
     except DomainError as error:
         raise HTTPException(500, "服务端会话快照写入失败") from error
+
+
+def _validate_worker_chat_input(req: ChatRequest) -> None:
+    """在 Run 认领、绑定和快照写入前拒绝已知的客户端输入越界。"""
+    store = _worker_session_store()
+    if store is None:
+        return
+    if len(req.attachments) > MAX_ATTACHMENTS:
+        raise HTTPException(
+            400, f"单条消息最多 {MAX_ATTACHMENTS} 个附件")
+    try:
+        store.validate_message(_session_user_message(req))
+    except DomainError as error:
+        raise HTTPException(
+            400, "消息内容或附件超过服务端快照限制") from error
+
+
+def _check_worker_upload_count(files: list[UploadFile]) -> None:
+    """worker 上传与聊天/快照共用同一附件上限，且在写盘前拒绝。"""
+    if _WORKER_SNAPSHOT is not None and len(files) > MAX_ATTACHMENTS:
+        raise HTTPException(
+            400, f"worker 单次最多上传 {MAX_ATTACHMENTS} 个附件")
 
 
 def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
@@ -3353,6 +3375,8 @@ async def _harness_ask(sk: str, questions: list[dict], emit) -> dict:
 async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: str,
                             config: dict, emit, timeout: int = TIMEOUT_CHAT, *,
                             interactive=True, execution_claimed=False) -> str:
+    # 非流式入口在调用本函数前尚未认领；输入错误必须原样返回 4xx。
+    _validate_worker_chat_input(req)
     pk = f"web:{sk}"
     turn_id = req.turnId or uuid.uuid4().hex
     full_text: list[str] = []
@@ -3663,6 +3687,9 @@ async def api_chat_stream(req: ChatRequest):
         if req.sessionId and history_path(SESSIONS_DIR, req.sessionId).is_file():
             raise HTTPException(409, "此会话属于 API 直连，请新建会话使用 OpenClaw")
         message = _chat_message(req)
+
+    # 输入越界必须在流式认领和事件日志创建之前拒绝。
+    _validate_worker_chat_input(req)
 
     # worker 流式入口：时效校验与唯一原子认领必须早于事件日志的创建/截断/追加，
     # 重复或过期请求直接返回冲突，不触碰原任务回放日志。认领成功后通过
@@ -4625,6 +4652,7 @@ async def api_upload(
 ):
     """Store chat attachments in a session-scoped inbox and return opaque refs."""
     scope = _attachment_scope(sessionId)
+    _check_worker_upload_count(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)
@@ -4676,6 +4704,7 @@ async def api_upload_local(
     """超过上传上限的文件复制通道：1MB 分块流式落盘（不整读进内存）、无大小上限；
     产出与 /api/upload 同构的附件引用（id/name/path），附件校验与清单链路零改动。"""
     scope = _attachment_scope(sessionId)
+    _check_worker_upload_count(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)

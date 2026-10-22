@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -16,7 +17,11 @@ from easel.control.types import DomainError, WorkspacePaths
 from easel.harnesses.base import HarnessError
 from easel.worker.config import sign_worker_snapshot
 from easel.worker.guard import WorkerIdentity
-from easel.worker.sessions import WorkspaceSessionStore
+from easel.worker.sessions import (
+    MAX_ATTACHMENTS,
+    MAX_MESSAGE_BYTES,
+    WorkspaceSessionStore,
+)
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "harness_rpc.py"
 WORKSPACE = "workspace-sessions-http"
@@ -74,6 +79,26 @@ def install_worker(tmp_path: Path, monkeypatch, *, run_id: str,
 def worker_client() -> TestClient:
     return TestClient(web.app, base_url="http://127.0.0.1:7860",
                       client=("203.0.113.10", 50000))
+
+
+def upload_files(client: TestClient, session_id: str, count: int,
+                 prefix: str = "attachment"):
+    return client.post(
+        "/api/upload", headers=HEADERS,
+        data={"sessionId": session_id},
+        files=[("files", (f"{prefix}-{index}.txt", b"x", "text/plain"))
+               for index in range(count)])
+
+
+def admission_state(state_root: Path, run_id: str) -> str:
+    database = state_root / "snapshot_admissions.sqlite3"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT state FROM snapshot_admissions"
+            " WHERE workspace_id = ? AND run_id = ?",
+            (WORKSPACE, run_id)).fetchone()
+    assert row is not None
+    return row[0]
 
 
 def install_adapter(monkeypatch, adapter) -> None:
@@ -194,6 +219,114 @@ def test_worker_http_chat_uses_real_acp_adapter_and_fixture(tmp_path, monkeypatc
     assert "initialize" in methods
     assert "session/new" in methods
     assert "session/prompt" in methods
+
+
+def test_worker_upload_and_chat_accept_21_attachments(tmp_path, monkeypatch):
+    paths = install_worker(tmp_path, monkeypatch, run_id="run-21",
+                           nonce="nonce-21")
+    adapter = SnapshotAdapter()
+    install_adapter(monkeypatch, adapter)
+
+    with worker_client() as client:
+        uploaded = upload_files(client, "session-21", 21)
+        assert uploaded.status_code == 200, uploaded.text
+        refs = uploaded.json()["files"]
+        assert len(refs) == 21
+        response = client.post("/api/chat", headers=HEADERS, json={
+            "message": "多附件", "sessionId": "session-21",
+            "attachments": refs})
+
+    assert response.status_code == 200, response.text
+    assert len(adapter.calls) == 1
+    store = WorkspaceSessionStore(paths.state_root, WORKSPACE)
+    messages = store.messages("session-21")
+    assert messages[0]["content"] == "多附件"
+    assert len(messages[0]["attachments"]) == 21
+    assert messages[1]["content"] == "answer-1"
+    assert admission_state(paths.state_root, "run-21") == "running"
+
+
+def test_worker_upload_over_limit_rejects_before_creating_batch(
+        tmp_path, monkeypatch):
+    paths = install_worker(tmp_path, monkeypatch, run_id="run-upload-limit",
+                           nonce="nonce-upload-limit")
+
+    with worker_client() as client:
+        response = upload_files(
+            client, "session-upload-limit", MAX_ATTACHMENTS + 1)
+
+    assert response.status_code == 400, response.text
+    assert str(MAX_ATTACHMENTS) in response.json()["detail"]
+    scope = web._attachment_scope("session-upload-limit")
+    assert not (paths.workspace_root / "outputs" / "_inbox" / scope).exists()
+
+
+def test_worker_chat_over_limit_rejects_before_claim_and_retry_succeeds(
+        tmp_path, monkeypatch):
+    paths = install_worker(tmp_path, monkeypatch, run_id="run-limit-a",
+                           nonce="nonce-limit-a")
+    adapter = SnapshotAdapter()
+    install_adapter(monkeypatch, adapter)
+
+    with worker_client() as client:
+        boundary = upload_files(
+            client, "session-limit", MAX_ATTACHMENTS, "boundary")
+        assert boundary.status_code == 200, boundary.text
+        refs = boundary.json()["files"]
+        assert len(refs) == MAX_ATTACHMENTS
+        at_limit = client.post("/api/chat", headers=HEADERS, json={
+            "message": "边界附件", "sessionId": "session-limit",
+            "attachments": refs})
+        assert at_limit.status_code == 200, at_limit.text
+        assert len(adapter.calls) == 1
+
+        # 新 Run 用于验证超限输入不消耗认领，修正后仍可执行一次。
+        install_worker(tmp_path, monkeypatch, run_id="run-limit-b",
+                       nonce="nonce-limit-b")
+        extra = upload_files(client, "session-limit", 1, "extra")
+        assert extra.status_code == 200, extra.text
+        over_limit = refs + extra.json()["files"]
+        assert len(over_limit) == MAX_ATTACHMENTS + 1
+        rejected = client.post("/api/chat", headers=HEADERS, json={
+            "message": "超限附件", "sessionId": "session-limit",
+            "attachments": over_limit})
+        assert rejected.status_code == 400, rejected.text
+        assert len(adapter.calls) == 1
+        assert admission_state(paths.state_root, "run-limit-b") == "accepted"
+
+        corrected = client.post("/api/chat", headers=HEADERS, json={
+            "message": "修正附件", "sessionId": "session-limit",
+            "attachments": extra.json()["files"]})
+        assert corrected.status_code == 200, corrected.text
+
+    assert len(adapter.calls) == 2
+    assert admission_state(paths.state_root, "run-limit-b") == "running"
+
+
+def test_worker_stream_rejects_oversized_message_before_claim(
+        tmp_path, monkeypatch):
+    paths = install_worker(tmp_path, monkeypatch, run_id="run-oversize",
+                           nonce="nonce-oversize")
+    adapter = SnapshotAdapter()
+    install_adapter(monkeypatch, adapter)
+    oversized = "x" * (MAX_MESSAGE_BYTES + 1)
+
+    with worker_client() as client:
+        rejected = client.post("/api/chat/stream", headers=HEADERS, json={
+            "message": oversized, "sessionId": "session-oversize",
+            "turnId": "turn-oversize"})
+        assert rejected.status_code == 400, rejected.text
+        assert not web._job_event_file("turn-oversize").exists()
+        assert adapter.calls == []
+        assert admission_state(paths.state_root, "run-oversize") == "accepted"
+
+        corrected = client.post("/api/chat/stream", headers=HEADERS, json={
+            "message": "修正消息", "sessionId": "session-oversize",
+            "turnId": "turn-corrected"})
+        assert corrected.status_code == 200, corrected.text
+
+    assert len(adapter.calls) == 1
+    assert admission_state(paths.state_root, "run-oversize") == "running"
 
 
 def test_worker_old_delete_rejects_without_touching_binding_or_messages(
