@@ -295,8 +295,10 @@ Chromium 沙箱门槛。本机 Docker Desktop 上最终驱动参数正确，但�
 Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通过**。
 镜像构建依赖 Debian/Playwright 下载，网络不可用时按未执行记录。
 
-测试只创建随机 UUID 命名的临时容器/网络，清理前核对受管标签；不删除开发者
-容器、workspace、outputs、profile 或浏览器状态。
+测试只创建随机 UUID 命名的临时容器/网络/卷，全部带本次 run 标签；清理前
+核对归属，不删除开发者容器、workspace、outputs、profile 或浏览器状态。
+Docker 拓扑测试用一次性初始化助手只对本次测试卷设置 UID 10001 的 0750/
+0400/0600 权限，不修改宿主临时目录或使用 0777/0666。
 
 ## 8. 当前未关闭门槛
 
@@ -339,4 +341,5 @@ Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通
   防火墙/IPv6、真实公网出口、真实供应商或 Task 5 live 出口已通过。
 - **目标 Linux 宿主网络与配额**：未提供已授权目标连接信息；本机 WSL 仅用于
   只读环境盘点，不作为目标宿主证据。宿主防火墙/DOCKER-USER、IPv4/IPv6
-  矩阵、XFS 真实限额与宿主 provisioner→worker 健康链仍需目标环境实测。
+  矩阵、XFS 真实限额、宿主 provisioner→worker 健康链及原生 Linux 上
+  UID 10001 测试卷权限仍需目标环境实测。

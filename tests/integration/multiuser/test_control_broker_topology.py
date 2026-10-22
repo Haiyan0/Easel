@@ -13,6 +13,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 
@@ -23,6 +24,7 @@ from easel.control.broker import BrokerService
 from easel.control.config import MASTER_KEY_BYTES, ConfigService
 from easel.control.egress import EgressGateway
 from easel.control.store import Store
+from tests.multiuser import topology_support as support
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 DOCKERFILE = ROOT / "deploy" / "multiuser" / "Dockerfile.worker"
@@ -47,6 +49,11 @@ def _docker(*args: str, timeout: float = 120.0,
         pytest.fail(f"docker {' '.join(args[:3])} 失败："
                     f"{result.stderr.strip()[-2000:]}")
     return result
+
+
+def _docker_cleanup(argv, *, timeout: float = 20.0):
+    """清理专用：返回非零而不是 pytest.fail，让 helper 逐项处理。"""
+    return _docker(*argv[1:], timeout=timeout, check=False)
 
 
 @pytest.fixture(scope="module")
@@ -188,20 +195,6 @@ def _wait_healthy(name: str, deadline: float) -> None:
     pytest.fail(f"{name} 未在期限内 healthy：{logs.stderr[-2000:]}")
 
 
-def _prepare_container_access(tmp_path: pathlib.Path, *,
-                              writable: tuple[pathlib.Path, ...] = ()) -> None:
-    """让容器内固定 UID 10001 能读取测试目录，写 SQLite 及其 WAL/SHM。
-
-    原生 Linux 上 pytest 临时目录通常属于宿主用户且为 0700；绑定挂载后
-    容器 UID 10001 无法遍历或写库。这里只放宽本次测试自建的临时路径：
-    目录 0777，普通输入文件 0644，SQLite 数据库 0666；不改仓库或开发者目录。
-    """
-    os.chmod(tmp_path, 0o777)
-    for path in tmp_path.iterdir():
-        if path.is_file():
-            os.chmod(path, 0o666 if path in writable else 0o644)
-
-
 def _seed_control_database(tmp_path):
     database = tmp_path / "control.sqlite3"
     with Store.open(database) as store:
@@ -233,11 +226,15 @@ def _seed_control_database(tmp_path):
 
 def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     suffix = uuid.uuid4().hex[:12]
+    run_id = uuid.uuid4().hex
     workspace_network = f"easel-topo-ws-{suffix}"
     outbound_network = f"easel-topo-out-{suffix}"
     control = f"easel-topo-control-{suffix}"
     sidecar = f"easel-topo-sidecar-{suffix}"
     worker = f"easel-topo-worker-{suffix}"
+    init = f"easel-topo-init-{suffix}"
+    init_check = f"easel-topo-init-check-{suffix}"
+    volume = f"easel-topo-data-{suffix}"
     policy = tmp_path / "policy.json"
     policy.write_text("{}", encoding="utf-8")
     token, member, other, run = _seed_control_database(tmp_path)
@@ -247,10 +244,13 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     control_script.write_text(_CONTROL_APP, encoding="utf-8")
     client_script = tmp_path / "client.py"
     client_script.write_text(_CLIENT, encoding="utf-8")
-    _prepare_container_access(
-        tmp_path, writable=tuple(
-            path for path in tmp_path.iterdir()
-            if path.name.startswith("control.sqlite3")))
+    labels = support.label_args(run_id)
+    resources = [
+        ("container", init_check), ("container", init),
+        ("container", worker), ("container", sidecar),
+        ("container", control), ("volume", volume),
+        ("network", workspace_network), ("network", outbound_network),
+    ]
     control_env = {
         "CONTROL_DB": "/srv/easel/control.sqlite3",
         "MASTER_KEY_FILE": "/srv/easel/master.key",
@@ -259,18 +259,55 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
         "HOME": "/tmp",
         "PYTHONPATH": "/opt/easel",
     }
+    access_code = (
+        "import pathlib,sqlite3;"
+        "root=pathlib.Path('/check');"
+        "assert (root/'control_app.py').read_text(encoding='utf-8');"
+        "sqlite3.connect(root/'control.sqlite3').close();"
+        "(root/'uid-write-check').write_text('ok',encoding='utf-8');"
+        "print('UID10001_ACCESS_OK')")
 
     try:
-        _docker("network", "create", "--internal", workspace_network)
-        _docker("network", "create", outbound_network)
+        _docker("network", "create", "--internal", *labels,
+                workspace_network)
+        _docker("network", "create", *labels, outbound_network)
+        _docker("volume", "create", *labels, volume)
+        volume_inspect = _docker("volume", "inspect", volume)
+        volume_labels = support.resource_labels(
+            "volume", volume_inspect.stdout)
+        assert volume_labels is not None
+        assert volume_labels.get(support.RUN_LABEL) == run_id
+
+        # 一次性 root 助手只操作本次标签标识的专用卷，把种子文件复制为
+        # UID 10001 所有：目录 0750、脚本/策略/key 0400、SQLite 0600。
+        # 不修改宿主临时目录，也不以 root 运行正式 control/worker。
+        _docker(
+            "run", "--rm", "--name", init, *labels,
+            "--user", "0:0", "--network", "none",
+            "-v", f"{tmp_path}:/seed:ro",
+            "-v", f"{volume}:/srv/easel",
+            execution_image, "sh", "-c", support.volume_init_script(),
+            timeout=60.0)
+        access = _docker(
+            "run", "--rm", "--name", init_check, *labels,
+            "--user", "10001:10001", "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--network", "none",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "-v", f"{volume}:/check",
+            execution_image, "python", "-c", access_code,
+            timeout=60.0)
+        assert "UID10001_ACCESS_OK" in access.stdout
+
         control_args = [
-            "run", "-d", "--name", control,
+            "run", "-d", "--name", control, *labels,
             "--user", "10001:10001", "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--network", outbound_network,
-            "-v", f"{tmp_path}:/srv/easel",
+            "-v", f"{volume}:/srv/easel",
             "--health-cmd",
             ("python -c \"import urllib.request;urllib.request.urlopen("
              "'http://127.0.0.1:7861/api/health',timeout=2)\""),
@@ -285,13 +322,13 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
         _wait_healthy(control, time.monotonic() + 60.0)
 
         _docker(
-            "run", "-d", "--name", sidecar,
+            "run", "-d", "--name", sidecar, *labels,
             "--user", "10001:10001", "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--network", workspace_network,
-            "-v", f"{policy}:/etc/easel/egress-policy.json:ro",
+            "-v", f"{volume}:/etc/easel:ro",
             "--health-cmd",
             ("python -c \"import urllib.request;urllib.request.urlopen("
              "'http://127.0.0.1:8899/healthz',timeout=2)\""),
@@ -301,7 +338,7 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "--listen", "0.0.0.0", "--broker-port", "8899",
             "--egress-port", "8898", "--broker-upstream",
             f"{control}:7861",
-            "--policy", "/etc/easel/egress-policy.json",
+            "--policy", "/etc/easel/policy.json",
             timeout=60.0)
         _docker("network", "connect", outbound_network, sidecar, timeout=30.0)
         _wait_healthy(sidecar, time.monotonic() + 60.0)
@@ -314,13 +351,13 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "RUN_ID": run.id,
         }
         worker_args = [
-            "run", "--rm", "--name", worker,
+            "run", "--rm", "--name", worker, *labels,
             "--network", workspace_network,
             "--user", "10001:10001", "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            "-v", f"{client_script}:/check/client.py:ro",
+            "-v", f"{volume}:/check:ro",
         ]
         for name, value in worker_env.items():
             worker_args.extend(["-e", f"{name}={value}"])
@@ -329,10 +366,14 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
         assert result.returncode == 0, result.stderr[-3000:]
         assert "CONTROL_BROKER_TOPOLOGY_OK" in result.stdout
     finally:
-        # 客户端固定命名：docker run CLI 超时后仍可按名字清理，不能依赖
-        # 匿名容器随 CLI 返回或 --rm 自动消失。
-        _docker("rm", "-f", worker, check=False)
-        _docker("rm", "-f", sidecar, check=False)
-        _docker("rm", "-f", control, check=False)
-        _docker("network", "rm", workspace_network, check=False)
-        _docker("network", "rm", outbound_network, check=False)
+        try:
+            cleanup_errors = support.cleanup_resources(
+                _docker_cleanup, resources, run_id)
+        except Exception as error:  # noqa: BLE001 - 保留原始测试异常
+            cleanup_errors = [
+                f"cleanup helper {type(error).__name__}: {error}"]
+        if cleanup_errors:
+            message = "拓扑资源清理失败: " + "; ".join(cleanup_errors)
+            if sys.exc_info()[0] is None:
+                pytest.fail(message)
+            print(message, file=sys.stderr)
