@@ -280,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="管理员出口策略 JSON（approved_hosts/approved_cidrs）")
     p_serve.add_argument("--provisioner-socket", default=None,
                          help="受限 provisioner 的本地 Unix socket；缺失时失败关闭")
+    p_serve.add_argument("--snapshot-key-file", default=None,
+                         help="受保护的 Ed25519 私钥文件；与受管 Agent 配置成对使用")
+    p_serve.add_argument("--managed-agent-config", default=None,
+                         help="受保护的受管 Agent JSON（revision/agent）；不从用户目录推断")
     p_serve.set_defaults(func=cmd_serve_control)
 
     # admin：仅本地/服务器执行，不提供远程无认证等价接口

@@ -19,7 +19,8 @@ from .types import DomainError, Identity
 
 TERMINAL_STATES = frozenset({"done", "failed", "interrupted", "cancelled"})
 DEFAULT_POLL_SECONDS = 0.5
-DEFAULT_AUTH_CHECK_SECONDS = 5.0
+# 撤销窗口要求 5 秒内关闭；复查间隔留在 4 秒，给轮询与调度抖动留出余量。
+DEFAULT_AUTH_CHECK_SECONDS = 4.0
 DEFAULT_HEARTBEAT_SECONDS = 15.0
 
 

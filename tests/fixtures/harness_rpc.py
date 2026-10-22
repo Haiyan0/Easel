@@ -8,9 +8,11 @@ import time
 runtime = sys.argv[1]
 mode = os.environ.get("FAKE_HARNESS_MODE", "normal")
 audit = os.environ["FAKE_HARNESS_AUDIT"]
-thread_id = "native-thread"
-turn_id = "native-turn"
-session_id = "native-session"
+# 可选的原生 ID 前缀：真实 TCP 集成用它区分两个 worker 的绑定；未设置时保持原值。
+native = os.environ.get("FAKE_HARNESS_NATIVE", "").strip()
+thread_id = f"{native}-thread" if native else "native-thread"
+turn_id = f"{native}-turn" if native else "native-turn"
+session_id = f"{native}-session" if native else "native-session"
 pending_prompt = None
 
 

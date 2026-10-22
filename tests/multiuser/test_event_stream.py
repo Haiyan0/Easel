@@ -418,6 +418,18 @@ def test_silent_sse_revocation_within_five_seconds(tmp_path):
     asyncio.run(scenario())
 
 
+def test_default_auth_check_window_bounds_revocation_within_five_seconds():
+    """默认轮询/复查间隔之和必须落在 5 秒撤销窗口内。
+
+    真实静默撤销测试使用可控时钟，只能证明“到点会复查”，不能证明默认
+    参数下最坏情况仍在 5 秒内关闭；这里直接约束默认常量关系。
+    """
+    from easel.control.stream import (DEFAULT_AUTH_CHECK_SECONDS,
+                                      DEFAULT_POLL_SECONDS)
+
+    assert DEFAULT_AUTH_CHECK_SECONDS + DEFAULT_POLL_SECONDS <= 5.0
+
+
 # ---------------------------------------------------------------------------
 # 问题归属
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -400,8 +401,11 @@ def create_app(*, store: Store, auth: AuthService,
     ``provisioner`` 是受限 provisioner 的客户端；提供时在 lifespan 内用应用
     自己的数据库连接构造 ``RuntimeManager``，避免跨线程复用启动前的连接。
 
-    ``relay_factory`` 接收 ``(runtime, sessions, auth, store)`` 并以位置参数
-    调用；未提供时任务入口保持 503，绝不直通旧本地 handler。
+    ``relay_factory`` 接收
+    ``(runtime, sessions, auth, store, http_client, broker, db_runner)`` 并以
+    位置参数调用；``http_client`` 由 lifespan 创建并关闭，``db_runner`` 保证
+    所有 SQLite 调用仍回到专用数据库线程。未提供 factory 时任务入口保持
+    503，绝不直通旧本地 handler。
     """
     control_path = Path(store.path).absolute()
     if broker is not None and config_service is None:
@@ -420,6 +424,7 @@ def create_app(*, store: Store, auth: AuthService,
         loop = asyncio.get_running_loop()
         app.state.db_executor = executor
         app.state.public_origin = public_origin
+        http_client: httpx.AsyncClient | None = None
         try:
             app.state.control_store = await loop.run_in_executor(
                 executor, Store.connect, control_path)
@@ -452,14 +457,22 @@ def create_app(*, store: Store, auth: AuthService,
             else:
                 app.state.broker = None
             if relay_factory is not None:
+                # 客户端归 lifespan 所有：连接池随应用退出关闭，不在每次
+                # 请求内新建，也不修改共享默认凭证。内部签名包与服务凭证
+                # 只走直连，绝不读取宿主环境/注册表代理（否则内网请求可能
+                # 被外部代理截走或失败）。
+                http_client = httpx.AsyncClient(trust_env=False)
                 app.state.relay = relay_factory(
                     app.state.runtime, app.state.sessions,
-                    app.state.auth, app.state.control_store)
+                    app.state.auth, app.state.control_store,
+                    http_client, app.state.broker, control_db_runner)
             else:
                 app.state.relay = None
             yield
         finally:
             try:
+                if http_client is not None:
+                    await http_client.aclose()
                 current_store = getattr(app.state, "control_store", None)
                 if current_store is not None:
                     await loop.run_in_executor(executor, current_store.close)
@@ -633,13 +646,25 @@ def create_app(*, store: Store, auth: AuthService,
 
     @app.get("/api/sessions/{session_id}/messages")
     async def session_messages(request: Request, session_id: str):
+        """读取本人 worker 的持久消息快照；读取不会启动新 prompt。
+
+        归属检查先于 relay 能力检查：外空间/未知会话始终 404，且不触发任何
+        worker 调用。真正的消息内容只来自本人内部路由，control 不读取由
+        客户端指定的服务器文件路径。
+        """
         service: SessionService = request.app.state.sessions
         limit = _query_int(request, "limit", 100, minimum=1, maximum=500)
         offset = _query_int(request, "offset", 0,
                             minimum=0, maximum=1_000_000)
-        messages = await _run_db(
-            request, service.messages, request.state.identity, session_id,
-            limit=limit, offset=offset)
+        await _run_db(
+            request, service.get_conversation,
+            request.state.identity, session_id)
+        relay = _relay(request)
+        result = await relay.messages(
+            request.state.identity, session_id, limit=limit, offset=offset)
+        messages = result.get("messages") if isinstance(result, dict) else None
+        if not isinstance(messages, list):
+            raise DomainError("upstream_invalid", 502)
         return JSONResponse(
             {"messages": messages},
             headers={"Cache-Control": "no-store"})
@@ -692,7 +717,7 @@ def create_app(*, store: Store, auth: AuthService,
 
     @app.get("/api/chat/jobs/{run_id}/stream")
     async def stream_chat_job(request: Request, run_id: str):
-        """可恢复 SSE：首帧前校验游标与归属，每 5 秒复查登录撤销。"""
+        """可恢复 SSE：首帧前校验游标与归属，每 4 秒复查登录撤销。"""
         service = _relay(request)
         after = _query_int(request, "after", 0, minimum=0,
                            maximum=1_000_000_000)

@@ -465,17 +465,21 @@ class WorkerRelay:
 
     async def messages(self, actor: Identity, session_id: str, *,
                        limit: int = 100, offset: int = 0) -> dict:
+        """读取本人 worker 的持久快照；无 Run 时为空历史，不启动执行。
+
+        读取只回到 control 库定位最近一次 Run 对应的本人 worker，再把分页
+        参数交给其内部快照路由；不会创建 Run、启动 prompt 或读取客户端给出
+        的任意文件根。
+        """
         conversation = await self._db(
             self._sessions.get_conversation, actor, session_id)
         self._require_capabilities()
         run = await self._db(
             self._store.latest_run_for_conversation, actor, conversation.id)
         if run is None:
-            config = await self._pinned(actor)
-            handle = await self._ensure_workspace_ready(
-                actor.workspace_id, config.revision)
-        else:
-            handle = await self._ensure_ready(run)
+            # 尚未接纳过任务：没有任何 worker 快照可读，也不为其启动容器。
+            return {"sessionId": conversation.id, "messages": []}
+        handle = await self._ensure_ready(run)
         response = await self._worker_request(
             handle, "GET",
             f"/internal/sessions/{conversation.id}/messages"

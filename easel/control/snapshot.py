@@ -5,11 +5,20 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+_MANAGED_FIELDS = frozenset({"revision", "agent"})
+_AGENT_FIELDS = frozenset({
+    "runtime", "command", "model", "sandbox", "timeout",
+    "codex_auto_approve"})
+_RUNTIMES = ("acp", "opencode", "codex")
+_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+_MAX_TIMEOUT = 86400
 
 
 def load_signing_key(path: str | Path) -> Ed25519PrivateKey:
@@ -22,3 +31,70 @@ def load_signing_key(path: str | Path) -> Ed25519PrivateKey:
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError("snapshot signing key must be Ed25519")
     return key
+
+
+def _command(value: object) -> list[str]:
+    if (not isinstance(value, list) or not 1 <= len(value) <= 64
+            or any(not isinstance(part, str) or not part
+                   or len(part) > 4096
+                   or any(ord(character) < 32 for character in part)
+                   for part in value)):
+        raise ValueError("managed agent command must be an argv array")
+    return list(value)
+
+
+def load_managed_agent_config(path: str | Path) -> tuple[int, dict]:
+    """读取受保护的受管 Agent 配置，返回 ``(revision, agent)``。
+
+    只接受固定字段，拒绝任何疑似凭证字段，避免管理员秘密被签进逐 Run
+    快照下发到 worker。受管命令只来自本文件，不读取用户 HOME 或可写
+    工作区的 ACP 配置。
+    """
+    config_path = Path(path)
+    data = config_path.read_bytes()
+    if os.name == "posix" and config_path.stat().st_mode & 0o077:
+        raise ValueError(
+            "managed agent config must not be group/world accessible")
+    try:
+        payload = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("managed agent config must be a JSON object") from None
+    if not isinstance(payload, dict) or set(payload) != _MANAGED_FIELDS:
+        raise ValueError("managed agent config fields are invalid")
+    revision = payload["revision"]
+    if type(revision) is not int or not 0 <= revision <= 2**31 - 1:
+        raise ValueError("managed agent revision must be a non-negative int")
+    agent = payload["agent"]
+    if not isinstance(agent, dict) or not agent:
+        raise ValueError("managed agent must be a non-empty object")
+    if set(agent) - _AGENT_FIELDS:
+        raise ValueError("managed agent contains unsupported fields")
+
+    runtime = agent.get("runtime")
+    if runtime not in _RUNTIMES:
+        raise ValueError("managed agent runtime is unsupported")
+    normalized: dict[str, object] = {"runtime": runtime}
+    if "command" in agent:
+        normalized["command"] = _command(agent["command"])
+    elif runtime == "acp":
+        raise ValueError("managed ACP agent requires an explicit command")
+    if "model" in agent:
+        model = agent["model"]
+        if (not isinstance(model, str) or not model or len(model) > 256
+                or any(ord(character) < 32 for character in model)):
+            raise ValueError("managed agent model is invalid")
+        normalized["model"] = model
+    if "sandbox" in agent:
+        if agent["sandbox"] not in _SANDBOXES:
+            raise ValueError("managed agent sandbox is invalid")
+        normalized["sandbox"] = agent["sandbox"]
+    if "timeout" in agent:
+        timeout = agent["timeout"]
+        if type(timeout) is not int or not 1 <= timeout <= _MAX_TIMEOUT:
+            raise ValueError("managed agent timeout is invalid")
+        normalized["timeout"] = timeout
+    if "codex_auto_approve" in agent:
+        if type(agent["codex_auto_approve"]) is not bool:
+            raise ValueError("managed agent codex_auto_approve is invalid")
+        normalized["codex_auto_approve"] = agent["codex_auto_approve"]
+    return revision, normalized

@@ -15,7 +15,9 @@ from .auth import AuthService
 from .broker import BrokerService
 from .config import ConfigService, load_master_key
 from .egress import EgressGateway, load_policy
+from .proxy import PinnedRunConfig, WorkerRelay
 from .runtime import UnixProvisionerClient
+from .snapshot import load_managed_agent_config, load_signing_key
 from .store import Store
 from .types import DomainError
 
@@ -75,6 +77,51 @@ def cmd_serve_control(args) -> int:
         print("错误：invalid_master_key", file=sys.stderr)
         return 2
 
+    # 逐 Run 签名密钥与受管 Agent 配置必须成对显式给出；只给其一视为
+    # 配置错误而不是静默降级。两者都不给时保持任务入口 503。
+    snapshot_key_file = getattr(args, "snapshot_key_file", None)
+    managed_config_file = getattr(args, "managed_agent_config", None)
+    signing_key = None
+    managed_agent = None
+    if bool(snapshot_key_file) != bool(managed_config_file):
+        print("错误：relay_config_incomplete", file=sys.stderr)
+        return 2
+    if snapshot_key_file:
+        try:
+            signing_key = load_signing_key(snapshot_key_file)
+        except OSError:
+            print("错误：snapshot_key_unavailable", file=sys.stderr)
+            return 2
+        except ValueError:
+            print("错误：snapshot_key_invalid", file=sys.stderr)
+            return 2
+        try:
+            managed_agent = load_managed_agent_config(managed_config_file)
+        except OSError:
+            print("错误：managed_config_unavailable", file=sys.stderr)
+            return 2
+        except ValueError:
+            # 不回显字段值：配置中可能误放管理员凭证
+            print("错误：managed_config_invalid", file=sys.stderr)
+            return 2
+
+    relay_factory = None
+    if signing_key is not None:
+        revision, agent = managed_agent
+
+        def pinned_config(_actor):
+            # 本任务只装配受管底座命令；逐 Run broker token 仍由后续
+            # 受管路由任务签发，此处不下发任何共享秘密。
+            return PinnedRunConfig(revision=revision, routes={}, agent=agent)
+
+        def relay_factory(runtime, sessions, auth, store, http_client,
+                          broker, db_runner):
+            return WorkerRelay(
+                runtime, sessions, auth, store=store,
+                signing_key=signing_key, config_provider=pinned_config,
+                http_client=http_client, broker=broker,
+                db_runner=db_runner)
+
     # 出口策略必须在打开控制库、启动 HTTP 之前校验失败
     policy_path = getattr(args, "egress_policy", None)
     egress_proxy = getattr(args, "egress_proxy", None)
@@ -116,7 +163,8 @@ def cmd_serve_control(args) -> int:
         broker = BrokerService(store, config_service, egress=egress)
         app = create_app(store=store, auth=AuthService(store), config=config,
                          config_service=config_service, broker=broker,
-                         provisioner=provisioner)
+                         provisioner=provisioner,
+                         relay_factory=relay_factory)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
         store.close()

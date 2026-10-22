@@ -1030,6 +1030,8 @@ class RunManager:
                 timeout=request.timeout)
         except asyncio.CancelledError:
             self.registry.finish_if_active(run_id, "cancelled", "stopped")
+            # 取消也是终态：必须释放会话锁，否则停止后同会话永远 busy
+            self._release(context)
             raise
         except asyncio.TimeoutError:
             emit("error", "Agent 执行超时，已终止本轮进程")
@@ -1079,6 +1081,9 @@ class RunManager:
         task = self._tasks.get(run_id)
         if task is not None and not task.done():
             task.cancel()
+            # 取消消息只是排队；必须等 supervisor 收尾，返回后同会话才真正
+            # 释放。否则调用方紧接着提交下一 Run 会读到过期的 conversation_busy。
+            await asyncio.gather(task, return_exceptions=True)
         return {"runId": run_id, "state": "cancelled"}
 
     async def answer(self, run_id: str, question_id: str,

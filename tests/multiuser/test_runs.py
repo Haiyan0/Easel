@@ -411,6 +411,49 @@ def test_duplicate_submit_after_worker_reload_does_not_prompt(tmp_path):
     asyncio.run(scenario())
 
 
+def test_stop_releases_conversation_for_next_run(tmp_path):
+    """停止后同一会话必须能接纳下一 Run，不能永久占用会话锁。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"conversation-a": "native-a"},
+        answers={"run-a": None, "run-b": "第二"},
+        chunks={},
+    )
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    routes = {"broker_token": "broker-token"}
+    first = sign(key, run_id="run-a", session_id="conversation-a",
+                 message="第一", routes=routes, agent=agent)
+    second = sign(key, run_id="run-b", session_id="conversation-a",
+                  message="第二", routes=routes, agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", first,
+            request_for("conversation-a", "第一", first))
+        await asyncio.wait_for(executor.event("run-a").wait(), timeout=5)
+        assert (await manager.stop("run-a"))["state"] == "cancelled"
+        await wait_until(lambda: manager.state("run-a") == "cancelled")
+        # stop 返回即表示取消收尾完成；调用方不得再让出事件循环才能复用会话
+        accepted = await manager.submit(
+            "run-b", second,
+            request_for("conversation-a", "第二", second))
+        assert accepted == {"runId": "run-b", "state": "running",
+                            "duplicate": False}
+        await asyncio.wait_for(executor.event("run-b").wait(), timeout=5)
+        executor.gate("run-b").set()
+        await wait_until(lambda: manager.state("run-b") == "done")
+        messages = manager.messages("conversation-a")["messages"]
+        assert [item["role"] for item in messages] == ["user", "user",
+                                                       "assistant"]
+        assert messages[-1]["content"] == "第二"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_missing_public_key_returns_503(tmp_path):
     paths = make_paths(tmp_path)
     key = Ed25519PrivateKey.generate()
