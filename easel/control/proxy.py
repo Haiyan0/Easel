@@ -28,7 +28,7 @@ from ..worker.sessions import MAX_ATTACHMENTS, MAX_MESSAGE_BYTES
 from .auth import AuthService
 from .runtime import RuntimeUnavailable
 from .sessions import SessionService
-from .store import Store
+from .store import Store, TERMINAL_RUN_STATUSES
 from .tasks import IMPLEMENTED_TASK_TYPES, entry_for_type
 from .types import DomainError, Identity, RunRecord, WorkerHandle
 
@@ -370,9 +370,36 @@ class WorkerRelay:
         """先回 Store 重查归属；外空间/未知 Run 在调用 worker 前 404。"""
         return await self._db(self._sessions.assert_run, actor, run_id)
 
+    async def _sync_worker_state(self, actor: Identity, run: RunRecord,
+                                 state: object) -> None:
+        """把 worker 的持久状态写回控制库。
+
+        控制库已是终态时不回退；真正终态统一走 ``finish_run``（容量只释放
+        一次）并撤销该 Run 的临时 broker 令牌。撤销是幂等的，重复同步安全。
+        """
+        if state in ("accepted", "reserved", "running"):
+            try:
+                await self._db(self._store.mark_running, actor, run.id)
+            except DomainError:
+                pass
+            return
+        if state == "awaiting_permission":
+            try:
+                await self._db(
+                    self._store.mark_awaiting_permission, actor, run.id)
+            except DomainError:
+                pass
+            return
+        if state in TERMINAL_RUN_STATUSES:
+            await self._db(
+                self._store.finish_run, actor, run.id, str(state))
+            if self._broker is not None:
+                await self._db(
+                    self._broker.revoke_run, run.id, run.workspace_id)
+
     async def stop(self, actor: Identity, payload: object) -> dict:
         run = await self._owned_run(actor, self._require_run_id(payload))
-        if run.status in ("done", "failed", "interrupted", "cancelled"):
+        if run.status in TERMINAL_RUN_STATUSES:
             return {"runId": run.id, "state": run.status}
         self._require_capabilities()
         handle = await self._ensure_ready(run)
@@ -380,12 +407,9 @@ class WorkerRelay:
             handle, "POST", f"/internal/runs/{run.id}/stop",
             {"runId": run.id, "sessionId": run.conversation_id})
         result = self._json_object(response)
-        try:
-            await self._db(self._store.finish_run, actor, run.id, "cancelled")
-        except DomainError:
-            pass
-        return {"runId": run.id,
-                "state": _safe_code(result.get("state"), "cancelled")}
+        state = _safe_code(result.get("state"), "cancelled")
+        await self._sync_worker_state(actor, run, state)
+        return {"runId": run.id, "state": state}
 
     async def events(self, actor: Identity, run_id: str, *,
                      after: int = 0) -> dict:
@@ -397,7 +421,9 @@ class WorkerRelay:
         response = await self._worker_request(
             handle, "GET",
             f"/internal/runs/{run.id}/events?after={int(after)}", None)
-        return self._json_object(response)
+        result = self._json_object(response)
+        await self._sync_worker_state(actor, run, result.get("state"))
+        return result
 
     async def answer(self, actor: Identity, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -414,7 +440,10 @@ class WorkerRelay:
             f"/internal/runs/{run.id}/questions/{question_id}/answer",
             {"runId": run.id, "questionId": question_id,
              "answers": dict(answers)})
-        return self._json_object(response)
+        result = self._json_object(response)
+        # 回答成功后 worker 已回到 running；控制库同步活跃状态
+        await self._sync_worker_state(actor, run, "running")
+        return result
 
     async def question_status(self, actor: Identity, payload: object) -> dict:
         if not isinstance(payload, dict):

@@ -35,6 +35,7 @@ from .policy import authorize, public_route
 from .runtime import RuntimeManager
 from .sessions import SessionService
 from .store import Store
+from .stream import run_event_stream
 from .types import DomainError, Identity
 
 SESSION_COOKIE = "__Host-easel_session"
@@ -54,12 +55,17 @@ _IMPLEMENTED_EXACT = frozenset({
     ("GET", "/api/sessions"),
     ("POST", "/api/sessions"),
     ("POST", "/api/chat"),
+    ("POST", "/api/chat/stream"),
+    ("POST", "/api/chat/stop"),
+    ("POST", "/api/chat/question/answer"),
+    ("POST", "/api/chat/question/status"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
     ("PATCH", re.compile(r"^/api/sessions/[^/]+$")),
     ("DELETE", re.compile(r"^/api/sessions/[^/]+$")),
     ("GET", re.compile(r"^/api/sessions/[^/]+/messages$")),
+    ("GET", re.compile(r"^/api/chat/jobs/[^/]+/stream$")),
 )
 """control 本轮真正装配的路由；其余已分类业务显式 503。"""
 
@@ -651,6 +657,66 @@ def create_app(*, store: Store, auth: AuthService,
         result = await service.submit(request.state.identity, payload)
         return JSONResponse(result, status_code=202,
                             headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/chat/stream")
+    async def submit_chat_stream(request: Request):
+        """流式入口同样先经接纳账本；客户端随后用 jobs/{runId}/stream 回放。"""
+        service = _relay(request)
+        payload = await _read_json_body(
+            request, limit=MAX_MESSAGE_BYTES + 65536)
+        result = await service.submit(request.state.identity, payload)
+        return JSONResponse(result, status_code=202,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/chat/stop")
+    async def stop_chat(request: Request):
+        service = _relay(request)
+        payload = await _read_json_body(request)
+        result = await service.stop(request.state.identity, payload)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/chat/question/answer")
+    async def answer_chat_question(request: Request):
+        service = _relay(request)
+        payload = await _read_json_body(request)
+        result = await service.answer(request.state.identity, payload)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/chat/question/status")
+    async def chat_question_status(request: Request):
+        service = _relay(request)
+        payload = await _read_json_body(request)
+        result = await service.question_status(
+            request.state.identity, payload)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/chat/jobs/{run_id}/stream")
+    async def stream_chat_job(request: Request, run_id: str):
+        """可恢复 SSE：首帧前校验游标与归属，每 5 秒复查登录撤销。"""
+        service = _relay(request)
+        after = _query_int(request, "after", 0, minimum=0,
+                           maximum=1_000_000_000)
+        header = request.headers.get("last-event-id")
+        if header is not None:
+            if not (header.isascii() and header.isdigit()):
+                raise DomainError("invalid_argument", 400)
+            after = int(header)
+        identity = request.state.identity
+        # 首次读取在开始流式响应前完成：无效游标/外空间 Run 返回明确的 JSON 错误
+        first = await service.events(identity, run_id, after=after)
+        token = request.cookies.get(SESSION_COOKIE) or ""
+        auth_service: AuthService = request.app.state.auth
+        sessions: SessionService = request.app.state.sessions
+
+        async def recheck() -> None:
+            current = await _run_db(request, auth_service.inspect, token)
+            await _run_db(request, sessions.assert_run, current, run_id)
+
+        return StreamingResponse(
+            run_event_stream(relay=service, actor=identity, run_id=run_id,
+                             page=first, recheck=recheck),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     @app.get("/api/settings/models")
     async def get_model_settings(request: Request):

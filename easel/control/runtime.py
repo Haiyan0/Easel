@@ -74,6 +74,7 @@ class RuntimeManager:
                  poll_interval: float = POLL_INTERVAL_SECONDS,
                  idle_seconds: int = IDLE_SECONDS,
                  drain_timeout: float = DRAIN_TIMEOUT_SECONDS,
+                 broker=None,
                  db_runner: Callable[..., Awaitable[object]] | None = None):
         self._store = store
         self._provisioner = provisioner
@@ -84,6 +85,8 @@ class RuntimeManager:
         self._poll_interval = max(0.001, float(poll_interval))
         self._idle_seconds = int(idle_seconds)
         self._drain_timeout = float(drain_timeout)
+        # 实例失效是真正的终态：标记残留 Run 时同步撤销其临时 broker 令牌
+        self._broker = broker
         # SQLite 连接有线程归属。真实 control 在 lifespan 用专用线程打开
         # Store，因此所有短数据库步骤都必须调度回该线程；容器/网络等待
         # 保持在异步层，不能占用数据库线程或事务。
@@ -456,14 +459,27 @@ class RuntimeManager:
 
     async def _fail_start(self, workspace_id: str,
                           lease: WorkerLease) -> None:
-        await self._db(self._store.fail_worker_start, workspace_id,
-                       self.owner_id, lease.generation, self._now())
+        interrupted = await self._db(
+            self._store.fail_worker_start, workspace_id, self.owner_id,
+            lease.generation, self._now())
+        await self._revoke_run_tokens(workspace_id, interrupted)
 
     async def _fail_ready(self, workspace_id: str,
                           lease: WorkerLease) -> None:
-        await self._db(self._store.fail_worker_state, workspace_id,
-                       self._now(), expected_state="ready",
-                       generation=lease.generation)
+        # 实例失效是真正的终态：同一次受代次保护的事务里把残留 Run 标为
+        # interrupted 并释放容量；worker 侧 reason/events 保留审查信息，
+        # 不自动重发任务。返回的 Run 还需撤销其临时 broker 令牌。
+        interrupted = await self._db(
+            self._store.fail_worker_state, workspace_id, self._now(),
+            expected_state="ready", generation=lease.generation)
+        await self._revoke_run_tokens(workspace_id, interrupted)
+
+    async def _revoke_run_tokens(self, workspace_id: str,
+                                 run_ids: list[str]) -> None:
+        if self._broker is None:
+            return
+        for run_id in run_ids:
+            await self._db(self._broker.revoke_run, run_id, workspace_id)
 
     async def _sleep_or_timeout(self, deadline: float, code: str) -> None:
         if self._clock() >= deadline:

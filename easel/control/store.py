@@ -656,11 +656,11 @@ class Store:
         return cursor.rowcount == 1
 
     def fail_worker_start(self, workspace_id: str, owner_id: str,
-                          generation: int, now: int) -> bool:
-        """标记本次启动失败，并把无法继续的残留任务转为 interrupted。
+                          generation: int, now: int) -> list[str]:
+        """标记本次启动失败，并返回被转为 interrupted 的残留任务。
 
-        只有仍持有当前代次时才允许改写；被新代次接管的旧启动返回 False，
-        不会覆盖新状态。
+        只有仍持有当前代次时才允许改写；被新代次接管的旧启动返回空列表，
+        不会覆盖新状态。返回值供调用方撤销这些 Run 的临时 broker 令牌。
         """
         workspace_id = _text(workspace_id)
         owner_id = _text(owner_id)
@@ -674,17 +674,17 @@ class Store:
                 " AND state = 'starting'",
                 (now, workspace_id, owner_id, int(generation)))
             if cursor.rowcount != 1:
-                return False
-            self._interrupt_active_runs_locked(workspace_id, now)
-        return True
+                return []
+            return self._interrupt_active_runs_locked(workspace_id, now)
 
     def fail_worker_state(self, workspace_id: str, now: int, *,
                           expected_state: str | None = None,
-                          generation: int | None = None) -> bool:
+                          generation: int | None = None) -> list[str]:
         """对账发现容器不可信时失败关闭；不接管、不缓存旧句柄。
 
         ``generation`` 用于防止过期的对账者失败掉另一个管理进程刚接管的新
-        代次。只清可再建句柄，不触碰持久挂载。
+        代次。只清可再建句柄，不触碰持久挂载。返回本次被转为 interrupted 的
+        残留任务 ID，供调用方撤销这些 Run 的临时 broker 令牌。
         """
         workspace_id = _text(workspace_id)
         now = int(now)
@@ -703,9 +703,8 @@ class Store:
                 " lease_expires_at = 0, updated_at = ? WHERE " + where,
                 (now, *values))
             if cursor.rowcount != 1:
-                return False
-            self._interrupt_active_runs_locked(workspace_id, now)
-        return True
+                return []
+            return self._interrupt_active_runs_locked(workspace_id, now)
 
     def mark_worker_draining(self, workspace_id: str, now: int, *,
                              generation: int | None = None) -> bool:
@@ -916,8 +915,11 @@ class Store:
             (_text(workspace_id), *TERMINAL_RUN_STATUSES)).fetchone()
         return int(row["total"])
 
-    def interrupt_active_runs(self, workspace_id: str, now: int) -> int:
-        """把崩溃/回收后的残留任务标为 interrupted；不自动重发。"""
+    def interrupt_active_runs(self, workspace_id: str, now: int) -> list[str]:
+        """把崩溃/回收后的残留任务标为 interrupted；不自动重发。
+
+        返回本次真正从活跃转为终态的 Run ID，供调用方撤销其 broker 令牌。
+        """
         with self._transaction():
             return self._interrupt_active_runs_locked(
                 _text(workspace_id), int(now))
@@ -949,14 +951,20 @@ class Store:
              now + lease_seconds, now, now))
 
     def _interrupt_active_runs_locked(self, workspace_id: str,
-                                      now: int) -> int:
-        cursor = self._connection.execute(
-            "UPDATE runs SET status = 'interrupted', finished_at = ?,"
-            " capacity_released_at = ?, release_count = release_count + 1"
-            " WHERE workspace_id = ? AND status NOT IN"
+                                      now: int) -> list[str]:
+        rows = self._connection.execute(
+            "SELECT id FROM runs WHERE workspace_id = ? AND status NOT IN"
             f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
-            (now, now, workspace_id, *TERMINAL_RUN_STATUSES))
-        return cursor.rowcount
+            (workspace_id, *TERMINAL_RUN_STATUSES)).fetchall()
+        run_ids = [str(row["id"]) for row in rows]
+        if run_ids:
+            self._connection.execute(
+                "UPDATE runs SET status = 'interrupted', finished_at = ?,"
+                " capacity_released_at = ?, release_count = release_count + 1"
+                " WHERE workspace_id = ? AND id IN"
+                f" ({','.join('?' for _ in run_ids)})",
+                (now, now, workspace_id, *run_ids))
+        return run_ids
 
     def _worker_lease_row(self, workspace_id: str) -> WorkerLease | None:
         row = self._connection.execute(
