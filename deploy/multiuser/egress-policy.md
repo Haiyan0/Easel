@@ -32,9 +32,9 @@ Engine 上的输出为准。
 | worker → 云元数据（169.254.169.254） | 拒绝 | `--internal` 无外部/链路本地路由 | 本机实测通过 |
 | worker → 公网 IPv4 | 拒绝 | `--internal` 禁止外部连通 | 本机实测通过（1.1.1.1:53 失败） |
 | worker → 公网 IPv6 | 拒绝 | 内部桥默认未启用 IPv6，无 IPv6 地址/默认路由 | 本机实测通过（检查地址/路由并实际连接失败） |
-| worker → 必要入口 / provider broker | **允许**（仅白名单路由） | worker 仅经 sidecar:8899 的 `/internal/broker/<channel>/<relative>` 精确路由表转发到 control broker | 本机 Docker 真实网络接线通过（fake broker；真实 control broker 联调未执行） |
+| worker → 必要入口 / provider broker | **允许**（仅白名单路由） | worker 仅经 sidecar:8899 的 `/internal/broker/<channel>/<relative>` 精确路由表转发到 control broker | 本机 Docker 网络接线通过（测试 HTTP 上游）；另以真实 create_app/Auth/Config/Broker + fake provider transport 经实际 sidecar socket 验证授权与拒绝；Docker 拓扑中的真实 control broker 未执行 |
 | worker → 受控公网出口（egress sidecar） | **允许**（仅策略批准目标） | worker 仅经 sidecar:8898 CONNECT，复用 Task 5 解析后固定 IP/拒绝私网/策略例外 | 本机 Docker 接线通过（批准测试网段与私网拒绝；真实公网出口未执行） |
-| worker → sidecar broker 入口的非白名单路径/方法 | 拒绝 | sidecar 只转发 `BROKER_ROUTE_TABLE` 精确 route；其余 404，不转发 control 管理接口 | 单测与真实接线测试通过 |
+| worker → sidecar broker 入口的非白名单路径/方法 | 拒绝 | sidecar 只转发 `BROKER_ROUTE_TABLE` 精确 route；其余 404，不转发 control 管理接口 | 单测、真实接线测试与真实 control app 经 sidecar 的管理路径 404 通过 |
 | 宿主 provisioner → worker lifecycle | 允许（仅健康探测） | 宿主经内部桥访问容器 IP:7860，带身份/token 校验 | 待 Linux 集成实测 |
 
 允许路径通过每空间 sidecar 实现：sidecar 同时接入 internal workspace 网络

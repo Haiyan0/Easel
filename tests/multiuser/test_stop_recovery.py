@@ -76,7 +76,8 @@ class FakeDocker:
         return subprocess.CompletedProcess(
             [], 1, "", f"Error: No such object: {target}\n")
 
-    def _container(self, workspace_id: str) -> dict:
+    def _container(self, workspace_id: str,
+                   env: list[str] | None = None) -> dict:
         paths = provisioner.prepare_workspace(self.root, workspace_id)
         return {
             "Id": f"{self.serial:064x}",
@@ -88,6 +89,7 @@ class FakeDocker:
                 "Cmd": ["python", "-m", "easel.worker.lifecycle",
                         "serve", "--host", "0.0.0.0", "--port", "7860"],
                 "Labels": provisioner.workload_labels(workspace_id, 1),
+                "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
             },
             "State": {"Running": True, "Health": {"Status": "healthy"}},
             "HostConfig": {
@@ -155,7 +157,10 @@ class FakeDocker:
             return self._ok(json.dumps([self.container]))
         if args[:1] == ["run"]:
             self.serial += 1
-            self.container = self._container(self.workspace_id)
+            env_path = pathlib.Path(
+                args[args.index("--env-file") + 1])
+            env = env_path.read_text(encoding="utf-8").splitlines()
+            self.container = self._container(self.workspace_id, env)
             return self._ok(self.container["Id"] + "\n")
         if args[:1] == ["stop"]:
             target = args[-1]

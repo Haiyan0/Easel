@@ -724,14 +724,90 @@ def _no_new_privileges_enabled(options: object) -> bool:
     return values == [True]
 
 
-def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
+def worker_wiring_env(workspace_id: str,
+                      sidecar_host: str | None) -> dict[str, str]:
+    """本次批准接线实际应写入容器 Env 的代理/broker 字段。"""
+    if sidecar_host is None:
+        return {}
+    if sidecar_host != sidecar_container_name(workspace_id):
+        raise _reject("sidecar_host_invalid")
+    broker_url = f"http://{sidecar_host}:{SIDECAR_BROKER_PORT}"
+    egress_url = f"http://{sidecar_host}:{SIDECAR_EGRESS_PORT}"
+    return {
+        "EASEL_BROKER_URL": broker_url,
+        "EASEL_EGRESS_PROXY": egress_url,
+        "HTTP_PROXY": egress_url,
+        "HTTPS_PROXY": egress_url,
+        "NO_PROXY": f"127.0.0.1,localhost,{sidecar_host}",
+    }
+
+
+def _worker_env_map(raw: dict) -> dict[str, str] | None:
+    """解析实际 Docker Config.Env；重复键/非字符串失败关闭。"""
+    config = raw.get("Config")
+    if not isinstance(config, dict):
+        return None
+    env = config.get("Env")
+    if env is None:
+        env = []
+    if not isinstance(env, list):
+        return None
+    parsed: dict[str, str] = {}
+    for item in env:
+        if not isinstance(item, str) or "=" not in item:
+            return None
+        name, value = item.split("=", 1)
+        if not name:
+            return None
+        key = name.lower()
+        if key in parsed:
+            return None
+        parsed[key] = value
+    return parsed
+
+
+def verify_worker_wiring(raw: dict | None, *, workspace_id: str,
+                         sidecar_host: str | None) -> bool:
+    """核对运行中 worker 的实际代理/broker 环境，而非宿主 env 文件。
+
+    Docker 的 ``--env-file`` 只在创建时读取；更新宿主文件不会改变已存在
+    容器的 ``Config.Env``。复用/接管前必须按实际 Env 验收，否则零出口旧
+    实例会被误报为已接线。
+    """
+    if not isinstance(raw, dict):
+        return False
+    env = _worker_env_map(raw)
+    if env is None:
+        return False
+    token = env.get("easel_service_token", "")
+    if (not token or not token.isascii() or len(token) > 512
+            or any(char in token for char in ("\n", "\r", "\0"))):
+        return False
+    try:
+        expected = {name.lower(): value
+                    for name, value in worker_wiring_env(
+                        workspace_id, sidecar_host).items()}
+    except ProvisionerError:
+        return False
+    if sidecar_host is not None:
+        # ALL_PROXY 会覆盖 HTTP(S)_PROXY；批准接线没有它。
+        if "all_proxy" in env:
+            return False
+        return all(env.get(key) == value
+                   for key, value in expected.items())
+    # 零出口模式：不能继承旧 sidecar 入口；允许 Docker daemon 注入的
+    # 普通代理变量，但任何仍指向本产品 sidecar 的代理都必须视为旧接线。
+    if ("easel_broker_url" in env or "easel_egress_proxy" in env):
+        return False
+    return not any(
+        "easel-sidecar-" in env.get(key, "")
+        for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"))
+
+
+def _verify_worker_static(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
                           paths: RuntimePaths) -> bool:
-    """严格核对实际容器配置；复用、接管、inspect 与健康循环共用同一门槛。
-
-    标签只表示归属，不能证明镜像、权限、资源、挂载或网络仍是批准配置。
-    任何字段缺失、类型异常或与批准值不一致都返回 False。
-    """
+    """核对除运行接线外的静态安全配置。"""
     if not isinstance(raw, dict):
         return False
     instance_id = raw.get("Id")
@@ -835,6 +911,23 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
             bool(bindings) for bindings in ports.values()):
         return False
     return True
+
+
+def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
+                          config_version: int, image: str,
+                          paths: RuntimePaths,
+                          sidecar_host: str | None = None) -> bool:
+    """严格核对实际容器配置；复用、接管、inspect 与健康循环共用同一门槛。
+
+    标签只表示归属，不能证明镜像、权限、资源、挂载、网络或运行接线仍是
+    批准配置。任何字段缺失、类型异常或与批准值不一致都返回 False。
+    """
+    if not _verify_worker_static(
+            raw, workspace_id=workspace_id,
+            config_version=config_version, image=image, paths=paths):
+        return False
+    return verify_worker_wiring(
+        raw, workspace_id=workspace_id, sidecar_host=sidecar_host)
 
 
 def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
@@ -1319,6 +1412,27 @@ class Provisioner:
             policy_file=policy, sidecar_network=network,
             broker_upstream=upstream)
 
+    def _sidecar_host(self, workspace_id: str) -> str | None:
+        if self._sidecar is None:
+            return None
+        return sidecar_container_name(workspace_id)
+
+    async def _sidecar_ready(self, workspace_id: str) -> bool:
+        """只读核对 sidecar 依赖；缺失/不安全返回 False，Docker 故障抛出。"""
+        if self._sidecar is None:
+            return True
+        network, _policy, _upstream = self._sidecar
+        try:
+            await self._require_sidecar_network(network)
+        except ProvisionerError as error:
+            if error.code in ("sidecar_network_missing",
+                              "sidecar_network_invalid"):
+                return False
+            raise
+        raw = await self._inspect_name(
+            sidecar_container_name(workspace_id))
+        return raw is not None and self._sidecar_verified(raw, workspace_id)
+
     async def _remove_sidecar_instance(self, workspace_id: str) -> None:
         name = sidecar_container_name(workspace_id)
         raw = await self._inspect_name(name)
@@ -1453,15 +1567,14 @@ class Provisioner:
             allow_unquotaed=self.settings.allow_unquotaed)
         token = await asyncio.to_thread(
             _load_or_create_token, self.settings.workspace_root, workspace_id)
-        sidecar_host = (sidecar_container_name(workspace_id)
-                        if self._sidecar is not None else None)
+        sidecar_host = self._sidecar_host(workspace_id)
         env_file = await asyncio.to_thread(
             write_env_file, self.settings.workspace_root, workspace_id,
             config_version, token, paths, sidecar_host=sidecar_host)
         await self._ensure_network(workspace_id)
-        await self._ensure_sidecar(workspace_id)
 
         existing = await self._inspect_raw(workspace_id)
+        sidecar_ensured = False
         if existing is not None:
             report = sanitize_inspect(existing)
             if not report["managed"]:
@@ -1470,16 +1583,38 @@ class Provisioner:
                 raise ProvisionerError("config_version_conflict")
             # 标签与健康响应不能证明安全配置；不符时失败关闭，不自动
             # 删除来源不明的容器，交部署方核查。
-            if not verify_worker_inspect(
+            if not _verify_worker_static(
                     existing, workspace_id=workspace_id,
                     config_version=config_version,
                     image=self.settings.image, paths=paths):
                 raise ProvisionerError("container_conflict")
-            if report["ready"] and await self._probe(
-                    workspace_id, config_version, report["upstream"], token):
-                return WorkerHandle(workspace_id, report["instance_id"],
-                                    report["upstream"], token, config_version)
-            await self._remove_container(workspace_id)
+            if not verify_worker_wiring(
+                    existing, workspace_id=workspace_id,
+                    sidecar_host=sidecar_host):
+                # 实际 Env 只在创建时读取。健康旧实例与批准接线不符时不能
+                # 为了迁移直接删容器，否则会中断可能正在执行的 Run；保留
+                # 实例，交控制面 drain/stop 后再重建。已退出/不健康的旧实例
+                # 可安全删除并按新接线重建，持久目录不删除。
+                if report["ready"] and await self._probe(
+                        workspace_id, config_version, report["upstream"],
+                        token):
+                    raise ProvisionerError("worker_wiring_mismatch")
+                await self._remove_container(workspace_id)
+                existing = None
+            else:
+                await self._ensure_sidecar(workspace_id)
+                sidecar_ensured = True
+                if report["ready"] and await self._probe(
+                        workspace_id, config_version, report["upstream"],
+                        token):
+                    return WorkerHandle(
+                        workspace_id, report["instance_id"],
+                        report["upstream"], token, config_version)
+                await self._remove_container(workspace_id)
+                existing = None
+
+        if existing is None and not sidecar_ensured:
+            await self._ensure_sidecar(workspace_id)
 
         await asyncio.to_thread(verify_prepared_paths, paths)
         argv = build_run_argv(
@@ -1501,7 +1636,8 @@ class Provisioner:
                 if not verify_worker_inspect(
                         raw, workspace_id=workspace_id,
                         config_version=config_version,
-                        image=self.settings.image, paths=paths):
+                        image=self.settings.image, paths=paths,
+                        sidecar_host=sidecar_host):
                     raise ProvisionerError("container_conflict")
                 report = sanitize_inspect(raw)
                 if (report["ready"]
@@ -1585,13 +1721,21 @@ class Provisioner:
                 workspace_id)
         except ProvisionerError:
             raise ProvisionerError("container_conflict") from None
-        if not verify_worker_inspect(
+        if not _verify_worker_static(
                 raw, workspace_id=workspace_id,
                 config_version=report["config_version"],
                 image=self.settings.image, paths=paths):
             raise ProvisionerError("container_conflict")
+        sidecar_host = self._sidecar_host(workspace_id)
+        wiring_ready = verify_worker_wiring(
+            raw, workspace_id=workspace_id, sidecar_host=sidecar_host)
         # 接管前复核实际网络的 internal/IPv4-only/bridge 属性。
         await self._require_existing_network(workspace_id)
+        # 对账必须验收完整批准依赖：缺 sidecar、sidecar 被篡改或其受控
+        # 出站网络失效时，worker 自身健康不能证明接线可用。
+        sidecar_ready = await self._sidecar_ready(workspace_id)
+        report["ready"] = bool(
+            report["ready"] and wiring_ready and sidecar_ready)
         if report["ready"]:
             try:
                 token = _load_or_create_token(

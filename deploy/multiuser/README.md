@@ -132,7 +132,10 @@ python deploy/multiuser/provisioner.py \
   只有明确指向本次容器/网络对象的 absent 响应按不存在处理；Docker context、
   endpoint、daemon、权限或 CLI 初始化错误一律失败关闭。inspect 退出 0
   但返回空数组、非数组或首项非对象时按 `inspect_invalid` /
-  `network_invalid` 失败，不能当作对象已消失。
+  `network_invalid` 失败，不能当作对象已消失。已存在的健康 worker 其实际
+  `Config.Env` 与当前 sidecar broker/proxy 接线不符时返回
+  `worker_wiring_mismatch`，不会复用为已接线 ready，也不会为迁移直接删除
+  该实例。
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 
@@ -203,8 +206,19 @@ docker network connect easel-control easel-sidecar-<uuid>
   `HTTP(S)_PROXY`，`NO_PROXY` 排除 sidecar 自身。环境代理只是客户端指向，
   真正的网络边界仍是 internal 网络 + sidecar。Task 9 的签名快照若包含
   `broker_url`，必须指向同一个 sidecar broker 名，不能回指 control 管理地址。
+- Docker 的 `--env-file` 只在创建容器时读取。复用/接管前除静态安全字段外，
+  还必须核对 inspect 中实际 `Config.Env` 的 broker/proxy/no-proxy；只更新
+  宿主 env 文件不构成新接线。健康运行中的旧实例与当前批准接线不符时返回
+  `worker_wiring_mismatch`，保留实例交控制面先 drain/stop，避免中断活跃
+  Run；已退出/不健康实例可按新接线重建，持久目录不删除。零出口模式兼容
+  无 sidecar 的实例，但不得继承仍指向 `easel-sidecar-*` 的旧代理。
 - sidecar 创建/复用/停止均要求严格 inspect：固定镜像、权限、资源、唯一
   策略挂载、恰好两条批准网络；停止失败明确报错，不写 stopped。
+- 重启对账/租约过期的 `inspect` 同时验收 worker 实际接线、workspace 网络、
+  sidecar 归属/固定镜像/权限/资源/策略挂载/两条网络/健康，以及受控出站
+  网络属性。任一缺失、不健康或被篡改时 `ready=false`，不接管、不缓存；
+  `inspect` 只读，不会自动补建 sidecar。合法完整依赖可直接接管，不重复
+  创建 worker/sidecar。
 
 ## 6. 生命周期与回收
 
@@ -244,6 +258,13 @@ docker network connect easel-control easel-sidecar-<uuid>
 
 ```powershell
 & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest tests/multiuser -q
+```
+
+真实 control broker 经实际 sidecar socket 的授权装配（无需 Docker；供应商
+传输为 fake）：
+
+```bash
+python -m pytest tests/multiuser/test_sidecar_broker_control.py -q
 ```
 
 真实容器隔离（Linux Docker Engine；显式选择，失败就如实记录）：
@@ -295,5 +316,9 @@ Chromium 返回 `No usable sandbox!`，因此**真实浏览器沙箱门槛未通
 - **宿主防火墙/DOCKER-USER 规则**：仓库只定义矩阵，未自动安装或验证规则。
 - **broker/受限公网出口到 worker 的允许路径**：代码与 sidecar 接线已完成，
   并用本机 Docker 真实网络验证 broker 白名单路由、批准出口与拒绝路径。
-  目标 Linux 宿主防火墙/IPv6、真实公网出口与 Task 5 live 出口门槛仍需
-  复验；不能把本机结果外推为生产网络矩阵已通过。
+  另一组装配测试启动真实 `create_app`/Auth/Config/Broker 与独立 sidecar
+  进程，经实际 sidecar socket 验证合法 token 到达 broker、错误/跨
+  workspace/run token 被真实 broker 拒绝，管理路径在 sidecar 入口 404；
+  供应商传输仍为 fake，未使用真实供应商凭证。目标 Linux 宿主防火墙/IPv6、
+  真实公网出口、真实 control broker 在 Docker 拓扑中的联调与 Task 5 live
+  出口门槛仍需复验；不能把本机结果外推为生产网络矩阵已通过。

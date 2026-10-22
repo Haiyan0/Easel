@@ -10,6 +10,9 @@ import sys
 
 import pytest
 
+from easel.control.runtime import RuntimeManager, RuntimeUnavailable
+from easel.control.store import Store
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy" / "multiuser" / "provisioner.py"
 
@@ -52,16 +55,18 @@ def _not_found(target: str) -> subprocess.CompletedProcess:
         [], 1, "", f"Error: No such object: {target}\n")
 
 
-def _worker_container(root: pathlib.Path) -> dict:
-    paths = provisioner.prepare_workspace(root, WORKSPACE)
+def _worker_container(root: pathlib.Path, env: list[str] | None = None,
+                      workspace: str = WORKSPACE) -> dict:
+    paths = provisioner.prepare_workspace(root, workspace)
     return {
         "Id": "1" * 64,
-        "Name": "/" + provisioner.container_name(WORKSPACE),
+        "Name": "/" + provisioner.container_name(workspace),
         "Config": {
             "User": "10001:10001", "Image": IMAGE, "Entrypoint": None,
             "Cmd": ["python", "-m", "easel.worker.lifecycle", "serve",
                     "--host", "0.0.0.0", "--port", "7860"],
-            "Labels": provisioner.workload_labels(WORKSPACE, 1),
+            "Labels": provisioner.workload_labels(workspace, 1),
+            "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
         },
         "State": {"Running": True, "Health": {"Status": "healthy"}},
         "HostConfig": {
@@ -70,7 +75,7 @@ def _worker_container(root: pathlib.Path) -> dict:
             "SecurityOpt": ["no-new-privileges:true"],
             "PidsLimit": 256, "Memory": 4 * 1024 ** 3,
             "MemorySwap": 4 * 1024 ** 3, "NanoCpus": 2_000_000_000,
-            "NetworkMode": provisioner.network_name(WORKSPACE),
+            "NetworkMode": provisioner.network_name(workspace),
             "PortBindings": {}, "PublishAllPorts": False, "Binds": [],
             "Devices": [], "PidMode": "", "IpcMode": "private",
             "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=1g"},
@@ -85,20 +90,21 @@ def _worker_container(root: pathlib.Path) -> dict:
         "NetworkSettings": {
             "Ports": {},
             "Networks": {
-                provisioner.network_name(WORKSPACE): {
+                provisioner.network_name(workspace): {
                     "IPAddress": "172.30.0.2"}},
         },
     }
 
 
-def _sidecar_container(policy: pathlib.Path) -> dict:
+def _sidecar_container(policy: pathlib.Path,
+                       workspace: str = WORKSPACE) -> dict:
     return {
         "Id": "2" * 64,
-        "Name": "/" + provisioner.sidecar_container_name(WORKSPACE),
+        "Name": "/" + provisioner.sidecar_container_name(workspace),
         "Config": {
             "User": "10001:10001", "Image": IMAGE, "Entrypoint": None,
             "Cmd": list(provisioner.sidecar_command(UPSTREAM)),
-            "Labels": provisioner.sidecar_labels(WORKSPACE),
+            "Labels": provisioner.sidecar_labels(workspace),
             "Healthcheck": {"Test": [
                 "CMD-SHELL",
                 ("python -c \"import urllib.request;"
@@ -114,7 +120,7 @@ def _sidecar_container(policy: pathlib.Path) -> dict:
             "Memory": provisioner.SIDECAR_MEMORY_BYTES,
             "MemorySwap": provisioner.SIDECAR_MEMORY_BYTES,
             "NanoCpus": provisioner.SIDECAR_NANO_CPUS,
-            "NetworkMode": provisioner.network_name(WORKSPACE),
+            "NetworkMode": provisioner.network_name(workspace),
             "PortBindings": {}, "PublishAllPorts": False, "Binds": [],
             "Devices": [], "PidMode": "", "IpcMode": "private",
             "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=64m"},
@@ -127,7 +133,7 @@ def _sidecar_container(policy: pathlib.Path) -> dict:
         "NetworkSettings": {
             "Ports": {},
             "Networks": {
-                provisioner.network_name(WORKSPACE): {
+                provisioner.network_name(workspace): {
                     "IPAddress": "172.30.0.3"}},
         },
     }
@@ -135,11 +141,15 @@ def _sidecar_container(policy: pathlib.Path) -> dict:
 
 class FakeDocker:
     def __init__(self, root: pathlib.Path, policy: pathlib.Path, *,
+                 workspace: str = WORKSPACE,
                  sidecar_failure: bool = False,
                  sidecar_stop_failure: bool = False,
-                 invalid_sidecar: bool = False):
+                 invalid_sidecar: bool = False,
+                 sidecar_network_internal: bool = False):
         self.root = root
         self.policy = policy
+        self.workspace = workspace
+        self.sidecar_network_internal = sidecar_network_internal
         self.sidecar_failure = sidecar_failure
         self.sidecar_stop_failure = sidecar_stop_failure
         self.invalid_sidecar = invalid_sidecar
@@ -158,14 +168,15 @@ class FakeDocker:
             if name == SIDECAR_NETWORK:
                 return _ok(json.dumps([{
                     "Name": SIDECAR_NETWORK, "Driver": "bridge",
-                    "Internal": False, "EnableIPv6": False}]))
-            if name == provisioner.network_name(WORKSPACE) and (
+                    "Internal": self.sidecar_network_internal,
+                    "EnableIPv6": False}]))
+            if name == provisioner.network_name(self.workspace) and (
                     self.workspace_network):
                 return _ok(json.dumps([{
                     "Name": name, "Driver": "bridge", "Internal": True,
                     "EnableIPv6": False,
                     "Labels": {"easel.managed": "true",
-                               "easel.workspace-id": WORKSPACE}}]))
+                               "easel.workspace-id": self.workspace}}]))
             return subprocess.CompletedProcess(
                 [], 1, "", f"Error response from daemon: network {name} not found\n")
         if args[:2] == ["network", "create"]:
@@ -191,13 +202,20 @@ class FakeDocker:
                 if self.sidecar_failure:
                     return subprocess.CompletedProcess(
                         argv, 1, "", "sidecar failed\n")
-                raw = _sidecar_container(self.policy)
+                raw = _sidecar_container(
+                    self.policy, workspace=self.workspace)
                 self.sidecar_runs += 1
                 if self.invalid_sidecar and self.sidecar_runs == 1:
                     raw["HostConfig"]["Privileged"] = True
                 self.containers[name] = raw
                 return _ok(raw["Id"] + "\n")
-            raw = _worker_container(self.root)
+            # Docker 只在创建时读取 env-file；fake 也必须保存当时内容，
+            # 否则“更新宿主文件”会被误当作容器实际配置已变化。
+            env_path = pathlib.Path(
+                args[args.index("--env-file") + 1])
+            env = env_path.read_text(encoding="utf-8").splitlines()
+            raw = _worker_container(
+                self.root, env=env, workspace=self.workspace)
             self.containers[name] = raw
             return _ok(raw["Id"] + "\n")
         if args[:1] == ["stop"]:
@@ -233,11 +251,11 @@ def _is_worker_run(command: list[str]) -> bool:
     return command[1:2] == ["run"] and not _is_sidecar_run(command)
 
 
-def _fake_health(monkeypatch):
+def _fake_health(monkeypatch, workspace: str = WORKSPACE):
     def fake_get(_host, _port, _path, _headers, _timeout):
         return {
-            "workspace_id": WORKSPACE, "config_version": 1,
-            "container_id": provisioner.container_name(WORKSPACE),
+            "workspace_id": workspace, "config_version": 1,
+            "container_id": provisioner.container_name(workspace),
             "ready": True,
         }
     monkeypatch.setattr(provisioner, "_http_get_json", fake_get)
@@ -355,6 +373,248 @@ def test_sidecar_stop_failure_is_reported(tmp_path, monkeypatch):
         asyncio.run(service.stop(WORKSPACE, handle.container_id))
     assert rejected.value.code == "sidecar_stop_failed"
     assert provisioner.sidecar_container_name(WORKSPACE) in fake.containers
+
+
+def _setup_started(tmp_path, monkeypatch, *, sidecar=True):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path, sidecar=sidecar)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    service = provisioner.Provisioner(settings, run=fake)
+    handle = asyncio.run(service.ensure(WORKSPACE, 1))
+    return root, settings, fake, service, handle
+
+
+def test_live_zero_egress_worker_is_not_reused_after_enabling_sidecar(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    seeded = _worker_container(
+        root, ["EASEL_SERVICE_TOKEN=old-token"])
+    fake.containers[provisioner.container_name(WORKSPACE)] = seeded
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_wiring_mismatch"
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is seeded
+    assert not [c for c in fake.commands if _is_worker_run(c)]
+    assert not [c for c in fake.commands if _is_sidecar_run(c)], (
+        "不能为无法安全迁移的活跃旧实例先创建 sidecar")
+
+
+def test_stopped_zero_egress_worker_is_rebuilt_with_actual_new_env(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    seeded = _worker_container(
+        root, ["EASEL_SERVICE_TOKEN=old-token"])
+    seeded["State"] = {"Running": False, "Status": "exited"}
+    fake.containers[provisioner.container_name(WORKSPACE)] = seeded
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    (paths.workspace / "keep.txt").write_text("persisted", encoding="utf-8")
+    service = provisioner.Provisioner(settings, run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 1))
+    assert (paths.workspace / "keep.txt").read_text(
+        encoding="utf-8") == "persisted"
+    assert handle.container_id == "1" * 64
+    worker = fake.containers[provisioner.container_name(WORKSPACE)]
+    env = worker["Config"]["Env"]
+    assert ("EASEL_BROKER_URL=http://"
+            f"{provisioner.sidecar_container_name(WORKSPACE)}:8899") in env
+    assert ("HTTP_PROXY=http://"
+            f"{provisioner.sidecar_container_name(WORKSPACE)}:8898") in env
+    assert len([c for c in fake.commands if _is_worker_run(c)]) == 1
+    assert len([c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+
+def test_running_worker_with_stale_proxy_env_is_not_reused(
+        tmp_path, monkeypatch):
+    _root, _settings_value, fake, service, _handle = _setup_started(
+        tmp_path, monkeypatch)
+    worker = fake.containers[provisioner.container_name(WORKSPACE)]
+    worker["Config"]["Env"] = [
+        "EASEL_SERVICE_TOKEN=old-token",
+        "EASEL_BROKER_URL=http://127.0.0.1:8899",
+        "HTTP_PROXY=http://127.0.0.1:8898",
+        "HTTPS_PROXY=http://127.0.0.1:8898",
+        "NO_PROXY=127.0.0.1,localhost",
+    ]
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_wiring_mismatch"
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is worker
+    assert len([c for c in fake.commands if _is_worker_run(c)]) == 1
+    assert len([c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+
+def test_zero_egress_worker_with_matching_env_is_still_reused(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path, sidecar=False)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    seeded = _worker_container(
+        root, ["EASEL_SERVICE_TOKEN=old-token"])
+    fake.containers[provisioner.container_name(WORKSPACE)] = seeded
+    service = provisioner.Provisioner(settings, run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 1))
+    assert handle.container_id == seeded["Id"]
+    assert not [c for c in fake.commands if _is_worker_run(c)]
+    assert not [c for c in fake.commands if _is_sidecar_run(c)]
+
+
+def test_inspect_does_not_report_ready_when_sidecar_is_missing(
+        tmp_path, monkeypatch):
+    _root, _settings_value, fake, service, _handle = _setup_started(
+        tmp_path, monkeypatch)
+    del fake.containers[provisioner.sidecar_container_name(WORKSPACE)]
+
+    report = asyncio.run(service.inspect(WORKSPACE))
+    assert report["managed"] is True
+    assert report["ready"] is False
+    assert len([c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+
+@pytest.mark.parametrize("tamper", ["unhealthy", "privileged", "network",
+                                    "outbound"])
+def test_inspect_does_not_report_ready_when_sidecar_is_tampered(
+        tmp_path, monkeypatch, tamper):
+    _root, _settings_value, fake, service, _handle = _setup_started(
+        tmp_path, monkeypatch)
+    sidecar = fake.containers[provisioner.sidecar_container_name(WORKSPACE)]
+    if tamper == "unhealthy":
+        sidecar["State"] = {
+            "Running": True, "Health": {"Status": "unhealthy"}}
+    elif tamper == "privileged":
+        sidecar["HostConfig"]["Privileged"] = True
+    elif tamper == "network":
+        sidecar["NetworkSettings"]["Networks"].pop(SIDECAR_NETWORK)
+    else:
+        fake.sidecar_network_internal = True
+
+    report = asyncio.run(service.inspect(WORKSPACE))
+    assert report["ready"] is False
+
+
+def test_inspect_does_not_report_ready_when_worker_wiring_is_stale(
+        tmp_path, monkeypatch):
+    _root, _settings_value, fake, service, _handle = _setup_started(
+        tmp_path, monkeypatch)
+    worker = fake.containers[provisioner.container_name(WORKSPACE)]
+    worker["Config"]["Env"] = ["EASEL_SERVICE_TOKEN=old-token"]
+
+    report = asyncio.run(service.inspect(WORKSPACE))
+    assert report["ready"] is False
+
+
+class _Clock:
+    def __init__(self, value: float = 1000.0):
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+@pytest.mark.parametrize("tamper", ["missing", "unhealthy", "privileged",
+                                    "network", "outbound"])
+def test_runtime_restart_does_not_adopt_worker_with_broken_sidecar(
+        tmp_path, monkeypatch, tamper):
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = _settings(tmp_path)
+    database = tmp_path / "control.sqlite3"
+    with Store.open(database) as bootstrap:
+        workspace_id = bootstrap.create_user("A").workspace_id
+    _fake_health(monkeypatch, workspace_id)
+    fake = FakeDocker(root, settings.sidecar_policy, workspace=workspace_id)
+    service = provisioner.Provisioner(settings, run=fake)
+    clock = _Clock()
+
+    async def scenario():
+        with Store.open(database) as first_store:
+            first = RuntimeManager(
+                first_store, service, clock=clock, lease_seconds=60,
+                poll_interval=0.01)
+            handle = await first.ensure_ready(workspace_id, 1)
+            assert handle.container_id == "1" * 64
+            sidecar = fake.containers[
+                provisioner.sidecar_container_name(workspace_id)]
+            if tamper == "missing":
+                del fake.containers[
+                    provisioner.sidecar_container_name(workspace_id)]
+            elif tamper == "unhealthy":
+                sidecar["State"] = {
+                    "Running": True, "Health": {"Status": "unhealthy"}}
+            elif tamper == "privileged":
+                sidecar["HostConfig"]["Privileged"] = True
+            elif tamper == "network":
+                sidecar["NetworkSettings"]["Networks"].pop(SIDECAR_NETWORK)
+            else:
+                fake.sidecar_network_internal = True
+
+            clock.value += 100  # 租约过期，等价管理进程重启后的对账
+            with Store.open(database) as second_store:
+                second = RuntimeManager(
+                    second_store, service, clock=clock, lease_seconds=60,
+                    poll_interval=0.01)
+                with pytest.raises(RuntimeUnavailable) as rejected:
+                    await second.ensure_ready(workspace_id, 1)
+                assert rejected.value.code == "worker_identity_mismatch"
+                lease = second_store.get_worker_lease(workspace_id)
+                assert lease.state == "failed"
+                assert len([
+                    c for c in fake.commands if _is_worker_run(c)]) == 1
+                assert len([
+                    c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+    asyncio.run(scenario())
+
+
+def test_runtime_restart_adopts_worker_with_complete_sidecar_dependency(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = _settings(tmp_path)
+    database = tmp_path / "control.sqlite3"
+    with Store.open(database) as bootstrap:
+        workspace_id = bootstrap.create_user("A").workspace_id
+    _fake_health(monkeypatch, workspace_id)
+    fake = FakeDocker(root, settings.sidecar_policy, workspace=workspace_id)
+    service = provisioner.Provisioner(settings, run=fake)
+    clock = _Clock()
+
+    async def scenario():
+        with Store.open(database) as first_store:
+            first = RuntimeManager(
+                first_store, service, clock=clock, lease_seconds=60,
+                poll_interval=0.01)
+            handle = await first.ensure_ready(workspace_id, 1)
+
+            clock.value += 100
+            with Store.open(database) as second_store:
+                second = RuntimeManager(
+                    second_store, service, clock=clock, lease_seconds=60,
+                    poll_interval=0.01)
+                adopted = await second.ensure_ready(workspace_id, 1)
+                assert adopted.container_id == handle.container_id
+                assert len([
+                    c for c in fake.commands if _is_worker_run(c)]) == 1
+                assert len([
+                    c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+    asyncio.run(scenario())
 
 
 def test_incomplete_or_insecure_sidecar_config_is_rejected(tmp_path):

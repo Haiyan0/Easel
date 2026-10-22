@@ -657,7 +657,7 @@ async def main():
             return self.completed(
                 argv, 1, stderr=f"Error: No such object: {target}\n")
 
-        def make_container(self):
+        def make_container(self, env=None):
             workspace_id = self.workspace_id
             paths = module.prepare_workspace(
                 pathlib.Path("/work"), workspace_id)
@@ -671,6 +671,7 @@ async def main():
                     "Cmd": ["python", "-m", "easel.worker.lifecycle",
                             "serve", "--host", "0.0.0.0", "--port", "7860"],
                     "Labels": module.workload_labels(workspace_id, 1),
+                    "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
                 },
                 "State": {"Running": True, "Health": {"Status": "healthy"}},
                 "HostConfig": {
@@ -759,7 +760,10 @@ async def main():
                     return self.not_found(argv, target)
                 return self.completed(argv, 0, json.dumps([self.container]))
             if args[:1] == ["run"]:
-                self.container = self.make_container()
+                env_path = pathlib.Path(
+                    args[args.index("--env-file") + 1])
+                env = env_path.read_text(encoding="utf-8").splitlines()
+                self.container = self.make_container(env)
                 return self.completed(argv, 0, "fake-container\n")
             if args[:1] == ["stop"]:
                 target = args[-1]
