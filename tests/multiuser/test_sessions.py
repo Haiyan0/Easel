@@ -15,6 +15,8 @@ from easel.worker.sessions import WorkspaceSessionStore
 
 WORKSPACE_A = "workspace-a"
 WORKSPACE_B = "workspace-b"
+MESSAGE_FORMAT = "easel.session.message"
+MESSAGE_VERSION = 1
 
 
 def assert_error(error: pytest.ExceptionInfo, code: str, status: int) -> None:
@@ -33,6 +35,24 @@ def _legacy_binding(root: pathlib.Path, workspace_id: str,
                                 "native_id": "native-legacy"}),
                     encoding="utf-8")
     return path
+
+
+def _write_message_record(path: pathlib.Path, workspace_id: str,
+                          session_id: str, message: dict, *,
+                          version: int = MESSAGE_VERSION,
+                          fmt: str = MESSAGE_FORMAT) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "format": fmt,
+        "version": version,
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+        "message": message,
+    }
+    data = (json.dumps(record, ensure_ascii=False,
+                       separators=(",", ":")) + "\n").encode("utf-8")
+    path.write_bytes(data)
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +151,93 @@ def test_same_root_workspaces_do_not_share_session_index(tmp_path):
     assert b.binding("same")["workspace_id"] == WORKSPACE_B
     assert [item["content"] for item in a.messages("same")] == ["A"]
     assert [item["content"] for item in b.messages("same")] == ["B"]
+
+
+def test_message_snapshot_records_owner_and_format(tmp_path):
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    store.bind("s1", "acp", "native-a", 1)
+    store.append_message("s1", {"role": "user", "content": "A-private"})
+
+    record = json.loads(store.messages_path("s1").read_text(encoding="utf-8"))
+    assert record["format"] == MESSAGE_FORMAT
+    assert record["version"] == MESSAGE_VERSION
+    assert record["workspace_id"] == WORKSPACE_A
+    assert record["session_id"] == "s1"
+    assert record["message"] == {"role": "user", "content": "A-private"}
+
+
+def test_copied_message_snapshot_from_another_workspace_is_rejected(tmp_path):
+    a = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    b = WorkspaceSessionStore(tmp_path, WORKSPACE_B)
+    a.bind("same", "acp", "native-a", 1)
+    b.bind("same", "acp", "native-b", 1)
+    a.append_message("same", {"role": "user", "content": "A-private"})
+    b.messages_path("same").write_bytes(
+        a.messages_path("same").read_bytes())
+
+    with pytest.raises(DomainError) as copied:
+        b.messages("same")
+    assert_error(copied, "session_workspace_mismatch", 409)
+    with pytest.raises(DomainError) as append_copied:
+        b.append_message("same", {"role": "user", "content": "B"})
+    assert_error(append_copied, "session_workspace_mismatch", 409)
+
+
+def test_copied_message_snapshot_from_another_session_is_rejected(tmp_path):
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    store.bind("s1", "acp", "native-a", 1)
+    store.bind("s2", "acp", "native-b", 1)
+    store.append_message("s1", {"role": "user", "content": "s1-private"})
+    store.messages_path("s2").write_bytes(
+        store.messages_path("s1").read_bytes())
+
+    with pytest.raises(DomainError) as copied:
+        store.messages("s2")
+    assert_error(copied, "session_identity_mismatch", 409)
+
+
+def test_missing_or_unknown_message_version_is_rejected(tmp_path):
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    store.bind("legacy", "acp", "native-legacy", 1)
+    legacy_path = store.messages_path("legacy")
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({"role": "user", "content": "old"}) + "\n",
+        encoding="utf-8")
+    before = legacy_path.read_bytes()
+
+    with pytest.raises(DomainError) as legacy:
+        store.messages("legacy")
+    assert_error(legacy, "session_legacy_unowned", 409)
+    with pytest.raises(DomainError) as append_legacy:
+        store.append_message("legacy", {"role": "user", "content": "new"})
+    assert_error(append_legacy, "session_legacy_unowned", 409)
+    assert legacy_path.read_bytes() == before
+
+    store.bind("future", "acp", "native-future", 1)
+    future_path = store.messages_path("future")
+    _write_message_record(future_path, WORKSPACE_A, "future",
+                          {"role": "user", "content": "future"},
+                          version=MESSAGE_VERSION + 1)
+    with pytest.raises(DomainError) as future:
+        store.messages("future")
+    assert_error(future, "session_version_unsupported", 409)
+
+
+def test_invalid_persisted_message_and_attachment_are_rejected(tmp_path):
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    for session_id, message in (
+            ("bad-role", {"role": "root", "content": "x"}),
+            ("bad-attachment", {
+                "role": "user", "content": "x",
+                "attachments": [{"path": "../secret"}]})):
+        store.bind(session_id, "acp", f"native-{session_id}", 1)
+        _write_message_record(
+            store.messages_path(session_id), WORKSPACE_A, session_id,
+            message)
+        with pytest.raises(DomainError) as invalid:
+            store.messages(session_id)
+        assert_error(invalid, "session_corrupt", 500)
 
 
 def test_concurrent_bind_allows_one_identity_only(tmp_path):

@@ -2,8 +2,9 @@
 
 所有用户提供的标识只用于哈希，不进入路径；数据位于
 ``<root>/sessions/<workspace-hash>/<session-hash>/``。绑定和消息追加都在
-跨进程文件锁内完成，写入使用临时文件 + fsync + replace，损坏或旧无归属
-记录明确失败，不当作空历史。
+跨进程文件锁内完成，写入使用临时文件 + fsync + replace。每条消息行带
+format/version/workspace/session envelope，读取和追加都校验归属与格式；
+损坏或旧无归属记录明确失败，不当作空历史。
 """
 from __future__ import annotations
 
@@ -29,6 +30,10 @@ except ImportError:  # pragma: no cover - POSIX
 
 SUPPORTED_RUNTIMES = ("api", "openclaw", "opencode", "codex", "acp")
 MESSAGE_ROLES = ("user", "assistant", "system", "tool")
+MESSAGE_FORMAT = "easel.session.message"
+MESSAGE_FORMAT_VERSION = 1
+_MESSAGE_FIELDS = frozenset({
+    "format", "version", "workspace_id", "session_id", "message"})
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_ATTACHMENTS = 20
 
@@ -121,23 +126,57 @@ def _read_json(path: Path) -> dict | None:
     return data
 
 
-def _message_from_line(line: bytes) -> dict:
+def _message_record(workspace_id: str, session_id: str, message: dict) -> dict:
+    return {
+        "format": MESSAGE_FORMAT,
+        "version": MESSAGE_FORMAT_VERSION,
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+        "message": message,
+    }
+
+
+def _message_from_line(line: bytes, *, workspace_id: str,
+                       session_id: str) -> dict:
+    """解析一条带归属/版本 envelope 的消息；旧无身份 JSONL 不静默认领。"""
     if not line or not line.endswith(b"\n"):
         raise DomainError("session_corrupt", 500)
     try:
-        message = json.loads(line.decode("utf-8"))
+        record = json.loads(line.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise DomainError("session_corrupt", 500) from None
-    if not isinstance(message, dict):
+    if not isinstance(record, dict):
         raise DomainError("session_corrupt", 500)
+    if "format" not in record or "version" not in record:
+        raise DomainError("session_legacy_unowned", 409)
+    if set(record) != _MESSAGE_FIELDS:
+        raise DomainError("session_corrupt", 500)
+    if record["format"] != MESSAGE_FORMAT:
+        raise DomainError("session_corrupt", 500)
+    version = record["version"]
+    if type(version) is not int:
+        raise DomainError("session_corrupt", 500)
+    if version != MESSAGE_FORMAT_VERSION:
+        raise DomainError("session_version_unsupported", 409)
+    if record["workspace_id"] != workspace_id:
+        raise DomainError("session_workspace_mismatch", 409)
+    if record["session_id"] != session_id:
+        raise DomainError("session_identity_mismatch", 409)
+    message = record["message"]
+    try:
+        _validate_message(message)
+    except DomainError:
+        raise DomainError("session_corrupt", 500) from None
     return message
 
 
-def _validate_messages_file(path: Path) -> None:
+def _validate_messages_file(path: Path, workspace_id: str,
+                            session_id: str) -> None:
     try:
         with path.open("rb") as stream:
             for line in stream:
-                _message_from_line(line)
+                _message_from_line(
+                    line, workspace_id=workspace_id, session_id=session_id)
     except OSError:
         raise DomainError("session_corrupt", 500) from None
 
@@ -303,15 +342,18 @@ class WorkspaceSessionStore:
                 raise DomainError("session_unbound", 409)
             path = self.messages_path(session_id)
             if path.exists():
-                _validate_messages_file(path)
+                _validate_messages_file(
+                    path, self.workspace_id, session_id)
             original_size: int | None = None
             try:
                 if path.exists():
                     original_size = path.stat().st_size
                 else:
                     original_size = 0
+                record = _message_record(
+                    self.workspace_id, session_id, message)
                 encoded = json.dumps(
-                    message, ensure_ascii=False,
+                    record, ensure_ascii=False,
                     separators=(",", ":")).encode("utf-8") + b"\n"
                 descriptor = os.open(
                     path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -358,7 +400,9 @@ class WorkspaceSessionStore:
             try:
                 with path.open("rb") as stream:
                     for line in stream:
-                        message = _message_from_line(line)
+                        message = _message_from_line(
+                            line, workspace_id=self.workspace_id,
+                            session_id=session_id)
                         if offset <= index < offset + limit:
                             result.append(message)
                         index += 1

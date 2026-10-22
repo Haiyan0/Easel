@@ -146,6 +146,28 @@ def _binding_path(session_id: str) -> Path:
         raise HTTPException(error.status, "Agent 会话标识无效") from error
 
 
+def _session_user_message(req: ChatRequest) -> dict:
+    """只记录客户端本轮原始输入与合法附件引用，不接收整段助手历史。"""
+    message: dict = {"role": "user", "content": req.message.strip()}
+    if req.attachments:
+        message["attachments"] = [
+            {"id": item.id, "name": item.name, "path": item.path}
+            for item in req.attachments
+        ]
+    return message
+
+
+def _append_session_message(session_id: str, message: dict) -> None:
+    """worker 私有快照写入；local 不改变既有历史格式。"""
+    store = _worker_session_store()
+    if store is None:
+        return
+    try:
+        store.append_message(session_id, message)
+    except DomainError as error:
+        raise HTTPException(500, "服务端会话快照写入失败") from error
+
+
 def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
     """启动时加载唯一受管快照：缺文件/公钥/run 或验签失败即失败关闭。"""
     snapshot_file = (os.environ.get(WORKER_SNAPSHOT_FILE_ENV) or "").strip()
@@ -3382,6 +3404,8 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             sk, runtime, native_id,
             _RUNTIME_PATHS.workspace_root if _WORKER_SNAPSHOT is not None
             else None)
+        # 快照写入失败时不得启动本轮执行；local 模式下此调用为空操作。
+        _append_session_message(sk, _session_user_message(req))
         _STOPPED_CHAT.discard(sk)
         proc._task = task
         _RUNNING_CHAT[sk] = proc
@@ -3421,6 +3445,10 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
                 sk, runtime, identifier,
                 _RUNTIME_PATHS.workspace_root
                 if _WORKER_SNAPSHOT is not None else None)), timeout)
+        # 只有适配器正常结束才落助手消息；取消/超时/错误经 SSE 或 HTTP
+        # 明示失败，不把半截输出伪装成完成的一轮。
+        _append_session_message(
+            sk, {"role": "assistant", "content": "".join(full_text)})
         clean_end = True
         reason = "completed"
     except asyncio.CancelledError:
@@ -5689,7 +5717,12 @@ def _write_baseline_profile(name: str, form: dict) -> None:
 
 @app.delete("/api/session/{session_key}")
 async def api_delete_session(session_key: str):
-    """删除 OpenClaw 本地的 session 记录。"""
+    """删除 OpenClaw 本地的 session 记录；worker 不可物理清除私有历史。"""
+    if _WORKER_SNAPSHOT is not None:
+        # 目录删除属于 control 的软删除；worker 若在此 unlink 绑定，会让同一
+        # Easel ID 重新绑定成空原生会话，并使既有消息文件变成孤儿。
+        raise HTTPException(
+            409, "worker 模式不支持删除会话；由控制层软删除并保留原生绑定与历史")
     if session_key in _RUNNING_CHAT or _session_lock(session_key).locked():
         raise HTTPException(409, "请先停止当前对话再删除")
     record = _session_binding(session_key)

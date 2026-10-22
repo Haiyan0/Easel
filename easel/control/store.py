@@ -1542,6 +1542,8 @@ class Store:
         conversation_id = _text(conversation_id)
         stamp = _now()
         with self._transaction():
+            # 身份/归属与变更共用同一写事务；事务外预检不能阻止并发禁用。
+            self._require_actor(actor)
             row = self._connection.execute(
                 "SELECT id, workspace_id, title, archived FROM conversations"
                 " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
@@ -1576,6 +1578,8 @@ class Store:
         conversation_id = _text(conversation_id)
         stamp = _now()
         with self._transaction():
+            # 身份/归属与删除共用同一写事务；事务外预检不能阻止并发禁用。
+            self._require_actor(actor)
             row = self._connection.execute(
                 "SELECT id FROM conversations WHERE workspace_id = ? AND id = ?"
                 " AND deleted_at IS NULL",

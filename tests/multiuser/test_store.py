@@ -904,6 +904,72 @@ def test_disable_race_never_admits_work_for_a_disabled_user(tmp_path):
         assert_error(blocked, 403, "user_disabled")
 
 
+@pytest.mark.parametrize("operation", ["rename", "archive", "delete"])
+def test_disable_before_mutation_transaction_still_blocks_write(
+        tmp_path, operation):
+    """更新/归档/删除必须与身份复查共用写事务。
+
+    在事务外预检通过后暂停，让第二个连接提交禁用，再放行写事务；如果
+    身份只在事务外检查，更新会错误落盘。这里用两个真实 Store 连接和
+    事件门闩确定性复现，不依赖线程调度碰运气。
+    """
+    path = tmp_path / "db"
+    with Store.open(path) as setup:
+        a = setup.create_user("A")
+        conversation = setup.create_conversation(a, "before")
+
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[Any] = []
+
+    def mutate() -> None:
+        # SQLite 连接只能在其创建线程使用；写连接在线程内单独打开。
+        with Store.open(path) as writer:
+            original = writer._transaction
+
+            @contextmanager
+            def gated_transaction():
+                entered.set()
+                assert release.wait(timeout=10), "测试未在超时内放行写事务"
+                with original():
+                    yield
+
+            writer._transaction = gated_transaction
+            try:
+                if operation == "rename":
+                    writer.update_conversation(a, conversation.id, title="after")
+                elif operation == "archive":
+                    writer.update_conversation(a, conversation.id, archived=True)
+                else:
+                    writer.delete_conversation(a, conversation.id)
+            except DomainError as error:
+                outcome.append(error)
+            except BaseException as error:  # 把意外异常带回主线程断言
+                outcome.append(error)
+
+    second = Store.connect(path)
+    thread = threading.Thread(target=mutate)
+    try:
+        thread.start()
+        assert entered.wait(timeout=10), "写操作未到达事务边界"
+        assert second.disable_user(a.user_id) is True
+    finally:
+        release.set()
+        thread.join(timeout=15)
+        second.close()
+    assert not thread.is_alive()
+    assert len(outcome) == 1, outcome
+    assert isinstance(outcome[0], DomainError)
+    assert (outcome[0].status, outcome[0].code) == (403, "user_disabled")
+
+    with sqlite3.connect(path) as raw:
+        row = raw.execute(
+            "SELECT title, archived, deleted_at FROM conversations"
+            " WHERE workspace_id = ? AND id = ?",
+            (a.workspace_id, conversation.id)).fetchone()
+    assert row == ("before", 0, None)
+
+
 def test_conversation_created_before_disable_is_settled_deterministically(tmp_path):
     """顺序一：新建会话先完成，随后禁用；结束后状态必须一致。
 
