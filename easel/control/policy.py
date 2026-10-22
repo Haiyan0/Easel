@@ -26,12 +26,14 @@ MANAGED_WRITE = "managed_write"
 WORKSPACE_READ = "workspace_read"
 WORKSPACE_WRITE = "workspace_write"
 TASK = "task"
+INTERNAL = "internal"
 FORBIDDEN = "forbidden"
 UNKNOWN = "unknown"
 
 _ADMIN_ONLY = frozenset({ADMIN_READ, ADMIN_WRITE, MANAGED_WRITE})
-_ALWAYS_DENIED = frozenset({FORBIDDEN})
-_WORKER_ALLOWED = frozenset({PUBLIC, WORKSPACE_READ, WORKSPACE_WRITE, TASK})
+_ALWAYS_DENIED = frozenset({FORBIDDEN, INTERNAL})
+_WORKER_ALLOWED = frozenset({
+    PUBLIC, WORKSPACE_READ, WORKSPACE_WRITE, TASK, INTERNAL})
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,18 @@ _RULES: tuple[_Route, ...] = (
            WORKSPACE_WRITE, "idea", 1),
     # 剪藏扩展是特殊通道，多人模式默认关闭
     _route("POST", r"^/api/clipper$", FORBIDDEN),
+
+    # worker 内部接口：只允许已验证服务凭证 + 逐 Run 签名的 relay 调用；
+    # control 自身的 authorize 对其它身份一律拒绝。
+    _route("POST", r"^/internal/runs/([^/]+)$", INTERNAL, "run", 1),
+    _route("GET", r"^/internal/runs/([^/]+)/events$", INTERNAL, "run", 1),
+    _route("POST", r"^/internal/runs/([^/]+)/stop$", INTERNAL, "run", 1),
+    _route("POST", r"^/internal/runs/([^/]+)/questions/([^/]+)/answer$",
+           INTERNAL, "run", 1),
+    _route("POST", r"^/internal/runs/([^/]+)/questions/status$",
+           INTERNAL, "run", 1),
+    _route("GET", r"^/internal/sessions/([^/]+)/messages$",
+           INTERNAL, "session", 1),
 )
 
 

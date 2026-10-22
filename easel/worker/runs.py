@@ -1,0 +1,1131 @@
+"""常驻 worker 的逐 Run 接纳、不可变执行上下文与持久事件。
+
+边界：
+
+* 每个 ``POST /internal/runs/{id}`` 先重新计算输入摘要并验证 v2 签名，签名
+  必须同时绑定 workspace/run/会话/输入/任务类型/配置修订；任何替换都在
+  接纳前以 403 拒绝。
+* 接纳、唯一执行认领、状态、事件与问题都落在本人 ``state_root`` 的 SQLite；
+  同一 Run/nonce 重复提交只返回持久状态，不会再次启动适配器。
+* 执行使用逐 Run 的不可变 ``RunRequest``（env/native/command/model 均来自
+  该 Run 的签名快照），不改写全局 ``_WORKER_SNAPSHOT`` 或 ``os.environ``。
+* HTTP 请求返回后 supervisor 独立运行；连接断开不取消后台任务，显式停止
+  或进程关闭才取消。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from ..control.types import DomainError, WorkspacePaths
+from ..harnesses.base import RunRequest
+from .config import (
+    RUN_TASK_TYPES,
+    RunSnapshot,
+    WorkerConfigSnapshot,
+    build_run_env,
+    run_input_digest,
+    run_snapshot_fingerprint,
+    verify_run_snapshot,
+)
+from .sessions import (
+    MAX_ATTACHMENTS,
+    SUPPORTED_RUNTIMES,
+    WorkspaceSessionStore,
+)
+
+ACTIVE_STATES = ("accepted", "running", "awaiting_permission")
+TERMINAL_STATES = ("done", "failed", "interrupted", "cancelled")
+_EVENT_KINDS = frozenset({
+    "token", "thinking", "activity", "question", "error", "done"})
+_MAX_TIMEOUT = 86400
+_DEFAULT_TIMEOUT = 1800
+
+Emit = Callable[[str, str], None]
+Ask = Callable[[list[dict]], Awaitable[dict[str, list[str]]]]
+Bind = Callable[[str], None]
+Executor = Callable[
+    [RunRequest, "RunContext", Bind, Emit, Ask], Awaitable[str | None]]
+
+
+# ---------------------------------------------------------------------------
+# 纯校验与不可变上下文
+# ---------------------------------------------------------------------------
+
+
+def _invalid(code: str = "run_invalid") -> DomainError:
+    return DomainError(code, 400)
+
+
+def _forbidden(code: str = "run_forbidden") -> DomainError:
+    return DomainError(code, 403)
+
+
+def _text(value: object, *, maximum: int) -> str:
+    if (not isinstance(value, str) or not value or len(value) > maximum
+            or any(ord(character) < 32 for character in value)):
+        raise _invalid()
+    return value
+
+
+def _optional_text(value: object, *, maximum: int) -> str | None:
+    if value is None:
+        return None
+    return _text(value, maximum=maximum)
+
+
+def _normalize_attachments(value: object) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > MAX_ATTACHMENTS:
+        raise _invalid("attachment_invalid")
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) - {"id", "name", "path"}:
+            raise _invalid("attachment_invalid")
+        path = item.get("path")
+        identifier = item.get("id")
+        name = item.get("name")
+        if (not isinstance(path, str) or not path or len(path) > 1024
+                or any(ord(character) < 32 for character in path)
+                or "\\" in path or path.startswith("~")):
+            raise _invalid("attachment_invalid")
+        if (not isinstance(identifier, str) or not identifier
+                or len(identifier) > 128):
+            raise _invalid("attachment_invalid")
+        if name is None:
+            name = PurePosixPath(path).name
+        if (not isinstance(name, str) or not name or len(name) > 260
+                or any(ord(character) < 32 for character in name)):
+            raise _invalid("attachment_invalid")
+        normalized.append({"id": identifier, "name": name, "path": path})
+    return tuple(normalized)
+
+
+def _attachment_context(paths: WorkspacePaths, conversation_id: str,
+                        attachments: tuple[dict[str, str], ...]) -> str:
+    """只允许当前会话 inbox 内的附件，并生成 Agent 侧清单。"""
+    if not attachments:
+        return ""
+    outputs = (paths.workspace_root / "outputs").resolve()
+    scope = hashlib.sha256(
+        conversation_id.encode("utf-8")).hexdigest()[:20]
+    rows: list[str] = []
+    seen: set[str] = set()
+    for attachment in attachments:
+        relative = PurePosixPath(attachment["path"])
+        if (relative.is_absolute() or len(relative.parts) != 4
+                or relative.parts[0] != "_inbox"
+                or relative.parts[1] != scope):
+            raise _forbidden("attachment_forbidden")
+        normalized = relative.as_posix()
+        expected = hashlib.sha256(
+            f"{scope}\0{normalized}".encode("utf-8")).hexdigest()[:24]
+        if attachment["id"] != expected:
+            raise _forbidden("attachment_forbidden")
+        full = (outputs / normalized).resolve()
+        if outputs not in full.parents:
+            raise _forbidden("attachment_forbidden")
+        if not full.is_file():
+            raise DomainError("attachment_missing", 404)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        rows.append(f"- outputs/{normalized}")
+    return (
+        "〔系统附件清单，仅供本轮执行，不要向用户复述文件上传过程或内部路径〕\n"
+        "只允许使用下列当前会话附件；禁止扫描、枚举或猜测 outputs/_inbox "
+        "中的其他文件：\n"
+        + "\n".join(rows)
+        + "\n需要纳入内容项目时，将清单内文件复制到 outputs/<项目>/assets/ "
+          "后再使用；保留 inbox 原件，确保重试仍可复现。"
+    )
+
+
+def _prompt(message: str, persona: str | None, manifest: str) -> str:
+    text = message.strip()
+    if manifest:
+        text = f"{text}\n\n{manifest}" if text else manifest
+    if not text:
+        raise _invalid("message_required")
+    if persona:
+        try:
+            from easel.persona import chat_turn_message
+            return chat_turn_message(text, persona)
+        except (ImportError, OSError):
+            pass
+    return text
+
+
+def _sandbox(value: object) -> str:
+    if value is None:
+        return "workspace-write"
+    if value not in ("read-only", "workspace-write", "danger-full-access"):
+        raise _invalid("agent_config_invalid")
+    return str(value)
+
+
+def _command(value: object, runtime: str) -> tuple[str, ...]:
+    if value is None:
+        if runtime == "acp":
+            raise _invalid("managed_command_required")
+        return ()
+    if (not isinstance(value, (list, tuple)) or not value
+            or len(value) > 64
+            or not all(isinstance(part, str) and part and len(part) <= 4096
+                       and "\0" not in part and "\n" not in part
+                       and "\r" not in part for part in value)):
+        raise _invalid("managed_command_invalid")
+    return tuple(value)
+
+
+def _timeout(value: object) -> int:
+    if value is None:
+        return _DEFAULT_TIMEOUT
+    if type(value) is not int or not 1 <= value <= _MAX_TIMEOUT:
+        raise _invalid("agent_config_invalid")
+    return value
+
+
+def _sensitive_values(snapshot: RunSnapshot) -> tuple[str, ...]:
+    values: set[str] = set()
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            if len(value) >= 6:
+                values.add(value)
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                if isinstance(key, str) and any(
+                        marker in key.upper()
+                        for marker in ("TOKEN", "SECRET", "KEY", "PASSWORD")):
+                    collect(item)
+                elif isinstance(item, Mapping):
+                    collect(item)
+
+    collect(snapshot.routes)
+    collect(snapshot.agent)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _scrub(text: str, secrets: tuple[str, ...]) -> str:
+    for secret in secrets:
+        text = text.replace(secret, "[redacted]")
+    return text
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """一次执行的不可变身份；适配器只能看到本 Run 的内容。"""
+
+    workspace_id: str
+    run_id: str
+    conversation_id: str
+    task_type: str
+    snapshot: RunSnapshot
+    runtime: str
+    native_id: str
+    persona: str | None
+    attachments: tuple[dict[str, str], ...]
+
+
+# ---------------------------------------------------------------------------
+# 持久接纳、状态、事件与问题
+# ---------------------------------------------------------------------------
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_admissions (
+    workspace_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    nonce TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT,
+    snapshot_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS run_events (
+    workspace_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    event_id INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS run_questions (
+    workspace_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    answers_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, question_id)
+);
+"""
+
+
+class RunRegistry:
+    """worker 侧唯一的 Run 账本；不复制 control 的容量/ID 表。"""
+
+    def __init__(self, path: Path | str, workspace_id: str, *,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.workspace_id = workspace_id
+        self._clock = clock
+        with closing(self._connect()) as connection:
+            connection.executescript(_SCHEMA)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            str(self.path), timeout=10, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    def _now(self) -> int:
+        return int(self._clock())
+
+    def _append_locked(self, connection: sqlite3.Connection, run_id: str,
+                       event: str, data: object, now: int) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(event_id), 0) + 1 FROM run_events"
+            " WHERE workspace_id = ? AND run_id = ?",
+            (self.workspace_id, run_id)).fetchone()
+        event_id = int(row[0])
+        connection.execute(
+            "INSERT INTO run_events"
+            " (workspace_id, run_id, event_id, event, data_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (self.workspace_id, run_id, event_id, event,
+             json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+             now))
+        return event_id
+
+    def admit(self, snapshot: RunSnapshot, snapshot_json: str) -> dict:
+        """原子接纳；重复同 nonce+同内容返回原状态，其它重用 409。"""
+        fingerprint = run_snapshot_fingerprint(snapshot)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT nonce, fingerprint, state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, snapshot.run_id)).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO run_admissions"
+                        " (workspace_id, run_id, conversation_id,"
+                        " input_digest, task_type, revision, nonce,"
+                        " fingerprint, state, snapshot_json, created_at,"
+                        " updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?)",
+                        (self.workspace_id, snapshot.run_id,
+                         snapshot.conversation_id, snapshot.input_digest,
+                         snapshot.task_type, snapshot.revision,
+                         snapshot.nonce, fingerprint, snapshot_json,
+                         now, now))
+                    self._append_locked(
+                        connection, snapshot.run_id, "state",
+                        {"state": "accepted"}, now)
+                    connection.execute("COMMIT")
+                    return {"state": "accepted", "duplicate": False}
+                if (row["nonce"] == snapshot.nonce
+                        and row["fingerprint"] == fingerprint):
+                    connection.execute("COMMIT")
+                    return {"state": row["state"], "duplicate": True}
+                connection.execute("ROLLBACK")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+        raise DomainError("snapshot_conflict", 409)
+
+    def claim(self, run_id: str, snapshot: RunSnapshot) -> bool:
+        """accepted→running 的唯一认领；重复/并发读同一行只成功一次。"""
+        fingerprint = run_snapshot_fingerprint(snapshot)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT nonce, fingerprint, state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if (row is None or row["state"] != "accepted"
+                        or row["nonce"] != snapshot.nonce
+                        or row["fingerprint"] != fingerprint):
+                    connection.execute("COMMIT")
+                    return False
+                connection.execute(
+                    "UPDATE run_admissions SET state = 'running',"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
+                    (now, self.workspace_id, run_id))
+                self._append_locked(
+                    connection, run_id, "state", {"state": "running"}, now)
+                connection.execute("COMMIT")
+                return True
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def state(self, run_id: str) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT state FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+        return None if row is None else str(row["state"])
+
+    def admission(self, run_id: str) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+        if row is None:
+            return None
+        return {
+            "runId": row["run_id"],
+            "conversationId": row["conversation_id"],
+            "inputDigest": row["input_digest"],
+            "taskType": row["task_type"],
+            "revision": row["revision"],
+            "nonce": row["nonce"],
+            "fingerprint": row["fingerprint"],
+            "state": row["state"],
+            "reason": row["reason"],
+            "snapshot": json.loads(row["snapshot_json"]),
+        }
+
+    def transition(self, run_id: str, expected: tuple[str, ...], state: str,
+                   reason: str | None = None) -> bool:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if row is None or row["state"] not in expected:
+                    connection.execute("COMMIT")
+                    return False
+                connection.execute(
+                    "UPDATE run_admissions SET state = ?, reason = ?,"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
+                    (state, reason, now, self.workspace_id, run_id))
+                data: dict[str, object] = {"state": state}
+                if reason:
+                    data["reason"] = reason
+                self._append_locked(connection, run_id, "state", data, now)
+                connection.execute("COMMIT")
+                return True
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def finish_if_active(self, run_id: str, state: str,
+                         reason: str | None = None) -> bool:
+        if state not in TERMINAL_STATES:
+            raise ValueError("finish_if_active requires a terminal state")
+        return self.transition(run_id, ACTIVE_STATES, state, reason)
+
+    def fail_after_output_error(self, run_id: str) -> bool:
+        """输出落盘失败：把已完成的 done 明确降级为 failed。"""
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if row is None or row["state"] != "done":
+                    connection.execute("COMMIT")
+                    return False
+                connection.execute(
+                    "UPDATE run_admissions SET state = 'failed',"
+                    " reason = 'output_storage_failed', updated_at = ?"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (now, self.workspace_id, run_id))
+                self._append_locked(
+                    connection, run_id, "state",
+                    {"state": "failed", "reason": "output_storage_failed"},
+                    now)
+                connection.execute("COMMIT")
+                return True
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def append_event(self, run_id: str, event: str, data: object) -> int | None:
+        """终态后冻结业务事件；返回 None 表示被终态拦截。"""
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if row is None or row["state"] in TERMINAL_STATES:
+                    connection.execute("COMMIT")
+                    return None
+                event_id = self._append_locked(
+                    connection, run_id, event, data, now)
+                connection.execute("COMMIT")
+                return event_id
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def events(self, run_id: str, after: int = 0) -> dict:
+        if type(after) is not int or after < 0:
+            raise _invalid("invalid_cursor")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT state FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+            if row is None:
+                raise DomainError("run_not_found", 404)
+            maximum = connection.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM run_events"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()[0]
+            if after > int(maximum):
+                raise _invalid("invalid_cursor")
+            rows = connection.execute(
+                "SELECT event_id, event, data_json FROM run_events"
+                " WHERE workspace_id = ? AND run_id = ? AND event_id > ?"
+                " ORDER BY event_id",
+                (self.workspace_id, run_id, after)).fetchall()
+        events = [{
+            "eventId": int(item["event_id"]),
+            "event": item["event"],
+            "data": json.loads(item["data_json"]),
+        } for item in rows]
+        return {
+            "runId": run_id,
+            "state": row["state"],
+            "events": events,
+            "lastEventId": int(maximum),
+        }
+
+    # -- 问题 --------------------------------------------------------------
+
+    def open_question(self, run_id: str, question_id: str,
+                      payload: dict, event_data: object) -> bool:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if row is None or row["state"] not in (
+                        "running", "awaiting_permission"):
+                    connection.execute("COMMIT")
+                    return False
+                connection.execute(
+                    "INSERT INTO run_questions"
+                    " (workspace_id, run_id, question_id, payload_json,"
+                    " status, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                    (self.workspace_id, run_id, question_id,
+                     json.dumps(payload, ensure_ascii=False,
+                                separators=(",", ":")), now, now))
+                if row["state"] != "awaiting_permission":
+                    connection.execute(
+                        "UPDATE run_admissions SET state ="
+                        " 'awaiting_permission', updated_at = ?"
+                        " WHERE workspace_id = ? AND run_id = ?",
+                        (now, self.workspace_id, run_id))
+                    self._append_locked(
+                        connection, run_id, "state",
+                        {"state": "awaiting_permission"}, now)
+                self._append_locked(
+                    connection, run_id, "question", event_data, now)
+                connection.execute("COMMIT")
+                return True
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def answer(self, run_id: str, question_id: str,
+               answers: Mapping[str, list[str]]) -> dict:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT status, payload_json FROM run_questions"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND question_id = ?",
+                    (self.workspace_id, run_id, question_id)).fetchone()
+                if row is None:
+                    connection.execute("COMMIT")
+                    raise DomainError("question_not_found", 404)
+                if row["status"] == "resolved":
+                    connection.execute("COMMIT")
+                    raise DomainError("question_resolved", 409)
+                if row["status"] != "pending":
+                    connection.execute("COMMIT")
+                    raise DomainError("question_expired", 409)
+                run = connection.execute(
+                    "SELECT state FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if run is None or run["state"] != "awaiting_permission":
+                    connection.execute(
+                        "UPDATE run_questions SET status = 'expired',"
+                        " updated_at = ? WHERE workspace_id = ?"
+                        " AND run_id = ? AND question_id = ?",
+                        (now, self.workspace_id, run_id, question_id))
+                    connection.execute("COMMIT")
+                    raise DomainError("question_expired", 409)
+                payload = json.loads(row["payload_json"])
+                required = set(_question_keys(payload.get("questions") or []))
+                if set(answers) != required:
+                    connection.execute("COMMIT")
+                    raise _invalid("question_answer_mismatch")
+                connection.execute(
+                    "UPDATE run_questions SET status = 'resolved',"
+                    " answers_json = ?, updated_at = ?"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND question_id = ? AND status = 'pending'",
+                    (json.dumps(dict(answers), ensure_ascii=False,
+                                separators=(",", ":")),
+                     now, self.workspace_id, run_id, question_id))
+                connection.execute(
+                    "UPDATE run_admissions SET state = 'running',"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
+                    (now, self.workspace_id, run_id))
+                self._append_locked(
+                    connection, run_id, "state", {"state": "running"}, now)
+                connection.execute("COMMIT")
+                return {"ok": True, "status": "resolved"}
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def expire_question(self, run_id: str, question_id: str) -> None:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "UPDATE run_questions SET status = 'expired',"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND question_id = ? AND status = 'pending'",
+                    (now, self.workspace_id, run_id, question_id))
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def question_status(self, run_id: str,
+                        question_ids: list[str]) -> dict:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT state FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+            if row is None:
+                raise DomainError("run_not_found", 404)
+            found: dict[str, str] = {}
+            for question_id in question_ids:
+                question = connection.execute(
+                    "SELECT status FROM run_questions"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND question_id = ?",
+                    (self.workspace_id, run_id, question_id)).fetchone()
+                found[question_id] = (
+                    "not_found" if question is None else question["status"])
+        return {"ok": True, "questions": {
+            question_id: {"status": status}
+            for question_id, status in found.items()}}
+
+    # -- 恢复 --------------------------------------------------------------
+
+    def recover_inflight(self, reason: str = "worker_restarted") -> list[str]:
+        """进程重载：残留活跃 Run 明确转 interrupted，问题作废。"""
+        now = self._now()
+        recovered: list[str] = []
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT run_id FROM run_admissions"
+                    " WHERE workspace_id = ? AND state IN"
+                    " ('accepted', 'running', 'awaiting_permission')",
+                    (self.workspace_id,)).fetchall()
+                for row in rows:
+                    run_id = str(row["run_id"])
+                    connection.execute(
+                        "UPDATE run_admissions SET state = 'interrupted',"
+                        " reason = ?, updated_at = ?"
+                        " WHERE workspace_id = ? AND run_id = ?",
+                        (reason, now, self.workspace_id, run_id))
+                    self._append_locked(
+                        connection, run_id, "state",
+                        {"state": "interrupted", "reason": reason}, now)
+                    recovered.append(run_id)
+                connection.execute(
+                    "UPDATE run_questions SET status = 'expired',"
+                    " updated_at = ? WHERE workspace_id = ?"
+                    " AND status = 'pending'",
+                    (now, self.workspace_id))
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+        return recovered
+
+
+def _question_keys(questions: list) -> list[str]:
+    keys: list[str] = []
+    for index, question in enumerate(questions):
+        if not isinstance(question, Mapping):
+            raise _invalid("question_invalid")
+        key = question.get("questionId", question.get("id", str(index)))
+        if not isinstance(key, str) or not key or len(key) > 256:
+            raise _invalid("question_invalid")
+        keys.append(key)
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# 执行管理
+# ---------------------------------------------------------------------------
+
+
+class RunManager:
+    """逐 Run 接纳与执行；一个进程内只维护一份持久登记。"""
+
+    def __init__(self, *, workspace_id: str, paths: WorkspacePaths,
+                 public_key, sessions: WorkspaceSessionStore | None = None,
+                 executor: Executor | None = None,
+                 base_env: Mapping[str, str] | None = None,
+                 clock: Callable[[], float] = time.time,
+                 native_binding_version: int = 1,
+                 question_timeout: int = _DEFAULT_TIMEOUT,
+                 recover: bool = True) -> None:
+        if not isinstance(paths, WorkspacePaths):
+            raise TypeError("paths must be WorkspacePaths")
+        if type(native_binding_version) is not int or native_binding_version < 1:
+            raise ValueError("native_binding_version must be positive")
+        if type(question_timeout) is not int or not 1 <= question_timeout <= _MAX_TIMEOUT:
+            raise ValueError("question_timeout out of range")
+        self.workspace_id = workspace_id
+        self._paths = paths
+        self._public_key = public_key
+        self._sessions = sessions or WorkspaceSessionStore(
+            paths.state_root, workspace_id)
+        self._custom_executor = executor is not None
+        self._executor = executor or _harness_executor
+        self._base_env = dict(base_env if base_env is not None else os.environ)
+        self._clock = clock
+        self._native_version = native_binding_version
+        self._question_timeout = question_timeout
+        self.registry = RunRegistry(
+            paths.state_root / "runs.sqlite3", workspace_id, clock=clock)
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._questions: dict[tuple[str, str], asyncio.Future] = {}
+        self._active_conversations: dict[str, str] = {}
+        self._closing = False
+        if recover:
+            self.registry.recover_inflight()
+
+    # -- 公开只读接口 ------------------------------------------------------
+
+    def state(self, run_id: str) -> str | None:
+        return self.registry.state(run_id)
+
+    def admission(self, run_id: str) -> dict | None:
+        return self.registry.admission(run_id)
+
+    def events(self, run_id: str, after: int = 0) -> dict:
+        return self.registry.events(run_id, after)
+
+    def question_status(self, run_id: str,
+                        question_ids: list[str]) -> dict:
+        return self.registry.question_status(run_id, question_ids)
+
+    def messages(self, session_id: str, *, limit: int = 100,
+                 offset: int = 0) -> dict:
+        return {
+            "sessionId": session_id,
+            "messages": self._sessions.messages(
+                session_id, limit=limit, offset=offset),
+        }
+
+    # -- 接纳 --------------------------------------------------------------
+
+    def _verify(self, run_id: str, envelope: object,
+                request: object) -> tuple[dict, RunSnapshot, dict]:
+        if self._public_key is None:
+            raise DomainError("capability_unavailable", 503)
+        if not isinstance(envelope, dict) or not isinstance(request, dict):
+            raise _invalid()
+        conversation_id = _text(request.get("sessionId"), maximum=256)
+        task_type = _text(request.get("taskType"), maximum=32)
+        if task_type not in RUN_TASK_TYPES:
+            raise _invalid()
+        message = request.get("message")
+        if not isinstance(message, str) or not message:
+            raise _invalid("message_required")
+        attachments = _normalize_attachments(request.get("attachments"))
+        persona = _optional_text(request.get("persona"), maximum=200)
+        digest = run_input_digest(
+            conversation_id=conversation_id, task_type=task_type,
+            message=message, attachments=list(attachments), persona=persona)
+        supplied_digest = request.get("inputDigest")
+        if not isinstance(supplied_digest, str) or supplied_digest != digest:
+            raise _invalid("input_digest_mismatch")
+        snapshot = verify_run_snapshot(
+            envelope, self._public_key,
+            expected_workspace_id=self.workspace_id,
+            expected_run_id=run_id,
+            expected_conversation_id=conversation_id,
+            expected_input_digest=digest,
+            expected_task_type=task_type,
+            now=int(self._clock()))
+        self._sessions.validate_message({
+            "role": "user",
+            "content": message.strip(),
+            "attachments": list(attachments),
+        })
+        normalized = {
+            "sessionId": conversation_id,
+            "taskType": task_type,
+            "message": message,
+            "attachments": attachments,
+            "persona": persona,
+        }
+        return envelope, snapshot, normalized
+
+    async def submit(self, run_id: str, envelope: object,
+                     request: object) -> dict:
+        envelope, snapshot, normalized = self._verify(
+            run_id, envelope, request)
+        admission = self.registry.admit(
+            snapshot, json.dumps(envelope, sort_keys=True,
+                                 separators=(",", ":")))
+        if admission["duplicate"]:
+            return {"runId": run_id, "state": admission["state"],
+                    "duplicate": True}
+        if not self.registry.claim(run_id, snapshot):
+            return {"runId": run_id, "state": self.registry.state(run_id),
+                    "duplicate": True}
+        try:
+            context, run_request = self._prepare(snapshot, normalized)
+        except DomainError as error:
+            self.registry.finish_if_active(
+                run_id, "failed", "admission_rejected")
+            raise error
+        task = asyncio.create_task(
+            self._supervise(context, run_request),
+            name=f"easel-run:{run_id}")
+        self._tasks[run_id] = task
+
+        def _cleanup(finished: asyncio.Task) -> None:
+            if self._tasks.get(run_id) is finished:
+                self._tasks.pop(run_id, None)
+
+        task.add_done_callback(_cleanup)
+        return {"runId": run_id, "state": "running", "duplicate": False}
+
+    def _prepare(self, snapshot: RunSnapshot, request: dict
+                 ) -> tuple[RunContext, RunRequest]:
+        agent = snapshot.agent
+        runtime = agent.get("runtime")
+        if runtime not in SUPPORTED_RUNTIMES:
+            raise _invalid("agent_runtime_unsupported")
+        if not self._custom_executor and runtime not in (
+                "acp", "opencode", "codex"):
+            raise DomainError("capability_unavailable", 503)
+        conversation_id = request["sessionId"]
+        if conversation_id in self._active_conversations:
+            raise DomainError("conversation_busy", 409)
+        command = _command(agent.get("command"), str(runtime))
+        model = agent.get("model")
+        if model is not None and (not isinstance(model, str)
+                                  or len(model) > 256):
+            raise _invalid("agent_config_invalid")
+        sandbox = _sandbox(agent.get("sandbox"))
+        timeout = _timeout(agent.get("timeout"))
+        auto_approve = agent.get("codex_auto_approve")
+        if auto_approve is not None and type(auto_approve) is not bool:
+            raise _invalid("agent_config_invalid")
+
+        binding = self._sessions.binding(conversation_id)
+        native_id = ""
+        if binding:
+            if binding.get("runtime") != runtime:
+                raise DomainError("session_binding_conflict", 409)
+            if binding.get("agent_version") != self._native_version:
+                raise DomainError("session_version_unsupported", 409)
+            native_id = binding.get("native_id") or ""
+            if not native_id and self._sessions.messages(
+                    conversation_id, limit=1):
+                raise DomainError("session_binding_incomplete", 409)
+        else:
+            self._sessions.bind(
+                conversation_id, str(runtime), "", self._native_version,
+                cwd=str(self._paths.workspace_root))
+
+        manifest = _attachment_context(
+            self._paths, conversation_id, request["attachments"])
+        prompt = _prompt(request["message"], request["persona"], manifest)
+        user_message: dict[str, object] = {
+            "role": "user", "content": request["message"].strip()}
+        if request["attachments"]:
+            user_message["attachments"] = list(request["attachments"])
+        self._sessions.append_message(conversation_id, user_message)
+
+        config = WorkerConfigSnapshot(
+            workspace_id=snapshot.workspace_id,
+            run_id=snapshot.run_id,
+            revision=snapshot.revision,
+            routes=snapshot.routes,
+            agent=snapshot.agent,
+            nonce=snapshot.nonce,
+            expires_at=snapshot.expires_at,
+        )
+        env = build_run_env(self._paths, config, self._base_env)
+        run_request = RunRequest(
+            prompt=prompt,
+            cwd=self._paths.workspace_root,
+            env=env,
+            native_id=native_id,
+            model=model or "",
+            sandbox=sandbox,
+            timeout=timeout,
+            command=command,
+            session_key=conversation_id,
+            codex_auto_approve=bool(auto_approve),
+            workspace_id=self.workspace_id,
+            code_root=self._paths.code_root,
+        )
+        context = RunContext(
+            workspace_id=self.workspace_id,
+            run_id=snapshot.run_id,
+            conversation_id=conversation_id,
+            task_type=snapshot.task_type,
+            snapshot=snapshot,
+            runtime=str(runtime),
+            native_id=native_id,
+            persona=request["persona"],
+            attachments=request["attachments"],
+        )
+        self._active_conversations[conversation_id] = snapshot.run_id
+        return context, run_request
+
+    # -- 执行 --------------------------------------------------------------
+
+    def _emit_for(self, context: RunContext, chunks: list[str],
+                  secrets: tuple[str, ...]) -> Emit:
+        def emit(kind: str, text: object) -> None:
+            if kind not in _EVENT_KINDS:
+                kind = "activity"
+            if not isinstance(text, str):
+                text = json.dumps(text, ensure_ascii=False)
+            text = _scrub(text, secrets)
+            if kind == "token":
+                chunks.append(text)
+            self.registry.append_event(context.run_id, kind, text)
+
+        return emit
+
+    def _bind_for(self, context: RunContext) -> Bind:
+        def bind(native_id: str) -> None:
+            if (not isinstance(native_id, str) or not native_id
+                    or len(native_id) > 512
+                    or any(character in native_id
+                           for character in ("\0", "\n", "\r", "\t"))):
+                raise _invalid("native_id_invalid")
+            self._sessions.bind(
+                context.conversation_id, context.runtime, native_id,
+                self._native_version,
+                cwd=str(self._paths.workspace_root))
+
+        return bind
+
+    def _ask_for(self, context: RunContext) -> Ask:
+        async def ask(questions: list[dict]) -> dict[str, list[str]]:
+            if (not isinstance(questions, list) or not questions
+                    or len(questions) > 20):
+                raise _invalid("question_invalid")
+            if not all(isinstance(item, dict) for item in questions):
+                raise _invalid("question_invalid")
+            _question_keys(questions)
+            question_id = "runq_" + uuid.uuid4().hex
+            payload = {"id": question_id, "questions": questions}
+            key = (context.run_id, question_id)
+            future = asyncio.get_running_loop().create_future()
+            self._questions[key] = future
+            opened = self.registry.open_question(
+                context.run_id, question_id, payload,
+                json.dumps(payload, ensure_ascii=False))
+            if not opened:
+                self._questions.pop(key, None)
+                raise DomainError("run_not_active", 409)
+            try:
+                return await asyncio.wait_for(
+                    future, timeout=self._question_timeout)
+            except asyncio.TimeoutError:
+                self.registry.expire_question(context.run_id, question_id)
+                raise
+            finally:
+                self._questions.pop(key, None)
+                self.registry.expire_question(context.run_id, question_id)
+
+        return ask
+
+    async def _supervise(self, context: RunContext,
+                         request: RunRequest) -> None:
+        run_id = context.run_id
+        chunks: list[str] = []
+        secrets = _sensitive_values(context.snapshot)
+        emit = self._emit_for(context, chunks, secrets)
+        bind = self._bind_for(context)
+        ask = self._ask_for(context)
+
+        try:
+            result = await asyncio.wait_for(
+                self._executor(request, context, bind, emit, ask),
+                timeout=request.timeout)
+        except asyncio.CancelledError:
+            self.registry.finish_if_active(run_id, "cancelled", "stopped")
+            raise
+        except asyncio.TimeoutError:
+            emit("error", "Agent 执行超时，已终止本轮进程")
+            self.registry.finish_if_active(run_id, "failed", "timeout")
+            self._release(context)
+            return
+        except DomainError as error:
+            emit("error", error.code)
+            self.registry.finish_if_active(
+                run_id, "failed", error.code)
+            self._release(context)
+            return
+        except Exception:
+            emit("error", "Agent 执行失败，请检查本机 CLI、登录和模型配置")
+            self.registry.finish_if_active(run_id, "failed", "agent_failed")
+            self._release(context)
+            return
+
+        try:
+            text = result if isinstance(result, str) else "".join(chunks)
+            if not self.registry.finish_if_active(run_id, "done", "completed"):
+                self._release(context)
+                return
+            self._sessions.append_message(
+                context.conversation_id,
+                {"role": "assistant", "content": text})
+        except DomainError:
+            self.registry.fail_after_output_error(run_id)
+            self.registry.append_event(run_id, "error", "输出保存失败")
+        finally:
+            self._release(context)
+
+    def _release(self, context: RunContext) -> None:
+        if self._active_conversations.get(context.conversation_id) == \
+                context.run_id:
+            self._active_conversations.pop(context.conversation_id, None)
+
+    # -- 控制入口 ----------------------------------------------------------
+
+    async def stop(self, run_id: str) -> dict:
+        state = self.registry.state(run_id)
+        if state is None:
+            raise DomainError("run_not_found", 404)
+        if state in TERMINAL_STATES:
+            return {"runId": run_id, "state": state}
+        self.registry.finish_if_active(run_id, "cancelled", "stop_requested")
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            task.cancel()
+        return {"runId": run_id, "state": "cancelled"}
+
+    async def answer(self, run_id: str, question_id: str,
+                     answers: object) -> dict:
+        if not isinstance(answers, dict):
+            raise _invalid("question_answer_invalid")
+        for key, values in answers.items():
+            if (not isinstance(key, str)
+                    or not isinstance(values, list)
+                    or not all(isinstance(item, str) for item in values)):
+                raise _invalid("question_answer_invalid")
+        key = (run_id, question_id)
+        if key not in self._questions:
+            raise DomainError("question_unavailable", 409)
+        result = self.registry.answer(
+            run_id, question_id, {str(k): list(v)
+                                  for k, v in answers.items()})
+        future = self._questions.pop(key, None)
+        if future is not None and not future.done():
+            future.set_result({str(k): list(v)
+                               for k, v in answers.items()})
+        return result
+
+    async def aclose(self) -> None:
+        """worker 关闭：取消在途 supervisor，并把残留 Run 标 interrupted。"""
+        self._closing = True
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.registry.recover_inflight("worker_shutdown")
+        self._tasks.clear()
+        self._questions.clear()
+        self._active_conversations.clear()
+
+
+# ---------------------------------------------------------------------------
+# 默认适配器执行器
+# ---------------------------------------------------------------------------
+
+
+async def _harness_executor(request: RunRequest, context: RunContext,
+                            bind: Bind, emit: Emit,
+                            ask: Ask) -> str | None:
+    from easel import harnesses
+
+    adapter = harnesses.adapter(context.runtime)
+    await adapter.run(request, emit, ask, bind)
+    return None

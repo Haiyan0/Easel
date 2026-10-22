@@ -57,9 +57,11 @@ from easel.harnesses.base import HarnessError, RunRequest
 from easel.control.policy import worker_allowed
 from easel.control.types import DomainError
 from easel.worker.config import (SnapshotAdmissionStore, WorkerConfigSnapshot,
-                                 build_run_env, load_worker_snapshot)
+                                 build_run_env, load_public_key,
+                                 load_worker_snapshot)
 from easel.worker.context import resolve_paths, service_mode
 from easel.worker.guard import load_worker_identity, verify_worker_request
+from easel.worker.runs import RunManager
 from easel.worker.sessions import MAX_ATTACHMENTS, WorkspaceSessionStore
 
 # worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
@@ -68,6 +70,8 @@ _RUNTIME_PATHS = resolve_paths(os.environ, PROJECT_ROOT)
 _SERVICE_MODE = service_mode(os.environ)
 _WORKER_SNAPSHOT: WorkerConfigSnapshot | None = None
 _WORKER_ADMISSION: dict | None = None
+_RUNS: RunManager | None = None
+"""常驻 worker 的逐 Run 管理器；旧单 Run 启动模式与 local 模式为空。"""
 
 WORKER_SNAPSHOT_FILE_ENV = "EASEL_WORKER_SNAPSHOT_FILE"
 WORKER_PUBLIC_KEY_FILE_ENV = "EASEL_WORKER_PUBLIC_KEY_FILE"
@@ -75,7 +79,11 @@ WORKER_PUBLIC_KEY_FILE_ENV = "EASEL_WORKER_PUBLIC_KEY_FILE"
 
 def _workspace_namespace() -> str:
     """RPC 进程池/关闭使用的 workspace namespace；local 为空。"""
-    return _WORKER_SNAPSHOT.workspace_id if _WORKER_SNAPSHOT is not None else ""
+    if _WORKER_SNAPSHOT is not None:
+        return _WORKER_SNAPSHOT.workspace_id
+    if _WORKER_IDENTITY is not None:
+        return _WORKER_IDENTITY.workspace_id
+    return ""
 
 
 NATIVE_BINDING_VERSION = 1
@@ -190,16 +198,26 @@ def _check_worker_upload_count(files: list[UploadFile]) -> None:
             400, f"worker 单次最多上传 {MAX_ATTACHMENTS} 个附件")
 
 
-def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
-    """启动时加载唯一受管快照：缺文件/公钥/run 或验签失败即失败关闭。"""
+def _load_worker_runtime() -> tuple[WorkerConfigSnapshot | None, dict | None]:
+    """加载 worker 启动配置。
+
+    * 同时给出快照文件与 EASEL_RUN_ID：保留旧单 Run 启动模式。
+    * 两者都不给出：常驻模式，仅加载固定身份与只读公钥，逐 Run 快照由
+      ``POST /internal/runs/{id}`` 验签接纳。
+    * 只给出其一、缺公钥或固定身份：失败关闭，不回退 local。
+    """
     snapshot_file = (os.environ.get(WORKER_SNAPSHOT_FILE_ENV) or "").strip()
     public_key_file = (os.environ.get(WORKER_PUBLIC_KEY_FILE_ENV) or "").strip()
     run_id = (os.environ.get("EASEL_RUN_ID") or "").strip()
-    if not snapshot_file or not public_key_file or not run_id:
-        raise RuntimeError(
-            "worker 模式必须显式配置受管快照文件、公钥文件和 EASEL_RUN_ID")
+    if not public_key_file:
+        raise RuntimeError("worker 模式必须显式配置只读公钥文件")
     if _WORKER_IDENTITY is None:
         raise RuntimeError("worker 受管快照需要固定 worker 身份")
+    if not snapshot_file and not run_id:
+        return None, None
+    if not snapshot_file or not run_id:
+        raise RuntimeError(
+            "worker 单 Run 模式必须同时配置受管快照文件与 EASEL_RUN_ID")
     snapshot = load_worker_snapshot(
         snapshot_file, public_key_file,
         expected_workspace_id=_WORKER_IDENTITY.workspace_id,
@@ -208,6 +226,26 @@ def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
         _RUNTIME_PATHS.state_root / "snapshot_admissions.sqlite3"
     ).admit(snapshot)
     return snapshot, admission
+
+
+def _load_run_manager() -> RunManager:
+    """常驻 worker：固定身份 + 只读公钥 + 逐 Run 持久接纳。"""
+    public_key_file = (os.environ.get(WORKER_PUBLIC_KEY_FILE_ENV) or "").strip()
+    if _WORKER_IDENTITY is None or not public_key_file:
+        raise RuntimeError("常驻 worker 缺少固定身份或只读公钥")
+    try:
+        public_key = load_public_key(public_key_file)
+    except DomainError:
+        raise RuntimeError("常驻 worker 只读公钥不可用") from None
+    return RunManager(
+        workspace_id=_WORKER_IDENTITY.workspace_id,
+        paths=_RUNTIME_PATHS,
+        public_key=public_key,
+        sessions=WorkspaceSessionStore(
+            _RUNTIME_PATHS.state_root, _WORKER_IDENTITY.workspace_id),
+        base_env=os.environ,
+        native_binding_version=NATIVE_BINDING_VERSION,
+    )
 
 
 class _WorkerExecutionRejected(Exception):
@@ -255,6 +293,8 @@ def _worker_execution_claim() -> None:
 
 if _SERVICE_MODE == "worker":
     _WORKER_SNAPSHOT, _WORKER_ADMISSION = _load_worker_runtime()
+    if _WORKER_SNAPSHOT is None:
+        _RUNS = _load_run_manager()
 try:
     from easel.gateway_questions import (
         GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
@@ -3375,6 +3415,9 @@ async def _harness_ask(sk: str, questions: list[dict], emit) -> dict:
 async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: str,
                             config: dict, emit, timeout: int = TIMEOUT_CHAT, *,
                             interactive=True, execution_claimed=False) -> str:
+    # 常驻 worker 只接受逐 Run 签名接纳；旧聊天入口不得绕过任务账本。
+    if _WORKER_IDENTITY is not None and _WORKER_SNAPSHOT is None:
+        raise HTTPException(409, "常驻 worker 只接受逐 Run 授权任务")
     # 非流式入口在调用本函数前尚未认领；输入错误必须原样返回 4xx。
     _validate_worker_chat_input(req)
     pk = f"web:{sk}"
@@ -6095,6 +6138,115 @@ async def api_ideas_delete(iid: str):
         raise HTTPException(404, "选题不存在")
     _write_ideas(new)
     return {"ok": True, "deleted": iid}
+
+
+# ---------------------------------------------------------------------------
+# 常驻 worker 内部路由：服务凭证之后还须逐 Run 签名与 workspace/run 绑定
+# ---------------------------------------------------------------------------
+
+
+def _run_manager() -> RunManager:
+    if _RUNS is None:
+        raise HTTPException(503, "run capability unavailable")
+    return _RUNS
+
+
+def _run_http_error(error: DomainError) -> HTTPException:
+    return HTTPException(error.status, error.code)
+
+
+@app.post("/internal/runs/{run_id}")
+async def api_internal_run_submit(run_id: str, request: Request):
+    """接纳并启动一个已验签的逐 Run 任务；返回后 supervisor 独立执行。"""
+    manager = _run_manager()
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_request") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid_request")
+    try:
+        result = await manager.submit(
+            run_id, payload.get("envelope"), payload.get("request"))
+    except DomainError as error:
+        raise _run_http_error(error) from error
+    return JSONResponse(result, status_code=202)
+
+
+@app.get("/internal/runs/{run_id}/events")
+async def api_internal_run_events(run_id: str, after: int = 0):
+    manager = _run_manager()
+    try:
+        return manager.events(run_id, after)
+    except DomainError as error:
+        raise _run_http_error(error) from error
+
+
+@app.post("/internal/runs/{run_id}/stop")
+async def api_internal_run_stop(run_id: str, request: Request):
+    manager = _run_manager()
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    admission = manager.admission(run_id)
+    if admission is None:
+        raise HTTPException(404, "run_not_found")
+    session_id = payload.get("sessionId")
+    if session_id is not None and session_id != admission["conversationId"]:
+        raise HTTPException(403, "run_binding_mismatch")
+    try:
+        return await manager.stop(run_id)
+    except DomainError as error:
+        raise _run_http_error(error) from error
+
+
+@app.post("/internal/runs/{run_id}/questions/{question_id}/answer")
+async def api_internal_question_answer(run_id: str, question_id: str,
+                                       request: Request):
+    manager = _run_manager()
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_request") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid_argument")
+    try:
+        return await manager.answer(
+            run_id, question_id, payload.get("answers"))
+    except DomainError as error:
+        raise _run_http_error(error) from error
+
+
+@app.post("/internal/runs/{run_id}/questions/status")
+async def api_internal_question_status(run_id: str, request: Request):
+    manager = _run_manager()
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_request") from None
+    question_ids = payload.get("questionIds") if isinstance(
+        payload, dict) else None
+    if (not isinstance(question_ids, list) or len(question_ids) > 100
+            or any(not isinstance(item, str) or not item
+                   or len(item) > 256 for item in question_ids)):
+        raise HTTPException(400, "invalid_argument")
+    try:
+        return manager.question_status(run_id, list(question_ids))
+    except DomainError as error:
+        raise _run_http_error(error) from error
+
+
+@app.get("/internal/sessions/{session_id}/messages")
+async def api_internal_session_messages(session_id: str, limit: int = 100,
+                                        offset: int = 0):
+    manager = _run_manager()
+    try:
+        return manager.messages(session_id, limit=limit, offset=offset)
+    except DomainError as error:
+        raise _run_http_error(error) from error
 
 
 if __name__ == "__main__":
