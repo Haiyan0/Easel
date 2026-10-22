@@ -16,6 +16,7 @@ import ipaddress
 import json
 import re
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..providers.openai import BROKER_ROUTE_TABLE
+from ..worker.sessions import MAX_MESSAGE_BYTES
 from .auth import AuthService
 from .config import ConfigService
 from .policy import authorize, public_route
@@ -51,6 +53,7 @@ _IMPLEMENTED_EXACT = frozenset({
     ("POST", "/api/settings/models/save"),
     ("GET", "/api/sessions"),
     ("POST", "/api/sessions"),
+    ("POST", "/api/chat"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
@@ -186,6 +189,14 @@ def _broker_route_registered(method: str, path: str) -> bool:
 
 def _config_service(request: Request) -> ConfigService:
     service = getattr(request.app.state, "config_service", None)
+    if service is None:
+        raise DomainError("capability_unavailable", 503)
+    return service
+
+
+def _relay(request: Request):
+    """未装配签名密钥/受管配置时，任务入口明确 503，不回退本地 handler。"""
+    service = getattr(request.app.state, "relay", None)
     if service is None:
         raise DomainError("capability_unavailable", 503)
     return service
@@ -372,7 +383,8 @@ async def _guard_request(request: Request, call_next):
 def create_app(*, store: Store, auth: AuthService,
                config: ControlConfig | None = None,
                config_service: ConfigService | None = None,
-               runtime=None, broker=None, provisioner=None) -> FastAPI:
+               runtime=None, broker=None, provisioner=None,
+               relay_factory: Callable[..., object] | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
     传入的 ``store`` 提供控制库位置；应用在 lifespan 中用专用数据库线程打开
@@ -381,6 +393,9 @@ def create_app(*, store: Store, auth: AuthService,
 
     ``provisioner`` 是受限 provisioner 的客户端；提供时在 lifespan 内用应用
     自己的数据库连接构造 ``RuntimeManager``，避免跨线程复用启动前的连接。
+
+    ``relay_factory`` 接收 ``(runtime, sessions, auth, store)`` 并以位置参数
+    调用；未提供时任务入口保持 503，绝不直通旧本地 handler。
     """
     control_path = Path(store.path).absolute()
     if broker is not None and config_service is None:
@@ -430,6 +445,12 @@ def create_app(*, store: Store, auth: AuthService,
                     db_runner=control_db_runner)
             else:
                 app.state.broker = None
+            if relay_factory is not None:
+                app.state.relay = relay_factory(
+                    app.state.runtime, app.state.sessions,
+                    app.state.auth, app.state.control_store)
+            else:
+                app.state.relay = None
             yield
         finally:
             try:
@@ -616,6 +637,20 @@ def create_app(*, store: Store, auth: AuthService,
         return JSONResponse(
             {"messages": messages},
             headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/chat")
+    async def submit_chat(request: Request):
+        """对话任务唯一公开入口：控制面接纳后由 relay 派发给本人 worker。
+
+        传输上限在消息上限之外预留 JSON 包装余量；真正的输入校验与摘要
+        仍在 relay 内完成，避免浏览器绕过 Run 账本或注入内部字段。
+        """
+        service = _relay(request)
+        payload = await _read_json_body(
+            request, limit=MAX_MESSAGE_BYTES + 65536)
+        result = await service.submit(request.state.identity, payload)
+        return JSONResponse(result, status_code=202,
+                            headers={"Cache-Control": "no-store"})
 
     @app.get("/api/settings/models")
     async def get_model_settings(request: Request):

@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -342,6 +342,23 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "ALTER TABLE runs ADD COLUMN dispatch_nonce TEXT",
         "ALTER TABLE runs ADD COLUMN worker_container_id TEXT",
         "ALTER TABLE runs ADD COLUMN dispatched_at INTEGER",
+    ),
+    # 版本 9：短请求租约。control 转发同步读/写时先登记带过期时间的租约，
+    # 异常或断线在 finally 释放；进程崩溃后租约按 expires_at 自行失效，避免
+    # 空闲回收误删仍有在途请求的 worker。
+    (
+        """
+        CREATE TABLE request_leases (
+            lease_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX request_leases_workspace_idx
+            ON request_leases (workspace_id, expires_at)
+        """,
+        "CREATE INDEX request_leases_expiry_idx ON request_leases (expires_at)",
     ),
 )
 
@@ -826,7 +843,11 @@ class Store:
         return cursor.rowcount == 1
 
     def list_idle_workers(self, now: int, idle_seconds: int) -> list[WorkerLease]:
-        """返回可回收实例：心跳存活、无活跃任务/请求且空闲已超阈值。"""
+        """返回可回收实例：心跳存活、无活跃任务/请求且空闲已超阈值。
+
+        在途短请求由 ``request_leases`` 计数；租约带过期时间，控制进程崩溃
+        未执行释放时也不会永久阻止回收。
+        """
         if type(idle_seconds) is not int or idle_seconds < 0:
             raise DomainError("invalid_argument", 400)
         now = int(now)
@@ -837,10 +858,56 @@ class Store:
             " AND NOT EXISTS (SELECT 1 FROM runs AS run"
             "  WHERE run.workspace_id = lease.workspace_id"
             f"  AND run.status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)}))"
+            " AND NOT EXISTS (SELECT 1 FROM request_leases AS lease_request"
+            "  WHERE lease_request.workspace_id = lease.workspace_id"
+            "  AND lease_request.expires_at > ?)"
             " ORDER BY lease.workspace_id",
-            (now, now - int(idle_seconds), *TERMINAL_RUN_STATUSES)).fetchall()
+            (now, now - int(idle_seconds),
+             *TERMINAL_RUN_STATUSES, now)).fetchall()
         return [lease for lease in (_worker_lease(row) for row in rows)
                 if lease is not None]
+
+    # -- 短请求租约 ---------------------------------------------------------
+
+    def begin_worker_request_lease(self, workspace_id: str, ttl_seconds: int,
+                                   *, now: int | None = None) -> str:
+        """登记一条有期限的在途请求租约；调用方必须在 finally 释放。
+
+        租约只证明“control 正在向该 workspace 转发一个同步短请求”，不授予
+        任何业务权限。过期行在下次登记时顺带清理。
+        """
+        workspace_id = _text(workspace_id)
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 3600:
+            raise DomainError("invalid_argument", 400)
+        stamp = _now() if now is None else int(now)
+        lease_id = uuid.uuid4().hex
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM request_leases WHERE expires_at <= ?", (stamp,))
+            self._connection.execute(
+                "INSERT INTO request_leases (lease_id, workspace_id, expires_at)"
+                " VALUES (?, ?, ?)",
+                (lease_id, workspace_id, stamp + ttl_seconds))
+        return lease_id
+
+    def end_worker_request_lease(self, lease_id: str) -> bool:
+        """释放租约；重复或过期释放返回 False，不产生新状态。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "DELETE FROM request_leases WHERE lease_id = ?",
+                (_text(lease_id),))
+        return cursor.rowcount == 1
+
+    def count_worker_request_leases(self, workspace_id: str, *,
+                                    now: int | None = None) -> int:
+        """统计尚未过期的在途请求；回收判定与异常恢复共用。"""
+        stamp = _now() if now is None else int(now)
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS total FROM request_leases"
+            " WHERE workspace_id = ? AND expires_at > ?",
+            (_text(workspace_id), stamp)).fetchone()
+        return int(row["total"])
+
 
     def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         row = self._connection.execute(
@@ -1805,6 +1872,23 @@ class Store:
                     " WHERE workspace_id = ? AND id = ? AND status NOT IN"
                     f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
                     (workspace_id, run_id, *TERMINAL_RUN_STATUSES))
+            return self._fetch_run(workspace_id, run_id)
+
+    def mark_awaiting_permission(self, actor: Identity, run_id: str) -> RunRecord:
+        """任务进入权限/问答等待；仍属于活跃状态，继续占用容量。
+
+        终态不可回退到等待；重复推进是幂等的，回放不改变任务状态。
+        """
+        workspace_id = self._require_actor(actor)
+        with self._transaction():
+            current = self._fetch_run(workspace_id, run_id)
+            if current.status in TERMINAL_RUN_STATUSES:
+                raise DomainError("terminal_run", 409)
+            self._connection.execute(
+                "UPDATE runs SET status = 'awaiting_permission'"
+                " WHERE workspace_id = ? AND id = ? AND status NOT IN"
+                f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                (workspace_id, run_id, *TERMINAL_RUN_STATUSES))
             return self._fetch_run(workspace_id, run_id)
 
     def mark_interrupted(self, actor: Identity, run_id: str) -> bool:

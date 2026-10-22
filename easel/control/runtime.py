@@ -447,6 +447,10 @@ class RuntimeManager:
         lease = await self._db(self._store.get_worker_lease, workspace_id)
         if lease is not None and lease.active_requests > 0:
             return True
+        if await self._db(
+                self._store.count_worker_request_leases, workspace_id,
+                now=self._now()) > 0:
+            return True
         return await self._db(
             self._store.count_active_runs_for_workspace, workspace_id) > 0
 

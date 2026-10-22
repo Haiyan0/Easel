@@ -16,7 +16,7 @@ import json
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from urllib.parse import urlsplit
@@ -29,6 +29,7 @@ from .auth import AuthService
 from .runtime import RuntimeUnavailable
 from .sessions import SessionService
 from .store import Store
+from .tasks import IMPLEMENTED_TASK_TYPES, entry_for_type
 from .types import DomainError, Identity, RunRecord, WorkerHandle
 
 _DEFAULT_SNAPSHOT_TTL = 1800
@@ -144,6 +145,8 @@ class WorkerRelay:
                  config_provider: PinnedConfigProvider | None = None,
                  http_client: httpx.AsyncClient | None = None,
                  broker=None, db_runner=None,
+                 accepted_task_types: Iterable[str] | None = None,
+                 request_lease_ttl: int = 60,
                  clock: Callable[[], float] = time.time,
                  snapshot_ttl: int = _DEFAULT_SNAPSHOT_TTL) -> None:
         if not isinstance(store, Store):
@@ -156,6 +159,12 @@ class WorkerRelay:
             raise TypeError("config_provider must be callable")
         if type(snapshot_ttl) is not int or not 1 <= snapshot_ttl <= 86400:
             raise ValueError("snapshot_ttl must be an integer in 1..86400")
+        if type(request_lease_ttl) is not int or not 1 <= request_lease_ttl <= 3600:
+            raise ValueError("request_lease_ttl must be an integer in 1..3600")
+        accepted = (IMPLEMENTED_TASK_TYPES if accepted_task_types is None
+                    else frozenset(accepted_task_types))
+        if any(entry_for_type(name) is None for name in accepted):
+            raise ValueError("accepted_task_types contains unknown task type")
         self._runtime = runtime
         self._sessions = sessions
         self._auth = auth
@@ -165,6 +174,8 @@ class WorkerRelay:
         self._http = http_client
         self._broker = broker
         self._db_runner = db_runner
+        self._accepted_task_types = frozenset(accepted)
+        self._request_lease_ttl = request_lease_ttl
         self._clock = clock
         self._snapshot_ttl = snapshot_ttl
 
@@ -221,9 +232,9 @@ class WorkerRelay:
         return config
 
     def _sign(self, run: RunRecord, config: PinnedRunConfig,
-              request: Mapping[str, object]) -> str:
+              request: Mapping[str, object], task_type: str) -> str:
         digest = run_input_digest(
-            conversation_id=run.conversation_id, task_type="chat",
+            conversation_id=run.conversation_id, task_type=task_type,
             message=str(request["message"]),
             attachments=list(request["attachments"]),
             persona=request.get("persona"))
@@ -233,7 +244,7 @@ class WorkerRelay:
             run_id=run.id,
             conversation_id=run.conversation_id,
             input_digest=digest,
-            task_type="chat",
+            task_type=task_type,
             revision=run.config_version,
             routes=dict(config.routes),
             agent=dict(config.agent),
@@ -242,7 +253,7 @@ class WorkerRelay:
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
-    def _stored_envelope(text: str, run: RunRecord) -> dict:
+    def _stored_envelope(text: str, run: RunRecord, task_type: str) -> dict:
         """复核持久快照没有指向别的 Run/会话；持久内容不可被并发替换。"""
         try:
             envelope = json.loads(text)
@@ -252,23 +263,38 @@ class WorkerRelay:
                 or envelope.get("workspace_id") != run.workspace_id
                 or envelope.get("run_id") != run.id
                 or envelope.get("conversation_id") != run.conversation_id
-                or envelope.get("task_type") != "chat"
+                or envelope.get("task_type") != task_type
                 or envelope.get("revision") != run.config_version):
             raise DomainError("snapshot_invalid", 500)
         return envelope
 
     async def submit(self, actor: Identity, payload: object) -> dict:
-        """校验 → 接纳 → 固定签名快照 → 原子认领派发。
+        """对话任务的统一入口；实际接纳走 :meth:`submit_task`。"""
+        return await self.submit_task(actor, "chat", payload)
 
-        返回服务器生成的 run_id。只有第一次认领会向 worker POST；重复提交
-        返回原 Run 的持久状态，不重新 prompt，也不因网络错误自动重发。
+    async def submit_task(self, actor: Identity, task_type: str,
+                          payload: object) -> dict:
+        """校验 → 归属 → worker 就绪 → 接纳 → 固定签名快照 → 原子派发。
+
+        只有 ``accepted_task_types`` 中且装配了业务适配器的类型可以进入账本；
+        未装配类型在保留任何容量、启动 worker 之前明确 503。worker 就绪检查
+        早于 ``reserve_run``，drain 期间的新任务不会留下残留接纳。
         """
-        request = _validate_task(payload, "chat")
+        entry = entry_for_type(task_type)
+        if entry is None:
+            raise DomainError("invalid_argument", 400)
+        if task_type not in self._accepted_task_types:
+            raise DomainError("capability_unavailable", 503)
+        request = _validate_task(payload, task_type)
         config = await self._pinned(actor)
         conversation_id = str(request["sessionId"])
+        # 归属必须早于 worker 启动；reserve_run 在事务内会再次复查
+        await self._db(self._sessions.get_conversation, actor, conversation_id)
+        handle = await self._ensure_workspace_ready(
+            actor.workspace_id, config.revision)
         client_request_id = request["turnId"] or uuid.uuid4().hex
         digest = run_input_digest(
-            conversation_id=conversation_id, task_type="chat",
+            conversation_id=conversation_id, task_type=task_type,
             message=request["message"], attachments=request["attachments"],
             persona=request["persona"])
 
@@ -278,18 +304,20 @@ class WorkerRelay:
         if run.config_version != config.revision:
             # 同一 client_request_id 已按旧修订固定，不能用新配置重建
             raise DomainError("configuration_changed", 409)
+        if (handle.workspace_id != run.workspace_id
+                or handle.config_version != run.config_version):
+            raise DomainError("worker_mismatch", 502)
 
-        signed = self._sign(run, config, request)
+        signed = self._sign(run, config, request, task_type)
         stored = await self._db(
             self._store.save_run_snapshot, actor, run.id, signed)
-        envelope = self._stored_envelope(stored, run)
+        envelope = self._stored_envelope(stored, run, task_type)
 
         state = await self._db(self._store.run_dispatch_state, actor, run.id)
         if state["dispatchState"] != "pending":
             return {"runId": run.id, "state": state["status"],
                     "duplicate": True}
 
-        handle = await self._ensure_ready(run)
         claimed = await self._db(
             self._store.claim_run_dispatch, actor, run.id,
             envelope["nonce"], handle.container_id)
@@ -443,6 +471,25 @@ class WorkerRelay:
 
     async def _worker_request(self, handle: WorkerHandle, method: str,
                               path: str, payload: object) -> httpx.Response:
+        """在途短请求持有 workspace 租约；无论成败都在 finally 释放。
+
+        租约只用于空闲回收判定：请求进行中不得回收该 worker。释放失败时
+        保留至 TTL 过期，不覆盖原始异常，也不永久阻塞后续回收。
+        """
+        lease_id = await self._db(
+            self._store.begin_worker_request_lease,
+            handle.workspace_id, self._request_lease_ttl)
+        try:
+            return await self._send(handle, method, path, payload)
+        finally:
+            try:
+                await self._db(
+                    self._store.end_worker_request_lease, lease_id)
+            except Exception:
+                pass
+
+    async def _send(self, handle: WorkerHandle, method: str,
+                    path: str, payload: object) -> httpx.Response:
         """固定 WorkerHandle 重建内部头；不跟随重定向，不暴露响应体。"""
         url = self._upstream(handle) + path
         headers = {
