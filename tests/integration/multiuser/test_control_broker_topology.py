@@ -123,9 +123,20 @@ with Store.open(db) as store:
 _CLIENT = r'''
 import json
 import os
+import pathlib
 
 import httpx
 
+
+for directory in ("/check", "/etc/easel", "/srv/easel"):
+    root = pathlib.Path(directory)
+    if not root.exists():
+        continue
+    assert not list(root.glob("control.sqlite3*")), directory
+    assert not (root / "master.key").exists(), directory
+    assert not (root / "control_app.py").exists(), directory
+assert pathlib.Path("/check/client.py").is_file()
+print("WORKER_MATERIALS_ISOLATED")
 
 base = f"http://{os.environ['SIDECAR']}:8899"
 token = os.environ["BROKER_TOKEN"]
@@ -234,7 +245,9 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     worker = f"easel-topo-worker-{suffix}"
     init = f"easel-topo-init-{suffix}"
     init_check = f"easel-topo-init-check-{suffix}"
-    volume = f"easel-topo-data-{suffix}"
+    control_volume = f"easel-topo-control-data-{suffix}"
+    sidecar_volume = f"easel-topo-sidecar-data-{suffix}"
+    worker_volume = f"easel-topo-worker-data-{suffix}"
     policy = tmp_path / "policy.json"
     policy.write_text("{}", encoding="utf-8")
     token, member, other, run = _seed_control_database(tmp_path)
@@ -245,10 +258,13 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
     client_script = tmp_path / "client.py"
     client_script.write_text(_CLIENT, encoding="utf-8")
     labels = support.label_args(run_id)
+    mounts = support.component_mounts(
+        control_volume, sidecar_volume, worker_volume)
     resources = [
         ("container", init_check), ("container", init),
         ("container", worker), ("container", sidecar),
-        ("container", control), ("volume", volume),
+        ("container", control), ("volume", control_volume),
+        ("volume", sidecar_volume), ("volume", worker_volume),
         ("network", workspace_network), ("network", outbound_network),
     ]
     control_env = {
@@ -263,29 +279,52 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
         "import pathlib,sqlite3;"
         "root=pathlib.Path('/check');"
         "assert (root/'control_app.py').read_text(encoding='utf-8');"
+        "assert (root/'master.key').read_bytes();"
         "sqlite3.connect(root/'control.sqlite3').close();"
         "(root/'uid-write-check').write_text('ok',encoding='utf-8');"
         "print('UID10001_ACCESS_OK')")
+    control_access_code = (
+        "import pathlib,sqlite3;"
+        "assert pathlib.Path('/srv/easel/master.key').read_bytes();"
+        "sqlite3.connect('/srv/easel/control.sqlite3').execute("
+        "'select 1').fetchone();"
+        "print('CONTROL_MATERIALS_ACCESS_OK')")
+    sidecar_isolation_code = r'''
+import pathlib
+for directory in ("/etc/easel", "/srv/easel", "/check"):
+    root = pathlib.Path(directory)
+    if not root.exists():
+        continue
+    assert not list(root.glob("control.sqlite3*")), directory
+    assert not (root / "master.key").exists(), directory
+    assert not (root / "control_app.py").exists(), directory
+assert pathlib.Path("/etc/easel/policy.json").is_file()
+print("SIDECAR_MATERIALS_ISOLATED")
+'''
 
     try:
         _docker("network", "create", "--internal", *labels,
                 workspace_network)
         _docker("network", "create", *labels, outbound_network)
-        _docker("volume", "create", *labels, volume)
-        volume_inspect = _docker("volume", "inspect", volume)
-        volume_labels = support.resource_labels(
-            "volume", volume_inspect.stdout)
-        assert volume_labels is not None
-        assert volume_labels.get(support.RUN_LABEL) == run_id
+        for name in (control_volume, sidecar_volume, worker_volume):
+            _docker("volume", "create", *labels, name)
+            inspected = _docker("volume", "inspect", name)
+            volume_labels = support.resource_labels(
+                "volume", inspected.stdout)
+            assert volume_labels is not None
+            assert volume_labels.get(support.RUN_LABEL) == run_id
 
-        # 一次性 root 助手只操作本次标签标识的专用卷，把种子文件复制为
-        # UID 10001 所有：目录 0750、脚本/策略/key 0400、SQLite 0600。
-        # 不修改宿主临时目录，也不以 root 运行正式 control/worker。
+        # 一次性 root 助手只操作本次标签标识的三个专用卷，把控制材料、
+        # sidecar 策略、worker 客户端脚本分别复制为 UID 10001 所有：
+        # 目录 0750、脚本/策略/key 0400、SQLite 0600。不修改宿主临时目录，
+        # 也不以 root 运行正式 control/worker。
         _docker(
             "run", "--rm", "--name", init, *labels,
             "--user", "0:0", "--network", "none",
             "-v", f"{tmp_path}:/seed:ro",
-            "-v", f"{volume}:/srv/easel",
+            "-v", f"{control_volume}:/control",
+            "-v", f"{sidecar_volume}:/sidecar",
+            "-v", f"{worker_volume}:/worker",
             execution_image, "sh", "-c", support.volume_init_script(),
             timeout=60.0)
         access = _docker(
@@ -295,7 +334,7 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "--security-opt=no-new-privileges:true",
             "--network", "none",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            "-v", f"{volume}:/check",
+            "-v", f"{control_volume}:/check",
             execution_image, "python", "-c", access_code,
             timeout=60.0)
         assert "UID10001_ACCESS_OK" in access.stdout
@@ -307,7 +346,7 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--network", outbound_network,
-            "-v", f"{volume}:/srv/easel",
+            "-v", mounts["control"][0],
             "--health-cmd",
             ("python -c \"import urllib.request;urllib.request.urlopen("
              "'http://127.0.0.1:7861/api/health',timeout=2)\""),
@@ -320,6 +359,10 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
                              "/srv/easel/control_app.py"])
         _docker(*control_args, timeout=60.0)
         _wait_healthy(control, time.monotonic() + 60.0)
+        control_access = _docker(
+            "exec", control, "python", "-c", control_access_code,
+            timeout=30.0)
+        assert "CONTROL_MATERIALS_ACCESS_OK" in control_access.stdout
 
         _docker(
             "run", "-d", "--name", sidecar, *labels,
@@ -328,7 +371,7 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--network", workspace_network,
-            "-v", f"{volume}:/etc/easel:ro",
+            "-v", mounts["sidecar"][0],
             "--health-cmd",
             ("python -c \"import urllib.request;urllib.request.urlopen("
              "'http://127.0.0.1:8899/healthz',timeout=2)\""),
@@ -342,6 +385,10 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             timeout=60.0)
         _docker("network", "connect", outbound_network, sidecar, timeout=30.0)
         _wait_healthy(sidecar, time.monotonic() + 60.0)
+        sidecar_isolation = _docker(
+            "exec", sidecar, "python", "-c", sidecar_isolation_code,
+            timeout=30.0)
+        assert "SIDECAR_MATERIALS_ISOLATED" in sidecar_isolation.stdout
 
         worker_env = {
             "SIDECAR": sidecar,
@@ -357,13 +404,14 @@ def test_worker_sidecar_control_broker_topology(execution_image, tmp_path):
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            "-v", f"{volume}:/check:ro",
+            "-v", mounts["worker"][0],
         ]
         for name, value in worker_env.items():
             worker_args.extend(["-e", f"{name}={value}"])
         worker_args.extend([execution_image, "python", "/check/client.py"])
         result = _docker(*worker_args, timeout=60.0, check=False)
         assert result.returncode == 0, result.stderr[-3000:]
+        assert "WORKER_MATERIALS_ISOLATED" in result.stdout
         assert "CONTROL_BROKER_TOPOLOGY_OK" in result.stdout
     finally:
         try:

@@ -49,11 +49,38 @@ def _is_delete(argv: list[str]) -> bool:
 
 def test_volume_init_uses_owner_only_restricted_modes():
     script = support.volume_init_script()
-    assert "install -d -o 10001 -g 10001 -m 0750 /srv/easel" in script
+    assert "install -d -o 10001 -g 10001 -m 0750 /control /sidecar /worker" in script
     assert "install -o 10001 -g 10001 -m 0400" in script
     assert "install -o 10001 -g 10001 -m 0600" in script
     for forbidden in ("0777", "0666", "chmod 777", "chmod 666"):
         assert forbidden not in script
+
+
+def test_component_mounts_do_not_share_control_materials():
+    mounts = support.component_mounts("control-vol", "sidecar-vol",
+                                      "worker-vol")
+    assert mounts == {
+        "control": ["control-vol:/srv/easel"],
+        "sidecar": ["sidecar-vol:/etc/easel:ro"],
+        "worker": ["worker-vol:/check:ro"],
+    }
+    for component in ("sidecar", "worker"):
+        joined = " ".join(mounts[component])
+        assert "control-vol" not in joined
+        assert "/srv/easel" not in joined
+
+
+def test_volume_init_keeps_control_materials_out_of_downstream_volumes():
+    script = support.volume_init_script()
+    lines = script.splitlines()
+    for line in lines:
+        if (line.startswith("install")
+                and ("master.key" in line or "control.sqlite3" in line)):
+            assert "/control/" in line
+    assert "/sidecar/policy.json" in script
+    assert "/worker/client.py" in script
+    assert "/sidecar/client.py" not in script
+    assert "/worker/policy.json" not in script
 
 
 def test_cleanup_skips_absent_resources_idempotently():

@@ -26,21 +26,36 @@ def label_args(run_id: str) -> list[str]:
     return result
 
 
+def component_mounts(control_volume: str, sidecar_volume: str,
+                     worker_volume: str) -> dict[str, list[str]]:
+    """正式测试组件只挂各自输入；控制 materials 绝不进入下游容器。"""
+    for name in (control_volume, sidecar_volume, worker_volume):
+        if not isinstance(name, str) or not name:
+            raise ValueError("volume name")
+    return {
+        "control": [f"{control_volume}:/srv/easel"],
+        "sidecar": [f"{sidecar_volume}:/etc/easel:ro"],
+        "worker": [f"{worker_volume}:/check:ro"],
+    }
+
+
 def volume_init_script() -> str:
     """一次性 root 初始化助手只写本次测试卷，创建 UID 10001 私有权限。
 
-    目录 0750、脚本/策略/测试 key 0400、SQLite 及其附属文件 0600；
-    不使用 0777/0666，也不修改宿主临时目录权限。
+    三个角色卷拆分：/control 只含控制脚本/key/数据库，/sidecar 只含策略，
+    /worker 只含客户端脚本。目录 0750、脚本/策略/key 0400、SQLite 及其
+    附属文件 0600；不使用 0777/0666，也不修改宿主临时目录权限。
     """
     return """set -eu
-install -d -o 10001 -g 10001 -m 0750 /srv/easel
-for file in control_app.py master.key policy.json client.py; do
-  install -o 10001 -g 10001 -m 0400 "/seed/$file" "/srv/easel/$file"
-done
+install -d -o 10001 -g 10001 -m 0750 /control /sidecar /worker
+install -o 10001 -g 10001 -m 0400 /seed/control_app.py /control/control_app.py
+install -o 10001 -g 10001 -m 0400 /seed/master.key /control/master.key
 for file in /seed/control.sqlite3*; do
   [ -e "$file" ] || continue
-  install -o 10001 -g 10001 -m 0600 "$file" "/srv/easel/${file##*/}"
+  install -o 10001 -g 10001 -m 0600 "$file" "/control/${file##*/}"
 done
+install -o 10001 -g 10001 -m 0400 /seed/policy.json /sidecar/policy.json
+install -o 10001 -g 10001 -m 0400 /seed/client.py /worker/client.py
 """
 
 
