@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -333,6 +333,15 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # 破坏；删除只影响目录可见性，原生历史与持久产物另由 worker 管。
     (
         "ALTER TABLE conversations ADD COLUMN deleted_at INTEGER",
+    ),
+    # 版本 8：逐 Run 签名快照与唯一派发标记。快照首次写入后不可替换；派发
+    # 认领在数据库事务内完成，重试不得再次向 worker 发布任务。
+    (
+        "ALTER TABLE runs ADD COLUMN snapshot_json TEXT",
+        "ALTER TABLE runs ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'pending'",
+        "ALTER TABLE runs ADD COLUMN dispatch_nonce TEXT",
+        "ALTER TABLE runs ADD COLUMN worker_container_id TEXT",
+        "ALTER TABLE runs ADD COLUMN dispatched_at INTEGER",
     ),
 )
 
@@ -1640,6 +1649,105 @@ class Store:
                  int(config_version), _now()))
         return RunRecord(run_id, workspace_id, conversation_id, "reserved", int(config_version))
 
+    def save_run_snapshot(self, actor: Identity, run_id: str,
+                          envelope_json: str) -> str:
+        """首次写入逐 Run 签名快照；重试读取原快照，绝不替换。
+
+        快照固定接纳时的配置、会话与输入摘要。并发首次提交只有一行能写入，
+        另一方读取同一份已签名内容，避免重试拼出第二份配置。
+        """
+        workspace_id = self._require_actor(actor)
+        if (not isinstance(envelope_json, str) or not envelope_json
+                or len(envelope_json) > 512 * 1024):
+            raise DomainError("snapshot_invalid", 400)
+        with self._transaction():
+            self._require_actor(actor)
+            row = self._connection.execute(
+                "SELECT snapshot_json FROM runs"
+                " WHERE workspace_id = ? AND id = ?",
+                (workspace_id, _text(run_id))).fetchone()
+            if row is None:
+                raise DomainError("not_found", 404)
+            if row["snapshot_json"] is not None:
+                return row["snapshot_json"]
+            self._connection.execute(
+                "UPDATE runs SET snapshot_json = ?"
+                " WHERE workspace_id = ? AND id = ? AND snapshot_json IS NULL",
+                (envelope_json, workspace_id, run_id))
+            return envelope_json
+
+    def get_run_snapshot(self, actor: Identity, run_id: str) -> str | None:
+        """读取已固定快照；查询不禁用用户也能读取，但不产生新快照。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT snapshot_json FROM runs"
+            " WHERE workspace_id = ? AND id = ?",
+            (workspace_id, _text(run_id))).fetchone()
+        if row is None:
+            raise DomainError("not_found", 404)
+        value = row["snapshot_json"]
+        return value if isinstance(value, str) else None
+
+    def claim_run_dispatch(self, actor: Identity, run_id: str, nonce: str,
+                           container_id: str) -> bool:
+        """原子认领唯一派发；只有 pending 行能进入 dispatching。
+
+        认领在数据库事务内完成，两个并发提交同输入时只有一个返回 True；
+        另一个必须读取持久状态，不能再次向 worker 发布任务。
+        """
+        workspace_id = self._require_actor(actor)
+        if (not isinstance(nonce, str) or not nonce or len(nonce) > 128
+                or not isinstance(container_id, str) or not container_id
+                or len(container_id) > 256):
+            raise DomainError("invalid_argument", 400)
+        with self._transaction():
+            self._require_actor(actor)
+            cursor = self._connection.execute(
+                "UPDATE runs SET dispatch_state = 'dispatching',"
+                " dispatch_nonce = ?, worker_container_id = ?, dispatched_at = ?"
+                " WHERE workspace_id = ? AND id = ? AND dispatch_state = 'pending'"
+                " AND status NOT IN"
+                f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                (nonce, container_id, _now(), workspace_id, _text(run_id),
+                 *TERMINAL_RUN_STATUSES))
+            return cursor.rowcount == 1
+
+    def mark_run_dispatched(self, actor: Identity, run_id: str,
+                            nonce: str) -> bool:
+        """worker 已接受任务后落持久标记；只匹配本次认领的 nonce。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        if not isinstance(nonce, str) or not nonce:
+            raise DomainError("invalid_argument", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE runs SET dispatch_state = 'dispatched'"
+                " WHERE workspace_id = ? AND id = ?"
+                " AND dispatch_state = 'dispatching' AND dispatch_nonce = ?"
+                " AND status NOT IN"
+                f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                (workspace_id, _text(run_id), nonce, *TERMINAL_RUN_STATUSES))
+            return cursor.rowcount == 1
+
+    def run_dispatch_state(self, actor: Identity, run_id: str) -> dict:
+        """读取派发与任务状态的窄视图；供重试对账，不创建新执行。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT id, status, dispatch_state, dispatch_nonce, config_version,"
+            " input_digest, client_request_id FROM runs"
+            " WHERE workspace_id = ? AND id = ?",
+            (workspace_id, _text(run_id))).fetchone()
+        if row is None:
+            raise DomainError("not_found", 404)
+        return {
+            "runId": row["id"],
+            "status": row["status"],
+            "dispatchState": row["dispatch_state"],
+            "dispatchNonce": row["dispatch_nonce"] or "",
+            "configVersion": int(row["config_version"]),
+            "inputDigest": row["input_digest"],
+            "clientRequestId": row["client_request_id"],
+        }
+
     def get_run(self, actor: Identity, run_id: str) -> RunRecord:
         """读取本空间单个任务；任务查询属于收尾路径，不禁用用户也能读取。"""
         workspace_id = self._require_actor(actor, allow_disabled=True)
@@ -1659,6 +1767,18 @@ class Store:
             " WHERE workspace_id = ? AND conversation_id = ? ORDER BY created_at, id",
             (workspace_id, _text(conversation_id))).fetchall()
         return [_run_record(row) for row in rows]
+
+    def latest_run_for_conversation(self, actor: Identity,
+                                    conversation_id: str) -> RunRecord | None:
+        """读取会话最近一次 Run；用于定位本人 worker，不产生新执行。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, client_request_id, input_digest,"
+            " status, config_version FROM runs"
+            " WHERE workspace_id = ? AND conversation_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (workspace_id, _text(conversation_id))).fetchone()
+        return _run_record(row) if row is not None else None
 
     def count_active_runs(self) -> int:
         """整机当前活跃任务数。"""

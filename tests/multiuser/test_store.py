@@ -111,9 +111,10 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
 
 RELEASED_SCHEMA_FINGERPRINT = (
-    "cbe69146b030c128abd7a6ba9d3b365d6aabb40fa118957e1cb3e5e7a5741f17"
+    "7cd70e06fc51e9869228be254774db15f2adbe273b923e1395b63249d2f73c17"
 )
-"""当前发布版（schema v7，Task 9 会话软删除）的 schema 指纹；变更 schema 时必须同步更新。"""
+"""当前发布版（schema v8，Task 10 逐 Run 快照与派发状态）的 schema 指纹；
+变更 schema 时必须同步更新。"""
 
 
 def schema_fingerprint(connection: sqlite3.Connection) -> str:
@@ -1631,6 +1632,59 @@ def test_v6_database_upgrade_preserves_conversation_and_run_for_soft_delete(
         with pytest.raises(DomainError) as missing:
             store.get_conversation(actor, "conv-old")
         assert_error(missing, 404, "not_found")
+
+
+def test_v7_database_upgrade_preserves_runs_and_dispatch_state(tmp_path):
+    """v7→v8 只追加快照/派发列；既有 Run 幂等与归属保持可读。"""
+    path = tmp_path / "v7-control.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for statements in MIGRATIONS[:7]:
+            for statement in statements:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 7")
+        connection.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (7, 900)")
+        connection.execute(
+            "INSERT INTO users (id, display_name, role, created_at)"
+            " VALUES ('user-old', '旧成员', 'member', 900)")
+        connection.execute(
+            "INSERT INTO workspaces (id, owner_user_id, state, config_version,"
+            " created_at) VALUES ('ws-old', 'user-old', 'ready', 3, 900)")
+        connection.execute(
+            "INSERT INTO conversations"
+            " (workspace_id, id, title, archived, created_at, updated_at)"
+            " VALUES ('ws-old', 'conv-old', '旧会话', 0, 900, 900)")
+        connection.execute(
+            "INSERT INTO runs (workspace_id, id, conversation_id,"
+            " client_request_id, input_digest, status, config_version, created_at)"
+            " VALUES ('ws-old', 'run-old', 'conv-old', 'request-old',"
+            " 'digest-old', 'reserved', 3, 900)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    actor = Identity("user-old", "ws-old", "member")
+    with Store.open(path) as store:
+        assert store.get_conversation(actor, "conv-old").title == "旧会话"
+        # 旧 Run 的幂等键继续有效，不因升级生成第二个 Run
+        repeated = store.reserve_run(
+            actor, "conv-old", "request-old", "digest-old", 3)
+        assert repeated.id == "run-old"
+        state = store.run_dispatch_state(actor, "run-old")
+        assert state["dispatchState"] == "pending"
+        assert state["configVersion"] == 3
+
+        saved = store.save_run_snapshot(actor, "run-old", '{"run_id":"run-old"}')
+        assert saved == '{"run_id":"run-old"}'
+        # 首次写入后重试不能替换签名内容
+        again = store.save_run_snapshot(actor, "run-old", '{"run_id":"other"}')
+        assert again == '{"run_id":"run-old"}'
+
+        assert store.claim_run_dispatch(actor, "run-old", "nonce-1", "c-1")
+        assert not store.claim_run_dispatch(actor, "run-old", "nonce-2", "c-2")
+        assert store.mark_run_dispatched(actor, "run-old", "nonce-1")
 
 
 def test_current_schema_version_is_recorded(tmp_path):

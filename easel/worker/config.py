@@ -32,13 +32,23 @@ from easel.control.types import DomainError, WorkspacePaths
 
 SNAPSHOT_ENVELOPE_VERSION = 1
 SNAPSHOT_SIGNATURE_DOMAIN = b"easel-worker-snapshot-v1\0"
+# 版本 2：逐 Run 内容绑定。v1 仅保留给启动时单 Run 兼容路径，常驻 worker
+# 的 /internal/runs 只接受 v2，避免同一签名替换会话、输入或任务类型。
+SNAPSHOT_ENVELOPE_VERSION_V2 = 2
+SNAPSHOT_V2_SIGNATURE_DOMAIN = b"easel-worker-snapshot-v2\0"
+RUN_TASK_TYPES = ("chat", "skill", "profile", "analytics", "publish", "browser")
 MAX_SNAPSHOT_BYTES = 1024 * 1024
 
 _PAYLOAD_FIELDS = ("envelope_version", "workspace_id", "run_id", "revision",
                    "routes", "agent", "expires_at", "nonce")
 _ENVELOPE_FIELDS = frozenset((*_PAYLOAD_FIELDS, "signature"))
+_V2_PAYLOAD_FIELDS = ("envelope_version", "workspace_id", "run_id",
+                      "conversation_id", "input_digest", "task_type",
+                      "revision", "routes", "agent", "expires_at", "nonce")
+_V2_ENVELOPE_FIELDS = frozenset((*_V2_PAYLOAD_FIELDS, "signature"))
 _ALLOWED_SECRET_KEYS = frozenset({"BROKER_TOKEN", "CREDENTIAL_REF",
                                   "CREDENTIAL_REFS"})
+_INPUT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 # 只保留跨平台启动与明确受管代理/编码所需变量；其余一律丢弃。
 _ENV_ALLOWLIST = frozenset({
@@ -66,6 +76,26 @@ class WorkerConfigSnapshot:
     expires_at: int = 0
 
 
+@dataclass(frozen=True)
+class RunSnapshot:
+    """逐 Run 已验签配置；内容绑定会话、输入摘要与任务类型。
+
+    常驻 worker 的每次执行只使用该不可变对象，不读取启动时全局快照，也不
+    以全局 ``os.environ``/请求共享字段轮换 token、模型或身份。
+    """
+
+    workspace_id: str
+    run_id: str
+    conversation_id: str
+    input_digest: str
+    task_type: str
+    revision: int
+    routes: Mapping[str, Any]
+    agent: Mapping[str, Any]
+    nonce: str
+    expires_at: int
+
+
 def _canonical(value: object) -> bytes:
     try:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -73,6 +103,24 @@ def _canonical(value: object) -> bytes:
     except (TypeError, ValueError):
         raise DomainError("snapshot_invalid", 403) from None
     return encoded.encode("utf-8")
+
+
+def run_input_digest(*, conversation_id: str, task_type: str, message: str,
+                     attachments: list | tuple = (),
+                     persona: str | None = None) -> str:
+    """逐 Run 输入摘要；control 提交与 worker 复核必须使用同一函数。
+
+    摘要只覆盖会改变执行语义的内容，不包含 turnId/runId 或传输头。附件顺序
+    视为语义的一部分；任何字段替换都会改变摘要并在验签绑定处拒绝。
+    """
+    payload = {
+        "conversation_id": conversation_id,
+        "task_type": task_type,
+        "message": message,
+        "attachments": list(attachments),
+        "persona": persona or "",
+    }
+    return hashlib.sha256(_canonical(payload)).hexdigest()
 
 
 def _text_id(value: object, name: str) -> str:
@@ -158,6 +206,75 @@ def sign_worker_snapshot(private_key: Ed25519PrivateKey, *,
             .decode("ascii").rstrip("=")}
 
 
+def _validate_v2_payload(payload: Mapping[str, Any]) -> None:
+    if payload.get("envelope_version") != SNAPSHOT_ENVELOPE_VERSION_V2:
+        raise DomainError("snapshot_invalid", 403)
+    _text_id(payload.get("workspace_id"), "workspace_id")
+    _text_id(payload.get("run_id"), "run_id")
+    _text_id(payload.get("conversation_id"), "conversation_id")
+    digest = payload.get("input_digest")
+    if not isinstance(digest, str) or _INPUT_DIGEST.fullmatch(digest) is None:
+        raise DomainError("snapshot_invalid", 403)
+    if payload.get("task_type") not in RUN_TASK_TYPES:
+        raise DomainError("snapshot_invalid", 403)
+    revision = payload.get("revision")
+    if type(revision) is not int or revision < 0:
+        raise DomainError("snapshot_invalid", 403)
+    for name in ("routes", "agent"):
+        if not isinstance(payload.get(name), Mapping):
+            raise DomainError("snapshot_invalid", 403)
+    expires_at = payload.get("expires_at")
+    if type(expires_at) is not int or expires_at <= 0:
+        raise DomainError("snapshot_invalid", 403)
+    nonce = payload.get("nonce")
+    if (not isinstance(nonce, str) or not 1 <= len(nonce) <= 128
+            or not nonce.isascii()
+            or any(ord(character) < 33 or ord(character) > 126
+                   for character in nonce)):
+        raise DomainError("snapshot_invalid", 403)
+    _validate_key_names(payload.get("routes"))
+    _validate_key_names(payload.get("agent"))
+
+
+def _v2_payload(workspace_id: str, run_id: str, conversation_id: str,
+                input_digest: str, task_type: str, revision: int,
+                routes: Mapping[str, Any], agent: Mapping[str, Any],
+                expires_at: int, nonce: str) -> dict[str, Any]:
+    payload = {
+        "envelope_version": SNAPSHOT_ENVELOPE_VERSION_V2,
+        "workspace_id": workspace_id,
+        "run_id": run_id,
+        "conversation_id": conversation_id,
+        "input_digest": input_digest,
+        "task_type": task_type,
+        "revision": revision,
+        "routes": dict(routes),
+        "agent": dict(agent),
+        "expires_at": expires_at,
+        "nonce": nonce,
+    }
+    _validate_v2_payload(payload)
+    return payload
+
+
+def sign_run_snapshot(private_key: Ed25519PrivateKey, *,
+                      workspace_id: str, run_id: str, conversation_id: str,
+                      input_digest: str, task_type: str, revision: int,
+                      routes: Mapping[str, Any], agent: Mapping[str, Any],
+                      expires_at: int, nonce: str) -> dict[str, Any]:
+    """逐 Run 签名：同一签名不能替换会话、输入摘要或任务类型。"""
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise DomainError("snapshot_key_invalid", 500)
+    payload = _v2_payload(workspace_id, run_id, conversation_id, input_digest,
+                          task_type, revision, routes, agent, expires_at,
+                          nonce)
+    signature = private_key.sign(
+        SNAPSHOT_V2_SIGNATURE_DOMAIN + _canonical(payload))
+    return {**payload,
+            "signature": base64.urlsafe_b64encode(signature)
+            .decode("ascii").rstrip("=")}
+
+
 def load_public_key(source: Ed25519PublicKey | str | Path) -> Ed25519PublicKey:
     """只接受公钥（对象、32 字节 raw 或 PEM）；任何私钥材料都不读取。"""
     if isinstance(source, Ed25519PublicKey):
@@ -221,6 +338,66 @@ def verify_worker_snapshot(
     return WorkerConfigSnapshot(
         workspace_id=payload["workspace_id"],
         run_id=payload["run_id"],
+        revision=int(payload["revision"]),
+        routes=dict(payload["routes"]),
+        agent=dict(payload["agent"]),
+        nonce=payload["nonce"],
+        expires_at=int(payload["expires_at"]))
+
+
+def verify_run_snapshot(
+        envelope: Mapping[str, Any],
+        public_key: Ed25519PublicKey | str | Path, *,
+        expected_workspace_id: str,
+        expected_run_id: str,
+        expected_conversation_id: str,
+        expected_input_digest: str,
+        expected_task_type: str,
+        expected_revision: int | None = None,
+        now: int | None = None) -> RunSnapshot:
+    """验签并核对逐 Run 内容绑定；任何替换都在进入执行前拒绝。"""
+    if not isinstance(envelope, Mapping):
+        raise DomainError("snapshot_invalid", 403)
+    if set(envelope) != _V2_ENVELOPE_FIELDS:
+        raise DomainError("snapshot_invalid", 403)
+    payload = {name: envelope[name] for name in _V2_PAYLOAD_FIELDS}
+    _validate_v2_payload(payload)
+    signature_text = envelope.get("signature")
+    if (not isinstance(signature_text, str) or not signature_text
+            or len(signature_text) > 256):
+        raise DomainError("snapshot_invalid", 403)
+    try:
+        padded = signature_text + "=" * (-len(signature_text) % 4)
+        signature = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (ValueError, UnicodeError):
+        raise DomainError("snapshot_invalid", 403) from None
+    if len(signature) != 64:
+        raise DomainError("snapshot_invalid", 403)
+    key = load_public_key(public_key)
+    try:
+        key.verify(signature,
+                   SNAPSHOT_V2_SIGNATURE_DOMAIN + _canonical(payload))
+    except (InvalidSignature, ValueError, TypeError):
+        raise DomainError("snapshot_invalid", 403) from None
+
+    if (payload["workspace_id"] != expected_workspace_id
+            or payload["run_id"] != expected_run_id
+            or payload["conversation_id"] != expected_conversation_id
+            or payload["input_digest"] != expected_input_digest
+            or payload["task_type"] != expected_task_type):
+        raise DomainError("snapshot_binding_mismatch", 403)
+    if (expected_revision is not None
+            and payload["revision"] != expected_revision):
+        raise DomainError("snapshot_invalid", 403)
+    current = int(time.time()) if now is None else int(now)
+    if int(payload["expires_at"]) <= current:
+        raise DomainError("snapshot_expired", 403)
+    return RunSnapshot(
+        workspace_id=payload["workspace_id"],
+        run_id=payload["run_id"],
+        conversation_id=payload["conversation_id"],
+        input_digest=payload["input_digest"],
+        task_type=payload["task_type"],
         revision=int(payload["revision"]),
         routes=dict(payload["routes"]),
         agent=dict(payload["agent"]),
@@ -342,6 +519,24 @@ def snapshot_fingerprint(snapshot: WorkerConfigSnapshot) -> str:
         "envelope_version": SNAPSHOT_ENVELOPE_VERSION,
         "workspace_id": snapshot.workspace_id,
         "run_id": snapshot.run_id,
+        "revision": snapshot.revision,
+        "routes": dict(snapshot.routes),
+        "agent": dict(snapshot.agent),
+        "expires_at": snapshot.expires_at,
+        "nonce": snapshot.nonce,
+    }
+    return hashlib.sha256(_canonical(payload)).hexdigest()
+
+
+def run_snapshot_fingerprint(snapshot: RunSnapshot) -> str:
+    """逐 Run 快照指纹；只覆盖签名 payload，不含 signature 本身。"""
+    payload = {
+        "envelope_version": SNAPSHOT_ENVELOPE_VERSION_V2,
+        "workspace_id": snapshot.workspace_id,
+        "run_id": snapshot.run_id,
+        "conversation_id": snapshot.conversation_id,
+        "input_digest": snapshot.input_digest,
+        "task_type": snapshot.task_type,
         "revision": snapshot.revision,
         "routes": dict(snapshot.routes),
         "agent": dict(snapshot.agent),
