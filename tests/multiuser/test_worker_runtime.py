@@ -22,6 +22,7 @@ from easel.harnesses.commands import acp_command
 from easel.harnesses.rpc import close_sessions, connection
 from easel.worker.config import (WorkerConfigSnapshot, sign_worker_snapshot)
 from easel.worker.guard import WorkerIdentity
+from easel.worker.sessions import WorkspaceSessionStore
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "harness_rpc.py"
 
@@ -40,6 +41,32 @@ def workspace_roots(tmp_path: Path) -> tuple[Path, Path]:
     (workspace / "outputs").mkdir(parents=True)
     (workspace / "profiles").mkdir(parents=True)
     return code, workspace
+
+
+def test_worker_binding_refuses_legacy_unowned_file(tmp_path, monkeypatch):
+    code, workspace = workspace_roots(tmp_path)
+    paths = WorkspacePaths(
+        code_root=code, workspace_root=workspace,
+        state_root=tmp_path / "state", home=tmp_path / "home")
+    monkeypatch.setattr(web, "_RUNTIME_PATHS", paths)
+    monkeypatch.setattr(web, "_WORKER_SNAPSHOT", WorkerConfigSnapshot(
+        "workspace-a", "run-a", 1, {}, {}))
+    monkeypatch.setattr(web, "_WORKER_IDENTITY",
+                        WorkerIdentity("workspace-a", "service-token"))
+    monkeypatch.setattr(web, "SESSIONS_DIR", paths.state_root / "sessions")
+    legacy = web.harness_store.binding_path(web.SESSIONS_DIR, "legacy")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({
+        "runtime": "acp", "native_id": "native-old"}), encoding="utf-8")
+
+    with pytest.raises(web.HTTPException) as rejected:
+        web._session_binding("legacy")
+    assert rejected.value.status_code == 409
+    assert "旧版无归属" in rejected.value.detail
+
+    with pytest.raises(web.HTTPException) as invalid:
+        web._session_binding("../escape")
+    assert invalid.value.status_code == 400
 
 
 def test_web_worker_startup_verifies_and_admits_snapshot_once(tmp_path, monkeypatch):
@@ -188,6 +215,11 @@ def test_web_worker_uses_managed_command_and_clean_env(tmp_path, monkeypatch):
     assert "admin-key-sentinel" not in " ".join(request.env.values())
     assert "OPENAI_API_KEY" not in request.env
     assert not any(kind == "error" for kind, _ in events)
+    binding = WorkspaceSessionStore(
+        paths.state_root, "workspace-a").binding("worker-session")
+    assert binding["native_id"] == "native-session"
+    assert binding["workspace_id"] == "workspace-a"
+    assert binding["agent_version"] == web.NATIVE_BINDING_VERSION
 
 
 def test_acp_worker_uses_managed_command_end_to_end(tmp_path):

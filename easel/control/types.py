@@ -40,11 +40,12 @@ class Identity:
 
 @dataclass(frozen=True)
 class ConversationRecord:
-    """控制层保存的会话元数据。"""
+    """控制层保存的会话元数据；archived 只影响目录可见性与新任务接纳。"""
 
     id: str
     workspace_id: str
     title: str
+    archived: bool = False
 
 
 @dataclass(frozen=True)

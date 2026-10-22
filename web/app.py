@@ -60,6 +60,7 @@ from easel.worker.config import (SnapshotAdmissionStore, WorkerConfigSnapshot,
                                  build_run_env, load_worker_snapshot)
 from easel.worker.context import resolve_paths, service_mode
 from easel.worker.guard import load_worker_identity, verify_worker_request
+from easel.worker.sessions import WorkspaceSessionStore
 
 # worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
 _WORKER_IDENTITY = load_worker_identity()
@@ -75,6 +76,71 @@ WORKER_PUBLIC_KEY_FILE_ENV = "EASEL_WORKER_PUBLIC_KEY_FILE"
 def _workspace_namespace() -> str:
     """RPC 进程池/关闭使用的 workspace namespace；local 为空。"""
     return _WORKER_SNAPSHOT.workspace_id if _WORKER_SNAPSHOT is not None else ""
+
+
+NATIVE_BINDING_VERSION = 1
+"""V1 受托 ACP/Agent 绑定契约版本；底座不兼容升级时必须显式提升。"""
+
+
+def _worker_session_store() -> WorkspaceSessionStore | None:
+    if _WORKER_SNAPSHOT is None:
+        return None
+    workspace_id = (_WORKER_IDENTITY.workspace_id
+                    if _WORKER_IDENTITY is not None
+                    else _WORKER_SNAPSHOT.workspace_id
+                    if _WORKER_SNAPSHOT is not None else "")
+    if not workspace_id:
+        return None
+    return WorkspaceSessionStore(_RUNTIME_PATHS.state_root, workspace_id)
+
+
+def _legacy_session_artifacts(session_id: str) -> bool:
+    """worker 启动前是否存在没有 workspace 归属的旧本地会话材料。"""
+    return (
+        harness_store.binding_path(SESSIONS_DIR, session_id).exists()
+        or history_path(SESSIONS_DIR, session_id).is_file()
+        or _transport_pin_file(session_id).is_file()
+        or _turn_file(f"web:{session_id}").is_file()
+        or (OPENCLAW_SESSIONS_DIR
+            / f"{_openclaw_session_id(session_id)}.jsonl").is_file()
+        or (OPENCLAW_SESSIONS_DIR
+            / f"{_openclaw_session_id(f'web:{session_id}')}.jsonl").is_file()
+    )
+
+
+def _session_binding(session_id: str) -> dict:
+    """worker 只读本人新格式绑定；local 继续读旧格式。"""
+    store = _worker_session_store()
+    if store is None:
+        return harness_store.binding(SESSIONS_DIR, session_id)
+    try:
+        if (not store.binding_path(session_id).exists()
+                and _legacy_session_artifacts(session_id)):
+            raise HTTPException(409, "旧版无归属会话记录，拒绝自动认领")
+        return store.binding(session_id)
+    except DomainError as error:
+        raise HTTPException(error.status, "Agent 会话绑定记录无效，不会自动重建历史") from error
+
+
+def _bind_session(session_id: str, runtime: str, native_id: str) -> None:
+    store = _worker_session_store()
+    if store is None:
+        harness_store.bind(SESSIONS_DIR, session_id, runtime, native_id)
+        return
+    try:
+        store.bind(session_id, runtime, native_id, NATIVE_BINDING_VERSION)
+    except DomainError as error:
+        raise HTTPException(409, "Agent 会话绑定冲突，不会自动重置历史") from error
+
+
+def _binding_path(session_id: str) -> Path:
+    store = _worker_session_store()
+    if store is None:
+        return harness_store.binding_path(SESSIONS_DIR, session_id)
+    try:
+        return store.binding_path(session_id)
+    except DomainError as error:
+        raise HTTPException(error.status, "Agent 会话标识无效") from error
 
 
 def _load_worker_runtime() -> tuple[WorkerConfigSnapshot, dict]:
@@ -1073,11 +1139,11 @@ def _chat_backend(session_id: str | None) -> str:
     if not session_id:
         return selected
     try:
-        record = harness_store.binding(SESSIONS_DIR, session_id)
+        record = _session_binding(session_id)
     except HarnessError as error:
         raise HTTPException(409, str(error)) from error
     owner = record.get("runtime")
-    if not owner:
+    if not owner and _WORKER_SNAPSHOT is None:
         if history_path(SESSIONS_DIR, session_id).is_file():
             owner = "api"
         elif ((OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(session_id)}.jsonl").is_file()
@@ -3307,9 +3373,9 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
         # 流式入口已在外层（事件日志副作用之前）认领，此处不得重复认领。
         if not execution_claimed:
             _worker_execution_claim()
-        record = harness_store.binding(SESSIONS_DIR, sk)
+        record = _session_binding(sk)
         native_id = record.get("native_id", "")
-        harness_store.bind(SESSIONS_DIR, sk, runtime, native_id)
+        _bind_session(sk, runtime, native_id)
         _STOPPED_CHAT.discard(sk)
         proc._task = task
         _RUNNING_CHAT[sk] = proc
@@ -3345,7 +3411,7 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
                              else _RUNTIME_PATHS.code_root)
         await asyncio.wait_for(harnesses.adapter(runtime).run(
             request, receive, ask,
-            lambda identifier: harness_store.bind(SESSIONS_DIR, sk, runtime, identifier)), timeout)
+            lambda identifier: _bind_session(sk, runtime, identifier)), timeout)
         clean_end = True
         reason = "completed"
     except asyncio.CancelledError:
@@ -5617,12 +5683,12 @@ async def api_delete_session(session_key: str):
     """删除 OpenClaw 本地的 session 记录。"""
     if session_key in _RUNNING_CHAT or _session_lock(session_key).locked():
         raise HTTPException(409, "请先停止当前对话再删除")
-    record = harness_store.binding(SESSIONS_DIR, session_key)
+    record = _session_binding(session_key)
     if record and record.get("runtime") != "openclaw":
         from easel.harnesses.rpc import close_sessions
         await close_sessions(session_key,
                              workspace_id=_workspace_namespace())
-        harness_store.binding_path(SESSIONS_DIR, session_key).unlink(missing_ok=True)
+        _binding_path(session_key).unlink(missing_ok=True)
         _turn_file(f"web:{session_key}").unlink(missing_ok=True)
         return {"deleted": True, "nativeHistoryDeleted": False}
     direct_history = history_path(SESSIONS_DIR, session_key)

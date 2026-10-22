@@ -24,7 +24,7 @@ from typing import Any, Iterator
 import pytest
 
 from easel.control import store as store_module
-from easel.control.store import CURRENT_SCHEMA_VERSION, Store
+from easel.control.store import CURRENT_SCHEMA_VERSION, MIGRATIONS, Store
 from easel.control.types import (
     BrowserSession,
     ConversationRecord,
@@ -111,9 +111,9 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
 
 RELEASED_SCHEMA_FINGERPRINT = (
-    "4dc08e96dbb432eb112a1bafdec6eaa7f994930d9228017862af576d963940de"
+    "cbe69146b030c128abd7a6ba9d3b365d6aabb40fa118957e1cb3e5e7a5741f17"
 )
-"""当前发布版（schema v6，Task 8 R1）的 schema 指纹；变更 schema 时必须同步更新。"""
+"""当前发布版（schema v7，Task 9 会话软删除）的 schema 指纹；变更 schema 时必须同步更新。"""
 
 
 def schema_fingerprint(connection: sqlite3.Connection) -> str:
@@ -1522,6 +1522,49 @@ def test_version_zero_database_is_migrated_in_place(tmp_path):
         assert connection.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     finally:
         connection.close()
+
+
+def test_v6_database_upgrade_preserves_conversation_and_run_for_soft_delete(
+        tmp_path):
+    """v6→v7 只追加 deleted_at；既有目录、Run 与外键引用保持不变。"""
+    path = tmp_path / "v6-control.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for statements in MIGRATIONS[:6]:
+            for statement in statements:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 6")
+        connection.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (6, 900)")
+        connection.execute(
+            "INSERT INTO users (id, display_name, role, created_at)"
+            " VALUES ('user-old', '旧成员', 'member', 900)")
+        connection.execute(
+            "INSERT INTO workspaces (id, owner_user_id, state, config_version,"
+            " created_at) VALUES ('ws-old', 'user-old', 'ready', 3, 900)")
+        connection.execute(
+            "INSERT INTO conversations"
+            " (workspace_id, id, title, archived, created_at, updated_at)"
+            " VALUES ('ws-old', 'conv-old', '旧会话', 0, 900, 900)")
+        connection.execute(
+            "INSERT INTO runs (workspace_id, id, conversation_id,"
+            " client_request_id, input_digest, status, config_version, created_at)"
+            " VALUES ('ws-old', 'run-old', 'conv-old', 'request-old',"
+            " 'digest-old', 'done', 3, 900)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    actor = Identity("user-old", "ws-old", "member")
+    with Store.open(path) as store:
+        assert store.get_conversation(actor, "conv-old").title == "旧会话"
+        assert store.get_run(actor, "run-old").id == "run-old"
+        store.delete_conversation(actor, "conv-old")
+        assert store.get_run(actor, "run-old").id == "run-old"
+        with pytest.raises(DomainError) as missing:
+            store.get_conversation(actor, "conv-old")
+        assert_error(missing, 404, "not_found")
 
 
 def test_current_schema_version_is_recorded(tmp_path):

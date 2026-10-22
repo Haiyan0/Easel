@@ -460,8 +460,8 @@ def test_health_is_minimal_and_private_paths_default_deny(tmp_path):
         assert client.post("/api/admin/bootstrap").status_code == 401
 
         csrf = exchange(client, invite).json()["csrfToken"]
-        # 已分类但未装配的 control 路由明确 503；未知路由 403
-        assert client.get("/api/sessions").status_code == 503
+        # Task 9 已装配会话目录；未知路由仍 403
+        assert client.get("/api/sessions").status_code == 200
         for path in ("/docs", "/openapi.json", "/api/admin/bootstrap",
                      "/api/unknown", "/api/env"):
             assert client.get(path).status_code == 403, path

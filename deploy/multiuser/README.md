@@ -345,3 +345,26 @@ worker 不挂载控制卷。一次性初始化助手只处理这三个卷，目�
   只读环境盘点，不作为目标宿主证据。宿主防火墙/DOCKER-USER、IPv4/IPv6
   矩阵、XFS 真实限额、宿主 provisioner→worker 健康链及原生 Linux 上
   UID 10001 测试卷权限仍需目标环境实测。
+
+## 9. 会话目录与 worker 快照
+
+control 已装配本人会话目录：
+
+```text
+GET    /api/sessions?limit=50&offset=0&include_archived=false
+POST   /api/sessions                 {"title":"新对话"}
+PATCH  /api/sessions/{id}            {"title":...} 或 {"archived":true|false}
+DELETE /api/sessions/{id}
+GET    /api/sessions/{id}/messages?limit=100&offset=0
+```
+
+- 所有调用使用现有 Cookie/Origin/CSRF 中间件；目录和 Run 按当前身份回到
+  control 数据库重查归属，外空间/未知/已删除会话统一 404。
+- 标题更新、归档和软删除均带 actor；活跃 Run 阻止删除，已存在 Run 的外键
+  与原生历史不被删除。
+- `GET /api/sessions/{id}/messages` 在 Task 10 relay/transport 装配前明确
+  返回 `capability_unavailable`，不会读取服务器任意路径或伪造空历史。
+- worker 的 `WorkspaceSessionStore` 位于本人 `state_root/sessions/`，按
+  workspace/session 哈希分目录；绑定记录 workspace/runtime/native_id/
+  agent_version，消息以加锁 JSONL 原子追加。旧无归属绑定/快照拒绝自动
+  认领；local 模式继续使用原有 `_sessions` 格式。

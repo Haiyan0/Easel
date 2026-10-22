@@ -253,7 +253,7 @@ def test_member_sensitive_writes_and_admin_routes_are_denied(tmp_path):
         assert client.get("/api/settings/local-agents").status_code == 403
         assert client.get("/api/settings/harness").status_code == 503
         assert client.get("/api/settings/models").status_code == 503
-        assert client.get("/api/sessions").status_code == 503
+        assert client.get("/api/sessions").status_code == 200
         assert client.get("/api/unknown").status_code == 403
 
         # 伪造 admin 身份头仍不能升级

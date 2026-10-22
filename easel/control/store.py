@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -328,6 +328,11 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         CREATE INDEX worker_leases_state_idx
             ON worker_leases (state, lease_expires_at)
         """,
+    ),
+    # 版本 7：会话目录软删除。保留 conversations 行，避免已有 Run 外键被
+    # 破坏；删除只影响目录可见性，原生历史与持久产物另由 worker 管。
+    (
+        "ALTER TABLE conversations ADD COLUMN deleted_at INTEGER",
     ),
 )
 
@@ -1476,6 +1481,8 @@ class Store:
     def create_conversation(self, actor: Identity, title: str = "新对话") -> ConversationRecord:
         workspace_id = self._require_actor(actor)
         self._require_ready_workspace(workspace_id)
+        if not isinstance(title, str) or not title:
+            raise DomainError("invalid_argument", 400)
         stamp = _now()
         conversation_id = uuid.uuid4().hex
         # 归属、禁用状态与空间状态在同一写事务内复查，避免检查后被禁用仍写入
@@ -1487,16 +1494,104 @@ class Store:
                 " (workspace_id, id, title, archived, created_at, updated_at)"
                 " VALUES (?, ?, ?, 0, ?, ?)",
                 (workspace_id, conversation_id, title, stamp, stamp))
-        return ConversationRecord(conversation_id, workspace_id, title)
+        return ConversationRecord(conversation_id, workspace_id, title, False)
 
     def get_conversation(self, actor: Identity, conversation_id: str) -> ConversationRecord:
         workspace_id = self._require_actor(actor)
         row = self._connection.execute(
-            "SELECT id, workspace_id, title FROM conversations WHERE workspace_id = ? AND id = ?",
+            "SELECT id, workspace_id, title, archived FROM conversations"
+            " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
             (workspace_id, _text(conversation_id))).fetchone()
         if row is None:
             raise DomainError("not_found", 404)
-        return ConversationRecord(row["id"], row["workspace_id"], row["title"])
+        return _conversation_record(row)
+
+    def list_conversations(self, actor: Identity, *, limit: int = 50,
+                           offset: int = 0,
+                           include_archived: bool = False) -> list[ConversationRecord]:
+        """按更新时间倒序列出本空间目录；每页有上限，排序以 id 稳定打破平局。"""
+        workspace_id = self._require_actor(actor)
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise DomainError("invalid_argument", 400)
+        if type(offset) is not int or offset < 0:
+            raise DomainError("invalid_argument", 400)
+        if not isinstance(include_archived, bool):
+            raise DomainError("invalid_argument", 400)
+        clauses = ["workspace_id = ?", "deleted_at IS NULL"]
+        parameters: list[object] = [workspace_id]
+        if not include_archived:
+            clauses.append("archived = 0")
+        rows = self._connection.execute(
+            "SELECT id, workspace_id, title, archived FROM conversations"
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*parameters, limit, offset)).fetchall()
+        return [_conversation_record(row) for row in rows]
+
+    def update_conversation(self, actor: Identity, conversation_id: str, *,
+                            title: str | None = None,
+                            archived: bool | None = None) -> ConversationRecord:
+        """原子更新标题/归档标志；至少给出一项，删除后的会话为 404。"""
+        workspace_id = self._require_actor(actor)
+        if title is None and archived is None:
+            raise DomainError("invalid_argument", 400)
+        if title is not None and (not isinstance(title, str) or not title):
+            raise DomainError("invalid_argument", 400)
+        if archived is not None and not isinstance(archived, bool):
+            raise DomainError("invalid_argument", 400)
+        conversation_id = _text(conversation_id)
+        stamp = _now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id, workspace_id, title, archived FROM conversations"
+                " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
+                (workspace_id, conversation_id)).fetchone()
+            if row is None:
+                raise DomainError("not_found", 404)
+            if archived is True and not row["archived"]:
+                busy = self._connection.execute(
+                    "SELECT id FROM runs WHERE workspace_id = ?"
+                    " AND conversation_id = ?"
+                    f" AND status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)})"
+                    " LIMIT 1",
+                    (workspace_id, conversation_id,
+                     *TERMINAL_RUN_STATUSES)).fetchone()
+                if busy is not None:
+                    raise DomainError("conversation_busy", 409)
+            next_title = title if title is not None else row["title"]
+            next_archived = (1 if archived is True
+                             else 0 if archived is False
+                             else row["archived"])
+            self._connection.execute(
+                "UPDATE conversations SET title = ?, archived = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
+                (next_title, next_archived, stamp, workspace_id,
+                 conversation_id))
+        return ConversationRecord(
+            conversation_id, workspace_id, next_title, bool(next_archived))
+
+    def delete_conversation(self, actor: Identity, conversation_id: str) -> None:
+        """软删除目录元数据；不删除 Run、原生历史或持久产物。"""
+        workspace_id = self._require_actor(actor)
+        conversation_id = _text(conversation_id)
+        stamp = _now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id FROM conversations WHERE workspace_id = ? AND id = ?"
+                " AND deleted_at IS NULL",
+                (workspace_id, conversation_id)).fetchone()
+            if row is None:
+                raise DomainError("not_found", 404)
+            busy = self._connection.execute(
+                "SELECT id FROM runs WHERE workspace_id = ? AND conversation_id = ?"
+                f" AND status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)}) LIMIT 1",
+                (workspace_id, conversation_id, *TERMINAL_RUN_STATUSES)).fetchone()
+            if busy is not None:
+                raise DomainError("conversation_busy", 409)
+            self._connection.execute(
+                "UPDATE conversations SET deleted_at = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
+                (stamp, stamp, workspace_id, conversation_id))
 
     # ------------------------------------------------------------------
     # 任务接纳
@@ -1633,10 +1728,13 @@ class Store:
 
     def _require_conversation(self, workspace_id: str, conversation_id: str) -> None:
         row = self._connection.execute(
-            "SELECT id FROM conversations WHERE workspace_id = ? AND id = ?",
+            "SELECT archived, deleted_at FROM conversations"
+            " WHERE workspace_id = ? AND id = ?",
             (workspace_id, conversation_id)).fetchone()
-        if row is None:
+        if row is None or row["deleted_at"] is not None:
             raise DomainError("not_found", 404)
+        if row["archived"]:
+            raise DomainError("conversation_archived", 409)
 
     def _require_conversation_free(self, workspace_id: str, conversation_id: str) -> None:
         """同一会话同时只允许一个活跃 prompt。
@@ -1776,6 +1874,11 @@ def _read_only_uri(path: Path) -> str:
     """构造只读连接 URI；用绝对 Path 的标准 file URI 编码，保证与读写连接
     指向同一文件（相对路径先转为绝对路径，保留现有兼容性）。"""
     return f"{Path(os.path.abspath(path)).as_uri()}?mode=ro"
+
+
+def _conversation_record(row: sqlite3.Row) -> ConversationRecord:
+    return ConversationRecord(
+        row["id"], row["workspace_id"], row["title"], bool(row["archived"]))
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:

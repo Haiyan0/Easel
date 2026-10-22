@@ -31,6 +31,7 @@ from .auth import AuthService
 from .config import ConfigService
 from .policy import authorize, public_route
 from .runtime import RuntimeManager
+from .sessions import SessionService
 from .store import Store
 from .types import DomainError, Identity
 
@@ -48,9 +49,14 @@ _IMPLEMENTED_EXACT = frozenset({
     ("POST", "/api/admin/managed-config"),
     ("GET", "/api/settings/models"),
     ("POST", "/api/settings/models/save"),
+    ("GET", "/api/sessions"),
+    ("POST", "/api/sessions"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
+    ("PATCH", re.compile(r"^/api/sessions/[^/]+$")),
+    ("DELETE", re.compile(r"^/api/sessions/[^/]+$")),
+    ("GET", re.compile(r"^/api/sessions/[^/]+/messages$")),
 )
 """control 本轮真正装配的路由；其余已分类业务显式 503。"""
 
@@ -238,11 +244,56 @@ def _identity_view(identity: Identity, csrf_token: str) -> dict:
     }
 
 
-async def _run_db(request: Request, function, *args):
+async def _run_db(request: Request, function, *args, **kwargs):
     """在专用数据库线程执行阻塞操作，保持 SQLite 连接线程边界。"""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        request.app.state.db_executor, functools.partial(function, *args))
+        request.app.state.db_executor,
+        functools.partial(function, *args, **kwargs))
+
+
+def _query_int(request: Request, name: str, default: int, *,
+               minimum: int, maximum: int) -> int:
+    value = request.query_params.get(name)
+    if value is None:
+        return default
+    if not value.isdigit():
+        raise DomainError("invalid_argument", 400)
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise DomainError("invalid_argument", 400)
+    return number
+
+
+def _query_bool(request: Request, name: str, default: bool = False) -> bool:
+    value = request.query_params.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in ("1", "true"):
+        return True
+    if normalized in ("0", "false"):
+        return False
+    raise DomainError("invalid_argument", 400)
+
+
+def _session_view(conversation) -> dict:
+    return {
+        "id": conversation.id,
+        "workspaceId": conversation.workspace_id,
+        "title": conversation.title,
+        "archived": conversation.archived,
+    }
+
+
+def _session_title(value: object) -> str:
+    if not isinstance(value, str):
+        raise DomainError("invalid_argument", 400)
+    title = value.strip()
+    if (not title or len(title) > 200
+            or any(ord(character) < 32 for character in title)):
+        raise DomainError("invalid_argument", 400)
+    return title
 
 
 async def _read_invite_token(request: Request) -> str:
@@ -365,6 +416,7 @@ def create_app(*, store: Store, auth: AuthService,
             else:
                 app.state.runtime = runtime
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)
+            app.state.sessions = SessionService(app.state.control_store)
             if config_service is not None:
                 # with_store 会读取并校验已有密文，必须在数据库专用线程执行
                 app.state.config_service = await loop.run_in_executor(
@@ -491,6 +543,79 @@ def create_app(*, store: Store, auth: AuthService,
                                secure=True, httponly=True, samesite="lax")
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.get("/api/sessions")
+    async def list_sessions(request: Request):
+        service: SessionService = request.app.state.sessions
+        limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
+        offset = _query_int(request, "offset", 0,
+                            minimum=0, maximum=1_000_000)
+        include_archived = _query_bool(request, "include_archived")
+        sessions = await _run_db(
+            request, service.list_conversations, request.state.identity,
+            limit=limit, offset=offset,
+            include_archived=include_archived)
+        next_offset = offset + len(sessions) if len(sessions) == limit else None
+        return JSONResponse(
+            {"sessions": [_session_view(item) for item in sessions],
+             "nextOffset": next_offset},
+            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/sessions")
+    async def create_session(request: Request):
+        service: SessionService = request.app.state.sessions
+        payload = await _read_json_body(request)
+        title = _session_title(payload.get("title", "新对话"))
+        session = await _run_db(
+            request, service.create_conversation,
+            request.state.identity, title)
+        return JSONResponse(
+            _session_view(session), status_code=201,
+            headers={"Cache-Control": "no-store"})
+
+    @app.patch("/api/sessions/{session_id}")
+    async def update_session(request: Request, session_id: str):
+        service: SessionService = request.app.state.sessions
+        payload = await _read_json_body(request)
+        title = None
+        archived = None
+        if "title" in payload:
+            title = _session_title(payload["title"])
+        if "archived" in payload:
+            if not isinstance(payload["archived"], bool):
+                raise DomainError("invalid_argument", 400)
+            archived = payload["archived"]
+        if title is None and archived is None:
+            raise DomainError("invalid_argument", 400)
+        session = await _run_db(
+            request, service.update_conversation,
+            request.state.identity, session_id,
+            title=title, archived=archived)
+        return JSONResponse(
+            _session_view(session),
+            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_session(request: Request, session_id: str):
+        service: SessionService = request.app.state.sessions
+        await _run_db(
+            request, service.delete_conversation,
+            request.state.identity, session_id)
+        return Response(status_code=204,
+                        headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/sessions/{session_id}/messages")
+    async def session_messages(request: Request, session_id: str):
+        service: SessionService = request.app.state.sessions
+        limit = _query_int(request, "limit", 100, minimum=1, maximum=500)
+        offset = _query_int(request, "offset", 0,
+                            minimum=0, maximum=1_000_000)
+        messages = await _run_db(
+            request, service.messages, request.state.identity, session_id,
+            limit=limit, offset=offset)
+        return JSONResponse(
+            {"messages": messages},
+            headers={"Cache-Control": "no-store"})
 
     @app.get("/api/settings/models")
     async def get_model_settings(request: Request):
