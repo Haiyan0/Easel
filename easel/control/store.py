@@ -1641,6 +1641,11 @@ class Store:
         workspace_id = self._require_actor(actor, allow_disabled=True)
         return self._fetch_run(workspace_id, run_id)
 
+    def assert_run(self, actor: Identity, run_id: str) -> RunRecord:
+        """会话/任务续接前的当前身份校验；禁用用户不能继续获得任务句柄。"""
+        workspace_id = self._require_actor(actor)
+        return self._fetch_run(workspace_id, _text(run_id))
+
     def list_runs(self, actor: Identity, conversation_id: str) -> list[RunRecord]:
         """按创建顺序列出本空间某个会话的任务。"""
         workspace_id = self._require_actor(actor)

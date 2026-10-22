@@ -257,7 +257,7 @@ def _query_int(request: Request, name: str, default: int, *,
     value = request.query_params.get(name)
     if value is None:
         return default
-    if not value.isdigit():
+    if not (value.isascii() and value.isdigit()):
         raise DomainError("invalid_argument", 400)
     number = int(value)
     if not minimum <= number <= maximum:

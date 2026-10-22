@@ -95,16 +95,16 @@ def _worker_session_store() -> WorkspaceSessionStore | None:
 
 
 def _legacy_session_artifacts(session_id: str) -> bool:
-    """worker 启动前是否存在没有 workspace 归属的旧本地会话材料。"""
+    """worker 启动前是否存在没有 workspace 归属的旧本地会话材料。
+
+    只检查 Easel state_root 内的旧材料；不探测开发者 HOME 下的 OpenClaw
+    原生历史。worker 模式也不会用这些旧文件推断 owner。
+    """
     return (
         harness_store.binding_path(SESSIONS_DIR, session_id).exists()
         or history_path(SESSIONS_DIR, session_id).is_file()
         or _transport_pin_file(session_id).is_file()
         or _turn_file(f"web:{session_id}").is_file()
-        or (OPENCLAW_SESSIONS_DIR
-            / f"{_openclaw_session_id(session_id)}.jsonl").is_file()
-        or (OPENCLAW_SESSIONS_DIR
-            / f"{_openclaw_session_id(f'web:{session_id}')}.jsonl").is_file()
     )
 
 
@@ -122,15 +122,18 @@ def _session_binding(session_id: str) -> dict:
         raise HTTPException(error.status, "Agent 会话绑定记录无效，不会自动重建历史") from error
 
 
-def _bind_session(session_id: str, runtime: str, native_id: str) -> None:
+def _bind_session(session_id: str, runtime: str, native_id: str,
+                  cwd: Path | None = None) -> None:
     store = _worker_session_store()
     if store is None:
         harness_store.bind(SESSIONS_DIR, session_id, runtime, native_id)
         return
     try:
-        store.bind(session_id, runtime, native_id, NATIVE_BINDING_VERSION)
+        store.bind(session_id, runtime, native_id, NATIVE_BINDING_VERSION,
+                   cwd=str(cwd) if cwd is not None else None)
     except DomainError as error:
-        raise HTTPException(409, "Agent 会话绑定冲突，不会自动重置历史") from error
+        raise HTTPException(
+            error.status, "Agent 会话绑定冲突，不会自动重置历史") from error
 
 
 def _binding_path(session_id: str) -> Path:
@@ -3375,7 +3378,10 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             _worker_execution_claim()
         record = _session_binding(sk)
         native_id = record.get("native_id", "")
-        _bind_session(sk, runtime, native_id)
+        _bind_session(
+            sk, runtime, native_id,
+            _RUNTIME_PATHS.workspace_root if _WORKER_SNAPSHOT is not None
+            else None)
         _STOPPED_CHAT.discard(sk)
         proc._task = task
         _RUNNING_CHAT[sk] = proc
@@ -3411,7 +3417,10 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
                              else _RUNTIME_PATHS.code_root)
         await asyncio.wait_for(harnesses.adapter(runtime).run(
             request, receive, ask,
-            lambda identifier: _bind_session(sk, runtime, identifier)), timeout)
+            lambda identifier: _bind_session(
+                sk, runtime, identifier,
+                _RUNTIME_PATHS.workspace_root
+                if _WORKER_SNAPSHOT is not None else None)), timeout)
         clean_end = True
         reason = "completed"
     except asyncio.CancelledError:

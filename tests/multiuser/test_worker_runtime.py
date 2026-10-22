@@ -220,6 +220,7 @@ def test_web_worker_uses_managed_command_and_clean_env(tmp_path, monkeypatch):
     assert binding["native_id"] == "native-session"
     assert binding["workspace_id"] == "workspace-a"
     assert binding["agent_version"] == web.NATIVE_BINDING_VERSION
+    assert binding["cwd"] == str(paths.workspace_root.resolve())
 
 
 def test_acp_worker_uses_managed_command_end_to_end(tmp_path):

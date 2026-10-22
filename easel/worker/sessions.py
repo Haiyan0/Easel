@@ -121,23 +121,25 @@ def _read_json(path: Path) -> dict | None:
     return data
 
 
-def _parse_messages(data: bytes) -> list[dict]:
-    if not data:
-        return []
-    if not data.endswith(b"\n"):
+def _message_from_line(line: bytes) -> dict:
+    if not line or not line.endswith(b"\n"):
         raise DomainError("session_corrupt", 500)
-    messages: list[dict] = []
-    for line in data.splitlines():
-        if not line:
-            raise DomainError("session_corrupt", 500)
-        try:
-            message = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            raise DomainError("session_corrupt", 500) from None
-        if not isinstance(message, dict):
-            raise DomainError("session_corrupt", 500)
-        messages.append(message)
-    return messages
+    try:
+        message = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise DomainError("session_corrupt", 500) from None
+    if not isinstance(message, dict):
+        raise DomainError("session_corrupt", 500)
+    return message
+
+
+def _validate_messages_file(path: Path) -> None:
+    try:
+        with path.open("rb") as stream:
+            for line in stream:
+                _message_from_line(line)
+    except OSError:
+        raise DomainError("session_corrupt", 500) from None
 
 
 def _validate_attachment(attachment: object) -> None:
@@ -204,9 +206,12 @@ class WorkspaceSessionStore:
 
     @contextmanager
     def _locked(self, session_dir: Path) -> Iterator[None]:
-        session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor = os.open(session_dir / "lock", os.O_CREAT | os.O_RDWR,
-                             0o600)
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(session_dir / "lock",
+                                 os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            raise DomainError("session_write_failed", 500) from None
         try:
             if fcntl is not None:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -298,11 +303,13 @@ class WorkspaceSessionStore:
                 raise DomainError("session_unbound", 409)
             path = self.messages_path(session_id)
             if path.exists():
-                try:
-                    _parse_messages(path.read_bytes())
-                except OSError:
-                    raise DomainError("session_corrupt", 500) from None
+                _validate_messages_file(path)
+            original_size: int | None = None
             try:
+                if path.exists():
+                    original_size = path.stat().st_size
+                else:
+                    original_size = 0
                 encoded = json.dumps(
                     message, ensure_ascii=False,
                     separators=(",", ":")).encode("utf-8") + b"\n"
@@ -319,6 +326,12 @@ class WorkspaceSessionStore:
                 finally:
                     os.close(descriptor)
             except OSError:
+                # 失败不能留下半行；已知原长度时尽力恢复。
+                if original_size is not None:
+                    try:
+                        os.truncate(path, original_size)
+                    except OSError:
+                        pass
                 raise DomainError("session_write_failed", 500) from None
 
     def messages(self, session_id: str, *, limit: int = 100,
@@ -340,8 +353,15 @@ class WorkspaceSessionStore:
             path = self.messages_path(session_id)
             if not path.exists():
                 return []
+            result: list[dict] = []
+            index = 0
             try:
-                data = path.read_bytes()
+                with path.open("rb") as stream:
+                    for line in stream:
+                        message = _message_from_line(line)
+                        if offset <= index < offset + limit:
+                            result.append(message)
+                        index += 1
             except OSError:
                 raise DomainError("session_corrupt", 500) from None
-            return _parse_messages(data)[offset:offset + limit]
+            return result

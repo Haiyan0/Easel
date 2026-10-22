@@ -360,8 +360,8 @@ GET    /api/sessions/{id}/messages?limit=100&offset=0
 
 - 所有调用使用现有 Cookie/Origin/CSRF 中间件；目录和 Run 按当前身份回到
   control 数据库重查归属，外空间/未知/已删除会话统一 404。
-- 标题更新、归档和软删除均带 actor；活跃 Run 阻止删除，已存在 Run 的外键
-  与原生历史不被删除。
+- 标题更新、归档和软删除均带 actor；活跃 Run 阻止归档/删除，已存在 Run
+  的外键与原生历史不被删除。
 - `GET /api/sessions/{id}/messages` 在 Task 10 relay/transport 装配前明确
   返回 `capability_unavailable`，不会读取服务器任意路径或伪造空历史。
 - worker 的 `WorkspaceSessionStore` 位于本人 `state_root/sessions/`，按

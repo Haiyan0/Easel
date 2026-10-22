@@ -192,6 +192,24 @@ def test_messages_without_binding_are_not_claimed_as_empty_history(tmp_path):
     assert not store.binding_path("orphan").exists()
 
 
+def test_failed_append_does_not_leave_partial_line(tmp_path, monkeypatch):
+    import easel.worker.sessions as worker_sessions
+
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    store.bind("s1", "acp", "native", 1)
+    store.append_message("s1", {"role": "user", "content": "before"})
+
+    def fail_write(_descriptor, _data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(worker_sessions.os, "write", fail_write)
+    with pytest.raises(DomainError) as failed:
+        store.append_message("s1", {"role": "user", "content": "after"})
+    assert_error(failed, "session_write_failed", 500)
+    assert [message["content"] for message in store.messages("s1")] == [
+        "before"]
+
+
 def test_corrupt_or_truncated_snapshot_is_not_treated_as_empty(tmp_path):
     store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
     store.bind("s1", "acp", "native", 1)
@@ -267,6 +285,22 @@ def test_session_service_is_scoped_to_actor_workspace(tmp_path):
             service.assert_run(b, run.id)
         assert_error(foreign, "not_found", 404)
         assert service.assert_run(a, run.id).id == run.id
+
+
+def test_disabled_actor_cannot_assert_run_or_read_directory(tmp_path):
+    with Store.open(tmp_path / "db") as store:
+        a = store.create_user("A")
+        service = SessionService(store)
+        session = service.create_conversation(a)
+        run = store.reserve_run(a, session.id, "request-disabled", "digest", 1)
+        store.disable_user(a.user_id)
+
+        with pytest.raises(DomainError) as directory:
+            service.list_conversations(a)
+        assert_error(directory, "user_disabled", 403)
+        with pytest.raises(DomainError) as run_rejected:
+            service.assert_run(a, run.id)
+        assert_error(run_rejected, "user_disabled", 403)
 
 
 def test_list_update_archive_delete_and_active_run_conflict(tmp_path):

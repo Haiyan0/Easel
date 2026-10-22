@@ -49,7 +49,7 @@ class SessionService:
         self._store.delete_conversation(actor, session_id)
 
     def assert_run(self, actor: Identity, run_id: str) -> RunRecord:
-        return self._store.get_run(actor, run_id)
+        return self._store.assert_run(actor, run_id)
 
     def messages(self, actor: Identity, session_id: str, *,
                  limit: int = 100, offset: int = 0) -> list[dict]:
