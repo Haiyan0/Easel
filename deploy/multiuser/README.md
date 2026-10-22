@@ -132,10 +132,10 @@ python deploy/multiuser/provisioner.py \
   只有明确指向本次容器/网络对象的 absent 响应按不存在处理；Docker context、
   endpoint、daemon、权限或 CLI 初始化错误一律失败关闭。inspect 退出 0
   但返回空数组、非数组或首项非对象时按 `inspect_invalid` /
-  `network_invalid` 失败，不能当作对象已消失。已存在的健康 worker 其实际
-  `Config.Env` 与当前 sidecar broker/proxy 接线不符时返回
-  `worker_wiring_mismatch`，不会复用为已接线 ready，也不会为迁移直接删除
-  该实例。
+  `network_invalid` 失败，不能当作对象已消失。仍被 Docker 标记 `Running`
+  的 worker，其实际 `Config.Env` 与当前 sidecar broker/proxy 接线不符时
+  返回 `worker_wiring_mismatch`，不会复用为已接线 ready，也不会因单次
+  lifecycle 探针失败而删除该实例；只有明确 `exited`/`dead` 才重建。
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 
@@ -208,10 +208,12 @@ docker network connect easel-control easel-sidecar-<uuid>
   `broker_url`，必须指向同一个 sidecar broker 名，不能回指 control 管理地址。
 - Docker 的 `--env-file` 只在创建容器时读取。复用/接管前除静态安全字段外，
   还必须核对 inspect 中实际 `Config.Env` 的 broker/proxy/no-proxy；只更新
-  宿主 env 文件不构成新接线。健康运行中的旧实例与当前批准接线不符时返回
-  `worker_wiring_mismatch`，保留实例交控制面先 drain/stop，避免中断活跃
-  Run；已退出/不健康实例可按新接线重建，持久目录不删除。零出口模式兼容
-  无 sidecar 的实例，但不得继承仍指向 `easel-sidecar-*` 的旧代理。
+  宿主 env 文件不构成新接线。旧实例与当前批准接线不符时，只要 Docker 仍
+  报告 `Running`（无论 lifecycle 探针超时、网络失败或返回 not ready），
+  都返回 `worker_wiring_mismatch` 并保留实例，交控制面先 drain/stop，单次
+  探针失败不构成删除授权。只有明确 `exited`/`dead` 的实例才按新接线重建，
+  持久目录不删除。零出口模式兼容无 sidecar 的实例，但不得继承仍指向
+  `easel-sidecar-*` 的旧代理。
 - sidecar 创建/复用/停止均要求严格 inspect：固定镜像、权限、资源、唯一
   策略挂载、恰好两条批准网络；停止失败明确报错，不写 stopped。
 - 重启对账/租约过期的 `inspect` 同时验收 worker 实际接线、workspace 网络、

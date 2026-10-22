@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import pathlib
@@ -405,6 +406,49 @@ def test_live_zero_egress_worker_is_not_reused_after_enabling_sidecar(
     assert not [c for c in fake.commands if _is_worker_run(c)]
     assert not [c for c in fake.commands if _is_sidecar_run(c)], (
         "不能为无法安全迁移的活跃旧实例先创建 sidecar")
+
+
+@pytest.mark.parametrize("probe_failure", ["timeout", "network", "not_ready"])
+def test_live_wiring_mismatch_preserves_running_worker_on_probe_failure(
+        tmp_path, monkeypatch, probe_failure):
+    root = tmp_path / "root"
+    root.mkdir()
+    # 缩短健康等待：若误走删除重建，测试不应为空等 60 秒。
+    settings = dataclasses.replace(_settings(tmp_path), health_timeout=0.2)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    seeded = _worker_container(
+        root, ["EASEL_SERVICE_TOKEN=old-token"])
+    fake.containers[provisioner.container_name(WORKSPACE)] = seeded
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    (paths.workspace / "keep.txt").write_text("persisted", encoding="utf-8")
+
+    def failing_probe(_host, _port, _path, _headers, _timeout):
+        if probe_failure == "timeout":
+            raise TimeoutError("probe timed out")
+        if probe_failure == "network":
+            raise OSError("probe network unreachable")
+        return {
+            "workspace_id": WORKSPACE, "config_version": 1,
+            "container_id": provisioner.container_name(WORKSPACE),
+            "ready": False,
+        }
+
+    monkeypatch.setattr(provisioner, "_http_get_json", failing_probe)
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_wiring_mismatch"
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is seeded
+    assert seeded["State"]["Running"] is True
+    assert seeded["Config"]["Env"] == ["EASEL_SERVICE_TOKEN=old-token"]
+    assert (paths.workspace / "keep.txt").read_text(
+        encoding="utf-8") == "persisted"
+    assert fake.removed == []
+    assert fake.stopped == []
+    assert not [c for c in fake.commands if _is_worker_run(c)]
+    assert not [c for c in fake.commands if _is_sidecar_run(c)], (
+        "运行中旧实例迁移前不得先变更 sidecar")
 
 
 def test_stopped_zero_egress_worker_is_rebuilt_with_actual_new_env(

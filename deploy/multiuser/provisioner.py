@@ -913,6 +913,20 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
     return True
 
 
+def worker_confirmed_exited(raw: dict | None) -> bool:
+    """只有 Docker 明确报告 exited/dead 才允许直接删除重建。
+
+    Running、restarting、paused、状态缺失或结构异常都不能作为迁移授权；
+    尤其不能仅凭一次 lifecycle 探针失败删除仍可能执行任务的实例。
+    """
+    if not isinstance(raw, dict):
+        return False
+    state = raw.get("State")
+    return (isinstance(state, dict)
+            and state.get("Running") is False
+            and state.get("Status") in ("exited", "dead"))
+
+
 def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
                           paths: RuntimePaths,
@@ -1591,13 +1605,11 @@ class Provisioner:
             if not verify_worker_wiring(
                     existing, workspace_id=workspace_id,
                     sidecar_host=sidecar_host):
-                # 实际 Env 只在创建时读取。健康旧实例与批准接线不符时不能
-                # 为了迁移直接删容器，否则会中断可能正在执行的 Run；保留
-                # 实例，交控制面 drain/stop 后再重建。已退出/不健康的旧实例
-                # 可安全删除并按新接线重建，持久目录不删除。
-                if report["ready"] and await self._probe(
-                        workspace_id, config_version, report["upstream"],
-                        token):
+                # 实际 Env 只在创建时读取。Docker 仍报告 Running（无论探针
+                # 结果）就证明没有停止授权，不能为了迁移直接删容器；保留
+                # 实例，交控制面 drain/stop 后再重建。只有明确 exited/dead
+                # 的实例才可安全重建，持久目录不删除。
+                if not worker_confirmed_exited(existing):
                     raise ProvisionerError("worker_wiring_mismatch")
                 await self._remove_container(workspace_id)
                 existing = None
