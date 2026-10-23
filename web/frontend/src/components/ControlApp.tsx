@@ -41,10 +41,17 @@ interface Recovery {
   eventId: number;
 }
 
-interface PendingSend {
+/**
+ * 本地待确认发送：不写入服务端消息列表，单独渲染；终态快照确认后才移除。
+ * 失败或结果未知时保留文本与 turnId，重试仍使用同一请求键。
+ */
+interface LocalSend {
   sessionId: string;
   turnId: string;
   text: string;
+  generation: number;
+  status: 'sending' | 'failed';
+  runId?: string;
 }
 
 const CONTROL_CHANNEL = 'easel-identity';
@@ -327,7 +334,7 @@ function ControlWorkspace({
   const [loading, setLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
   const [notice, setNotice] = useState('');
-  const [pendingSend, setPendingSend] = useState<PendingSend | null>(null);
+  const [localSends, setLocalSends] = useState<LocalSend[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const streamRef = useRef<AbortController | null>(null);
   const streamOwner = useRef<string | null>(null);
@@ -340,6 +347,8 @@ function ControlWorkspace({
   const activeIdRef = useRef<string | null>(null);
   const sessionsRef = useRef<ServerSession[]>([]);
   const sessionsSeq = useRef(0);
+  // 本地待确认发送：发送代次/protocol 与 state 同步，供异步收尾读取
+  const localSendsRef = useRef<LocalSend[]>([]);
   // 会话选择代次：异步历史/admission 只能提交到发起时的选择
   const selectionSeq = useRef(0);
   // 用户主动选择代次：目录刷新等待期间的新选择不被旧请求撤销
@@ -367,6 +376,62 @@ function ControlWorkspace({
     activeIdRef.current = sessionId;
     setActiveId(sessionId);
   }, []);
+
+  const updateLocalSends = useCallback((
+    update: (current: LocalSend[]) => LocalSend[],
+  ) => {
+    const next = update(localSendsRef.current);
+    localSendsRef.current = next;
+    setLocalSends(next);
+  }, []);
+
+  const beginLocalSend = useCallback((send: LocalSend) => {
+    updateLocalSends((current) => {
+      const index = current.findIndex((item) =>
+        item.sessionId === send.sessionId && item.turnId === send.turnId);
+      if (index < 0) return [...current, send];
+      return current.map((item, itemIndex) =>
+        itemIndex === index ? send : item);
+    });
+  }, [updateLocalSends]);
+
+  const markLocalAdmitted = useCallback((
+    generation: number, turnId: string, runId: string,
+  ) => {
+    updateLocalSends((current) => current.map((item) =>
+      item.generation === generation && item.turnId === turnId
+        ? { ...item, status: 'sending', runId } : item));
+  }, [updateLocalSends]);
+
+  const markLocalFailed = useCallback((
+    generation: number, turnId: string,
+  ) => {
+    updateLocalSends((current) => current.map((item) =>
+      item.generation === generation && item.turnId === turnId
+        ? { ...item, status: 'failed' } : item));
+  }, [updateLocalSends]);
+
+  const removeLocalSendRun = useCallback((runId: string) => {
+    updateLocalSends((current) => {
+      const next = current.filter((item) => item.runId !== runId);
+      return next.length === current.length ? current : next;
+    });
+  }, [updateLocalSends]);
+
+  /** 初始快照已确认：加载开始前已接纳且不再活跃的 Run 已写入历史。 */
+  const pruneLocalSends = useCallback((
+    sessionId: string, knownRunIds: Set<string>,
+    activeRunIds: Set<string>,
+  ) => {
+    if (knownRunIds.size === 0) return;
+    updateLocalSends((current) => {
+      const next = current.filter((item) => !(
+        item.sessionId === sessionId && item.runId
+        && knownRunIds.has(item.runId)
+        && !activeRunIds.has(item.runId)));
+      return next.length === current.length ? current : next;
+    });
+  }, [updateLocalSends]);
 
   const call = useCallback(async <T,>(path: string, init?: RequestInit) => {
     try {
@@ -593,8 +658,14 @@ function ControlWorkspace({
     sessionId: string, runId: string, state: string,
     owns: () => boolean,
   ) => {
-    // 终态历史刷新必须绑定到启动它的 Run/连接/选择；旧收尾不得写新 Run
-    if (!owns()) return;
+    // 终态历史收敛只受身份/会话/消息窗口约束：旧连接不再是当前 Run 时，
+    // 只要本人当前选择仍有待确认发送，服务端快照仍可用于恢复已完成回答；
+    // 新 Run 的状态、题卡和选择由 runId 闸门保护，旧收尾不得改动。
+    const allowed = () => epochs.isCurrent(epoch)
+      && activeIdRef.current === sessionId
+      && (owns() || localSendsRef.current.some(
+        (item) => item.sessionId === sessionId));
+    if (!allowed()) return;
     clearRecoveryForRun(ctx, sessionId, runId);
     messageSeq.current += 1;
     const generation = messageSeq.current;
@@ -602,26 +673,28 @@ function ControlWorkspace({
     try {
       latest = await fetchLatestMessages(sessionId);
     } catch {
-      if (owns()) {
+      if (allowed()) {
         apply(() => {
-          setNotice('最终历史读取失败；请稍后重试。');
+          setNotice('最终历史读取失败；待确认输入仍保留，可重试或稍后恢复。');
           setRun((current) => current && current.runId === runId
             ? { ...current, state, question: null } : current);
-          setAnswers({});
+          if (runRef.current?.runId === runId) setAnswers({});
         });
       }
       return;
     }
-    if (!owns() || generation !== messageSeq.current) return;
+    if (!allowed() || generation !== messageSeq.current) return;
     apply(() => {
       setMessages(latest.messages);
       setMessageStart(latest.start);
       setMessageTotal(latest.total);
       setRun((current) => current && current.runId === runId
         ? { ...current, state, question: null } : current);
-      setAnswers({});
+      if (runRef.current?.runId === runId) setAnswers({});
     });
-  }, [apply, ctx, fetchLatestMessages]);
+    // 该 Run 的用户消息已随服务端快照提交，移除对应的本地待确认条目
+    removeLocalSendRun(runId);
+  }, [apply, ctx, epoch, epochs, fetchLatestMessages, removeLocalSendRun]);
 
   const connectRun = useCallback(async (
     runId: string, sessionId: string, after: number, turnId: string,
@@ -768,17 +841,24 @@ function ControlWorkspace({
     messageSeq.current += 1;
     let cancelled = false;
     const sendAtStart = sendSeq.current;
+    // 只按加载开始前已接纳的 Run 清理；加载期间新接纳的 Run 不误删。
+    const knownRunIds = new Set(localSendsRef.current
+      .filter((item) => item.sessionId === sessionId && item.runId)
+      .map((item) => item.runId as string));
     (async () => {
       try {
         const runs = await loadActiveRuns(sessionId);
         const latest = await fetchLatestMessages(sessionId);
-        if (cancelled || !isSelected(sessionId, seq)
-            || sendSeq.current !== sendAtStart) return;
+        if (cancelled || !isSelected(sessionId, seq)) return;
         apply(() => {
           setMessages(latest.messages);
           setMessageStart(latest.start);
           setMessageTotal(latest.total);
         });
+        // 已接纳且不再活跃的本地发送已写入服务端快照，移除待确认条目。
+        pruneLocalSends(sessionId, knownRunIds,
+          new Set(runs.map((item) => item.runId)));
+        if (sendSeq.current !== sendAtStart) return;
         const recovery = readRecovery(ctx, sessionId);
         const plan = recoveryAction(runs, recovery?.runId || null);
         if (plan.action === 'stream' && plan.runId) {
@@ -790,8 +870,7 @@ function ControlWorkspace({
           clearRecovery(ctx, sessionId);
         }
       } catch (error) {
-        if (cancelled || !isSelected(sessionId, seq)
-            || sendSeq.current !== sendAtStart) return;
+        if (cancelled || !isSelected(sessionId, seq)) return;
         apply(() => setHistoryError(error instanceof AuthError
           ? `历史读取失败（${error.status}）`
           : '历史读取失败，请稍后重试。'));
@@ -799,7 +878,7 @@ function ControlWorkspace({
     })();
     return () => { cancelled = true; };
   }, [abortStream, activeId, apply, connectRun, ctx, fetchLatestMessages,
-      isSelected, loadActiveRuns]);
+      isSelected, loadActiveRuns, pruneLocalSends]);
 
   const loadMoreSessions = useCallback(async () => {
     if (sessionNextOffset === null) return;
@@ -903,21 +982,18 @@ function ControlWorkspace({
   }, [activeId, apply, call, ctx, reloadSessions]);
 
   const submitTurn = useCallback(async (
-    sessionId: string, turnId: string, text: string, appendUser: boolean,
+    sessionId: string, turnId: string, text: string,
   ) => {
     const epochAtStart = epoch;
     if (!epochs.isCurrent(epochAtStart)) return;
-    // 从开始提交新输入起就保护本地消息窗口：在途终态/404 刷新不得覆盖，
-    // 不能等 admission 到达、新 SSE 建立后才取得保护。
+    // 从开始提交新输入起就保护本地发送代次：待确认输入独立于服务端消息
+    // 列表展示，旧终态/404 刷新可用于恢复已完成回答，但不得改动新 Run。
     sendSeq.current += 1;
-    messageSeq.current += 1;
     const sendGeneration = sendSeq.current;
     setNotice('');
-    if (appendUser && activeIdRef.current === sessionId) {
-      apply(() => setMessages((current) => [
-        ...current, { role: 'user', content: text },
-      ]));
-    }
+    beginLocalSend({
+      sessionId, turnId, text, generation: sendGeneration, status: 'sending',
+    });
     try {
       const body = await call<Record<string, unknown>>('/api/chat', {
         method: 'POST',
@@ -926,7 +1002,7 @@ function ControlWorkspace({
       });
       if (!epochs.isCurrent(epochAtStart)) return;
       const admission = parseAdmission(202, body);
-      setPendingSend(null);
+      markLocalAdmitted(sendGeneration, turnId, admission.runId);
       const recovery = {
         runId: admission.runId, turnId, eventId: 0,
       };
@@ -940,19 +1016,20 @@ function ControlWorkspace({
       }
     } catch (error) {
       if (!epochs.isCurrent(epochAtStart)) return;
-      // 已有更新的本地发送代次接管界面；旧请求的失败不再改写提示/待重试
+      // 已有更新的本地发送代次接管界面；旧请求的失败不再改写较新的待确认状态
       if (sendSeq.current !== sendGeneration) return;
+      markLocalFailed(sendGeneration, turnId);
       if (activeIdRef.current !== sessionId) return;
       const status = error instanceof AuthError ? error.status : 0;
       const detail = error instanceof Error ? error.message : '';
-      setPendingSend({ sessionId, turnId, text });
       apply(() => setNotice(
         status === 409 ? `当前会话已有任务在运行或请求冲突：${detail}`
           : status === 502 || status === 0
             ? '发送结果未知。不会自动重发；可点击“重试同一请求”确认。'
             : `发送失败（${status || '网络'}）：${detail}`));
     }
-  }, [apply, call, connectRun, ctx, epoch, epochs]);
+  }, [apply, beginLocalSend, call, connectRun, ctx, epoch, epochs,
+      markLocalAdmitted, markLocalFailed]);
 
   const activeSession = sessions.find((item) => item.id === activeId) || null;
   const visibleRun = run && run.sessionId === activeId ? run : null;
@@ -970,7 +1047,7 @@ function ControlWorkspace({
     }
     const turnId = makeTurnId();
     setInput('');
-    await submitTurn(activeId, turnId, text, true);
+    await submitTurn(activeId, turnId, text);
   }, [activeId, activeSession, input, run, submitTurn]);
 
   const stop = useCallback(async () => {
@@ -1140,6 +1217,23 @@ function ControlWorkspace({
               {message.content}
             </article>
           ))}
+          {localSends.filter((item) => item.sessionId === activeId).map(
+            (item) => (
+              <article key={`local-${item.turnId}`} style={{
+                maxWidth: '760px', whiteSpace: 'pre-wrap',
+                lineHeight: 1.6, fontSize: '14px',
+                padding: '10px 14px', borderRadius: '12px',
+                background: '#242a36', border: '1px solid #242a35',
+                justifySelf: 'end',
+              }}>
+                <div style={{ fontSize: '11px', color: '#8a92a1',
+                  marginBottom: '4px' }}>
+                  你 · {item.status === 'failed'
+                    ? '待确认（未完成）' : '发送中'}
+                </div>
+                {item.text}
+              </article>
+            ))}
           {visibleRun && visibleRun.content && !isTerminalRun(visibleRun.state)
             ? (
               <article style={{
@@ -1168,14 +1262,14 @@ function ControlWorkspace({
               {notice}
             </div>
           ) : null}
-          {pendingSend && pendingSend.sessionId === activeId ? (
-            <button style={styles.accent} onClick={() => {
-              const pending = pendingSend;
-              setPendingSend(null);
-              void submitTurn(pending.sessionId, pending.turnId,
-                pending.text, false);
-            }}>重试同一请求（不会新造请求键）</button>
-          ) : null}
+          {localSends.filter((item) => item.sessionId === activeId
+            && item.status === 'failed').map((item) => (
+            <button key={`retry-${item.turnId}`} style={styles.accent}
+              onClick={() => void submitTurn(
+                item.sessionId, item.turnId, item.text)}>
+              重试同一请求（不会新造请求键）
+            </button>
+          ))}
           {visibleRun && !isTerminalRun(visibleRun.state)
             && !streamActive ? (
             <button style={styles.button} onClick={() => {
@@ -1298,8 +1392,18 @@ async function handleFrame(
   persist: (cursor: number) => void,
   owns: () => boolean,
 ): Promise<boolean> {
-  // 整个帧都属于启动该连接/选择的 Run；旧连接迟到帧一律不得提交
-  if (!owns()) return false;
+  // 整个帧都属于启动该连接/选择的 Run；旧连接迟到帧一律不得提交。
+  // 仅终态允许触发一次受身份/会话/待确认发送约束的历史收敛，
+  // 否则新请求失败时上一轮已完成回答会永久缺失。
+  if (!owns()) {
+    if (frame.event === 'state') {
+      const state = stateFromEvent(frame);
+      if (state && isTerminalRun(state.state)) {
+        await finishRun(sessionId, runId, state.state, owns);
+      }
+    }
+    return false;
+  }
   // 只在状态事件写恢复游标；token 是 provisional，刷新后可从状态点重放。
   if (frame.event === 'state' && frame.id > 0) persist(frame.id);
   if (frame.event === 'state') {

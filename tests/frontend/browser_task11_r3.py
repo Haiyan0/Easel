@@ -267,6 +267,14 @@ async def wait_ready(page) -> None:
         " return !!t && !t.disabled; }", timeout=30000)
 
 
+async def select_target(page, title: str, warmup: str = "s099") -> None:
+    """先切到其它会话；目标若是启动自动选中会话，重复点击不会重载。"""
+    if title == warmup:
+        warmup = "s098"
+    await r1.select_session(page, warmup)
+    await r1.select_session(page, title)
+
+
 async def send_text(page, text: str) -> None:
     await page.locator("textarea").fill(text)
     await page.get_by_role("button", name="发送").click()
@@ -320,7 +328,7 @@ async def scenario_r3_01a(browser, origin, invite, capture, sessions,
         await page.route(
             re.compile(r"/api/chat/jobs/[^/]+/stream"),
             install_stream(page, [sse, sse_new, sse_done]))
-        await r1.select_session(page, "s010")
+        await select_target(page, "s010")
         await wait_event(phase["initial_done"], "初始历史响应", 30)
         await wait_ready(page)
 
@@ -411,7 +419,7 @@ async def scenario_r3_01b(browser, origin, invite, capture, sessions,
         await page.route(
             re.compile(r"/api/chat/jobs/[^/]+/stream"),
             install_stream(page, [sse, sse_new]))
-        await r1.select_session(page, "s011")
+        await select_target(page, "s011")
         await wait_event(phase["initial_done"], "初始历史响应", 30)
         await wait_ready(page)
 
@@ -482,7 +490,7 @@ async def scenario_r3_01c(browser, origin, invite, capture, sessions,
         await page.route(
             re.compile(r"/api/chat/jobs/[^/]+/stream"),
             install_stream(page, [sse_old, sse_new]))
-        await r1.select_session(page, "s012")
+        await select_target(page, "s012")
         await wait_event(phase["initial_done"], "初始历史响应", 30)
         await wait_ready(page)
 
@@ -562,7 +570,7 @@ async def scenario_r3_01d(browser, origin, invite, capture, sessions,
                 body=sse)
         await page.route(
             re.compile(r"/api/chat/jobs/[^/]+/stream"), stream)
-        await r1.select_session(page, "s013")
+        await select_target(page, "s013")
         await wait_event(phase["initial_done"], "初始历史响应", 30)
         await wait_ready(page)
 
@@ -620,7 +628,8 @@ async def broadcast_refresh(page2, channel: str) -> None:
 
 async def scenario_r3_02(browser, origin, invite, capture, sessions,
                          identity, db_path: Path, first_page, oldest,
-                         results, failures, screenshots) -> None:
+                         deleted_first, deleted_second, results, failures,
+                         screenshots) -> None:
     """目录刷新补页/存在性查询期间，用户的新选择不得被旧请求撤销。"""
     context = page = page2 = None
     results_map: dict[str, bool] = {}
@@ -788,7 +797,7 @@ async def scenario_r3_02(browser, origin, invite, capture, sessions,
         await page.unroute(page2_pattern)
 
         # 当前会话真实删除 + 慢存在性响应期间用户另选
-        s050 = sessions["s050"]
+        s050 = deleted_first
         await r1.select_session(page, s050.title)
         assert s050.title in await header_text(page)
         store = Store.connect(db_path)
@@ -834,7 +843,7 @@ async def scenario_r3_02(browser, origin, invite, capture, sessions,
         await page.unroute(existence_pattern)
 
         # 当前会话删除且用户未另选：明确回落到其它仍存在会话
-        s051 = sessions["s051"]
+        s051 = deleted_second
         await r1.select_session(page, s051.title)
         store = Store.connect(db_path)
         try:
@@ -904,6 +913,8 @@ async def main() -> int:
             identities["A"], limit=200, include_archived=True)
         sessions = {item.title: item for item in rows}
         first_page = rows[0]
+        deleted_first = rows[1]
+        deleted_second = rows[2]
     finally:
         store.close()
 
@@ -955,8 +966,9 @@ async def main() -> int:
             if not only or "02" in only:
                 await scenario_r3_02(
                     browser, origin, invites["A"].pop(), capture, sessions,
-                    identities["A"], db_path, first_page, oldest, results,
-                    failures, screenshots)
+                    identities["A"], db_path, first_page, oldest,
+                    deleted_first, deleted_second, results, failures,
+                    screenshots)
             await browser.close()
             browser = None
     finally:
