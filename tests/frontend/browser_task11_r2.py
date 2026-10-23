@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import httpx
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "multiuser"))
@@ -89,6 +91,7 @@ async def main() -> int:
     screenshots: list[str] = []
     results: dict[str, bool] = {}
 
+    browser = None
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
@@ -127,11 +130,26 @@ async def main() -> int:
                         "q2": {"status": "pending"}}})))
             await page.route("**/api/chat/jobs/*/stream*", sse_two)
             held = {"n": 0}
+            # 用测试证书作为 CA 的隔离读取端：浏览器本身仍由 SPKI 固定验证，
+            # 这里只是先抓取旧响应，再延迟交给真实页面。
+            # 浏览器本身仍由 SPKI 固定严格验证；隔离测试读取端只访问
+            # 本次临时 HTTPS 服务，用 verify=False 抓取旧响应做延迟交付。
+            capture = httpx.AsyncClient(
+                verify=False, trust_env=False, timeout=10)
 
             async def hold_history(route):
+                # 先取得旧历史响应，再延迟交付：模拟审计的“旧响应晚到”
                 held["n"] += 1
+                cookies = await context.cookies(origin)
+                cookie_header = "; ".join(
+                    f"{item['name']}={item['value']}" for item in cookies)
+                response = await capture.get(
+                    route.request.url, headers={"Cookie": cookie_header})
+                body = await response.aread()
                 await asyncio.sleep(4.0)
-                await route.continue_()
+                await route.fulfill(
+                    status=response.status_code,
+                    headers=dict(response.headers), body=body)
 
             await page.route(
                 f"**/api/sessions/{by_title['s010'].id}/messages*",
@@ -337,7 +355,15 @@ async def main() -> int:
             hang.stop()
             await browser.close()
     finally:
-        host.stop()
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        try:
+            host.stop()
+        except AssertionError as error:
+            print("CONTROL_STOP_WARNING", error)
         try:
             worker.stop()
         except Exception:
