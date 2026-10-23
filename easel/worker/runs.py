@@ -277,12 +277,14 @@ def _public_questions(questions: list[dict], secrets: tuple[str, ...]
                         f"option {option_index + 1}")
                     while label in labels or label in values:
                         label = f"{label} #{option_index + 1}"
-                    while True:
-                        value = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
-                        if value not in values and value not in labels:
-                            break
-                    values[value] = original_text
                     labels[label] = original_text
+                    base = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
+                    value = base
+                    suffix = 1
+                    while value in values or value in labels:
+                        value = f"{base}_{suffix}"
+                        suffix += 1
+                    values[value] = original_text
                     public_options.append({
                         **{key: _scrub_payload(field_value, secrets)
                            for key, field_value in option.items()},
@@ -295,12 +297,14 @@ def _public_questions(questions: list[dict], secrets: tuple[str, ...]
                     label = _scrub(original_text, secrets)
                     while label in labels or label in values:
                         label = f"{label} #{option_index + 1}"
-                    while True:
-                        value = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
-                        if value not in values and value not in labels:
-                            break
-                    values[value] = original_text
                     labels[label] = original_text
+                    base = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
+                    value = base
+                    suffix = 1
+                    while value in values or value in labels:
+                        value = f"{base}_{suffix}"
+                        suffix += 1
+                    values[value] = original_text
                     public_options.append({"label": label, "value": value})
             item["options"] = public_options
         selections[question_key] = {"values": values, "labels": labels}

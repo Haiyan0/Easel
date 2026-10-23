@@ -1094,6 +1094,60 @@ def test_crash_during_final_message_write_preserves_history_and_recovers(
         asyncio.run(reopened.aclose())
 
 
+def test_question_label_equal_to_opaque_value_stays_unambiguous(
+        tmp_path, monkeypatch):
+    """label 与同题 opaque 值同名时生成唯一 value，不猜测授权。"""
+    import easel.worker.runs as runs_module
+
+    fixed = "b" * 32
+
+    class FixedUuid:
+        hex = fixed
+
+    monkeypatch.setattr(runs_module.uuid, "uuid4", lambda: FixedUuid())
+    collide = "qopt_" + fixed
+
+    class Executor:
+        def __init__(self) -> None:
+            self.answers = None
+
+        async def __call__(self, request, context, bind, emit, ask):
+            self.answers = await ask([{
+                "questionId": "q", "question": "同名？",
+                "options": [{"label": collide}, {"label": "ok"}],
+            }])
+            return "完成"
+
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = Executor()
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="同名", routes={"broker_token": "opaque-token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "同名", envelope))
+        await wait_until(
+            lambda: manager.state("run-a") == "awaiting_permission")
+        payload = available_questions(manager, "run-a")[0]["questions"][0]
+        options = payload["options"]
+        assert options[0]["label"] == collide
+        assert options[0]["value"] == collide + "_1"
+        await manager.answer(
+            "run-a", available_questions(manager, "run-a")[0]["id"],
+            {"q": [options[0]["label"]]})
+        await wait_until(lambda: manager.state("run-a") == "done")
+        assert executor.answers == {"q": [collide]}
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_acp_permission_text_is_scrubbed_but_choice_maps(tmp_path):
     """真实 ACP 夹具把 Run token 放进 toolCall.title/选项：公开文本必须脱敏。"""
     import os
