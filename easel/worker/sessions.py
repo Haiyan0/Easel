@@ -114,6 +114,16 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise DomainError("session_write_failed", 500) from None
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    """有界写入全部字节；用于临时文件的历史复制与新记录追加。"""
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
 def _read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -338,25 +348,15 @@ class WorkspaceSessionStore:
         _validate_message(message)
 
     def _append_locked(self, session_id: str, message: dict) -> None:
-        """在会话锁内原子追加一行：临时文件 + fsync + replace。
+        """在会话锁内原子追加一行：有界流式复制 + fsync + replace。
 
-        直接 append 在进程写一半退出时会留下半行，之后整个会话都不可读。
-        这里先完整写入同目录临时文件，再原子替换；原文件要么保持旧内容，
-        要么包含完整的新行。既有文件必须先通过全部行校验，绝不截断或认领
-        任意损坏/错误身份的 JSONL。
+        逐行校验并复制既有记录到同目录临时文件，再原子替换；不把整份历史
+        读入内存，内存峰值只与单条记录大小相关。直接 append 在进程写一半
+        退出时会留下半行，因此绝不退回直接追加；也绝不截断或认领任意损坏/
+        错误身份的 JSONL。
         """
         path = self.messages_path(session_id)
         directory = path.parent
-        existing = b""
-        if path.exists():
-            _validate_messages_file(
-                path, self.workspace_id, session_id)
-            try:
-                existing = path.read_bytes()
-            except OSError:
-                raise DomainError("session_corrupt", 500) from None
-            if existing and not existing.endswith(b"\n"):
-                raise DomainError("session_corrupt", 500)
         # 清理崩溃遗留的临时文件；它们从未提交，也不是可信消息记录
         for stale in directory.glob(f".{path.name}.*.tmp"):
             try:
@@ -376,12 +376,28 @@ class WorkspaceSessionStore:
             try:
                 if hasattr(os, "fchmod"):
                     os.fchmod(descriptor, 0o600)
-                view = memoryview(existing + encoded)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError("short write")
-                    view = view[written:]
+                if path.exists():
+                    # 读取/校验异常只归为损坏；写入临时文件失败仍按磁盘
+                    # 写入失败处理，不能误报为消息损坏。
+                    def validated_lines():
+                        try:
+                            with path.open("rb") as source:
+                                for line in source:
+                                    _message_from_line(
+                                        line,
+                                        workspace_id=self.workspace_id,
+                                        session_id=session_id)
+                                    if not line.endswith(b"\n"):
+                                        raise DomainError(
+                                            "session_corrupt", 500)
+                                    yield line
+                        except OSError:
+                            raise DomainError(
+                                "session_corrupt", 500) from None
+
+                    for line in validated_lines():
+                        _write_all(descriptor, line)
+                _write_all(descriptor, encoded)
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -394,6 +410,8 @@ class WorkspaceSessionStore:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
+        except DomainError:
+            raise
         except OSError:
             raise DomainError("session_write_failed", 500) from None
         finally:

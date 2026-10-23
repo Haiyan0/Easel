@@ -803,8 +803,16 @@ class WorkerRelay:
             if (dispatch_state == "pending"
                     and now - created_at < self._dispatch_grace):
                 return False
-            await self._finish_system(workspace_id, run_id, "interrupted")
-            return True
+            # 扫描到的 pending 行可能已被合法准备/派发；收尾必须在同一
+            # 写事务内比较全部观察前提，CAS 不匹配就放弃本次旧判断。
+            interrupted = await self._db(
+                self._store.interrupt_unstarted_run, workspace_id, run_id,
+                expected_status=str(row.get("status") or ""),
+                expected_dispatch_state=dispatch_state,
+                expected_container=row.get("workerContainerId"),
+                expected_prepare_owner=row.get("prepareOwner"),
+                expected_prepare_expires_at=row.get("prepareExpiresAt"))
+            return bool(interrupted)
         dispatched_at = row.get("dispatchedAt")
         if (dispatch_state == "dispatching"
                 and isinstance(dispatched_at, int)

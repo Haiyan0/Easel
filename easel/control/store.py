@@ -1978,11 +1978,12 @@ class Store:
             "configVersion": int(row["config_version"]),
             "dispatchState": row["dispatch_state"],
             "dispatchNonce": row["dispatch_nonce"] or "",
-            "workerContainerId": row["worker_container_id"] or "",
+            # 保留 NULL 与空串的区别：后台 CAS 必须比较原值
+            "workerContainerId": row["worker_container_id"],
             "createdAt": int(row["created_at"]),
             "dispatchedAt": (int(row["dispatched_at"])
                              if row["dispatched_at"] is not None else None),
-            "prepareOwner": row["prepare_owner"] or "",
+            "prepareOwner": row["prepare_owner"],
             "prepareExpiresAt": (int(row["prepare_expires_at"])
                                  if row["prepare_expires_at"] is not None
                                  else None),
@@ -2021,6 +2022,47 @@ class Store:
                     f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
                     (status, workspace_id, run_id, *TERMINAL_RUN_STATUSES))
             return cursor.rowcount == 1
+
+    def interrupt_unstarted_run(
+            self, workspace_id: str, run_id: str, *,
+            expected_status: str, expected_dispatch_state: str,
+            expected_container: str | None,
+            expected_prepare_owner: str | None,
+            expected_prepare_expires_at: int | None) -> bool:
+        """原子收尾“仍未派发”的 Run；旧扫描不得改写已准备/已派发的行。
+
+        所有观察前提（状态、派发状态、实例绑定、准备所有者/期限）都在同一
+        写事务内比较；任一字段变化即放弃本次判断。容量释放与 token 撤销也
+        在同一事务提交，绝不基于进程内锁或事后再查询。
+        """
+        workspace_id = _text(workspace_id)
+        run_id = _text(run_id)
+        if not isinstance(expected_status, str) or not expected_status:
+            raise DomainError("invalid_argument", 400)
+        if not isinstance(expected_dispatch_state, str) \
+                or not expected_dispatch_state:
+            raise DomainError("invalid_argument", 400)
+        stamp = _now()
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE runs SET status = 'interrupted', finished_at = ?,"
+                " capacity_released_at = ?,"
+                " release_count = release_count + 1"
+                " WHERE workspace_id = ? AND id = ? AND status = ?"
+                " AND capacity_released_at IS NULL AND status NOT IN"
+                f" ({_placeholders(TERMINAL_RUN_STATUSES)})"
+                " AND dispatch_state = ?"
+                " AND worker_container_id IS ?"
+                " AND prepare_owner IS ?"
+                " AND prepare_expires_at IS ?",
+                (stamp, stamp, workspace_id, run_id, expected_status,
+                 *TERMINAL_RUN_STATUSES, expected_dispatch_state,
+                 expected_container, expected_prepare_owner,
+                 expected_prepare_expires_at))
+            if cursor.rowcount != 1:
+                return False
+            self._revoke_tokens_locked(workspace_id, run_id, stamp)
+            return True
 
     def count_active_runs(self) -> int:
         """整机当前活跃任务数。"""

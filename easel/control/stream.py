@@ -56,17 +56,25 @@ class AuthGuardedStreamingResponse(StreamingResponse):
         self._auth_check_seconds = max(0.05, float(auth_check_seconds))
 
     async def _watch_auth(self) -> None:
+        loop = asyncio.get_running_loop()
+        interval = self._auth_check_seconds
+        # 固定节拍：下一次检查从本次开始时刻计时，而不是成功完成后再等
+        # 满 4 秒；本次检查耗时会计入窗口预算。
+        deadline = loop.time() + interval
         while True:
-            await asyncio.sleep(self._auth_check_seconds)
+            now = loop.time()
+            if now < deadline:
+                await asyncio.sleep(deadline - now)
+            started = loop.time()
             try:
                 # 复查自身也受窗口约束：4 秒复查 + 0.8 秒上限仍 < 5 秒
                 await asyncio.wait_for(
-                    self._recheck(),
-                    timeout=min(0.8, self._auth_check_seconds))
+                    self._recheck(), timeout=min(0.8, interval))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 return
+            deadline = started + interval
 
     async def stream_response(self, send) -> None:
         stream = asyncio.create_task(super().stream_response(send))

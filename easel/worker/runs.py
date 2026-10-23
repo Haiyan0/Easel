@@ -1015,6 +1015,8 @@ class RunManager:
             self.registry.recover_inflight()
             # 已保存输出但尚未提交 done 的 Run：补提交，消息按 runId 去重。
             self._recover_finalizing()
+            # 失败/中断/未知 Run 的暂存输出保留，不按“不在 finalizing”删除。
+            self._recover_orphan_outputs()
 
     # -- 公开只读接口 ------------------------------------------------------
 
@@ -1345,7 +1347,10 @@ class RunManager:
             self.registry.append_event(run_id, "error", "输出保存失败")
             self.registry.finish_finalizing(
                 run_id, "failed", "output_storage_failed")
-            self._discard_output(run_id)
+            # 普通完成失败同样保留唯一完整输出；移动失败时留在原位置，
+            # 由下次启动的重开清理再尝试，绝不静默删除。
+            self._preserve_failed_output(
+                run_id, self._finalizing_path(run_id))
             return
         self.registry.finish_finalizing(run_id, "done", "completed")
         self._discard_output(run_id)
@@ -1377,7 +1382,9 @@ class RunManager:
                 if hasattr(os, "fchmod"):
                     os.fchmod(descriptor, 0o600)
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump({"runId": run_id, "content": text}, stream,
+                    json.dump({"runId": run_id,
+                               "workspaceId": self.workspace_id,
+                               "content": text}, stream,
                               ensure_ascii=False, separators=(",", ":"))
                     stream.flush()
                     os.fsync(stream.fileno())
@@ -1414,6 +1421,7 @@ class RunManager:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 content = data.get("content")
                 if (data.get("runId") != run_id
+                        or data.get("workspaceId") != self.workspace_id
                         or not isinstance(content, str)
                         or not isinstance(conversation_id, str)
                         or not conversation_id):
@@ -1421,7 +1429,8 @@ class RunManager:
             except (OSError, ValueError):
                 self.registry.finish_finalizing(
                     run_id, "failed", "output_missing")
-                path.unlink(missing_ok=True)
+                # 损坏/不匹配的暂存材料也不静默删除；移入失败区保留证据
+                self._preserve_failed_output(run_id, path)
                 continue
             try:
                 self._sessions.append_message_once(
@@ -1437,13 +1446,29 @@ class RunManager:
                 self.registry.finish_finalizing(
                     run_id, "done", "completed")
                 path.unlink(missing_ok=True)
-        # 清理不处于收尾的孤儿暂存文件（例如 done 提交后、删除前崩溃）
+
+    def _recover_orphan_outputs(self) -> None:
+        """处理不处于 finalizing 的暂存文件。
+
+        只有 Run 明确 done（成功提交后才会写 done）才可删除；failed /
+        interrupted / 未知状态的文件一律保留或移入 failed_outputs。移动
+        失败时留在原位置，绝不以“不在 finalizing 集合”为依据删除。
+        """
         directory = self._finalizing_dir()
-        if directory.exists():
-            remaining = set(self.registry.finalizing_runs())
-            for path in directory.glob("*.json"):
-                if path.stem not in remaining:
-                    path.unlink(missing_ok=True)
+        if not directory.exists():
+            return
+        finalizing = set(self.registry.finalizing_runs())
+        for path in directory.glob("*.json"):
+            run_id = path.stem
+            if run_id in finalizing:
+                continue
+            admission = self.registry.admission(run_id)
+            state = admission.get("state") if admission else None
+            if state == "done":
+                # done 只在本轮输出一致提交后才写入，可作为清理证据
+                path.unlink(missing_ok=True)
+                continue
+            self._preserve_failed_output(run_id, path)
 
     def _release(self, context: RunContext) -> None:
         if self._active_conversations.get(context.conversation_id) == \

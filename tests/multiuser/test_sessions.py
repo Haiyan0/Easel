@@ -24,6 +24,39 @@ def assert_error(error: pytest.ExceptionInfo, code: str, status: int) -> None:
     assert (error.value.code, error.value.status) == (code, status)
 
 
+def test_append_peak_memory_does_not_scale_with_history(tmp_path):
+    """小追加的内存峰值只与单条记录相关，不随历史总量线性增长。"""
+    import tracemalloc
+
+    def build(root: pathlib.Path, count: int):
+        store = WorkspaceSessionStore(root, WORKSPACE_A)
+        store.bind("s", "acp", "native", 1)
+        content = "x" * (256 * 1024)
+        for _ in range(count):
+            store.append_message("s", {"role": "user", "content": content})
+        return store
+
+    def append_peak(store: WorkspaceSessionStore) -> int:
+        tracemalloc.start()
+        try:
+            store.append_message(
+                "s", {"role": "assistant", "content": "small"})
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    small = build(tmp_path / "small", 8)    # 约 2 MB 历史
+    large = build(tmp_path / "large", 32)   # 约 8 MB 历史
+    small_peak = append_peak(small)
+    large_peak = append_peak(large)
+    assert large_peak < 4 * 1024 * 1024, large_peak
+    assert large_peak < small_peak * 2 + 1024 * 1024, (
+        small_peak, large_peak)
+    messages = small.messages("s", limit=500, offset=0)
+    assert len(messages) == 9
+    assert messages[-1]["content"] == "small"
+
+
 def _legacy_binding(root: pathlib.Path, workspace_id: str,
                     session_id: str) -> pathlib.Path:
     base = (root / "sessions" / hashlib.sha256(

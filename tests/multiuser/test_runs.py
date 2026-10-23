@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -613,6 +614,100 @@ def test_output_storage_failure_never_publishes_done(tmp_path):
         await manager.aclose()
 
     asyncio.run(scenario())
+
+
+def test_output_failure_preserves_staged_text(tmp_path):
+    """普通完成追加失败：必须保留本轮完整输出，不能当垃圾删除。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    manager = make_manager(paths, key, ImmediateAnswerExecutor("回答"))
+    manager._sessions = AssistantWriteFailSessions(paths.state_root, WORKSPACE)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(lambda: manager.state("run-a") == "failed")
+        candidates = list((paths.state_root / "failed_outputs").glob("*.json"))
+        candidates += list((paths.state_root / "finalizing").glob("*.json"))
+        assert candidates, "失败路径必须保留完整暂存输出"
+        data = json.loads(candidates[0].read_text(encoding="utf-8"))
+        assert data["runId"] == "run-a"
+        assert data["workspaceId"] == WORKSPACE
+        assert data["content"] == "回答"
+        assert manager.events("run-a", after=0)["state"] == "failed"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_recovery_failure_keeps_output_when_preserve_move_fails(
+        tmp_path, monkeypatch):
+    """恢复追加失败且移动失败：原位置保留；再次重开只移走不删除。"""
+    import easel.worker.runs as runs_module
+
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"conversation-a": "native-a"}, answers={"run-a": None},
+        chunks={})
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def start() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await asyncio.wait_for(executor.event("run-a").wait(), timeout=5)
+        assert manager.registry.begin_finalize("run-a") is True
+        manager._stage_output("run-a", "回答")
+
+    asyncio.run(start())
+    stage = paths.state_root / "finalizing" / "run-a.json"
+    assert stage.exists()
+
+    class FailingSessions(WorkspaceSessionStore):
+        def append_message_once(self, session_id, run_id, message):
+            raise DomainError("session_write_failed", 500)
+
+    original_replace = os.replace
+
+    def fail_replace(src, dst):
+        raise OSError("preserve move failed")
+
+    monkeypatch.setattr(runs_module.os, "replace", fail_replace)
+    failing = RunManager(
+        workspace_id=WORKSPACE, paths=paths, public_key=key.public_key(),
+        sessions=FailingSessions(paths.state_root, WORKSPACE),
+        executor=NeverExecutor(), base_env={"PATH": "C:\\bin"},
+        clock=lambda: CLOCK)
+    assert failing.state("run-a") == "failed"
+    assert stage.exists(), "移动失败时不得删除唯一恢复输出"
+    assert json.loads(stage.read_text(encoding="utf-8"))["content"] == "回答"
+
+    monkeypatch.setattr(runs_module.os, "replace", original_replace)
+    reopened = make_manager(paths, key, NeverExecutor())
+    preserved = paths.state_root / "failed_outputs" / "run-a.json"
+    assert not stage.exists()
+    assert preserved.exists()
+    assert json.loads(preserved.read_text(encoding="utf-8"))["content"] == \
+        "回答"
+    assert [item["role"] for item in
+            reopened.messages("conversation-a")["messages"]] == ["user"]
+
+    again = make_manager(paths, key, NeverExecutor())
+    assert preserved.exists(), "后续重开不得删除失败输出"
+    asyncio.run(reopened.aclose())
+    asyncio.run(again.aclose())
 
 
 def test_assistant_output_is_persisted_before_done_state(tmp_path):

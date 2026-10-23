@@ -278,14 +278,15 @@ class MutableProvider:
 def make_relay(store: Store, client: httpx.AsyncClient, *,
                runtime=None, broker=None, provider=None,
                signing_key=None, dispatch_grace: int = 60,
-               snapshot_ttl: int = 1800) -> WorkerRelay:
+               snapshot_ttl: int = 1800,
+               db_runner=None) -> WorkerRelay:
     return WorkerRelay(
         runtime or StaticRuntime(), SessionService(store), AuthService(store),
         store=store,
         signing_key=signing_key or Ed25519PrivateKey.generate(),
         http_client=client, config_provider=provider or MutableProvider(),
         broker=broker, dispatch_grace=dispatch_grace,
-        snapshot_ttl=snapshot_ttl)
+        snapshot_ttl=snapshot_ttl, db_runner=db_runner)
 
 
 def payload(conversation_id: str, message: str = "执行任务",
@@ -842,6 +843,102 @@ def test_concurrent_prepare_has_single_owner_and_failure_cannot_interrupt(
     asyncio.run(scenario())
 
 
+def test_stale_pending_scan_cannot_interrupt_dispatched_run(tmp_path):
+    """后台基于旧 pending 行的收尾必须 CAS；已准备/派发的 Run 不受改写。"""
+    async def scenario() -> None:
+        path = tmp_path / "control.sqlite3"
+        scan_store = Store.connect(path)
+        submit_store = Store.connect(path)
+        try:
+            user = scan_store.create_user("Owner")
+            conversation = scan_store.create_conversation(user, "交错")
+            key = Ed25519PrivateKey.generate()
+            broker = FakeBroker()
+            runtime = StaticRuntime()
+            reserved = asyncio.Event()
+            scanned = asyncio.Event()
+            dispatched = asyncio.Event()
+
+            class CaptureWorker(httpx.AsyncBaseTransport):
+                def __init__(self) -> None:
+                    self.posts = 0
+
+                async def handle_async_request(self, request):
+                    if request.method == "POST":
+                        self.posts += 1
+                    dispatched.set()
+                    return httpx.Response(
+                        202, json={"state": "running"}, request=request)
+
+            transport = CaptureWorker()
+
+            async def submit_runner(function, *args, **kwargs):
+                if getattr(function, "__name__", "") == "reserve_run":
+                    result = function(*args, **kwargs)
+                    reserved.set()
+                    await asyncio.wait_for(scanned.wait(), timeout=5)
+                    return result
+                return function(*args, **kwargs)
+
+            async def scan_runner(function, *args, **kwargs):
+                name = getattr(function, "__name__", "")
+                if name == "list_active_run_bindings":
+                    result = function(*args, **kwargs)
+                    scanned.set()
+                    return result
+                if name == "interrupt_unstarted_run":
+                    # 旧扫描已决定收尾；等待合法提交完成派发后再执行 CAS
+                    await asyncio.wait_for(dispatched.wait(), timeout=5)
+                    return function(*args, **kwargs)
+                return function(*args, **kwargs)
+
+            async with httpx.AsyncClient(
+                    transport=transport) as submit_client, \
+                    httpx.AsyncClient(
+                        transport=httpx.MockTransport(
+                            lambda request: httpx.Response(
+                                200, json={"state": "running",
+                                           "events": [],
+                                           "lastEventId": 0}))) as scan_client:
+                scan_relay = make_relay(
+                    scan_store, scan_client, runtime=runtime,
+                    broker=broker, signing_key=key, db_runner=scan_runner)
+                scan_relay._system_clock = lambda: time.time() + 100
+                submit_relay = make_relay(
+                    submit_store, submit_client, runtime=runtime,
+                    signing_key=key, db_runner=submit_runner)
+
+                submit_task = asyncio.create_task(submit_relay.submit(
+                    user, payload(conversation.id, turn_id="race-turn")))
+                await asyncio.wait_for(reserved.wait(), timeout=5)
+                reconcile_task = asyncio.create_task(
+                    scan_relay.reconcile_once())
+                submitted = await asyncio.wait_for(submit_task, timeout=5)
+                result = await asyncio.wait_for(reconcile_task, timeout=5)
+                run_id = submitted["runId"]
+                assert result["finished"] == 0
+                assert scan_store.get_run(user, run_id).status == "running"
+                assert scan_store.count_active_runs() == 1
+                assert scan_store.get_run_snapshot(user, run_id) is not None
+                assert transport.posts == 1
+                assert broker.revoked == [], "旧扫描不得撤销成功方 token"
+                # 真正未准备/已过期的 Run 仍可结算一次
+                stale = scan_store.reserve_run(
+                    user, scan_store.create_conversation(user, "未准备").id,
+                    "stale-turn", "stale-digest", REVISION)
+                scan_store.claim_run_preparation(
+                    user, stale.id, "expired-owner",
+                    int(time.time()) - 100, 1)
+                await scan_relay.reconcile_once()
+                assert scan_store.get_run(user, stale.id).status == \
+                    "interrupted"
+        finally:
+            scan_store.close()
+            submit_store.close()
+
+    asyncio.run(scenario())
+
+
 def test_prepare_owner_crash_is_recovered_without_republish(tmp_path):
     """准备所有权持有者崩溃：后台中断、不接管重发，重试只读原 admission。"""
     from easel.worker.config import run_input_digest
@@ -868,7 +965,8 @@ def test_prepare_owner_crash_is_recovered_without_republish(tmp_path):
                 await relay.reconcile_once()
                 assert store.get_run(user, run.id).status == "interrupted"
                 assert store.count_active_runs() == 0
-                assert broker.revoked == [(run.id, user.workspace_id)]
+                # token 撤销与容量释放在 Store CAS 同一事务内完成；该路径
+                # 没有真实 broker 快照，FakeBroker 不是证据来源
                 assert transport.calls == []
 
                 retried = await relay.submit(

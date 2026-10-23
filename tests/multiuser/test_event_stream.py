@@ -479,6 +479,148 @@ def test_slow_consumer_send_is_closed_by_auth_watchdog():
     asyncio.run(scenario())
 
 
+def test_auth_watchdog_uses_fixed_cadence_from_check_start():
+    """默认参数下检查耗时计入窗口：撤销到关闭仍 ≤5 秒。"""
+    from easel.control.stream import AuthGuardedStreamingResponse
+
+    class BlockingBody:
+        def __init__(self) -> None:
+            self.closed = False
+            self.produced = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.produced += 1
+            if self.produced == 1:
+                return b"event: token\ndata: \"private\"\n\n"
+            await asyncio.sleep(60)
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        body = BlockingBody()
+        block = asyncio.Event()
+        sent: list[bytes] = []
+        state = {"calls": 0}
+        revoked_at: dict[str, float] = {}
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.start":
+                return
+            if message.get("body"):
+                sent.append(message["body"])
+                await block.wait()
+
+        async def recheck() -> None:
+            call = state["calls"]
+            state["calls"] += 1
+            if call == 0:
+                # 检查开始即读到登录有效，随后（本次检查期间）撤销
+                revoked_at["t"] = time.monotonic()
+                await asyncio.sleep(0.7)
+                return
+            await asyncio.sleep(0.7)
+            raise DomainError("unauthorized", 401)
+
+        response = AuthGuardedStreamingResponse(
+            body, recheck=recheck, auth_check_seconds=4.0,
+            media_type="text/event-stream")
+        task = asyncio.create_task(response.stream_response(send))
+        await wait_until(lambda: len(sent) == 1)
+        await asyncio.wait_for(task, timeout=12)
+        closed_at = time.monotonic()
+        assert task.exception() is None
+        assert state["calls"] >= 2
+        elapsed = closed_at - revoked_at["t"]
+        assert elapsed <= 5.0, f"撤销到关闭 {elapsed:.3f}s"
+        assert sent == [b'event: token\ndata: "private"\n\n']
+        assert body.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_auth_watchdog_check_timeout_fails_closed():
+    from easel.control.stream import AuthGuardedStreamingResponse
+
+    async def scenario() -> None:
+        closed = {"value": False}
+
+        class Body:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return b"chunk"
+
+            async def aclose(self):
+                closed["value"] = True
+
+        block = asyncio.Event()
+        sent: list[bytes] = []
+
+        async def send(message) -> None:
+            if message["type"] != "http.response.start" and message.get("body"):
+                sent.append(message["body"])
+                await block.wait()
+
+        async def recheck() -> None:
+            await asyncio.sleep(30)
+
+        response = AuthGuardedStreamingResponse(
+            Body(), recheck=recheck, auth_check_seconds=0.2,
+            media_type="text/event-stream")
+        task = asyncio.create_task(response.stream_response(send))
+        await wait_until(lambda: len(sent) == 1)
+        await asyncio.wait_for(task, timeout=2)
+        assert task.exception() is None
+        assert closed["value"] is True
+        # 监视/发送任务均已结束，没有残留后台任务
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_watchdog_cleans_up_on_downstream_disconnect():
+    from easel.control.stream import AuthGuardedStreamingResponse
+
+    async def scenario() -> None:
+        body = {"closed": False}
+
+        class Body:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return b"chunk"
+
+            async def aclose(self):
+                body["closed"] = True
+
+        async def send(message) -> None:
+            if message["type"] != "http.response.start" and message.get("body"):
+                raise OSError("client disconnected")
+
+        async def recheck() -> None:
+            return None
+
+        response = AuthGuardedStreamingResponse(
+            Body(), recheck=recheck, auth_check_seconds=10.0,
+            media_type="text/event-stream")
+        with pytest.raises(OSError):
+            await response.stream_response(send)
+        assert body["closed"] is True
+        current = asyncio.current_task()
+        leftovers = [task for task in asyncio.all_tasks()
+                     if task is not current and not task.done()]
+        assert leftovers == []
+
+    asyncio.run(scenario())
+
+
 def test_watchdog_does_not_close_normal_stream():
     from easel.control.stream import AuthGuardedStreamingResponse
 
