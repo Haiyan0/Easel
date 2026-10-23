@@ -93,3 +93,82 @@ def test_session_runs_are_owned_paginated_and_secret_free(tmp_path):
             f"/api/sessions/{conversation.id}/runs?limit=201").status_code == 400
         assert client.get(
             f"/api/sessions/{conversation.id}/runs?offset=-1").status_code == 400
+
+
+class FakeRelay:
+    async def messages(self, actor, session_id, *, limit, offset):
+        return {"sessionId": session_id,
+                "messages": [{"role": "user", "content": "归档消息"}],
+                "total": 2500}
+
+
+def test_archived_conversation_allows_reads_but_blocks_new_runs(tmp_path):
+    with control_api(tmp_path, relay_factory=lambda *args: FakeRelay()) as (
+            client, store, auth, admin, member, other):
+        csrf = login(client, auth, admin, member)
+        conversation = store.create_conversation(member, "归档")
+        run = store.reserve_run(
+            member, conversation.id, "archived-run", "digest", REVISION)
+        store.finish_run(member, run.id, "done")
+        store.update_conversation(member, conversation.id, archived=True)
+
+        listed = client.get(f"/api/sessions/{conversation.id}/runs")
+        assert listed.status_code == 200, listed.text
+        assert [item["runId"] for item in listed.json()["runs"]] == [run.id]
+        active = client.get(
+            f"/api/sessions/{conversation.id}/runs?active=true")
+        assert active.status_code == 200
+        assert active.json()["runs"] == []
+
+        messages = client.get(
+            f"/api/sessions/{conversation.id}/messages")
+        assert messages.status_code == 200, messages.text
+        assert messages.json()["total"] == 2500
+        assert messages.json()["messages"][0]["content"] == "归档消息"
+
+        # 归档仍禁止新 Run；不通过只读接口绕过
+        import pytest
+        from easel.control.types import DomainError
+        with pytest.raises(DomainError) as archived:
+            store.reserve_run(
+                member, conversation.id, "new-run", "digest-2", REVISION)
+        assert archived.value.code == "conversation_archived"
+        assert archived.value.status == 409
+
+        store.delete_conversation(member, conversation.id)
+        assert client.get(
+            f"/api/sessions/{conversation.id}/runs").status_code == 404
+        assert client.get(
+            f"/api/sessions/{conversation.id}/messages").status_code == 404
+
+
+def test_active_run_filter_finds_run_beyond_first_pages(tmp_path):
+    with control_api(tmp_path) as (client, store, auth, admin, member, other):
+        conversation = store.create_conversation(member, "长历史")
+        stamp = 900
+        rows = []
+        for index in range(2000):
+            rows.append((
+                member.workspace_id, f"old-{index:04d}", conversation.id,
+                f"req-{index}", f"digest-{index}", "done", REVISION,
+                stamp + index, stamp + index, stamp + index, 1))
+        with store._transaction():
+            store._connection.executemany(
+                "INSERT INTO runs (workspace_id, id, conversation_id,"
+                " client_request_id, input_digest, status, config_version,"
+                " created_at, finished_at, capacity_released_at, release_count)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        active = store.reserve_run(
+            member, conversation.id, "active-last", "digest-active", REVISION)
+        login(client, auth, admin, member)
+
+        active_page = client.get(
+            f"/api/sessions/{conversation.id}/runs"
+            "?active=true&limit=200&offset=0")
+        assert active_page.status_code == 200, active_page.text
+        assert [item["runId"] for item in active_page.json()["runs"]] == [
+            active.id]
+        first = client.get(
+            f"/api/sessions/{conversation.id}/runs?limit=200&offset=0")
+        assert first.status_code == 200
+        assert active.id not in [item["runId"] for item in first.json()["runs"]]

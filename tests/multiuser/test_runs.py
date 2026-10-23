@@ -710,6 +710,31 @@ def test_recovery_failure_keeps_output_when_preserve_move_fails(
     asyncio.run(again.aclose())
 
 
+def test_messages_total_supports_latest_window(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    manager = make_manager(paths, key, ImmediateAnswerExecutor("回答"))
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(lambda: manager.state("run-a") == "done")
+        payload = manager.messages("conversation-a", limit=1, offset=0)
+        assert payload["total"] == 2
+        assert len(payload["messages"]) == 1
+        latest = manager.messages("conversation-a", limit=1, offset=1)
+        assert latest["messages"][0]["content"] == "回答"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_assistant_output_is_persisted_before_done_state(tmp_path):
     paths = make_paths(tmp_path)
     key = Ed25519PrivateKey.generate()

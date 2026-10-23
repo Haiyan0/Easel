@@ -959,7 +959,7 @@ def test_two_worker_authorized_relay_end_to_end(tmp_path, monkeypatch):
                      f"/api/sessions/{session_empty}/messages",
                      headers=read_headers(auth_b1))
         assert empty.status_code == 200, empty.text
-        assert empty.json() == {"messages": []}
+        assert empty.json() == {"messages": [], "total": 0}
         assert runtime.count(ws_b) == b_calls_before_empty
 
         # ------------------------------------------------------------------

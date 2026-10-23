@@ -687,9 +687,10 @@ def create_app(*, store: Store, auth: AuthService,
         limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
         offset = _query_int(request, "offset", 0,
                             minimum=0, maximum=1_000_000)
+        active_only = _query_bool(request, "active")
         runs = await _run_db(
             request, service.list_runs, request.state.identity, session_id,
-            limit=limit, offset=offset)
+            limit=limit, offset=offset, active_only=active_only)
         next_offset = offset + len(runs) if len(runs) == limit else None
         return JSONResponse(
             {"runs": [{"runId": run.id,
@@ -719,8 +720,11 @@ def create_app(*, store: Store, auth: AuthService,
         messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(messages, list):
             raise DomainError("upstream_invalid", 502)
+        total = result.get("total")
+        if type(total) is not int or total < len(messages):
+            total = len(messages)
         return JSONResponse(
-            {"messages": messages},
+            {"messages": messages, "total": total},
             headers={"Cache-Control": "no-store"})
 
     @app.post("/api/chat")

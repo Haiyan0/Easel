@@ -155,14 +155,14 @@ def test_messages_route_reads_own_worker_snapshot_with_pagination(tmp_path):
             assert response.json() == {"messages": [
                 {"role": "user", "content": "第一问"},
                 {"role": "assistant", "content": "第一答"},
-            ]}
+            ], "total": 2}
             assert response.headers["cache-control"] == "no-store"
 
             # 无 Run 的会话不启动 worker，也不读取宿主任意路径
             empty_response = client.get(
                 f"/api/sessions/{empty.id}/messages")
             assert empty_response.status_code == 200, empty_response.text
-            assert empty_response.json() == {"messages": []}
+            assert empty_response.json() == {"messages": [], "total": 0}
     finally:
         close_clients(clients)
 

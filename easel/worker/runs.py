@@ -1049,6 +1049,7 @@ class RunManager:
             "sessionId": session_id,
             "messages": self._sessions.messages(
                 session_id, limit=limit, offset=offset),
+            "total": self._sessions.count_messages(session_id),
         }
 
     # -- 接纳 --------------------------------------------------------------

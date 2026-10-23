@@ -492,3 +492,30 @@ class WorkspaceSessionStore:
             except OSError:
                 raise DomainError("session_corrupt", 500) from None
             return result
+
+    def count_messages(self, session_id: str) -> int:
+        """只读统计消息条数；用于前端最新窗口与可分页历史。"""
+        _session_id(session_id)
+        session_dir = self._session_dir(session_id)
+        if not session_dir.exists():
+            return 0
+        with self._locked(session_dir):
+            if self._read_binding_locked(session_id) is None:
+                path = self.messages_path(session_id)
+                if path.exists():
+                    raise DomainError("session_unbound", 409)
+                return 0
+            path = self.messages_path(session_id)
+            if not path.exists():
+                return 0
+            total = 0
+            try:
+                with path.open("rb") as stream:
+                    for line in stream:
+                        _message_from_line(
+                            line, workspace_id=self.workspace_id,
+                            session_id=session_id)
+                        total += 1
+            except OSError:
+                raise DomainError("session_corrupt", 500) from None
+            return total

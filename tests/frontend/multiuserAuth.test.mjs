@@ -118,6 +118,18 @@ test('a stale epoch 401 cannot invalidate the newly logged-in identity', async (
   );
   assert.equal(epochs.isCurrent(newEpoch), true);
   assert.equal(epochs.isCurrent(oldEpoch), false);
+
+  // 当前身份的 401 必须标记为可卸载私人树
+  const current = epochs.begin(B);
+  await assert.rejects(
+    () => auth.identityFetch({
+      epochs, epoch: current, ctx: context(B), url: '/x',
+      fetchImpl: fetch401,
+    }),
+    (error) => error.status === 401
+      && error.identityInvalidated === true,
+  );
+  assert.equal(epochs.isCurrent(current), false);
 });
 
 test('403 and 503 keep explicit status, never fall back to local', async () => {

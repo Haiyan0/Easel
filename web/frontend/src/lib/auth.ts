@@ -22,6 +22,8 @@ export interface AuthContext {
 export class AuthError extends Error {
   status: number;
   code: string;
+  /** 401 是否由当前身份 epoch 的请求触发；旧 epoch 迟到 401 为 false。 */
+  identityInvalidated?: boolean;
 
   constructor(status: number, code: string, message?: string) {
     super(message || code);
@@ -254,11 +256,13 @@ export async function identityFetch<T>(
     throw new AuthError(0, 'network_unavailable');
   }
   if (response.status === 401) {
-    // 旧 epoch 迟到的 401 不能把刚登录的 B 踢下线
-    if (request.epochs.isCurrent(request.epoch)) {
-      request.epochs.invalidate();
-    }
-    throw new AuthError(401, 'unauthorized');
+    // 先判断是否属于当前身份，再失效并标记；调用方据此卸载私人树。
+    // 旧 epoch 迟到的 401 不失效、不通知，不能把刚登录的 B 踢下线。
+    const owned = request.epochs.isCurrent(request.epoch);
+    if (owned) request.epochs.invalidate();
+    const error = new AuthError(401, 'unauthorized');
+    error.identityInvalidated = owned;
+    throw error;
   }
   if (!response.ok) throw await errorFrom(response);
   if (response.status === 204) return undefined as T;

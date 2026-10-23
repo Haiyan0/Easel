@@ -190,6 +190,18 @@ export function parseMessages(payload: unknown): ServerMessage[] {
   });
 }
 
+/** 消息页：total 用于定位最新窗口；缺失/非法时只用当前页长度。 */
+export function parseMessagePage(payload: unknown): {
+  messages: ServerMessage[];
+  total: number;
+} {
+  const messages = parseMessages(payload);
+  const raw = (payload as Record<string, unknown>).total;
+  const total = typeof raw === 'number' && Number.isInteger(raw)
+    && raw >= messages.length ? raw : messages.length;
+  return { messages, total };
+}
+
 /**
  * 恢复计划：只发现本人活跃 Run 并连接回放；任何情况下都不重新 POST prompt。
  */

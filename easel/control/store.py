@@ -1933,21 +1933,34 @@ class Store:
         return [_run_record(row) for row in rows]
 
     def list_run_page(self, actor: Identity, conversation_id: str, *,
-                      limit: int = 50, offset: int = 0) -> list[RunRecord]:
-        """稳定分页读取本人会话的 Run 元数据；不含 token/签名/内部地址。"""
+                      limit: int = 50, offset: int = 0,
+                      active_only: bool = False) -> list[RunRecord]:
+        """稳定分页读取本人会话的 Run 元数据；不含 token/签名/内部地址。
+
+        归档会话允许本人只读历史与 Run 元数据；新 Run 准入仍由
+        ``_require_conversation`` 拒绝归档。
+        """
         workspace_id = self._require_actor(actor, allow_disabled=True)
         if type(limit) is not int or not 1 <= limit <= 200:
             raise DomainError("invalid_argument", 400)
         if type(offset) is not int or offset < 0:
             raise DomainError("invalid_argument", 400)
-        self._require_conversation(workspace_id, _text(conversation_id))
+        if not isinstance(active_only, bool):
+            raise DomainError("invalid_argument", 400)
+        self._require_conversation_readable(
+            workspace_id, _text(conversation_id))
+        clause = ""
+        values: list[object] = [workspace_id, conversation_id]
+        if active_only:
+            clause = (" AND status NOT IN"
+                      f" ({_placeholders(TERMINAL_RUN_STATUSES)})")
+            values.extend(TERMINAL_RUN_STATUSES)
         rows = self._connection.execute(
             "SELECT workspace_id, id, conversation_id, client_request_id,"
             " input_digest, status, config_version FROM runs"
-            " WHERE workspace_id = ? AND conversation_id = ?"
-            " ORDER BY created_at, rowid LIMIT ? OFFSET ?",
-            (workspace_id, conversation_id, int(limit),
-             int(offset))).fetchall()
+            " WHERE workspace_id = ? AND conversation_id = ?" + clause
+            + " ORDER BY created_at, rowid LIMIT ? OFFSET ?",
+            (*values, int(limit), int(offset))).fetchall()
         return [_run_record(row) for row in rows]
 
     def latest_run_for_conversation(self, actor: Identity,
@@ -2178,6 +2191,16 @@ class Store:
         if row is None:
             raise DomainError("not_found", 404)
         return _run_record(row)
+
+    def _require_conversation_readable(self, workspace_id: str,
+                                       conversation_id: str) -> None:
+        """只读历史校验：允许归档，但删除/外空间仍 404。"""
+        row = self._connection.execute(
+            "SELECT deleted_at FROM conversations"
+            " WHERE workspace_id = ? AND id = ?",
+            (workspace_id, conversation_id)).fetchone()
+        if row is None or row["deleted_at"] is not None:
+            raise DomainError("not_found", 404)
 
     def _require_conversation(self, workspace_id: str, conversation_id: str) -> None:
         row = self._connection.execute(

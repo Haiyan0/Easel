@@ -522,3 +522,26 @@ def test_archived_conversation_cannot_accept_new_run(tmp_path):
         with pytest.raises(DomainError) as archived:
             store.reserve_run(a, session.id, "request-1", "digest", 1)
         assert_error(archived, "conversation_archived", 409)
+
+
+def test_large_history_count_and_latest_window(tmp_path):
+    store = WorkspaceSessionStore(tmp_path / "state", WORKSPACE_A)
+    store.bind("big", "acp", "native-big", 1)
+    path = store.messages_path("big")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for index in range(2500):
+            stream.write(json.dumps({
+                "format": "easel.session.message",
+                "version": 1,
+                "workspace_id": WORKSPACE_A,
+                "session_id": "big",
+                "message": {"role": "user", "content": f"m{index}"},
+            }, ensure_ascii=False) + "\n")
+    assert store.count_messages("big") == 2500
+    latest = store.messages("big", limit=500, offset=2000)
+    assert len(latest) == 500
+    assert latest[0]["content"] == "m2000"
+    assert latest[-1]["content"] == "m2499"
+    older = store.messages("big", limit=500, offset=1500)
+    assert older[0]["content"] == "m1500"

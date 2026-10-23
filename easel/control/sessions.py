@@ -52,11 +52,13 @@ class SessionService:
         return self._store.assert_run(actor, run_id)
 
     def list_runs(self, actor: Identity, session_id: str, *,
-                  limit: int = 50, offset: int = 0) -> list[RunRecord]:
-        """本人会话的 Run 元数据；先按 actor 校验会话归属。"""
+                  limit: int = 50, offset: int = 0,
+                  active_only: bool = False) -> list[RunRecord]:
+        """本人会话的 Run 元数据；归档会话仍可只读，外空间 404。"""
         conversation = self._store.get_conversation(actor, session_id)
         return self._store.list_run_page(
-            actor, conversation.id, limit=limit, offset=offset)
+            actor, conversation.id, limit=limit, offset=offset,
+            active_only=active_only)
 
     def messages(self, actor: Identity, session_id: str, *,
                  limit: int = 100, offset: int = 0) -> list[dict]:

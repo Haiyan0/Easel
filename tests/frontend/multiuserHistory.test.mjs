@@ -152,6 +152,13 @@ test('session, run and message pages validate shape and pagination', () => {
     messages: [{ role: 'user', content: '你好' }],
   });
   assert.equal(messages[0].content, '你好');
+  const page = idle.parseMessagePage({
+    messages: [{ role: 'user', content: '你好' }], total: 2500,
+  });
+  assert.equal(page.total, 2500);
+  assert.equal(idle.parseMessagePage({
+    messages: [{ role: 'user', content: '你好' }],
+  }).total, 1);
   assert.throws(() => idle.parseMessages({ messages: [{ role: 'user' }] }));
   assert.throws(() => idle.parseMessages({}));
 });
