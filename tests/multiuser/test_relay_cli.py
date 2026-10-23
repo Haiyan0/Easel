@@ -46,6 +46,14 @@ def write_agent_config(tmp_path, payload: dict, name="managed-agent.json"):
     return path
 
 
+def frontend_build(tmp_path):
+    """测试用最小固定构建目录；不依赖 gitignored 的真实 dist。"""
+    dist = tmp_path / "frontend-dist"
+    dist.mkdir(exist_ok=True)
+    (dist / "index.html").write_text("<html>test</html>", encoding="utf-8")
+    return dist
+
+
 def capture_app(tmp_path, monkeypatch):
     from easel.control import cli as control_cli
 
@@ -73,7 +81,8 @@ def test_serve_control_assembles_relay_only_from_explicit_files(
                  "--public-origin", ORIGIN,
                  "--master-key-file", str(master),
                  "--snapshot-key-file", str(signing),
-                 "--managed-agent-config", str(agent_config)])
+                 "--managed-agent-config", str(agent_config),
+                 "--frontend-dir", str(frontend_build(tmp_path))])
     assert code == 0
     app = captured["app"]
     with TestClient(app, base_url=ORIGIN):
@@ -104,7 +113,8 @@ def test_serve_control_without_relay_files_keeps_task_capability_503(
     code = main(["serve-control",
                  "--control-dir", str(tmp_path / "control"),
                  "--public-origin", ORIGIN,
-                 "--master-key-file", str(master)])
+                 "--master-key-file", str(master),
+                 "--frontend-dir", str(frontend_build(tmp_path))])
     assert code == 0
     app = captured["app"]
     with TestClient(app, base_url=ORIGIN):
