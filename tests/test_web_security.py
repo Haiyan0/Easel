@@ -63,6 +63,14 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
+def test_local_runtime_mode_is_explicit(client):
+    """local 服务提供可信启动信息；前端不得把缺失/异常解释为 local。"""
+    response = client.get("/api/runtime")
+    assert response.status_code == 200
+    assert response.json() == {"mode": "local"}
+    assert response.headers["cache-control"] == "no-store"
+
+
 def _save(client, payload):
     return client.post("/api/settings/models/save", json=payload)
 

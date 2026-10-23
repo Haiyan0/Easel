@@ -1645,6 +1645,13 @@ async def static_file(path: str):
     return FileResponse(fp, headers=headers)
 
 
+@app.get("/api/runtime")
+async def api_runtime_mode():
+    """本地单用户服务的可信启动信息；control 由 control app 返回 control。"""
+    return JSONResponse({"mode": "local"},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/status")
 async def api_status():
     direct = _direct_api_enabled()

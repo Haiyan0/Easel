@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { ReactNode } from 'react';
 import Sidebar from './components/Sidebar';
 import type { Page } from './components/Sidebar';
 import ChatPage from './components/ChatPage';
@@ -19,6 +20,8 @@ import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from 
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
+import ControlApp from './components/ControlApp';
+import { detectRuntimeMode } from './lib/control';
 import {
   loadSessions,
   saveSessions,
@@ -45,6 +48,55 @@ function onboardingSeen(): boolean {
 }
 
 export default function App() {
+  const [mode, setMode] = useState<'loading' | 'control' | 'local'
+    | 'error'>('loading');
+
+  useEffect(() => {
+    let alive = true;
+    detectRuntimeMode()
+      .then((next) => { if (alive) setMode(next); })
+      .catch(() => { if (alive) setMode('error'); });
+    return () => { alive = false; };
+  }, []);
+
+  if (mode === 'loading') {
+    return <ModeNotice text="正在确认服务模式…" />;
+  }
+  if (mode === 'error') {
+    return (
+      <ModeNotice text="无法确认服务模式。为保护身份数据，未加载本地缓存。">
+        <button
+          onClick={() => window.location.reload()}
+          style={{
+            border: 'none', background: '#8b5cf6', color: 'white',
+            borderRadius: '9px', padding: '9px 14px', cursor: 'pointer',
+          }}
+        >重试</button>
+      </ModeNotice>
+    );
+  }
+  return mode === 'control' ? <ControlApp /> : <LocalApp />;
+}
+
+function ModeNotice({ text, children }: {
+  text: string; children?: ReactNode;
+}) {
+  return (
+    <main style={{
+      minHeight: '100vh', display: 'grid', placeItems: 'center',
+      background: '#0f1115', color: '#c8ced9', padding: '24px',
+      fontFamily: 'system-ui, sans-serif',
+    }}>
+      <div style={{ maxWidth: '440px', textAlign: 'center',
+        display: 'grid', gap: '14px' }}>
+        <div>{text}</div>
+        {children}
+      </div>
+    </main>
+  );
+}
+
+export function LocalApp() {
   const [currentPage, setCurrentPage] = useState<Page>('dashboard');
   const [personas, setPersonas] = useState<PersonaItem[]>([]);
   const [selectedPersona, setSelectedPersona] = useState('');

@@ -25,7 +25,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, Response,
+                               StreamingResponse)
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..providers.openai import BROKER_ROUTE_TABLE
@@ -48,6 +49,7 @@ _INTERNAL_BROKER_PREFIX = "/internal/broker/"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _IMPLEMENTED_EXACT = frozenset({
     ("GET", "/api/health"),
+    ("GET", "/api/runtime"),
     ("POST", "/api/auth/exchange"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
@@ -67,7 +69,14 @@ _IMPLEMENTED_PATTERNS = (
     ("PATCH", re.compile(r"^/api/sessions/[^/]+$")),
     ("DELETE", re.compile(r"^/api/sessions/[^/]+$")),
     ("GET", re.compile(r"^/api/sessions/[^/]+/messages$")),
+    ("GET", re.compile(r"^/api/sessions/[^/]+/runs$")),
     ("GET", re.compile(r"^/api/chat/jobs/[^/]+/stream$")),
+    ("GET", re.compile(r"^/$")),
+    ("GET", re.compile(r"^/onepage$")),
+    ("GET", re.compile(r"^/assets/[^/].*$")),
+    ("GET", re.compile(r"^/static/[^/].*$")),
+    ("GET", re.compile(r"^/favicon\.svg$")),
+    ("GET", re.compile(r"^/icons\.svg$")),
 )
 """control 本轮真正装配的路由；其余已分类业务显式 503。"""
 
@@ -392,6 +401,7 @@ def create_app(*, store: Store, auth: AuthService,
                config: ControlConfig | None = None,
                config_service: ConfigService | None = None,
                runtime=None, broker=None, provisioner=None,
+               frontend_dir: str | Path | None = None,
                relay_factory: Callable[..., object] | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
@@ -413,6 +423,13 @@ def create_app(*, store: Store, auth: AuthService,
         raise ValueError("broker requires config_service")
     if provisioner is not None and runtime is not None:
         raise ValueError("runtime and provisioner are mutually exclusive")
+    frontend_root: Path | None = None
+    if frontend_dir is not None:
+        frontend_root = Path(frontend_dir).resolve()
+        if (not frontend_root.is_dir()
+                or not (frontend_root / "index.html").is_file()):
+            # 固定构建目录缺失时明确失败，不回退任意服务器路径
+            raise ValueError("frontend_build_missing")
     public_origin = config.public_origin if config is not None else None
     if public_origin is not None:
         # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
@@ -526,6 +543,12 @@ def create_app(*, store: Store, auth: AuthService,
     @app.get("/api/health")
     async def health():
         return JSONResponse({"status": "ok"},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/runtime")
+    async def runtime_mode():
+        """公开可信启动信息；未知/缺失时前端失败关闭，不猜测 local。"""
+        return JSONResponse({"mode": "control"},
                             headers={"Cache-Control": "no-store"})
 
     @app.post("/api/auth/exchange")
@@ -656,6 +679,24 @@ def create_app(*, store: Store, auth: AuthService,
             request.state.identity, session_id)
         return Response(status_code=204,
                         headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/sessions/{session_id}/runs")
+    async def session_runs(request: Request, session_id: str):
+        """本人会话的 Run 元数据窄路由；稳定分页、不含任何凭证。"""
+        service: SessionService = request.app.state.sessions
+        limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
+        offset = _query_int(request, "offset", 0,
+                            minimum=0, maximum=1_000_000)
+        runs = await _run_db(
+            request, service.list_runs, request.state.identity, session_id,
+            limit=limit, offset=offset)
+        next_offset = offset + len(runs) if len(runs) == limit else None
+        return JSONResponse(
+            {"runs": [{"runId": run.id,
+                       "conversationId": run.conversation_id,
+                       "state": run.status} for run in runs],
+             "nextOffset": next_offset},
+            headers={"Cache-Control": "no-store"})
 
     @app.get("/api/sessions/{session_id}/messages")
     async def session_messages(request: Request, session_id: str):
@@ -797,6 +838,53 @@ def create_app(*, store: Store, auth: AuthService,
             settings, expected_version)
         return JSONResponse({"version": version},
                             headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------
+    # 固定前端构建目录：只公开索引、assets/static 与两个根文件
+    # ------------------------------------------------------------------
+
+    if frontend_root is not None:
+        def frontend_file(base: Path, relative: str) -> Path:
+            try:
+                candidate = (base / relative).resolve()
+            except OSError:
+                raise DomainError("not_found", 404) from None
+            if candidate != base and base not in candidate.parents:
+                raise DomainError("not_found", 404)
+            if not candidate.is_file():
+                raise DomainError("not_found", 404)
+            return candidate
+
+        @app.get("/")
+        @app.get("/onepage")
+        async def frontend_index():
+            return FileResponse(
+                frontend_root / "index.html", media_type="text/html",
+                headers={"Cache-Control": "no-store"})
+
+        @app.get("/assets/{asset_path:path}")
+        async def frontend_asset(asset_path: str):
+            return FileResponse(
+                frontend_file(frontend_root / "assets", asset_path),
+                headers={"Cache-Control":
+                         "public, max-age=31536000, immutable"})
+
+        @app.get("/static/{asset_path:path}")
+        async def frontend_static(asset_path: str):
+            return FileResponse(
+                frontend_file(frontend_root / "static", asset_path))
+
+        @app.get("/favicon.svg")
+        async def frontend_favicon():
+            return FileResponse(
+                frontend_file(frontend_root, "favicon.svg"),
+                media_type="image/svg+xml")
+
+        @app.get("/icons.svg")
+        async def frontend_icons():
+            return FileResponse(
+                frontend_file(frontend_root, "icons.svg"),
+                media_type="image/svg+xml")
 
     # ------------------------------------------------------------------
     # provider broker：独立 opaque token 分支，精确注册首批 adapter 路由

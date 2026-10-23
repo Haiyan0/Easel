@@ -306,6 +306,44 @@ def test_formal_assembly_issues_working_run_scoped_broker_token(tmp_path):
     asyncio.run(scenario())
 
 
+def test_serve_control_serves_explicit_frontend_dir(tmp_path, monkeypatch):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>control-ui</html>",
+                                     encoding="utf-8")
+
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--frontend-dir", str(dist)])
+    assert code == 0
+    app = captured["app"]
+    with TestClient(app, base_url=ORIGIN) as client:
+        index = client.get("/")
+        assert index.status_code == 200
+        assert "control-ui" in index.text
+        assert client.get("/api/runtime").json() == {"mode": "control"}
+
+
+def test_serve_control_rejects_missing_frontend_build(
+        tmp_path, monkeypatch, capsys):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--frontend-dir", str(tmp_path / "missing")])
+    output = capsys.readouterr()
+    assert code != 0
+    assert "frontend_build_missing" in output.err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
 def test_serve_control_rejects_agent_config_with_secret_field(
         tmp_path, monkeypatch, capsys):
     captured = capture_app(tmp_path, monkeypatch)

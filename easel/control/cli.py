@@ -170,6 +170,14 @@ def cmd_serve_control(args) -> int:
             return 2
         provisioner = UnixProvisionerClient(provisioner_socket)
 
+    # 固定前端构建目录：显式给出时必须存在，否则回退任意服务器路径是禁止的
+    frontend_dir = getattr(args, "frontend_dir", None)
+    if frontend_dir is not None:
+        build = Path(frontend_dir).resolve()
+        if not build.is_dir() or not (build / "index.html").is_file():
+            print("错误：frontend_build_missing", file=sys.stderr)
+            return 2
+
     store = Store.connect(_control_db(args.control_dir))
     try:
         try:
@@ -182,7 +190,7 @@ def cmd_serve_control(args) -> int:
         broker = BrokerService(store, config_service, egress=egress)
         app = create_app(store=store, auth=AuthService(store), config=config,
                          config_service=config_service, broker=broker,
-                         provisioner=provisioner,
+                         provisioner=provisioner, frontend_dir=frontend_dir,
                          relay_factory=relay_factory)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接

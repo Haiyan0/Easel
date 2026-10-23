@@ -1932,6 +1932,24 @@ class Store:
             (workspace_id, _text(conversation_id))).fetchall()
         return [_run_record(row) for row in rows]
 
+    def list_run_page(self, actor: Identity, conversation_id: str, *,
+                      limit: int = 50, offset: int = 0) -> list[RunRecord]:
+        """稳定分页读取本人会话的 Run 元数据；不含 token/签名/内部地址。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise DomainError("invalid_argument", 400)
+        if type(offset) is not int or offset < 0:
+            raise DomainError("invalid_argument", 400)
+        self._require_conversation(workspace_id, _text(conversation_id))
+        rows = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, client_request_id,"
+            " input_digest, status, config_version FROM runs"
+            " WHERE workspace_id = ? AND conversation_id = ?"
+            " ORDER BY created_at, rowid LIMIT ? OFFSET ?",
+            (workspace_id, conversation_id, int(limit),
+             int(offset))).fetchall()
+        return [_run_record(row) for row in rows]
+
     def latest_run_for_conversation(self, actor: Identity,
                                     conversation_id: str) -> RunRecord | None:
         """读取会话最近一次 Run；用于定位本人 worker，不产生新执行。"""

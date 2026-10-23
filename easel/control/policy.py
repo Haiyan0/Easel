@@ -67,11 +67,14 @@ def _route(methods: str | Iterable[str], pattern: str, kind: str,
 _RULES: tuple[_Route, ...] = (
     # 公开：仅这些明确路由无需登录
     _route("GET", r"^/api/health$", PUBLIC),
+    _route("GET", r"^/api/runtime$", PUBLIC),
     _route("POST", r"^/api/auth/exchange$", PUBLIC),
     _route("GET", r"^/$", PUBLIC),
     _route("GET", r"^/onepage$", PUBLIC),
     _route("GET", r"^/assets/(.+)$", PUBLIC),
     _route("GET", r"^/static/(.+)$", PUBLIC),
+    _route("GET", r"^/favicon\.svg$", PUBLIC),
+    _route("GET", r"^/icons\.svg$", PUBLIC),
 
     # 身份
     _route("GET", r"^/api/auth/me$", CONTROL_READ),
@@ -96,6 +99,8 @@ _RULES: tuple[_Route, ...] = (
     _route(("PATCH", "DELETE"), r"^/api/sessions/([^/]+)$",
            CONTROL_WRITE, "session", 1),
     _route("GET", r"^/api/sessions/([^/]+)/messages$",
+           CONTROL_READ, "session", 1),
+    _route("GET", r"^/api/sessions/([^/]+)/runs$",
            CONTROL_READ, "session", 1),
 
     # 个人模型设置（control 权限/覆盖服务）

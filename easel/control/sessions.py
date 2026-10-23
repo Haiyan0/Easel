@@ -51,6 +51,13 @@ class SessionService:
     def assert_run(self, actor: Identity, run_id: str) -> RunRecord:
         return self._store.assert_run(actor, run_id)
 
+    def list_runs(self, actor: Identity, session_id: str, *,
+                  limit: int = 50, offset: int = 0) -> list[RunRecord]:
+        """本人会话的 Run 元数据；先按 actor 校验会话归属。"""
+        conversation = self._store.get_conversation(actor, session_id)
+        return self._store.list_run_page(
+            actor, conversation.id, limit=limit, offset=offset)
+
     def messages(self, actor: Identity, session_id: str, *,
                  limit: int = 100, offset: int = 0) -> list[dict]:
         """只有实际授权 transport 才能返回消息；本批不伪造空历史。"""
