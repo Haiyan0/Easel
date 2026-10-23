@@ -208,6 +208,26 @@ test('local session history still reads, continues and deletes in isolation', ()
   assert.equal(afterDelete[0].messages[0].content, '保留');
 });
 
+test('older message windows exactly cover the unloaded interval', () => {
+  const cases = [
+    [500, { offset: 0, limit: 500 }],
+    [501, { offset: 1, limit: 500 }],
+    [999, { offset: 499, limit: 500 }],
+    [1000, { offset: 500, limit: 500 }],
+    [1001, { offset: 501, limit: 500 }],
+    [2002, { offset: 1502, limit: 500 }],
+    [2501, { offset: 2001, limit: 500 }],
+    [2502, { offset: 2002, limit: 500 }],
+    [2, { offset: 0, limit: 2 }],
+  ];
+  for (const [start, expected] of cases) {
+    const window = JSON.parse(JSON.stringify(
+      idle.olderMessageWindow(start)));
+    assert.deepEqual(window, expected);
+    assert.equal(window.offset + window.limit, start);
+  }
+});
+
 test('terminal states are explicit and do not depend on a done event name', () => {
   for (const state of ['done', 'failed', 'interrupted', 'cancelled']) {
     assert.equal(idle.isTerminalRun(state), true);

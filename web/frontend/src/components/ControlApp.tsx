@@ -8,6 +8,7 @@ import {
 import type { AuthContext } from '../lib/auth';
 import {
   consumeSseChunk, isActiveRun, isTerminalRun, optionSubmitValue,
+  olderMessageWindow,
   parseAdmission, parseMessagePage, parseQuestionData, parseRunPage,
   parseSessionPage, questionAnswerKey, recoveryAction, stateFromEvent,
   textFromEvent,
@@ -78,6 +79,18 @@ function writeRecovery(ctx: AuthContext, sessionId: string,
 function clearRecovery(ctx: AuthContext, sessionId: string): void {
   try {
     sessionStorage.removeItem(identityCacheKey(ctx, `run:${sessionId}`));
+  } catch { /* ignore */ }
+}
+
+/** 只清理属于该 Run 的恢复记录，不删除同会话新 Run 的恢复。 */
+function clearRecoveryForRun(ctx: AuthContext, sessionId: string,
+                             runId: string): void {
+  try {
+    const key = identityCacheKey(ctx, `run:${sessionId}`);
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return;
+    const value = JSON.parse(raw) as { runId?: unknown };
+    if (value?.runId === runId) sessionStorage.removeItem(key);
   } catch { /* ignore */ }
 }
 
@@ -158,8 +171,10 @@ export default function ControlApp() {
   }, []);
 
   const expire = useCallback((message = '') => {
+    const prior = identityRef.current;
     checkSeq.current += 1;
     epochs.current.invalidate();
+    if (prior) clearIdentityStorage(prior);
     setIdentity(null);
     setEpoch(0);
     setStatus('anonymous');
@@ -316,11 +331,15 @@ function ControlWorkspace({
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const streamRef = useRef<AbortController | null>(null);
   const streamOwner = useRef<string | null>(null);
+  const connectionSeq = useRef(0);
+  const [streamActive, setStreamActive] = useState(false);
   // 身份卸载时同时中止普通 JSON 请求；epoch 校验仍是最终提交闸门。
   const requestAbort = useRef(new AbortController());
   const runRef = useRef<ClientRun | null>(null);
   const contentChannel = useRef<BroadcastChannel | null>(null);
   const activeIdRef = useRef<string | null>(null);
+  const sessionsRef = useRef<ServerSession[]>([]);
+  const sessionsSeq = useRef(0);
   // 会话选择代次：异步历史/admission 只能提交到发起时的选择
   const selectionSeq = useRef(0);
   // 消息窗口代次：终态刷新后，旧的“加载更早”结果不得造成空洞/混排
@@ -328,6 +347,7 @@ function ControlWorkspace({
 
   useEffect(() => { runRef.current = run; }, [run]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
 
   const apply = useCallback((update: () => void) => {
     if (epochs.isCurrent(epoch)) update();
@@ -355,30 +375,83 @@ function ControlWorkspace({
     }
   }, [ctx, epoch, epochs, onExpired]);
 
+  const sessionStatus = useCallback(async (
+    sessionId: string,
+  ): Promise<'alive' | 'gone' | 'unknown'> => {
+    try {
+      await call(`/api/sessions/${encodeURIComponent(sessionId)}/runs`
+                 + '?limit=1&offset=0');
+      return 'alive';
+    } catch (error) {
+      if (error instanceof AuthError && error.status === 404) return 'gone';
+      return 'unknown';
+    }
+  }, [call]);
+
   const loadSessionsPage = useCallback(async (
     offset: number, append: boolean, select?: string | null,
   ) => {
+    const seq = ++sessionsSeq.current;
     try {
-      const page = parseSessionPage(await call(
+      let page = parseSessionPage(await call(
         `/api/sessions?limit=100&offset=${offset}&include_archived=true`));
+      if (seq !== sessionsSeq.current) return;
+      let visible = page.sessions;
+      let nextOffset = page.nextOffset;
+      const wanted = select === undefined ? activeIdRef.current : select;
+      let keep: ServerSession | null = null;
+      if (!append && wanted && !visible.some((item) => item.id === wanted)) {
+        // 不能因为第一页没有就推断删除；在有界分页内继续查找本人目录
+        let searchOffset = nextOffset;
+        let pages = 0;
+        while (searchOffset !== null && pages < 10) {
+          const nextPage = parseSessionPage(await call(
+            `/api/sessions?limit=100&offset=${searchOffset}`
+            + '&include_archived=true'));
+          if (seq !== sessionsSeq.current) return;
+          const seen = new Set(visible.map((item) => item.id));
+          visible = [...visible,
+            ...nextPage.sessions.filter((item) => !seen.has(item.id))];
+          keep = nextPage.sessions.find((item) => item.id === wanted) || null;
+          nextOffset = nextPage.nextOffset;
+          searchOffset = nextOffset;
+          pages += 1;
+          if (keep) break;
+        }
+        if (!keep) {
+          const previous = sessionsRef.current.find(
+            (item) => item.id === wanted) || null;
+          const status = await sessionStatus(wanted);
+          if (seq !== sessionsSeq.current) return;
+          if (status === 'alive' && previous) {
+            keep = previous;
+            visible = [...visible, previous];
+          } else if (status === 'unknown' && previous) {
+            // 服务故障不能当作删除；保留当前选择，避免无端切走
+            keep = previous;
+            visible = [...visible, previous];
+          }
+        }
+      }
       apply(() => {
         setSessions((current) => {
-          if (!append) return page.sessions;
+          if (!append) return visible;
           const seen = new Set(current.map((item) => item.id));
           return [...current,
             ...page.sessions.filter((item) => !seen.has(item.id))];
         });
-        setSessionNextOffset(page.nextOffset);
+        setSessionNextOffset(nextOffset);
         setLoading(false);
         if (!append) {
-          const wanted = select === undefined ? activeIdRef.current : select;
-          const next = page.sessions.find((item) => item.id === wanted)
-            || page.sessions.find((item) => !item.archived)
-            || page.sessions[0] || null;
+          const next = keep
+            || visible.find((item) => item.id === wanted)
+            || visible.find((item) => !item.archived)
+            || visible[0] || null;
           setActiveId(next ? next.id : null);
         }
       });
     } catch (error) {
+      if (seq !== sessionsSeq.current) return;
       apply(() => {
         setLoading(false);
         setHistoryError(error instanceof AuthError
@@ -386,7 +459,7 @@ function ControlWorkspace({
           : '目录读取失败，请稍后重试。');
       });
     }
-  }, [apply, call]);
+  }, [apply, call, sessionStatus]);
 
   const reloadSessions = useCallback(async (select?: string | null) => {
     await loadSessionsPage(0, false, select);
@@ -423,9 +496,11 @@ function ControlWorkspace({
   }, [ctx.userId, ctx.workspaceId, reloadSessions]);
 
   const abortStream = useCallback(() => {
+    connectionSeq.current += 1;
     streamRef.current?.abort();
     streamRef.current = null;
     streamOwner.current = null;
+    setStreamActive(false);
   }, []);
 
   useEffect(() => () => {
@@ -440,11 +515,11 @@ function ControlWorkspace({
     }));
 
   const fetchMessagesPage = useCallback(async (
-    sessionId: string, offset: number,
+    sessionId: string, offset: number, limit: number = 500,
   ) => {
     return parseMessagePage(await call(
       `/api/sessions/${encodeURIComponent(sessionId)}/messages`
-      + `?limit=500&offset=${offset}`));
+      + `?limit=${limit}&offset=${offset}`));
   }, [call]);
 
   const fetchLatestMessages = useCallback(async (sessionId: string) => {
@@ -489,21 +564,39 @@ function ControlWorkspace({
     return runs;
   }, [call]);
 
-  const finishRun = useCallback(async (sessionId: string,
-                                     runId: string, state: string) => {
-    if (!epochs.isCurrent(epoch)) return;
-    clearRecovery(ctx, sessionId);
-    if (activeIdRef.current !== sessionId) return;
-    if (streamOwner.current === runId) abortStream();
-    await refreshLatestMessages(sessionId);
-    if (!isSelected(sessionId)) return;
+  const finishRun = useCallback(async (
+    sessionId: string, runId: string, state: string,
+    owns: () => boolean,
+  ) => {
+    // 终态历史刷新必须绑定到启动它的 Run/连接/选择；旧收尾不得写新 Run
+    if (!owns()) return;
+    clearRecoveryForRun(ctx, sessionId, runId);
+    messageSeq.current += 1;
+    const generation = messageSeq.current;
+    let latest;
+    try {
+      latest = await fetchLatestMessages(sessionId);
+    } catch {
+      if (owns()) {
+        apply(() => {
+          setNotice('最终历史读取失败；请稍后重试。');
+          setRun((current) => current && current.runId === runId
+            ? { ...current, state, question: null } : current);
+          setAnswers({});
+        });
+      }
+      return;
+    }
+    if (!owns() || generation !== messageSeq.current) return;
     apply(() => {
+      setMessages(latest.messages);
+      setMessageStart(latest.start);
+      setMessageTotal(latest.total);
       setRun((current) => current && current.runId === runId
         ? { ...current, state, question: null } : current);
       setAnswers({});
     });
-  }, [abortStream, apply, ctx, epoch, epochs, isSelected,
-      refreshLatestMessages]);
+  }, [apply, ctx, fetchLatestMessages]);
 
   const connectRun = useCallback(async (
     runId: string, sessionId: string, after: number, turnId: string,
@@ -511,6 +604,7 @@ function ControlWorkspace({
   ) => {
     if (!isSelected(sessionId, seq === null ? undefined : seq)) return;
     abortStream();
+    const connection = ++connectionSeq.current;
     const controller = new AbortController();
     streamRef.current = controller;
     streamOwner.current = runId;
@@ -522,8 +616,15 @@ function ControlWorkspace({
         cursor: Math.max(0, after),
       };
     runRef.current = initial;
+    setStreamActive(true);
     apply(() => setRun(initial));
-    const owns = () => epochs.isCurrent(epoch)
+    if (!previous || previous.runId !== runId) {
+      // 新 Run 开始：旧题卡选择不能带入
+      setAnswers({});
+    }
+    const owns = () => connectionSeq.current === connection
+      && !controller.signal.aborted
+      && epochs.isCurrent(epoch)
       && activeIdRef.current === sessionId
       && runRef.current?.runId === runId;
     const persist = (cursor: number) => {
@@ -611,10 +712,14 @@ function ControlWorkspace({
       }
     } finally {
       // 覆盖 fetch 失败、非 2xx、缺 body、读取结束/异常/主动取消所有退出路径；
-      // 只清理属于自己的 controller，旧失败不得清掉新连接。
+      // 只清理属于自己的 controller/连接状态，旧失败不得清掉新连接。
       if (streamRef.current === controller) {
         streamRef.current = null;
         if (streamOwner.current === runId) streamOwner.current = null;
+      }
+      if (connectionSeq.current === connection) {
+        // 可渲染状态：相同 503 文案的连续失败也必须重新显示重连按钮
+        setStreamActive(false);
       }
     }
   }, [abortStream, apply, call, ctx, epoch, epochs, finishRun,
@@ -677,14 +782,15 @@ function ControlWorkspace({
     setMessageLoadingMore(true);
     const generation = messageSeq.current;
     try {
-      const offset = Math.max(0, messageStart - 500);
-      const payload = await fetchMessagesPage(sessionId, offset);
+      const window = olderMessageWindow(messageStart);
+      const payload = await fetchMessagesPage(
+        sessionId, window.offset, window.limit);
       if (!isSelected(sessionId) || generation !== messageSeq.current) return;
       apply(() => {
         setMessages((current) => [
           ...toUiMessages(payload.messages), ...current,
         ]);
-        setMessageStart(offset);
+        setMessageStart(window.offset);
       });
     } catch {
       if (isSelected(sessionId) && generation === messageSeq.current) {
@@ -1034,7 +1140,7 @@ function ControlWorkspace({
             }}>重试同一请求（不会新造请求键）</button>
           ) : null}
           {visibleRun && !isTerminalRun(visibleRun.state)
-            && !streamRef.current ? (
+            && !streamActive ? (
             <button style={styles.button} onClick={() => {
               const current = visibleRun;
               void connectRun(current.runId, current.sessionId,
@@ -1150,13 +1256,15 @@ async function handleFrame(
   setRun: Dispatch<SetStateAction<ClientRun | null>>,
   setNotice: (value: string) => void,
   call: <T,>(path: string, init?: RequestInit) => Promise<T>,
-  finishRun: (sessionId: string, runId: string,
-              state: string) => Promise<void>,
+  finishRun: (sessionId: string, runId: string, state: string,
+              owns: () => boolean) => Promise<void>,
   persist: (cursor: number) => void,
   owns: () => boolean,
 ): Promise<boolean> {
+  // 整个帧都属于启动该连接/选择的 Run；旧连接迟到帧一律不得提交
+  if (!owns()) return false;
   // 只在状态事件写恢复游标；token 是 provisional，刷新后可从状态点重放。
-  if (owns() && frame.event === 'state' && frame.id > 0) persist(frame.id);
+  if (frame.event === 'state' && frame.id > 0) persist(frame.id);
   if (frame.event === 'state') {
     const state = stateFromEvent(frame);
     if (!state) return false;
@@ -1166,7 +1274,7 @@ async function handleFrame(
         ? { ...current, state: state.state, cursor: frame.id } : current);
     });
     if (terminal) {
-      await finishRun(sessionId, runId, state.state);
+      await finishRun(sessionId, runId, state.state, owns);
       return true;
     }
     return false;

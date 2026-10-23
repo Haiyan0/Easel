@@ -73,12 +73,14 @@ def seed_ui_data(db_path: Path, worker, identities):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as stream:
             for index in range(2500):
+                # 1 与 0 正文相同：分页不得用正文去重，也不能误删合法消息
+                content = "m0" if index == 1 else f"m{index}"
                 stream.write(json.dumps({
                     "format": "easel.session.message",
                     "version": 1,
                     "workspace_id": member.workspace_id,
                     "session_id": big.id,
-                    "message": {"role": "user", "content": f"m{index}"},
+                    "message": {"role": "user", "content": content},
                 }, ensure_ascii=False) + "\n")
         return big, oldest
     finally:
@@ -184,7 +186,17 @@ async def main() -> int:
                     break
                 await more.click()
                 await page.wait_for_timeout(250)
-            await page.get_by_text("m0", exact=False).wait_for(timeout=30000)
+            await page.get_by_text("m0", exact=False).first.wait_for(timeout=30000)
+            article_texts = [
+                text.strip() for text in
+                await page.locator("article").all_inner_texts()]
+            message_texts = [
+                text for text in article_texts
+                if text.startswith("你\n") or text.startswith("助手\n")]
+            assert len(message_texts) == 2502, len(message_texts)
+            assert sum(1 for text in message_texts
+                       if text == "你\nm0") == 2
+            results["large_messages_unique_no_overlap"] = True
             results["large_messages_reachable"] = True
             assert any("/runs?active=true" in url for url in requests)
             results["active_run_filter_used"] = True
@@ -394,13 +406,31 @@ async def main() -> int:
                 lambda route: route.fulfill(
                     status=401, content_type="application/json",
                     body=json.dumps({"code": "unauthorized"})))
+            a_prefix = (f"easel:control:v1:{identities['A'].user_id}:"
+                        f"{identities['A'].workspace_id}:")
+            b_key = (f"easel:control:v1:{identities['B'].user_id}:"
+                     f"{identities['B'].workspace_id}:active_session")
+            await page.evaluate(
+                "([aKey, bKey]) => {"
+                " localStorage.setItem(aKey, 'a-run');"
+                " localStorage.setItem(bKey, 'b-keep');"
+                " localStorage.setItem('easel_sessions', 'local-keep');"
+                "}", [a_prefix + f"run:{big.id}", b_key])
             await page.get_by_role(
                 "button", name="新建会话").click()
             await page.wait_for_selector("#invite", timeout=15000)
             body = await page.locator("body").inner_text()
             assert "m2499" not in body
             assert "你好" not in body
+            keys = await page.evaluate("Object.keys(localStorage)")
+            assert not any(key.startswith(a_prefix) for key in keys), keys
+            assert await page.evaluate(
+                "key => localStorage.getItem(key)", b_key) == "b-keep"
+            assert await page.evaluate(
+                "key => localStorage.getItem(key)",
+                "easel_sessions") == "local-keep"
             results["business_401_unmounts_private_tree"] = True
+            results["business_401_clears_own_cache_only"] = True
             path = SCREENSHOTS / "r1-01-business-401.png"
             await page.screenshot(path=str(path))
             screenshots.append(str(path))

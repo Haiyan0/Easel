@@ -316,6 +316,16 @@ export function parseQuestionData(data: string): ControlQuestion | null {
   return { id: payload.id, questions };
 }
 
+/** “加载更早”精确覆盖尚未加载区间；不重复读入已加载消息。 */
+export function olderMessageWindow(start: number): {
+  offset: number;
+  limit: number;
+} {
+  const safeStart = Number.isInteger(start) && start > 0 ? start : 0;
+  const offset = Math.max(0, safeStart - 500);
+  return { offset, limit: safeStart - offset };
+}
+
 /** 题卡提交值：opaque value 优先；local 旧题卡回退 label。 */
 export function optionSubmitValue(option: ControlQuestionOption): string {
   return option.value && option.value.length > 0
