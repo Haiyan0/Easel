@@ -323,6 +323,8 @@ function ControlWorkspace({
   const activeIdRef = useRef<string | null>(null);
   // 会话选择代次：异步历史/admission 只能提交到发起时的选择
   const selectionSeq = useRef(0);
+  // 消息窗口代次：终态刷新后，旧的“加载更早”结果不得造成空洞/混排
+  const messageSeq = useRef(0);
 
   useEffect(() => { runRef.current = run; }, [run]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
@@ -460,8 +462,11 @@ function ControlWorkspace({
   const refreshLatestMessages = useCallback(async (
     sessionId: string, seq?: number,
   ) => {
+    messageSeq.current += 1;
+    const generation = messageSeq.current;
     const latest = await fetchLatestMessages(sessionId);
-    if (!isSelected(sessionId, seq)) return null;
+    if (!isSelected(sessionId, seq)
+        || generation !== messageSeq.current) return null;
     apply(() => {
       setMessages(latest.messages);
       setMessageStart(latest.start);
@@ -627,6 +632,8 @@ function ControlWorkspace({
     setHistoryError('');
     setMessageStart(0);
     setMessageTotal(0);
+    setMessageLoadingMore(false);
+    messageSeq.current += 1;
     let cancelled = false;
     (async () => {
       try {
@@ -668,10 +675,11 @@ function ControlWorkspace({
     const sessionId = activeIdRef.current;
     if (!sessionId || messageStart <= 0 || messageLoadingMore) return;
     setMessageLoadingMore(true);
+    const generation = messageSeq.current;
     try {
       const offset = Math.max(0, messageStart - 500);
       const payload = await fetchMessagesPage(sessionId, offset);
-      if (!isSelected(sessionId)) return;
+      if (!isSelected(sessionId) || generation !== messageSeq.current) return;
       apply(() => {
         setMessages((current) => [
           ...toUiMessages(payload.messages), ...current,
@@ -679,11 +687,11 @@ function ControlWorkspace({
         setMessageStart(offset);
       });
     } catch {
-      if (isSelected(sessionId)) {
+      if (isSelected(sessionId) && generation === messageSeq.current) {
         apply(() => setNotice('更早历史加载失败，请重试。'));
       }
     } finally {
-      if (isSelected(sessionId)) setMessageLoadingMore(false);
+      setMessageLoadingMore(false);
     }
   }, [apply, fetchMessagesPage, isSelected, messageLoadingMore,
       messageStart]);
