@@ -36,7 +36,8 @@ from .policy import authorize, public_route
 from .runtime import RuntimeManager
 from .sessions import SessionService
 from .store import Store
-from .stream import run_event_stream
+from .stream import (AuthGuardedStreamingResponse,
+                     DEFAULT_AUTH_CHECK_SECONDS, run_event_stream)
 from .types import DomainError, Identity
 
 SESSION_COOKIE = "__Host-easel_session"
@@ -749,9 +750,11 @@ def create_app(*, store: Store, auth: AuthService,
             current = await _run_db(request, auth_service.inspect, token)
             await _run_db(request, sessions.assert_run, current, run_id)
 
-        return StreamingResponse(
+        return AuthGuardedStreamingResponse(
             run_event_stream(relay=service, actor=identity, run_id=run_id,
                              page=first, recheck=recheck),
+            recheck=recheck,
+            auth_check_seconds=DEFAULT_AUTH_CHECK_SECONDS,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 

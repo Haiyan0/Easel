@@ -338,26 +338,45 @@ class WorkspaceSessionStore:
         _validate_message(message)
 
     def _append_locked(self, session_id: str, message: dict) -> None:
-        """在会话锁内追加一行消息；失败回滚到原长度，不留半行。"""
+        """在会话锁内原子追加一行：临时文件 + fsync + replace。
+
+        直接 append 在进程写一半退出时会留下半行，之后整个会话都不可读。
+        这里先完整写入同目录临时文件，再原子替换；原文件要么保持旧内容，
+        要么包含完整的新行。既有文件必须先通过全部行校验，绝不截断或认领
+        任意损坏/错误身份的 JSONL。
+        """
         path = self.messages_path(session_id)
+        directory = path.parent
+        existing = b""
         if path.exists():
             _validate_messages_file(
                 path, self.workspace_id, session_id)
-        original_size: int | None = None
-        try:
-            if path.exists():
-                original_size = path.stat().st_size
-            else:
-                original_size = 0
-            record = _message_record(
-                self.workspace_id, session_id, message)
-            encoded = json.dumps(
-                record, ensure_ascii=False,
-                separators=(",", ":")).encode("utf-8") + b"\n"
-            descriptor = os.open(
-                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
-                view = memoryview(encoded)
+                existing = path.read_bytes()
+            except OSError:
+                raise DomainError("session_corrupt", 500) from None
+            if existing and not existing.endswith(b"\n"):
+                raise DomainError("session_corrupt", 500)
+        # 清理崩溃遗留的临时文件；它们从未提交，也不是可信消息记录
+        for stale in directory.glob(f".{path.name}.*.tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        record = _message_record(
+            self.workspace_id, session_id, message)
+        encoded = json.dumps(
+            record, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8") + b"\n"
+        temporary: Path | None = None
+        try:
+            descriptor, name = tempfile.mkstemp(
+                dir=directory, prefix=f".{path.name}.", suffix=".tmp")
+            temporary = Path(name)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                view = memoryview(existing + encoded)
                 while view:
                     written = os.write(descriptor, view)
                     if written <= 0:
@@ -366,14 +385,23 @@ class WorkspaceSessionStore:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        except OSError:
-            # 失败不能留下半行；已知原长度时尽力恢复。
-            if original_size is not None:
+            os.replace(temporary, path)
+            temporary = None
+            if os.name == "posix":
+                # 目录项持久化，确保 replace 在掉电后仍可见
+                directory_fd = os.open(directory, os.O_RDONLY)
                 try:
-                    os.truncate(path, original_size)
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except OSError:
+            raise DomainError("session_write_failed", 500) from None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
                 except OSError:
                     pass
-            raise DomainError("session_write_failed", 500) from None
 
     def append_message(self, session_id: str, message: dict) -> None:
         _session_id(session_id)

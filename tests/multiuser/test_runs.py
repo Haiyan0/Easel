@@ -884,6 +884,216 @@ def test_events_nonce_is_checked_against_admission(tmp_path):
     asyncio.run(scenario())
 
 
+class BatchQuestionsExecutor:
+    """一次 ask 携带两个问题，用于验证选项映射按问题隔离。"""
+
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+        self.answers = None
+        self.prompts = 0
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+        self.answers = await ask([
+            {"questionId": "first", "question": "第一问",
+             "options": [{"label": f"allow {self.secret}"},
+                         {"label": "deny"}]},
+            {"questionId": "second", "question": "第二问",
+             "options": [{"label": "allow [redacted]"}, {"label": "deny"}]},
+        ])
+        return "完成"
+
+
+def test_question_option_mapping_is_isolated_per_question(tmp_path):
+    """脱敏 label 碰撞不能跨题选错；跨题 opaque 值必须拒绝且不消耗问题。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    secret = "batch-question-token-sentinel"
+    executor = BatchQuestionsExecutor(secret)
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="批量问题", routes={"broker_token": secret},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "批量问题", envelope))
+        await wait_until(
+            lambda: manager.state("run-a") == "awaiting_permission")
+        payload = available_questions(manager, "run-a")[0]
+        first, second = payload["questions"]
+        assert secret not in json.dumps(payload, ensure_ascii=False)
+        first_allow = first["options"][0]
+        second_allow = second["options"][0]
+        # 两题的公开 label 碰撞，但 value 必须各自映射回原题选项
+        assert first_allow["label"] == second_allow["label"] == \
+            "allow [redacted]"
+
+        # 跨题 opaque value：拒绝且不消耗第一问
+        with pytest.raises(DomainError):
+            await manager.answer(
+                "run-a", payload["id"],
+                {"first": [second_allow["value"]],
+                 "second": [second_allow["label"]]})
+        assert manager.question_status(
+            "run-a", [payload["id"]])["questions"][payload["id"]][
+                "status"] == "pending"
+
+        # 未知的 opaque 前缀同样不能冒充
+        with pytest.raises(DomainError):
+            await manager.answer(
+                "run-a", payload["id"],
+                {"first": ["opt_not_issued"],
+                 "second": [second_allow["label"]]})
+        assert manager.question_status(
+            "run-a", [payload["id"]])["questions"][payload["id"]][
+                "status"] == "pending"
+
+        # 合法 label：按各自问题映射到原始选项
+        await manager.answer(
+            "run-a", payload["id"],
+            {"first": [first_allow["label"]],
+             "second": [second_allow["value"]]})
+        await wait_until(lambda: manager.state("run-a") == "done")
+        assert executor.answers == {
+            "first": [f"allow {secret}"],
+            "second": ["allow [redacted]"],
+        }
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+CRASH_CHILD_SOURCE = r'''
+import os, sys
+sys.path.insert(0, {root!r})
+from easel.worker.sessions import WorkspaceSessionStore
+from easel.worker.runs import RunRegistry
+
+mode = {mode!r}
+run_id = {run_id!r}
+session_id = {session!r}
+store = WorkspaceSessionStore({state!r}, {workspace!r})
+message = {{"role": "assistant", "content": "回答", "runId": run_id}}
+if mode == "partial-write":
+    real_write = os.write
+    def crash(fd, data):
+        real_write(fd, bytes(data)[:40])
+        os._exit(42)
+    os.write = crash
+elif mode == "before-replace":
+    os.replace = lambda src, dst: os._exit(42)
+elif mode == "after-replace":
+    real_replace = os.replace
+    def crash(src, dst):
+        real_replace(src, dst)
+        os._exit(42)
+    os.replace = crash
+elif mode == "after-final-state":
+    real_replace = os.replace
+    def crash(src, dst):
+        real_replace(src, dst)
+        RunRegistry({registry!r}, {workspace!r}).finish_finalizing(
+            run_id, "done", "completed")
+        os._exit(42)
+    os.replace = crash
+store.append_message_once(session_id, run_id, message)
+os._exit(0)
+'''
+
+
+def _run_crash_child(tmp_path, paths, mode: str, run_id: str,
+                     session_id: str) -> None:
+    import subprocess
+    import sys
+
+    script = tmp_path / f"crash_{mode}.py"
+    script.write_text(CRASH_CHILD_SOURCE.format(
+        root=str(Path(__file__).resolve().parents[2]),
+        mode=mode,
+        run_id=run_id,
+        session=session_id,
+        state=str(paths.state_root),
+        workspace=WORKSPACE,
+        registry=str(paths.state_root / "runs.sqlite3"),
+    ), encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(script)], cwd=str(tmp_path),
+        capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 42, (completed.stdout, completed.stderr)
+
+
+class HistoryExecutor:
+    """第一轮立即完成；第二轮阻塞，供崩溃注入。"""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def __call__(self, request, context, bind, emit, ask):
+        if not context.native_id:
+            bind("native-a")
+        if request.prompt.startswith("第一轮"):
+            return "旧回答"
+        self.entered.set()
+        await self.gate.wait()
+        return "回答"
+
+
+def test_crash_during_final_message_write_preserves_history_and_recovers(
+        tmp_path):
+    """真实子进程在追加中/提交前后退出：旧多轮历史仍可读，输出最多一次。"""
+    for mode in ("partial-write", "before-replace", "after-replace",
+                 "after-final-state"):
+        case = tmp_path / mode
+        case.mkdir()
+        paths = make_paths(case)
+        key = Ed25519PrivateKey.generate()
+        executor = HistoryExecutor()
+        manager = make_manager(paths, key, executor)
+        agent = {"runtime": "acp", "command": ["fixture-acp"],
+                 "sandbox": "read-only", "timeout": 60}
+        old = sign(key, run_id="run-old", session_id="conversation-a",
+                   message="第一轮", routes={"broker_token": "token"},
+                   agent=agent)
+        envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                        message="第二轮", routes={"broker_token": "token"},
+                        agent=agent)
+
+        async def start() -> None:
+            await manager.submit(
+                "run-old", old,
+                request_for("conversation-a", "第一轮", old))
+            await wait_until(lambda: manager.state("run-old") == "done")
+            await manager.submit(
+                "run-a", envelope,
+                request_for("conversation-a", "第二轮", envelope))
+            await asyncio.wait_for(executor.entered.wait(), timeout=5)
+            assert manager.registry.begin_finalize("run-a") is True
+            manager._stage_output("run-a", "回答")
+
+        asyncio.run(start())
+        _run_crash_child(case, paths, mode, "run-a", "conversation-a")
+
+        reopened = make_manager(paths, key, NeverExecutor())
+        assert reopened.state("run-a") == "done", mode
+        messages = reopened.messages("conversation-a")["messages"]
+        assert [item["role"] for item in messages] == [
+            "user", "assistant", "user", "assistant"], (mode, messages)
+        assert [item["content"] for item in messages] == [
+            "第一轮", "旧回答", "第二轮", "回答"], mode
+        assert sum(1 for item in messages
+                   if item.get("runId") == "run-a") == 1, mode
+        assert reopened.events("run-a", after=0)["state"] == "done"
+
+        # 原 manager 的 supervisor 属于上一个已关闭事件循环；恢复后的
+        # 新 manager 只负责读出持久结果，不等待旧任务。
+        asyncio.run(reopened.aclose())
+
+
 def test_acp_permission_text_is_scrubbed_but_choice_maps(tmp_path):
     """真实 ACP 夹具把 Run token 放进 toolCall.title/选项：公开文本必须脱敏。"""
     import os

@@ -218,6 +218,8 @@ class StaticRuntime:
 class FakeProvisioner:
     def __init__(self) -> None:
         self.starts = 0
+        self.stops = 0
+        self.fail_stops = False
         self.handles: dict[str, WorkerHandle] = {}
 
     async def ensure(self, workspace_id: str,
@@ -231,7 +233,9 @@ class FakeProvisioner:
         return handle
 
     async def stop(self, workspace_id: str, instance_id: str) -> None:
-        return None
+        if self.fail_stops:
+            raise OSError("stop failed")
+        self.stops += 1
 
     async def inspect(self, workspace_id: str) -> dict:
         handle = self.handles[workspace_id]
@@ -273,13 +277,15 @@ class MutableProvider:
 
 def make_relay(store: Store, client: httpx.AsyncClient, *,
                runtime=None, broker=None, provider=None,
-               signing_key=None, dispatch_grace: int = 60) -> WorkerRelay:
+               signing_key=None, dispatch_grace: int = 60,
+               snapshot_ttl: int = 1800) -> WorkerRelay:
     return WorkerRelay(
         runtime or StaticRuntime(), SessionService(store), AuthService(store),
         store=store,
         signing_key=signing_key or Ed25519PrivateKey.generate(),
         http_client=client, config_provider=provider or MutableProvider(),
-        broker=broker, dispatch_grace=dispatch_grace)
+        broker=broker, dispatch_grace=dispatch_grace,
+        snapshot_ttl=snapshot_ttl)
 
 
 def payload(conversation_id: str, message: str = "执行任务",
@@ -507,6 +513,369 @@ def test_lost_dispatch_response_converges_from_worker_state(tmp_path):
                 finally:
                     await reconciler.stop()
             await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+class FlakyTransport(WorkerTransport):
+    """可切换事件/停止故障与停止返回状态。"""
+
+    def __init__(self, managers, **kwargs) -> None:
+        super().__init__(managers, **kwargs)
+        self.fail_events = False
+        self.fail_stop = False
+        self.stop_state: str | None = None
+        self.target: str | None = None
+
+    def _is_target(self, request) -> bool:
+        return bool(self.target) and \
+            f"/internal/runs/{self.target}" in request.url.path
+
+    async def handle_async_request(self, request):
+        path = request.url.path
+        target = self._is_target(request)
+        if (target and self.fail_events and request.method == "GET"
+                and path.endswith("/events")):
+            raise httpx.ConnectError("events unavailable", request=request)
+        if (target and request.method == "POST" and path.endswith("/stop")
+                and self.fail_stop):
+            raise httpx.ConnectError("stop unavailable", request=request)
+        if (target and request.method == "POST" and path.endswith("/stop")
+                and self.stop_state is not None):
+            return httpx.Response(
+                200, json={"runId": path.split("/")[3],
+                           "state": self.stop_state},
+                request=request)
+        return await super().handle_async_request(request)
+
+
+def test_deadline_without_confirmed_stop_keeps_capacity(tmp_path):
+    """GET/stop 失败或 stop 返回 running 时不得释放仍执行的任务。"""
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            user = store.create_user("Owner")
+            conversation = store.create_conversation(user, "到期")
+            key = Ed25519PrivateKey.generate()
+            executor = BlockingExecutor()
+            manager = make_manager(
+                make_paths(tmp_path), user.workspace_id, key, executor)
+            transport = FlakyTransport({user.workspace_id: manager})
+            broker = FakeBroker()
+            provisioner = FakeProvisioner()
+            runtime = RuntimeManager(store, provisioner, clock=time.time)
+            now = {"value": time.time()}
+
+            def clock() -> float:
+                return now["value"]
+
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(
+                    store, client, runtime=runtime, broker=broker,
+                    signing_key=key, snapshot_ttl=30)
+                relay._system_clock = clock
+                run_id = (await relay.submit(
+                    user, payload(conversation.id)))["runId"]
+                transport.target = run_id
+                await wait_until(lambda: manager.state(run_id) == "running")
+                original_token = json.loads(
+                    store.get_run_snapshot(user, run_id))["routes"][
+                        "broker_token"]
+                now["value"] += 1000  # 超过快照有效期 + 收尾余量
+
+                # GET 与 stop 都失败：执行状态未知，容量必须保持
+                transport.fail_events = True
+                transport.fail_stop = True
+                await relay.reconcile_once()
+                assert store.get_run(user, run_id).status == "running"
+                assert store.count_active_runs() == 1
+                # 占满第二个容量后，第三个任务必须仍被拒绝
+                second = store.create_conversation(user, "第二个")
+                second_run = store.reserve_run(
+                    user, second.id, "capacity-2", "digest-2", REVISION)
+                assert store.count_active_runs() == 2
+                third = store.create_conversation(user, "第三个")
+                with pytest.raises(DomainError) as full:
+                    await relay.submit(user, payload(third.id))
+                assert full.value.code == "workspace_capacity"
+                # 释放占位 Run，后续只观察目标 Run 的容量保持
+                store.finish_run(user, second_run.id, "cancelled")
+                assert store.count_active_runs() == 1
+                # 截止后先撤销凭证限制新模型调用，但不释放任务预算
+                assert broker.revoked == [(run_id, user.workspace_id)]
+                assert original_token
+
+                # 模拟 control 重启：新 relay 从控制库恢复待确认状态
+                relay2 = make_relay(
+                    store, client, runtime=runtime, broker=broker,
+                    signing_key=key, snapshot_ttl=30)
+                relay2._system_clock = clock
+
+                # 恢复 GET，但 stop 仍失败：继续对账、继续占用
+                transport.fail_events = False
+                await relay2.reconcile_once()
+                assert store.get_run(user, run_id).status == "running"
+                assert store.count_active_runs() == 1
+
+                # stop 返回 running/finalizing：仍不得释放
+                transport.fail_stop = False
+                transport.stop_state = "running"
+                await relay2.reconcile_once()
+                assert store.get_run(user, run_id).status == "running"
+                assert store.count_active_runs() == 1
+
+                # 停止确认后才释放一次
+                transport.stop_state = "cancelled"
+                await relay2.reconcile_once()
+                assert store.get_run(user, run_id).status == "cancelled"
+                assert store.count_active_runs() == 0
+                assert (run_id, user.workspace_id) in broker.revoked
+                accepted = await relay.submit(user, payload(third.id))
+                assert accepted["runId"]
+                assert store.count_active_runs() == 1
+                rows = store._connection.execute(
+                    "SELECT release_count FROM runs WHERE id = ?",
+                    (run_id,)).fetchone()
+                assert rows["release_count"] == 1
+            executor.gate.set()
+            await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_instance_gone_requires_confirmed_provisioner_stop(tmp_path):
+    """原实例句柄不可用本身不是执行结束证据；确认停止后才释放。"""
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            user = store.create_user("Owner")
+            first = store.create_conversation(user, "旧一")
+            second = store.create_conversation(user, "旧二")
+            key = Ed25519PrivateKey.generate()
+            executor = BlockingExecutor()
+            manager = make_manager(
+                make_paths(tmp_path), user.workspace_id, key, executor)
+            transport = WorkerTransport({user.workspace_id: manager})
+            broker = FakeBroker()
+            provisioner = FakeProvisioner()
+            runtime = RuntimeManager(store, provisioner, clock=time.time)
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(
+                    store, client, runtime=runtime, broker=broker,
+                    signing_key=key)
+
+                async def replace_instance() -> None:
+                    store.stop_worker(user.workspace_id, int(time.time()))
+                    handle = await runtime.ensure_ready(
+                        user.workspace_id, REVISION)
+                    assert handle.container_id
+
+                run_a = (await relay.submit(
+                    user, payload(first.id)))["runId"]
+                await wait_until(lambda: manager.state(run_a) == "running")
+                await replace_instance()
+                provisioner.fail_stops = True
+                await relay.reconcile_once()
+                assert store.get_run(user, run_a).status == "running"
+                assert store.count_active_runs() == 1
+                provisioner.fail_stops = False
+                await relay.reconcile_once()
+                assert store.get_run(user, run_a).status == "interrupted"
+                assert store.count_active_runs() == 0
+
+                # 第二个 Run：provisioner 明确停止成功才释放
+                run_b = (await relay.submit(
+                    user, payload(second.id)))["runId"]
+                await wait_until(lambda: manager.state(run_b) == "running")
+                await replace_instance()
+                provisioner.stops = 0
+                await relay.reconcile_once()
+                assert provisioner.stops >= 1
+                assert store.get_run(user, run_b).status == "interrupted"
+                assert store.count_active_runs() == 0
+            executor.gate.set()
+            await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_prepare_has_single_owner_and_failure_cannot_interrupt(
+        tmp_path):
+    """并发同请求只有一个准备者；另一方的签发失败不得中断已派发 Run。"""
+    from easel.control.broker import BrokerService
+    from easel.control.cli import build_relay_factory
+    from easel.control.config import ConfigService, MASTER_KEY_BYTES
+    from easel.control.egress import EgressGateway
+    from easel.control.proxy import BrokerDestination
+
+    class StaticRuntime:
+        async def ensure_ready(self, workspace_id, config_version):
+            return WorkerHandle(workspace_id, "container-prepare",
+                                "http://worker.test", "service-token",
+                                config_version)
+
+        async def bound_handle(self, workspace_id, container_id,
+                               config_version):
+            return WorkerHandle(workspace_id, container_id,
+                                "http://worker.test", "service-token",
+                                config_version)
+
+    class SecondIssueFails:
+        def __init__(self, real) -> None:
+            self.real = real
+            self.issues = 0
+
+        def ensure_issuable(self, actor, channel):
+            return self.real.ensure_issuable(actor, channel)
+
+        def issue(self, actor, run_id, channel):
+            self.issues += 1
+            if self.issues > 1:
+                raise DomainError("capability_unavailable", 503)
+            return self.real.issue(actor, run_id, channel)
+
+        def revoke_run(self, run_id, workspace_id):
+            return self.real.revoke_run(run_id, workspace_id)
+
+    class CaptureWorker(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.posts = 0
+
+        async def handle_async_request(self, request):
+            if request.method == "POST":
+                self.posts += 1
+            return httpx.Response(
+                202, json={"state": "running"}, request=request)
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+            conversation = store.create_conversation(member, "并发准备")
+            config = ConfigService(store, b"k" * MASTER_KEY_BYTES)
+            config.publish(admin, {"defaults": {"chat": {
+                "provider": "deepseek", "model": "deepseek-chat",
+                "base_url": "https://chat.example/v1",
+                "protocol": "openai",
+                "secret": {"CHAT_API_KEY": "chat-secret"},
+                "options": {},
+            }}}, expected_version=0)
+            broker = SecondIssueFails(BrokerService(
+                store, config,
+                egress=EgressGateway(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={})))))
+            key = Ed25519PrivateKey.generate()
+            factory = build_relay_factory(
+                signing_key=key, revision=REVISION,
+                agent={"runtime": "acp", "command": ["managed-agent"],
+                       "sandbox": "read-only", "timeout": 60},
+                broker_destination=BrokerDestination(
+                    "https://control.internal", "chat"))
+            transport = CaptureWorker()
+            lookups = {"n": 0}
+            both_looked = asyncio.Event()
+            reserves = {"n": 0}
+            both_reserved = asyncio.Event()
+            snapshots = {"n": 0}
+            both_snapshots = asyncio.Event()
+
+            def make_runner():
+                async def runner(function, *args, **kwargs):
+                    name = getattr(function, "__name__", "")
+                    if name == "lookup_run":
+                        result = function(*args, **kwargs)
+                        lookups["n"] += 1
+                        if lookups["n"] == 2:
+                            both_looked.set()
+                        await asyncio.wait_for(both_looked.wait(), timeout=0.5)
+                        return result
+                    if name == "reserve_run":
+                        result = function(*args, **kwargs)
+                        reserves["n"] += 1
+                        if reserves["n"] == 2:
+                            both_reserved.set()
+                        await asyncio.wait_for(
+                            both_reserved.wait(), timeout=0.5)
+                        return result
+                    if name == "get_run_snapshot":
+                        result = function(*args, **kwargs)
+                        snapshots["n"] += 1
+                        if snapshots["n"] == 2:
+                            both_snapshots.set()
+                        try:
+                            await asyncio.wait_for(
+                                both_snapshots.wait(), timeout=0.05)
+                        except asyncio.TimeoutError:
+                            pass
+                        return result
+                    return function(*args, **kwargs)
+                return runner
+
+            clients = [httpx.AsyncClient(transport=transport)
+                       for _ in range(2)]
+            relays = [
+                factory(StaticRuntime(), SessionService(store),
+                        AuthService(store), store, client, broker, runner)
+                for client, runner in zip(clients, [make_runner(),
+                                                     make_runner()])
+            ]
+            body = {"sessionId": conversation.id,
+                    "turnId": "same-turn", "message": "同一个请求"}
+            try:
+                results = await asyncio.gather(
+                    relays[0].submit(member, dict(body)),
+                    relays[1].submit(member, dict(body)),
+                    return_exceptions=True)
+            finally:
+                for client in clients:
+                    await client.aclose()
+
+            assert all(isinstance(item, dict) for item in results), results
+            assert {item["runId"] for item in results} == {
+                results[0]["runId"]}
+            assert sorted(item["duplicate"] for item in results) == [
+                False, True]
+            assert broker.issues == 1, "并发提交不得铸造第二个 token"
+            assert transport.posts == 1
+            run_id = results[0]["runId"]
+            assert store.get_run(member, run_id).status == "running"
+            assert store.count_active_runs() == 1
+
+    asyncio.run(scenario())
+
+
+def test_prepare_owner_crash_is_recovered_without_republish(tmp_path):
+    """准备所有权持有者崩溃：后台中断、不接管重发，重试只读原 admission。"""
+    from easel.worker.config import run_input_digest
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            user = store.create_user("Owner")
+            conversation = store.create_conversation(user, "准备崩溃")
+            digest = run_input_digest(
+                conversation_id=conversation.id, task_type="chat",
+                message="执行任务", attachments=[], persona=None)
+            run = store.reserve_run(
+                user, conversation.id, "crash-turn", digest, REVISION)
+            assert store.claim_run_preparation(
+                user, run.id, "dead-preparer", int(time.time()), 5)
+            broker = FakeBroker()
+            transport = WorkerTransport({})
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(
+                    store, client, broker=broker,
+                    signing_key=Ed25519PrivateKey.generate(),
+                    dispatch_grace=0)
+                relay._system_clock = lambda: time.time() + 100
+                await relay.reconcile_once()
+                assert store.get_run(user, run.id).status == "interrupted"
+                assert store.count_active_runs() == 0
+                assert broker.revoked == [(run.id, user.workspace_id)]
+                assert transport.calls == []
+
+                retried = await relay.submit(
+                    user, payload(conversation.id, turn_id="crash-turn"))
+                assert retried == {"runId": run.id, "state": "interrupted",
+                                   "duplicate": True}
+                assert transport.calls == []
 
     asyncio.run(scenario())
 

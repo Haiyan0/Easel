@@ -15,6 +15,8 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+from starlette.responses import StreamingResponse
+
 from .types import DomainError, Identity
 
 TERMINAL_STATES = frozenset({"done", "failed", "interrupted", "cancelled"})
@@ -33,6 +35,64 @@ def _frame(event: dict) -> bytes:
         f"event: {event['event']}\n"
         f"data: {data}\n\n"
     ).encode("utf-8")
+
+
+class AuthGuardedStreamingResponse(StreamingResponse):
+    """认证监视独立于响应生成器推进的流式响应。
+
+    生成器自身的复查会在 ``yield`` 处暂停；当下游 ASGI send 被慢消费者
+    阻塞时，生成器无法继续，撤销检查也就无法运行。这里把认证检查放进独立
+    任务，与 ``StreamingResponse.stream_response`` 竞速；撤销/失败时取消
+    发送任务、关闭响应体迭代器并等待清理，不取消 Run supervisor。
+    """
+
+    def __init__(self, content, *, recheck: Callable[[], Awaitable[None]],
+                 auth_check_seconds: float = DEFAULT_AUTH_CHECK_SECONDS,
+                 **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        if not callable(recheck):
+            raise TypeError("recheck must be callable")
+        self._recheck = recheck
+        self._auth_check_seconds = max(0.05, float(auth_check_seconds))
+
+    async def _watch_auth(self) -> None:
+        while True:
+            await asyncio.sleep(self._auth_check_seconds)
+            try:
+                # 复查自身也受窗口约束：4 秒复查 + 0.8 秒上限仍 < 5 秒
+                await asyncio.wait_for(
+                    self._recheck(),
+                    timeout=min(0.8, self._auth_check_seconds))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+
+    async def stream_response(self, send) -> None:
+        stream = asyncio.create_task(super().stream_response(send))
+        watch = asyncio.create_task(self._watch_auth())
+        try:
+            done, _ = await asyncio.wait(
+                {stream, watch}, return_when=asyncio.FIRST_COMPLETED)
+            if watch in done:
+                # 撤销/复查失败：只终止该连接及其在途读取
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
+            else:
+                watch.cancel()
+                await asyncio.gather(watch, return_exceptions=True)
+                await stream
+        finally:
+            for task in (stream, watch):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stream, watch, return_exceptions=True)
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
 
 
 async def run_event_stream(

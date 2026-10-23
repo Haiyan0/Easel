@@ -39,6 +39,8 @@ _DEFAULT_SNAPSHOT_TTL = 1800
 _DISPATCH_GRACE_SECONDS = 60
 # 任务截止（快照有效期/agent timeout）后的收尾余量。
 _RECONCILE_GRACE_SECONDS = 60
+# 唯一准备所有权租约；崩溃后由后台按原 Run 收尾，不接管重发。
+_PREPARE_LEASE_SECONDS = 60
 _ALLOWED_TASK_FIELDS = frozenset(
     {"sessionId", "turnId", "message", "attachments", "persona"})
 _MAX_IDENTIFIER = 256
@@ -231,10 +233,10 @@ class WorkerRelay:
     # 依赖与数据库线程
     # ------------------------------------------------------------------
 
-    async def _db(self, function, *args):
+    async def _db(self, function, *args, **kwargs):
         if self._db_runner is None:
-            return function(*args)
-        return await self._db_runner(function, *args)
+            return function(*args, **kwargs)
+        return await self._db_runner(function, *args, **kwargs)
 
     def _require_capabilities(self) -> None:
         if (self._runtime is None or self._signing_key is None
@@ -409,8 +411,16 @@ class WorkerRelay:
                 or handle.config_version != run.config_version):
             raise DomainError("worker_mismatch", 502)
 
-        # 并发同请求：reserve_run 可能返回另一方刚创建的 Run。快照首写
-        # 胜出；已有快照、或修订已固定为旧值时只返回原 admission，不重签。
+        # 并发同请求：reserve_run 可能返回另一方刚创建的 Run。准备所有权
+        # 在签发/固定快照之前原子认领；非所有者只读原 admission，既不铸造
+        # 第二个 token，也不能补偿性地中断所有者已派发的 Run。
+        prepare_owner = secrets.token_urlsafe(24)
+        acquired = await self._db(
+            self._store.claim_run_preparation, actor, run.id,
+            prepare_owner, int(self._system_clock()),
+            _PREPARE_LEASE_SECONDS)
+        if not acquired:
+            return await self._duplicate(actor, run)
         stored_existing = await self._db(
             self._store.get_run_snapshot, actor, run.id)
         if stored_existing is not None:
@@ -421,20 +431,22 @@ class WorkerRelay:
         try:
             routes = await self._run_routes(actor, run, config)
         except DomainError:
-            # 签发在接纳后失败（极窄的配置竞态）：明确收尾，不占容量
+            # 只有准备所有者、且尚未派发时才能补偿；非所有者不会走到这里
             await self._converge(actor, run, "interrupted")
             raise
         signed = self._sign(run, config, request, task_type, routes)
         stored = await self._db(
             self._store.save_run_snapshot, actor, run.id, signed)
         if stored != signed:
-            # 另一并发提交先固定了快照；由它负责唯一派发
+            # 已有另一份固定快照：只读原 admission，不中断其执行
             return await self._duplicate(actor, run)
         envelope = self._stored_envelope(stored, run, task_type)
 
         claimed = await self._db(
             self._store.claim_run_dispatch, actor, run.id,
-            envelope["nonce"], handle.container_id)
+            envelope["nonce"], handle.container_id,
+            prepare_owner=prepare_owner,
+            now=int(self._system_clock()))
         if not claimed:
             state = await self._db(
                 self._store.run_dispatch_state, actor, run.id)
@@ -589,6 +601,11 @@ class WorkerRelay:
         except DomainError as error:
             if error.code != "worker_instance_gone":
                 raise
+            if not await self._confirm_instance_stopped(
+                    run.workspace_id,
+                    str(binding.get("workerContainerId") or "")):
+                raise DomainError("worker_instance_unconfirmed", 503) \
+                    from None
             await self._converge(actor, run, "interrupted")
             return {"runId": run.id, "state": "interrupted"}
         try:
@@ -617,6 +634,11 @@ class WorkerRelay:
         except DomainError as error:
             if error.code != "worker_instance_gone":
                 raise
+            if not await self._confirm_instance_stopped(
+                    run.workspace_id,
+                    str(binding.get("workerContainerId") or "")):
+                raise DomainError("worker_instance_unconfirmed", 503) \
+                    from None
             await self._converge(actor, run, "interrupted")
             return self._local_page(await self._owned_run(actor, run.id))
         if handle is None:
@@ -649,6 +671,11 @@ class WorkerRelay:
         except DomainError as error:
             if error.code != "worker_instance_gone":
                 raise
+            if not await self._confirm_instance_stopped(
+                    run.workspace_id,
+                    str(binding.get("workerContainerId") or "")):
+                raise DomainError("worker_instance_unconfirmed", 503) \
+                    from None
             await self._converge(actor, run, "interrupted")
             raise DomainError("run_interrupted", 409) from None
         if handle is None:
@@ -687,6 +714,11 @@ class WorkerRelay:
         except DomainError as error:
             if error.code != "worker_instance_gone":
                 raise
+            if not await self._confirm_instance_stopped(
+                    run.workspace_id,
+                    str(binding.get("workerContainerId") or "")):
+                raise DomainError("worker_instance_unconfirmed", 503) \
+                    from None
             await self._converge(actor, run, "interrupted")
             raise DomainError("run_interrupted", 409) from None
         if handle is None:
@@ -761,8 +793,13 @@ class WorkerRelay:
         dispatch_state = str(row.get("dispatchState") or "")
         created_at = int(row.get("createdAt") or now)
         if not container:
-            # pending：从未认领派发，超过宽限期仍无实例则明确终止，不能
-            # 永久只返回 duplicate。
+            # pending：从未认领派发。准备所有权持有者崩溃后，只能用持久
+            # 租约到期 + 宽限期判断“准备未完成”，再由后台中断；绝不把
+            # 同一 Run 交给另一请求重新签发/重发。
+            prepare_expires = row.get("prepareExpiresAt")
+            if (isinstance(prepare_expires, int)
+                    and now < prepare_expires + self._dispatch_grace):
+                return False
             if (dispatch_state == "pending"
                     and now - created_at < self._dispatch_grace):
                 return False
@@ -777,10 +814,19 @@ class WorkerRelay:
         handle = await self._lookup_existing(
             workspace_id, container, int(row["configVersion"]))
         if handle is None:
-            # 原实例已确认失效：残留 Run 中断，绝不查新实例冒充旧执行
-            await self._finish_system(workspace_id, run_id, "interrupted")
-            return True
+            # 句柄不可用不是“执行已结束”的证据；只有按原实例 ID 确认停止
+            # （provisioner 幂等 stop 成功）才允许中断并释放容量。
+            if await self._confirm_instance_stopped(workspace_id, container):
+                await self._finish_system(
+                    workspace_id, run_id, "interrupted")
+                return True
+            return False
         deadline = self._run_deadline(row)
+        timed_out = now >= deadline
+        if timed_out:
+            # 截止后先撤销凭证限制新的模型调用，但仍保留任务预算直到
+            # 停止被确认；撤销本身不能证明外部副作用已结束。
+            await self._revoke_token_system(workspace_id, run_id)
         nonce = str(row.get("dispatchNonce") or "")
         suffix = f"&nonce={quote(nonce, safe='')}" if nonce else ""
         try:
@@ -789,15 +835,14 @@ class WorkerRelay:
                 f"/internal/runs/{run_id}/events?after=0{suffix}", None)
         except DomainError as error:
             if error.code == "not_found":
-                # 原实例确认没有该 Run：派发未落地，安全收敛为中断
+                # 同一原实例明确没有该 Run：派发未落地，安全收敛
                 await self._finish_system(
                     workspace_id, run_id, "interrupted")
                 return True
-            if now >= deadline:
-                await self._finish_system(
-                    workspace_id, run_id, "interrupted")
-                return True
-            return False
+            if not timed_out:
+                return False
+            return await self._confirm_stop(
+                workspace_id, run_id, handle)
         result = self._json_object(response)
         state = result.get("state")
         if state in TERMINAL_RUN_STATUSES:
@@ -809,17 +854,45 @@ class WorkerRelay:
         elif state == "awaiting_permission":
             await self._sync_system_status(
                 workspace_id, run_id, "awaiting_permission")
-        if now >= deadline:
-            # 超过任务截止仍活跃：先按原实例请求停止，再明确中断收尾
-            try:
-                await self._worker_request(
-                    handle, "POST", f"/internal/runs/{run_id}/stop",
-                    {"runId": run_id})
-            except DomainError:
-                pass
-            await self._finish_system(workspace_id, run_id, "interrupted")
+        if not timed_out:
+            return False
+        return await self._confirm_stop(workspace_id, run_id, handle)
+
+    async def _confirm_stop(self, workspace_id: str, run_id: str,
+                            handle: WorkerHandle) -> bool:
+        """请求原实例停止并等待可验证终态；失败/非终态保持占用。"""
+        try:
+            response = await self._worker_request(
+                handle, "POST", f"/internal/runs/{run_id}/stop",
+                {"runId": run_id})
+        except DomainError:
+            return False
+        result = self._json_object(response)
+        state = result.get("state")
+        if state in TERMINAL_RUN_STATUSES:
+            await self._finish_system(
+                workspace_id, run_id, str(state))
             return True
         return False
+
+    async def _confirm_instance_stopped(self, workspace_id: str,
+                                        container_id: str) -> bool:
+        confirm = getattr(self._runtime, "confirm_instance_stopped", None)
+        if not callable(confirm):
+            return False
+        try:
+            return bool(await confirm(workspace_id, container_id))
+        except Exception:
+            return False
+
+    async def _revoke_token_system(self, workspace_id: str,
+                                   run_id: str) -> None:
+        if self._broker is None:
+            return
+        try:
+            await self._db(self._broker.revoke_run, run_id, workspace_id)
+        except DomainError:
+            pass
 
     async def _sync_system_status(self, workspace_id: str, run_id: str,
                                   status: str) -> None:

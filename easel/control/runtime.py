@@ -29,6 +29,7 @@ WORKSPACE_LABEL = "easel.workspace-id"
 CONFIG_VERSION_LABEL = "easel.config-version"
 
 READY_TIMEOUT_SECONDS = 60.0
+CONFIRM_STOP_TIMEOUT_SECONDS = 15.0
 IDLE_SECONDS = 900
 LEASE_SECONDS = 120
 DRAIN_TIMEOUT_SECONDS = 60.0
@@ -152,6 +153,26 @@ class RuntimeManager:
         return WorkerHandle(lease.workspace_id, lease.container_id,
                             lease.upstream, lease.service_token,
                             lease.config_version)
+
+    async def confirm_instance_stopped(self, workspace_id: str,
+                                       container_id: str) -> bool:
+        """按不可复用实例 ID 确认旧实例已停止；失败时保持待确认。
+
+        ``provisioner.stop`` 对已不存在的目标幂等成功；只有调用成功才可
+        作为“执行已结束”的证据。不得用 ``bound_handle`` 不可用、inspect
+        失败或租约状态代替该确认。
+        """
+        if not isinstance(container_id, str) or not container_id:
+            return False
+        try:
+            await asyncio.wait_for(
+                self._provisioner.stop(workspace_id, container_id),
+                timeout=CONFIRM_STOP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return True
 
     async def drain(self, workspace_id: str) -> None:
         """拒绝新任务，等活动任务与请求归零后停止容器；超时保留 draining。

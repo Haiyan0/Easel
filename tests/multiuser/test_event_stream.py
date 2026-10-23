@@ -426,6 +426,87 @@ def test_silent_sse_revocation_within_five_seconds(tmp_path):
     asyncio.run(scenario())
 
 
+def test_slow_consumer_send_is_closed_by_auth_watchdog():
+    """ASGI send 被背压阻塞时，认证监视仍须在窗口内结束响应。"""
+    from easel.control.stream import AuthGuardedStreamingResponse
+
+    class BlockingBody:
+        def __init__(self) -> None:
+            self.closed = False
+            self.produced = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.produced += 1
+            if self.produced == 1:
+                return b'event: token\ndata: "private"\n\n'
+            await asyncio.sleep(60)
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        body = BlockingBody()
+        block = asyncio.Event()
+        sent: list[bytes] = []
+        state = {"checks": 0}
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.start":
+                return
+            if message.get("body"):
+                sent.append(message["body"])
+                await block.wait()
+
+        async def recheck() -> None:
+            state["checks"] += 1
+            raise DomainError("unauthorized", 401)
+
+        response = AuthGuardedStreamingResponse(
+            body, recheck=recheck, auth_check_seconds=0.2,
+            media_type="text/event-stream")
+        task = asyncio.create_task(response.stream_response(send))
+        await wait_until(lambda: len(sent) == 1)
+        await asyncio.wait_for(task, timeout=2)
+        assert task.exception() is None
+        assert state["checks"] >= 1
+        assert sent == [b'event: token\ndata: "private"\n\n']
+        assert body.closed is True, "撤销后必须关闭响应体迭代器"
+
+    asyncio.run(scenario())
+
+
+def test_watchdog_does_not_close_normal_stream():
+    from easel.control.stream import AuthGuardedStreamingResponse
+
+    async def scenario() -> None:
+        sent: list[bytes] = []
+        checks = {"n": 0}
+
+        async def body():
+            yield b"one"
+            yield b"two"
+
+        async def send(message) -> None:
+            if message["type"] != "http.response.start" and message.get("body"):
+                sent.append(message["body"])
+
+        async def recheck() -> None:
+            checks["n"] += 1
+
+        response = AuthGuardedStreamingResponse(
+            body(), recheck=recheck, auth_check_seconds=10.0,
+            media_type="text/event-stream")
+        await asyncio.wait_for(response.stream_response(send), timeout=2)
+        assert sent == [b"one", b"two"]
+        assert checks["n"] == 0
+
+    asyncio.run(scenario())
+
+
 def test_default_auth_check_window_bounds_revocation_within_five_seconds():
     """默认轮询/复查间隔之和必须落在 5 秒撤销窗口内。
 

@@ -240,21 +240,30 @@ def _scrub_payload(value: object, secrets: tuple[str, ...]) -> object:
     return value
 
 
+OPAQUE_OPTION_PREFIX = "qopt_"
+
+
 def _public_questions(questions: list[dict], secrets: tuple[str, ...]
-                      ) -> tuple[list[dict], dict[str, str]]:
-    """生成公开问题与授权映射。
+                      ) -> tuple[list[dict], dict[str, dict[str, dict[str, str]]]]:
+    """生成公开问题与按问题隔离的授权映射。
 
     公开选项带 opaque ``value``；浏览器可回传 ``value`` 或脱敏后的 label，
-    worker 再映射回适配器使用的原始选项文本。脱敏后重复的 label 通过
-    序号区分，绝不因隐藏文本而混淆两个不同授权选项。
+    worker 只在**同一问题**内映射回原始选项。Opaque 值随机生成且避开本题
+    所有 label，避免 label 假冒 value；脱敏后重复的 label 通过序号区分。
+    返回值外层按 questionId 分区，跨题值不会互相翻译。
     """
     public: list[dict] = []
-    selections: dict[str, str] = {}
-    used: set[tuple[int, str]] = set()
+    selections: dict[str, dict[str, dict[str, str]]] = {}
     for question_index, question in enumerate(questions):
         item = _scrub_payload(question, secrets)
         if not isinstance(item, dict):
             raise _invalid("question_invalid")
+        question_key = str(question.get(
+            "questionId", question.get("id", question_index)))
+        if question_key in selections:
+            raise _invalid("question_invalid")
+        values: dict[str, str] = {}
+        labels: dict[str, str] = {}
         options = question.get("options")
         if isinstance(options, list):
             public_options: list[object] = []
@@ -266,12 +275,14 @@ def _public_questions(questions: list[dict], secrets: tuple[str, ...]
                         original if isinstance(original, str) else str(original))
                     label = _scrub(original_text, secrets) or (
                         f"option {option_index + 1}")
-                    while (question_index, label) in used:
+                    while label in labels or label in values:
                         label = f"{label} #{option_index + 1}"
-                    used.add((question_index, label))
-                    value = f"opt_{question_index}_{option_index}"
-                    selections[value] = original_text
-                    selections[label] = original_text
+                    while True:
+                        value = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
+                        if value not in values and value not in labels:
+                            break
+                    values[value] = original_text
+                    labels[label] = original_text
                     public_options.append({
                         **{key: _scrub_payload(field_value, secrets)
                            for key, field_value in option.items()},
@@ -282,13 +293,50 @@ def _public_questions(questions: list[dict], secrets: tuple[str, ...]
                     original_text = (
                         option if isinstance(option, str) else str(option))
                     label = _scrub(original_text, secrets)
-                    value = f"opt_{question_index}_{option_index}"
-                    selections[value] = original_text
-                    selections[label] = original_text
+                    while label in labels or label in values:
+                        label = f"{label} #{option_index + 1}"
+                    while True:
+                        value = OPAQUE_OPTION_PREFIX + uuid.uuid4().hex
+                        if value not in values and value not in labels:
+                            break
+                    values[value] = original_text
+                    labels[label] = original_text
                     public_options.append({"label": label, "value": value})
             item["options"] = public_options
+        selections[question_key] = {"values": values, "labels": labels}
         public.append(item)
     return public, selections
+
+
+def _translate_answers(selections: dict[str, dict[str, dict[str, str]]],
+                       answers: dict[str, list[str]]) -> dict[str, list[str]]:
+    """把公开选择翻译回原选项；跨题/伪造 opaque 值明确拒绝。"""
+    translated: dict[str, list[str]] = {}
+    for question_key, chosen in answers.items():
+        mapping = selections.get(question_key)
+        if mapping is None:
+            raise _invalid("question_answer_mismatch")
+        values = mapping["values"]
+        labels = mapping["labels"]
+        if not values and not labels:
+            # 无选项的自由文本问题：保持原有透传语义
+            translated[question_key] = list(chosen)
+            continue
+        resolved: list[str] = []
+        for item in chosen:
+            if item in values and item in labels:
+                raise DomainError("question_answer_ambiguous", 400)
+            if item in values:
+                resolved.append(values[item])
+            elif item in labels:
+                resolved.append(labels[item])
+            elif item.startswith(OPAQUE_OPTION_PREFIX):
+                # 不得用别题的 opaque 值或伪造前缀冒充本题选项
+                raise DomainError("question_answer_ambiguous", 400)
+            else:
+                raise _invalid("question_answer_mismatch")
+        translated[question_key] = resolved
+    return translated
 
 
 @dataclass(frozen=True)
@@ -1341,6 +1389,16 @@ class RunManager:
         except (OSError, DomainError):
             pass
 
+    def _preserve_failed_output(self, run_id: str, path: Path) -> None:
+        """提交失败时保留暂存输出；只有一致提交后才允许删除恢复材料。"""
+        try:
+            target_dir = self._paths.state_root / "failed_outputs"
+            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(path, target_dir / f"{run_id}.json")
+        except OSError:
+            # 保留原位置也可；绝不静默删除
+            pass
+
     def _recover_finalizing(self) -> None:
         """重开时补提交已暂存输出；消息按 runId 去重，不重复追加。"""
         finalizing = set(self.registry.finalizing_runs())
@@ -1369,10 +1427,12 @@ class RunManager:
             except Exception:
                 self.registry.finish_finalizing(
                     run_id, "failed", "output_storage_failed")
+                # 提交未成功：保留暂存输出供审查/人工恢复，不能当垃圾删除
+                self._preserve_failed_output(run_id, path)
             else:
                 self.registry.finish_finalizing(
                     run_id, "done", "completed")
-            path.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
         # 清理不处于收尾的孤儿暂存文件（例如 done 提交后、删除前崩溃）
         directory = self._finalizing_dir()
         if directory.exists():
@@ -1418,15 +1478,11 @@ class RunManager:
         entry = self._questions.get(key)
         if entry is None:
             raise DomainError("question_unavailable", 409)
-        result = self.registry.answer(
-            run_id, question_id, {str(k): list(v)
-                                  for k, v in answers.items()})
+        normalized = {str(k): list(v) for k, v in answers.items()}
+        # 先校验/翻译，再消耗 pending 问题：非法回答不能把问题置为 resolved
+        translated = _translate_answers(entry["selections"], normalized)
+        result = self.registry.answer(run_id, question_id, normalized)
         future = entry["future"]
-        selections = entry["selections"]
-        translated = {
-            str(k): [selections.get(item, item) for item in values]
-            for k, values in answers.items()
-        }
         self._questions.pop(key, None)
         if future is not None and not future.done():
             future.set_result(translated)

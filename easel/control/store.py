@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -359,6 +359,12 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             ON request_leases (workspace_id, expires_at)
         """,
         "CREATE INDEX request_leases_expiry_idx ON request_leases (expires_at)",
+    ),
+    # 版本 10：同一 Run 的唯一准备所有权。并发同请求只允许一个调用签发
+    # token/固定快照；其他调用只读原 admission，不能补偿性地中断共享 Run。
+    (
+        "ALTER TABLE runs ADD COLUMN prepare_owner TEXT",
+        "ALTER TABLE runs ADD COLUMN prepare_expires_at INTEGER",
     ),
 )
 
@@ -1801,28 +1807,72 @@ class Store:
         value = row["snapshot_json"]
         return value if isinstance(value, str) else None
 
+    def claim_run_preparation(self, actor: Identity, run_id: str,
+                              owner: str, now: int, ttl_seconds: int) -> bool:
+        """为同一 Run 建立唯一、持久、不可接管的准备所有权。
+
+        只有第一个并发提交能签发 token/固定快照；其他提交读取原 admission。
+        所有权不因租约过期而被另一请求接管：持有者崩溃后由后台对账按原
+        Run 收尾，绝不盲目重发业务。
+        """
+        workspace_id = self._require_actor(actor)
+        if (not isinstance(owner, str) or not owner or len(owner) > 128
+                or not owner.isascii()):
+            raise DomainError("invalid_argument", 400)
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 3600:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            self._require_actor(actor)
+            cursor = self._connection.execute(
+                "UPDATE runs SET prepare_owner = ?, prepare_expires_at = ?"
+                " WHERE workspace_id = ? AND id = ? AND prepare_owner IS NULL"
+                " AND capacity_released_at IS NULL AND status NOT IN"
+                f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                (owner, now + ttl_seconds, workspace_id, _text(run_id),
+                 *TERMINAL_RUN_STATUSES))
+            return cursor.rowcount == 1
+
     def claim_run_dispatch(self, actor: Identity, run_id: str, nonce: str,
-                           container_id: str) -> bool:
+                           container_id: str, *,
+                           prepare_owner: str | None = None,
+                           now: int | None = None) -> bool:
         """原子认领唯一派发；只有 pending 行能进入 dispatching。
 
         认领在数据库事务内完成，两个并发提交同输入时只有一个返回 True；
-        另一个必须读取持久状态，不能再次向 worker 发布任务。
+        另一个必须读取持久状态，不能再次向 worker 发布任务。提供
+        ``prepare_owner`` 时只有仍持有准备所有权的调用者可以派发；成功后
+        清除准备标记。
         """
         workspace_id = self._require_actor(actor)
         if (not isinstance(nonce, str) or not nonce or len(nonce) > 128
                 or not isinstance(container_id, str) or not container_id
                 or len(container_id) > 256):
             raise DomainError("invalid_argument", 400)
+        where = (
+            " WHERE workspace_id = ? AND id = ? AND dispatch_state = 'pending'"
+            " AND status NOT IN"
+            f" ({_placeholders(TERMINAL_RUN_STATUSES)})")
+        values: list[object] = [nonce, container_id, _now(), workspace_id,
+                                _text(run_id), *TERMINAL_RUN_STATUSES]
+        if prepare_owner is not None:
+            if (not isinstance(prepare_owner, str) or not prepare_owner
+                    or len(prepare_owner) > 128):
+                raise DomainError("invalid_argument", 400)
+            if type(now) is not int:
+                raise DomainError("invalid_argument", 400)
+            where += (" AND prepare_owner = ?"
+                      " AND prepare_expires_at IS NOT NULL"
+                      " AND prepare_expires_at > ?")
+            values.extend((prepare_owner, now))
         with self._transaction():
             self._require_actor(actor)
             cursor = self._connection.execute(
                 "UPDATE runs SET dispatch_state = 'dispatching',"
-                " dispatch_nonce = ?, worker_container_id = ?, dispatched_at = ?"
-                " WHERE workspace_id = ? AND id = ? AND dispatch_state = 'pending'"
-                " AND status NOT IN"
-                f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
-                (nonce, container_id, _now(), workspace_id, _text(run_id),
-                 *TERMINAL_RUN_STATUSES))
+                " dispatch_nonce = ?, worker_container_id = ?, dispatched_at = ?,"
+                " prepare_owner = NULL, prepare_expires_at = NULL"
+                + where,
+                tuple(values))
             return cursor.rowcount == 1
 
     def mark_run_dispatched(self, actor: Identity, run_id: str,
@@ -1915,7 +1965,8 @@ class Store:
         rows = self._connection.execute(
             "SELECT workspace_id, id, conversation_id, status, config_version,"
             " dispatch_state, dispatch_nonce, worker_container_id, created_at,"
-            " dispatched_at, snapshot_json FROM runs"
+            " dispatched_at, prepare_owner, prepare_expires_at,"
+            " snapshot_json FROM runs"
             f" WHERE status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)})"
             " ORDER BY created_at, rowid",
             TERMINAL_RUN_STATUSES).fetchall()
@@ -1931,6 +1982,10 @@ class Store:
             "createdAt": int(row["created_at"]),
             "dispatchedAt": (int(row["dispatched_at"])
                              if row["dispatched_at"] is not None else None),
+            "prepareOwner": row["prepare_owner"] or "",
+            "prepareExpiresAt": (int(row["prepare_expires_at"])
+                                 if row["prepare_expires_at"] is not None
+                                 else None),
             "snapshotJson": row["snapshot_json"],
         } for row in rows]
 
