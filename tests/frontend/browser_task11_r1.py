@@ -45,7 +45,7 @@ def make_invites(db_path: Path, count: int = 12):
             identities[name] = store.get_identity(row["user_id"])
         invites = {
             name: [auth.create_invite(admin, identities[name].user_id)
-                   for _ in range(count // 2)]
+                   for _ in range(count)]
             for name in ("A", "B")
         }
         return identities, invites
@@ -235,6 +235,36 @@ async def main() -> int:
             assert "s002" in await page.locator("header").inner_text()
             assert not any("/api/chat/jobs/" in url for url in chat_requests)
             results["late_admission_does_not_steal_ui"] = True
+            await page.unroute("**/api/chat")
+            await context.close()
+
+            # S3b: 退出切账号后旧 admission 不重建缓存、不发新 SSE
+            context, page = await open_app(
+                browser, origin, invites["A"].pop())
+            await select_session(page, "s005")
+            late_requests: list[str] = []
+            page.on("request", lambda request: late_requests.append(
+                request.url) if "/api/chat" in request.url else None)
+
+            async def hold_late(route):
+                await asyncio.sleep(2.5)
+                await route.continue_()
+
+            await page.route("**/api/chat", hold_late)
+            await page.locator("textarea").fill("切换账号")
+            await page.get_by_role("button", name="发送").click()
+            await page.wait_for_timeout(100)
+            await page.get_by_role("button", name="退出登录").click()
+            await page.wait_for_selector("#invite", timeout=15000)
+            await base.login(page, invites["B"].pop())
+            await page.wait_for_timeout(3200)
+            body = await page.locator("body").inner_text()
+            assert "切换账号" not in body
+            assert not any("/api/chat/jobs/" in url for url in late_requests),                 late_requests
+            keys = await page.evaluate("Object.keys(sessionStorage)")
+            ws_a = identities["A"].workspace_id
+            assert not any(ws_a in key for key in keys), keys
+            results["late_admission_after_account_switch_ignored"] = True
             await page.unroute("**/api/chat")
             await context.close()
 
