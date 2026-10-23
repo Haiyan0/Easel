@@ -342,6 +342,10 @@ function ControlWorkspace({
   const sessionsSeq = useRef(0);
   // 会话选择代次：异步历史/admission 只能提交到发起时的选择
   const selectionSeq = useRef(0);
+  // 用户主动选择代次：目录刷新等待期间的新选择不被旧请求撤销
+  const userSelectSeq = useRef(0);
+  // 本地发送代次：从提交新一轮输入起保护输入，旧收尾不得覆盖
+  const sendSeq = useRef(0);
   // 消息窗口代次：终态刷新后，旧的“加载更早”结果不得造成空洞/混排
   const messageSeq = useRef(0);
 
@@ -356,6 +360,13 @@ function ControlWorkspace({
   const isSelected = useCallback((sessionId: string, seq?: number) =>
     epochs.isCurrent(epoch) && activeIdRef.current === sessionId
     && (seq === undefined || selectionSeq.current === seq), [epoch, epochs]);
+
+  // 用户主动选择：同步更新代次与 ref，等待中的目录刷新不得回切
+  const chooseSession = useCallback((sessionId: string) => {
+    userSelectSeq.current += 1;
+    activeIdRef.current = sessionId;
+    setActiveId(sessionId);
+  }, []);
 
   const call = useCallback(async <T,>(path: string, init?: RequestInit) => {
     try {
@@ -392,13 +403,15 @@ function ControlWorkspace({
     offset: number, append: boolean, select?: string | null,
   ) => {
     const seq = ++sessionsSeq.current;
+    // 目录请求与用户选择分别取代次：等待期间用户另选时只更新目录
+    const wanted = select === undefined ? activeIdRef.current : select;
+    const selectionAtStart = userSelectSeq.current;
     try {
       let page = parseSessionPage(await call(
         `/api/sessions?limit=100&offset=${offset}&include_archived=true`));
       if (seq !== sessionsSeq.current) return;
       let visible = page.sessions;
       let nextOffset = page.nextOffset;
-      const wanted = select === undefined ? activeIdRef.current : select;
       let keep: ServerSession | null = null;
       if (!append && wanted && !visible.some((item) => item.id === wanted)) {
         // 不能因为第一页没有就推断删除；在有界分页内继续查找本人目录
@@ -433,6 +446,16 @@ function ControlWorkspace({
           }
         }
       }
+      const selectionChanged = userSelectSeq.current !== selectionAtStart;
+      if (!append && selectionChanged) {
+        // 用户在等待期间主动选择了其它会话：保留其条目，但不改活动键/连接
+        const currentId = activeIdRef.current;
+        if (currentId && !visible.some((item) => item.id === currentId)) {
+          const current = sessionsRef.current.find(
+            (item) => item.id === currentId);
+          if (current) visible = [...visible, current];
+        }
+      }
       apply(() => {
         setSessions((current) => {
           if (!append) return visible;
@@ -442,7 +465,7 @@ function ControlWorkspace({
         });
         setSessionNextOffset(nextOffset);
         setLoading(false);
-        if (!append) {
+        if (!append && !selectionChanged) {
           const next = keep
             || visible.find((item) => item.id === wanted)
             || visible.find((item) => !item.archived)
@@ -539,9 +562,11 @@ function ControlWorkspace({
   ) => {
     messageSeq.current += 1;
     const generation = messageSeq.current;
+    const sendGeneration = sendSeq.current;
     const latest = await fetchLatestMessages(sessionId);
     if (!isSelected(sessionId, seq)
-        || generation !== messageSeq.current) return null;
+        || generation !== messageSeq.current
+        || sendSeq.current !== sendGeneration) return null;
     apply(() => {
       setMessages(latest.messages);
       setMessageStart(latest.start);
@@ -622,11 +647,13 @@ function ControlWorkspace({
       // 新 Run 开始：旧题卡选择不能带入
       setAnswers({});
     }
+    const sendGeneration = sendSeq.current;
     const owns = () => connectionSeq.current === connection
       && !controller.signal.aborted
       && epochs.isCurrent(epoch)
       && activeIdRef.current === sessionId
-      && runRef.current?.runId === runId;
+      && runRef.current?.runId === runId
+      && sendSeq.current === sendGeneration;
     const persist = (cursor: number) => {
       if (cursor > 0 && epochs.isCurrent(epoch)) {
         writeRecovery(ctx, sessionId, { runId, turnId, eventId: cursor });
@@ -740,11 +767,13 @@ function ControlWorkspace({
     setMessageLoadingMore(false);
     messageSeq.current += 1;
     let cancelled = false;
+    const sendAtStart = sendSeq.current;
     (async () => {
       try {
         const runs = await loadActiveRuns(sessionId);
         const latest = await fetchLatestMessages(sessionId);
-        if (cancelled || !isSelected(sessionId, seq)) return;
+        if (cancelled || !isSelected(sessionId, seq)
+            || sendSeq.current !== sendAtStart) return;
         apply(() => {
           setMessages(latest.messages);
           setMessageStart(latest.start);
@@ -761,7 +790,8 @@ function ControlWorkspace({
           clearRecovery(ctx, sessionId);
         }
       } catch (error) {
-        if (cancelled || !isSelected(sessionId, seq)) return;
+        if (cancelled || !isSelected(sessionId, seq)
+            || sendSeq.current !== sendAtStart) return;
         apply(() => setHistoryError(error instanceof AuthError
           ? `历史读取失败（${error.status}）`
           : '历史读取失败，请稍后重试。'));
@@ -877,6 +907,11 @@ function ControlWorkspace({
   ) => {
     const epochAtStart = epoch;
     if (!epochs.isCurrent(epochAtStart)) return;
+    // 从开始提交新输入起就保护本地消息窗口：在途终态/404 刷新不得覆盖，
+    // 不能等 admission 到达、新 SSE 建立后才取得保护。
+    sendSeq.current += 1;
+    messageSeq.current += 1;
+    const sendGeneration = sendSeq.current;
     setNotice('');
     if (appendUser && activeIdRef.current === sessionId) {
       apply(() => setMessages((current) => [
@@ -905,6 +940,8 @@ function ControlWorkspace({
       }
     } catch (error) {
       if (!epochs.isCurrent(epochAtStart)) return;
+      // 已有更新的本地发送代次接管界面；旧请求的失败不再改写提示/待重试
+      if (sendSeq.current !== sendGeneration) return;
       if (activeIdRef.current !== sessionId) return;
       const status = error instanceof AuthError ? error.status : 0;
       const detail = error instanceof Error ? error.message : '';
@@ -1019,7 +1056,7 @@ function ControlWorkspace({
           {sessions.map((session) => (
             <button
               key={session.id}
-              onClick={() => setActiveId(session.id)}
+              onClick={() => chooseSession(session.id)}
               style={{
                 ...styles.button,
                 textAlign: 'left', overflow: 'hidden',
