@@ -19,11 +19,13 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
 from ..worker.config import run_input_digest, sign_run_snapshot
+from ..worker.guard import (SERVICE_TOKEN_HEADER, WORKSPACE_HEADER,
+                            no_client_auth, strip_request_headers)
 from ..worker.sessions import MAX_ATTACHMENTS, MAX_MESSAGE_BYTES
 from .auth import AuthService
 from .runtime import RuntimeUnavailable
@@ -33,6 +35,10 @@ from .tasks import IMPLEMENTED_TASK_TYPES, entry_for_type
 from .types import DomainError, Identity, RunRecord, WorkerHandle
 
 _DEFAULT_SNAPSHOT_TTL = 1800
+# 派发认领后给 POST 一个宽限期，避免对账抢在 worker 接纳前把结果判死。
+_DISPATCH_GRACE_SECONDS = 60
+# 任务截止（快照有效期/agent timeout）后的收尾余量。
+_RECONCILE_GRACE_SECONDS = 60
 _ALLOWED_TASK_FIELDS = frozenset(
     {"sessionId", "turnId", "message", "attachments", "persona"})
 _MAX_IDENTIFIER = 256
@@ -40,16 +46,42 @@ _MAX_PERSONA = 200
 
 
 @dataclass(frozen=True)
+class BrokerDestination:
+    """逐 Run broker 目的地；凭证由 BrokerService.issue 在接纳后签发。"""
+
+    url: str
+    channel: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.url, str) or not self.url:
+            raise ValueError("broker url must be a non-empty string")
+        parsed = urlsplit(self.url)
+        if (parsed.scheme not in ("http", "https") or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+                or parsed.path not in ("", "/")):
+            raise ValueError("broker url must be a plain http(s) origin")
+        if (not isinstance(self.channel, str) or not self.channel
+                or len(self.channel) > 32
+                or not all(character.islower() or character.isdigit()
+                           or character == "_" for character in self.channel)):
+            raise ValueError("broker channel is invalid")
+        object.__setattr__(self, "url", self.url.rstrip("/"))
+
+
+@dataclass(frozen=True)
 class PinnedRunConfig:
     """接纳时固定的配置视图；由受管配置 provider 原子读取。
 
     ``revision`` 是 Run 固定的配置修订，不是 worker 容器的版本、能力覆盖
-    版本或原生绑定契约版本。routes/agent 只包含该 Run 所需的最小内容。
+    版本或原生绑定契约版本。routes/agent 只包含该 Run 所需的最小内容；
+    ``broker`` 声明目的地/channel，实际 token 由接纳后的正式装配签发。
     """
 
     revision: int
     routes: Mapping[str, object]
     agent: Mapping[str, object]
+    broker: BrokerDestination | None = None
 
     def __post_init__(self) -> None:
         if type(self.revision) is not int or self.revision < 0:
@@ -57,6 +89,12 @@ class PinnedRunConfig:
         if not isinstance(self.routes, Mapping) or not isinstance(
                 self.agent, Mapping):
             raise ValueError("routes/agent must be mappings")
+        if self.broker is not None:
+            if not isinstance(self.broker, BrokerDestination):
+                raise ValueError("broker must be a BrokerDestination")
+            if "broker_token" in self.routes or "broker_url" in self.routes:
+                # 静态凭证与逐 Run 签发不能混用，避免旧 token 覆盖新签发
+                raise ValueError("routes must not mix static broker credentials")
         object.__setattr__(self, "routes", MappingProxyType(dict(self.routes)))
         object.__setattr__(self, "agent", MappingProxyType(dict(self.agent)))
 
@@ -148,6 +186,8 @@ class WorkerRelay:
                  accepted_task_types: Iterable[str] | None = None,
                  request_lease_ttl: int = 60,
                  clock: Callable[[], float] = time.time,
+                 system_clock: Callable[[], float] = time.time,
+                 dispatch_grace: int = _DISPATCH_GRACE_SECONDS,
                  snapshot_ttl: int = _DEFAULT_SNAPSHOT_TTL) -> None:
         if not isinstance(store, Store):
             raise TypeError("store must be a Store")
@@ -157,10 +197,14 @@ class WorkerRelay:
             raise TypeError("auth must be an AuthService")
         if config_provider is not None and not callable(config_provider):
             raise TypeError("config_provider must be callable")
+        if not callable(system_clock):
+            raise TypeError("system_clock must be callable")
         if type(snapshot_ttl) is not int or not 1 <= snapshot_ttl <= 86400:
             raise ValueError("snapshot_ttl must be an integer in 1..86400")
         if type(request_lease_ttl) is not int or not 1 <= request_lease_ttl <= 3600:
             raise ValueError("request_lease_ttl must be an integer in 1..3600")
+        if type(dispatch_grace) is not int or not 0 <= dispatch_grace <= 3600:
+            raise ValueError("dispatch_grace must be an integer in 0..3600")
         accepted = (IMPLEMENTED_TASK_TYPES if accepted_task_types is None
                     else frozenset(accepted_task_types))
         if any(entry_for_type(name) is None for name in accepted):
@@ -177,6 +221,10 @@ class WorkerRelay:
         self._accepted_task_types = frozenset(accepted)
         self._request_lease_ttl = request_lease_ttl
         self._clock = clock
+        # 对账时间必须与 Store 的 created_at/dispatched_at 同源（真实时钟）；
+        # 签名时钟可被测试固定，但两者不得混用。
+        self._system_clock = system_clock
+        self._dispatch_grace = dispatch_grace
         self._snapshot_ttl = snapshot_ttl
 
     # ------------------------------------------------------------------
@@ -231,8 +279,53 @@ class WorkerRelay:
             raise DomainError("capability_unavailable", 503)
         return config
 
+    async def _ensure_broker_capability(self, actor: Identity,
+                                        config: PinnedRunConfig) -> None:
+        if config.broker is None:
+            return
+        if self._broker is None:
+            raise DomainError("capability_unavailable", 503)
+        try:
+            await self._db(
+                self._broker.ensure_issuable, actor, config.broker.channel)
+        except DomainError as error:
+            if error.status in (400, 404, 503):
+                raise DomainError("capability_unavailable", 503) from None
+            raise
+
+    async def _run_routes(self, actor: Identity, run: RunRecord,
+                          config: PinnedRunConfig) -> Mapping[str, object]:
+        """固定该 Run 的最小 broker 路由。
+
+        正式装配在接纳后调用 ``BrokerService.issue``，token 只绑定本人的
+        workspace/run/channel；签发失败（未配置该 channel 等）明确 503，
+        不以空 routes 接纳一个看似可运行的在线任务。签发与配置快照在同一
+        数据库事务内完成，重试/重启复用原签名包，不会换 token。
+        """
+        if config.broker is None:
+            return config.routes
+        if self._broker is None:
+            raise DomainError("capability_unavailable", 503)
+        try:
+            token = await self._db(
+                self._broker.issue, actor, run.id, config.broker.channel)
+        except DomainError as error:
+            if error.status in (400, 404, 503):
+                raise DomainError("capability_unavailable", 503) from None
+            raise
+        return {**config.routes,
+                "broker_url": config.broker.url,
+                "broker_token": token}
+
+    async def _duplicate(self, actor: Identity, run: RunRecord) -> dict:
+        state = await self._db(
+            self._store.run_dispatch_state, actor, run.id)
+        return {"runId": run.id, "state": state["status"],
+                "duplicate": True}
+
     def _sign(self, run: RunRecord, config: PinnedRunConfig,
-              request: Mapping[str, object], task_type: str) -> str:
+              request: Mapping[str, object], task_type: str,
+              routes: Mapping[str, object] | None = None) -> str:
         digest = run_input_digest(
             conversation_id=run.conversation_id, task_type=task_type,
             message=str(request["message"]),
@@ -246,7 +339,7 @@ class WorkerRelay:
             input_digest=digest,
             task_type=task_type,
             revision=run.config_version,
-            routes=dict(config.routes),
+            routes=dict(config.routes if routes is None else routes),
             agent=dict(config.agent),
             expires_at=int(self._clock()) + self._snapshot_ttl,
             nonce=secrets.token_urlsafe(24))
@@ -286,37 +379,58 @@ class WorkerRelay:
         if task_type not in self._accepted_task_types:
             raise DomainError("capability_unavailable", 503)
         request = _validate_task(payload, task_type)
-        config = await self._pinned(actor)
         conversation_id = str(request["sessionId"])
-        # 归属必须早于 worker 启动；reserve_run 在事务内会再次复查
+        # 归属必须早于任何配置读取或 worker 启动；reserve_run 会再复查
         await self._db(self._sessions.get_conversation, actor, conversation_id)
-        handle = await self._ensure_workspace_ready(
-            actor.workspace_id, config.revision)
         client_request_id = request["turnId"] or uuid.uuid4().hex
         digest = run_input_digest(
             conversation_id=conversation_id, task_type=task_type,
             message=request["message"], attachments=request["attachments"],
             persona=request["persona"])
 
+        # 幂等识别先于读取最新配置：同输入重试返回原 Run/原快照，管理员
+        # 更新配置或新 worker 不可用都不能改变已固定的接纳。
+        existing = await self._db(
+            self._store.lookup_run, actor, conversation_id,
+            client_request_id, digest)
+        if existing is not None:
+            return await self._duplicate(actor, existing)
+
+        config = await self._pinned(actor)
+        # 能力检查先于启动 worker 与占用容量：缺受管 broker 路由时明确
+        # 503，不留下一个永远无法派发的 reserved Run。
+        await self._ensure_broker_capability(actor, config)
+        handle = await self._ensure_workspace_ready(
+            actor.workspace_id, config.revision)
         run = await self._db(
             self._store.reserve_run, actor, conversation_id,
             client_request_id, digest, config.revision)
-        if run.config_version != config.revision:
-            # 同一 client_request_id 已按旧修订固定，不能用新配置重建
-            raise DomainError("configuration_changed", 409)
         if (handle.workspace_id != run.workspace_id
                 or handle.config_version != run.config_version):
             raise DomainError("worker_mismatch", 502)
 
-        signed = self._sign(run, config, request, task_type)
+        # 并发同请求：reserve_run 可能返回另一方刚创建的 Run。快照首写
+        # 胜出；已有快照、或修订已固定为旧值时只返回原 admission，不重签。
+        stored_existing = await self._db(
+            self._store.get_run_snapshot, actor, run.id)
+        if stored_existing is not None:
+            return await self._duplicate(actor, run)
+        if run.config_version != config.revision:
+            return await self._duplicate(actor, run)
+
+        try:
+            routes = await self._run_routes(actor, run, config)
+        except DomainError:
+            # 签发在接纳后失败（极窄的配置竞态）：明确收尾，不占容量
+            await self._converge(actor, run, "interrupted")
+            raise
+        signed = self._sign(run, config, request, task_type, routes)
         stored = await self._db(
             self._store.save_run_snapshot, actor, run.id, signed)
+        if stored != signed:
+            # 另一并发提交先固定了快照；由它负责唯一派发
+            return await self._duplicate(actor, run)
         envelope = self._stored_envelope(stored, run, task_type)
-
-        state = await self._db(self._store.run_dispatch_state, actor, run.id)
-        if state["dispatchState"] != "pending":
-            return {"runId": run.id, "state": state["status"],
-                    "duplicate": True}
 
         claimed = await self._db(
             self._store.claim_run_dispatch, actor, run.id,
@@ -397,15 +511,95 @@ class WorkerRelay:
                 await self._db(
                     self._broker.revoke_run, run.id, run.workspace_id)
 
+    async def _binding(self, actor: Identity, run: RunRecord) -> dict:
+        return await self._db(
+            self._store.run_dispatch_state, actor, run.id)
+
+    async def _existing_handle(self, run: RunRecord,
+                               binding: Mapping[str, object]
+                               ) -> WorkerHandle | None:
+        """按持久 worker 实例 ID 取句柄；draining 仍允许既有 Run 收尾。
+
+        不调用 ``ensure_ready``：既有 Run 不能启动、升级或替换实例，也
+        不能在原实例失效后把操作发到另一代次伪装成原 Run。
+        """
+        container = binding.get("workerContainerId")
+        if not isinstance(container, str) or not container:
+            return None
+        handle = await self._lookup_existing(
+            run.workspace_id, container, run.config_version)
+        if handle is None:
+            raise DomainError("worker_instance_gone", 409)
+        return handle
+
+    async def _lookup_existing(self, workspace_id: str, container: str,
+                               config_version: int) -> WorkerHandle | None:
+        """按不可复用实例 ID 取句柄；runtime 可提供更强的存活核对。
+
+        ``RuntimeManager.bound_handle`` 以持久租约/代次实现；自定义 runtime
+        可通过同名方法声明实例存活。两条路径都绝不调用 ``ensure_ready``，
+        因此不会启动、升级或替换实例。
+        """
+        lookup = getattr(self._runtime, "bound_handle", None)
+        if callable(lookup):
+            handle = await lookup(
+                workspace_id, container, config_version)
+            if (not isinstance(handle, WorkerHandle)
+                    or handle.workspace_id != workspace_id
+                    or handle.container_id != container
+                    or handle.config_version != config_version):
+                return None
+            return handle
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
+        if (lease is None or lease.container_id != container
+                or lease.state not in ("ready", "draining")
+                or lease.config_version != config_version
+                or not lease.upstream or not lease.service_token):
+            return None
+        return WorkerHandle(workspace_id, lease.container_id,
+                            lease.upstream, lease.service_token,
+                            config_version)
+
+    async def _converge(self, actor: Identity, run: RunRecord,
+                        state: str) -> None:
+        await self._db(self._store.finish_run, actor, run.id, state)
+        await self._revoke_run_token(run)
+
+    async def _revoke_run_token(self, run: RunRecord) -> None:
+        if self._broker is not None:
+            await self._db(self._broker.revoke_run, run.id, run.workspace_id)
+
+    @staticmethod
+    def _local_page(run: RunRecord) -> dict:
+        return {"runId": run.id, "state": run.status,
+                "events": [], "lastEventId": 0}
+
     async def stop(self, actor: Identity, payload: object) -> dict:
         run = await self._owned_run(actor, self._require_run_id(payload))
         if run.status in TERMINAL_RUN_STATUSES:
             return {"runId": run.id, "state": run.status}
         self._require_capabilities()
-        handle = await self._ensure_ready(run)
-        response = await self._worker_request(
-            handle, "POST", f"/internal/runs/{run.id}/stop",
-            {"runId": run.id, "sessionId": run.conversation_id})
+        binding = await self._binding(actor, run)
+        if not binding.get("workerContainerId"):
+            # 从未派发：没有外部执行，直接本地终态并撤销预留凭证
+            await self._converge(actor, run, "cancelled")
+            return {"runId": run.id, "state": "cancelled"}
+        try:
+            handle = await self._existing_handle(run, binding)
+        except DomainError as error:
+            if error.code != "worker_instance_gone":
+                raise
+            await self._converge(actor, run, "interrupted")
+            return {"runId": run.id, "state": "interrupted"}
+        try:
+            response = await self._worker_request(
+                handle, "POST", f"/internal/runs/{run.id}/stop",
+                {"runId": run.id, "sessionId": run.conversation_id})
+        except DomainError as error:
+            if error.code != "not_found":
+                raise
+            await self._converge(actor, run, "interrupted")
+            return {"runId": run.id, "state": "interrupted"}
         result = self._json_object(response)
         state = _safe_code(result.get("state"), "cancelled")
         await self._sync_worker_state(actor, run, state)
@@ -417,10 +611,25 @@ class WorkerRelay:
             raise DomainError("invalid_argument", 400)
         run = await self._owned_run(actor, _text(run_id, maximum=128))
         self._require_capabilities()
-        handle = await self._ensure_ready(run)
-        response = await self._worker_request(
-            handle, "GET",
-            f"/internal/runs/{run.id}/events?after={int(after)}", None)
+        binding = await self._binding(actor, run)
+        try:
+            handle = await self._existing_handle(run, binding)
+        except DomainError as error:
+            if error.code != "worker_instance_gone":
+                raise
+            await self._converge(actor, run, "interrupted")
+            return self._local_page(await self._owned_run(actor, run.id))
+        if handle is None:
+            return self._local_page(run)
+        try:
+            response = await self._worker_request(
+                handle, "GET",
+                f"/internal/runs/{run.id}/events?after={int(after)}", None)
+        except DomainError as error:
+            if error.code != "not_found":
+                raise
+            await self._converge(actor, run, "interrupted")
+            return self._local_page(await self._owned_run(actor, run.id))
         result = self._json_object(response)
         await self._sync_worker_state(actor, run, result.get("state"))
         return result
@@ -434,15 +643,31 @@ class WorkerRelay:
         if not isinstance(answers, dict):
             raise DomainError("invalid_argument", 400)
         self._require_capabilities()
-        handle = await self._ensure_ready(run)
-        response = await self._worker_request(
-            handle, "POST",
-            f"/internal/runs/{run.id}/questions/{question_id}/answer",
-            {"runId": run.id, "questionId": question_id,
-             "answers": dict(answers)})
+        binding = await self._binding(actor, run)
+        try:
+            handle = await self._existing_handle(run, binding)
+        except DomainError as error:
+            if error.code != "worker_instance_gone":
+                raise
+            await self._converge(actor, run, "interrupted")
+            raise DomainError("run_interrupted", 409) from None
+        if handle is None:
+            raise DomainError("run_not_dispatched", 409)
+        try:
+            response = await self._worker_request(
+                handle, "POST",
+                f"/internal/runs/{run.id}/questions/{question_id}/answer",
+                {"runId": run.id, "questionId": question_id,
+                 "answers": dict(answers)})
+        except DomainError as error:
+            if error.code != "not_found":
+                raise
+            await self._converge(actor, run, "interrupted")
+            raise DomainError("run_interrupted", 409) from None
         result = self._json_object(response)
-        # 回答成功后 worker 已回到 running；控制库同步活跃状态
-        await self._sync_worker_state(actor, run, "running")
+        # 同步 worker 的真实状态：仍有其它未决问题时保持 awaiting_permission
+        await self._sync_worker_state(
+            actor, run, result.get("state", "running"))
         return result
 
     async def question_status(self, actor: Identity, payload: object) -> dict:
@@ -456,7 +681,16 @@ class WorkerRelay:
                        or len(item) > 256 for item in question_ids)):
             raise DomainError("invalid_argument", 400)
         self._require_capabilities()
-        handle = await self._ensure_ready(run)
+        binding = await self._binding(actor, run)
+        try:
+            handle = await self._existing_handle(run, binding)
+        except DomainError as error:
+            if error.code != "worker_instance_gone":
+                raise
+            await self._converge(actor, run, "interrupted")
+            raise DomainError("run_interrupted", 409) from None
+        if handle is None:
+            raise DomainError("run_not_dispatched", 409)
         response = await self._worker_request(
             handle, "POST",
             f"/internal/runs/{run.id}/questions/status",
@@ -467,24 +701,171 @@ class WorkerRelay:
                        limit: int = 100, offset: int = 0) -> dict:
         """读取本人 worker 的持久快照；无 Run 时为空历史，不启动执行。
 
-        读取只回到 control 库定位最近一次 Run 对应的本人 worker，再把分页
-        参数交给其内部快照路由；不会创建 Run、启动 prompt 或读取客户端给出
-        的任意文件根。
+        读取只回到 control 库定位最近一次已派发 Run 对应的本人 worker，再把
+        分页参数交给其内部快照路由；不会创建 Run、启动 prompt 或读取客户端
+        给出的任意文件根。draining 期间按原实例读取，不触发新容器。
         """
         conversation = await self._db(
             self._sessions.get_conversation, actor, session_id)
         self._require_capabilities()
         run = await self._db(
-            self._store.latest_run_for_conversation, actor, conversation.id)
+            self._store.latest_dispatched_run_for_conversation,
+            actor, conversation.id)
         if run is None:
-            # 尚未接纳过任务：没有任何 worker 快照可读，也不为其启动容器。
-            return {"sessionId": conversation.id, "messages": []}
-        handle = await self._ensure_ready(run)
+            # 兼容早期未记录实例 ID 的 Run：仍定位最近 Run 读取
+            run = await self._db(
+                self._store.latest_run_for_conversation,
+                actor, conversation.id)
+            if run is None:
+                return {"sessionId": conversation.id, "messages": []}
+            handle = await self._ensure_ready(run)
+        else:
+            binding = await self._binding(actor, run)
+            try:
+                handle = await self._existing_handle(run, binding)
+            except DomainError as error:
+                if error.code != "worker_instance_gone":
+                    raise
+                raise DomainError("worker_unavailable", 502) from None
+            if handle is None:
+                return {"sessionId": conversation.id, "messages": []}
         response = await self._worker_request(
             handle, "GET",
             f"/internal/sessions/{conversation.id}/messages"
             f"?limit={int(limit)}&offset={int(offset)}", None)
         return self._json_object(response)
+
+    # ------------------------------------------------------------------
+    # 后台持久对账（与 SSE/登录状态无关）
+    # ------------------------------------------------------------------
+
+    async def reconcile_once(self) -> dict:
+        """核对所有未终态 Run；完成、崩溃与派发未知都有明确收敛。
+
+        不依赖浏览器 events/stop、Cookie 或用户在线状态；control 重启后
+        从控制库继续。派发中的 Run 先等认领宽限期，再按持久 nonce 与不可
+        复用 worker 实例 ID 查询；从不自动重发任务 POST。
+        """
+        rows = await self._db(self._store.list_active_run_bindings)
+        finished = 0
+        for row in rows:
+            if await self._reconcile_run(row):
+                finished += 1
+        return {"checked": len(rows), "finished": finished}
+
+    async def _reconcile_run(self, row: Mapping[str, object]) -> bool:
+        now = int(self._system_clock())
+        workspace_id = str(row["workspaceId"])
+        run_id = str(row["runId"])
+        container = str(row.get("workerContainerId") or "")
+        dispatch_state = str(row.get("dispatchState") or "")
+        created_at = int(row.get("createdAt") or now)
+        if not container:
+            # pending：从未认领派发，超过宽限期仍无实例则明确终止，不能
+            # 永久只返回 duplicate。
+            if (dispatch_state == "pending"
+                    and now - created_at < self._dispatch_grace):
+                return False
+            await self._finish_system(workspace_id, run_id, "interrupted")
+            return True
+        dispatched_at = row.get("dispatchedAt")
+        if (dispatch_state == "dispatching"
+                and isinstance(dispatched_at, int)
+                and now - dispatched_at < self._dispatch_grace):
+            # 派发结果未知：先等本次 POST 的宽限期，不抢在接纳前查询
+            return False
+        handle = await self._lookup_existing(
+            workspace_id, container, int(row["configVersion"]))
+        if handle is None:
+            # 原实例已确认失效：残留 Run 中断，绝不查新实例冒充旧执行
+            await self._finish_system(workspace_id, run_id, "interrupted")
+            return True
+        deadline = self._run_deadline(row)
+        nonce = str(row.get("dispatchNonce") or "")
+        suffix = f"&nonce={quote(nonce, safe='')}" if nonce else ""
+        try:
+            response = await self._worker_request(
+                handle, "GET",
+                f"/internal/runs/{run_id}/events?after=0{suffix}", None)
+        except DomainError as error:
+            if error.code == "not_found":
+                # 原实例确认没有该 Run：派发未落地，安全收敛为中断
+                await self._finish_system(
+                    workspace_id, run_id, "interrupted")
+                return True
+            if now >= deadline:
+                await self._finish_system(
+                    workspace_id, run_id, "interrupted")
+                return True
+            return False
+        result = self._json_object(response)
+        state = result.get("state")
+        if state in TERMINAL_RUN_STATUSES:
+            await self._finish_system(
+                workspace_id, run_id, str(state))
+            return True
+        if state in ("accepted", "reserved", "running"):
+            await self._sync_system_status(workspace_id, run_id, "running")
+        elif state == "awaiting_permission":
+            await self._sync_system_status(
+                workspace_id, run_id, "awaiting_permission")
+        if now >= deadline:
+            # 超过任务截止仍活跃：先按原实例请求停止，再明确中断收尾
+            try:
+                await self._worker_request(
+                    handle, "POST", f"/internal/runs/{run_id}/stop",
+                    {"runId": run_id})
+            except DomainError:
+                pass
+            await self._finish_system(workspace_id, run_id, "interrupted")
+            return True
+        return False
+
+    async def _sync_system_status(self, workspace_id: str, run_id: str,
+                                  status: str) -> None:
+        try:
+            await self._db(self._store.sync_run_status,
+                           workspace_id, run_id, status)
+        except DomainError:
+            pass
+
+    async def _finish_system(self, workspace_id: str, run_id: str,
+                             status: str) -> None:
+        """后台终态：容量只释放一次，并撤销该 Run 的全部 broker token。"""
+        try:
+            await self._db(self._store.sync_run_status,
+                           workspace_id, run_id, status)
+        except DomainError:
+            pass
+        if self._broker is not None:
+            try:
+                await self._db(
+                    self._broker.revoke_run, run_id, workspace_id)
+            except DomainError:
+                pass
+
+    @staticmethod
+    def _run_deadline(row: Mapping[str, object]) -> int:
+        """任务截止：快照有效期与 agent timeout 的较大者加收尾余量。"""
+        created = int(row.get("createdAt") or 0)
+        expires = 0
+        timeout = 0
+        raw = row.get("snapshotJson")
+        if isinstance(raw, str):
+            try:
+                envelope = json.loads(raw)
+                if isinstance(envelope, dict):
+                    value = envelope.get("expires_at")
+                    if type(value) is int:
+                        expires = value
+                    agent = envelope.get("agent")
+                    if isinstance(agent, Mapping):
+                        budget = agent.get("timeout")
+                        if type(budget) is int:
+                            timeout = budget
+            except ValueError:
+                pass
+        return max(expires, created + timeout) + _RECONCILE_GRACE_SECONDS
 
     # ------------------------------------------------------------------
     # worker HTTP
@@ -523,18 +904,29 @@ class WorkerRelay:
 
     async def _send(self, handle: WorkerHandle, method: str,
                     path: str, payload: object) -> httpx.Response:
-        """固定 WorkerHandle 重建内部头；不跟随重定向，不暴露响应体。"""
+        """固定 WorkerHandle 重建内部身份；先清洗最终合并的 Request。
+
+        仅自行构造 headers 不够：``AsyncClient.build_request/send`` 会合并
+        client 默认 headers、cookie jar 与自动 auth。这里在最终 Request 上
+        删除 Cookie/Authorization/Forwarded/X-Easel-* 等外来凭证，再用无操作
+        auth 覆盖默认认证，然后从服务端句柄重建内部头。不跟随重定向，也不
+        修改共享 client 的 headers/cookies/auth。
+        """
         url = self._upstream(handle) + path
         headers = {
-            "X-Easel-Workspace-Id": handle.workspace_id,
-            "X-Easel-Service-Token": handle.service_token,
+            WORKSPACE_HEADER: handle.workspace_id,
+            SERVICE_TOKEN_HEADER: handle.service_token,
         }
         if payload is not None:
             headers["Content-Type"] = "application/json"
         try:
             request = self._http.build_request(
                 method, url, headers=headers, json=payload)
-            response = await self._http.send(request, follow_redirects=False)
+            strip_request_headers(request.headers)
+            request.headers[WORKSPACE_HEADER] = handle.workspace_id
+            request.headers[SERVICE_TOKEN_HEADER] = handle.service_token
+            response = await self._http.send(
+                request, auth=no_client_auth(), follow_redirects=False)
         except httpx.HTTPError:
             raise DomainError("upstream_unavailable", 502) from None
         if 300 <= response.status_code < 400:

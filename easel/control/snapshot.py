@@ -8,14 +8,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-_MANAGED_FIELDS = frozenset({"revision", "agent"})
+_MANAGED_FIELDS = frozenset({"revision", "agent", "broker"})
 _AGENT_FIELDS = frozenset({
     "runtime", "command", "model", "sandbox", "timeout",
     "codex_auto_approve"})
+_BROKER_FIELDS = frozenset({"url", "channel"})
 _RUNTIMES = ("acp", "opencode", "codex")
 _SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 _MAX_TIMEOUT = 86400
@@ -43,12 +45,34 @@ def _command(value: object) -> list[str]:
     return list(value)
 
 
-def load_managed_agent_config(path: str | Path) -> tuple[int, dict]:
-    """读取受保护的受管 Agent 配置，返回 ``(revision, agent)``。
+def _broker_destination(value: object) -> dict:
+    """受管 broker 目的地：只允许固定 URL + channel，不携带任何凭证。"""
+    if not isinstance(value, dict) or set(value) != _BROKER_FIELDS:
+        raise ValueError("managed broker fields are invalid")
+    url = value["url"]
+    channel = value["channel"]
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        raise ValueError("managed broker url is invalid")
+    parsed = urlsplit(url)
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or parsed.path not in ("", "/")):
+        raise ValueError("managed broker url is invalid")
+    if (not isinstance(channel, str) or not channel
+            or len(channel) > 32
+            or not all(character.islower() or character.isdigit()
+                       or character == "_" for character in channel)):
+        raise ValueError("managed broker channel is invalid")
+    return {"url": url.rstrip("/"), "channel": channel}
+
+
+def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
+    """读取受保护的受管 Agent 配置，返回 ``(revision, agent, broker)``。
 
     只接受固定字段，拒绝任何疑似凭证字段，避免管理员秘密被签进逐 Run
-    快照下发到 worker。受管命令只来自本文件，不读取用户 HOME 或可写
-    工作区的 ACP 配置。
+    快照下发到 worker。``broker`` 只声明目的地与 channel；逐 Run token
+    由正式装配在接纳后调用 BrokerService.issue 签发。
     """
     config_path = Path(path)
     data = config_path.read_bytes()
@@ -97,4 +121,5 @@ def load_managed_agent_config(path: str | Path) -> tuple[int, dict]:
         if type(agent["codex_auto_approve"]) is not bool:
             raise ValueError("managed agent codex_auto_approve is invalid")
         normalized["codex_auto_approve"] = agent["codex_auto_approve"]
-    return revision, normalized
+    broker = _broker_destination(payload["broker"])
+    return revision, normalized, broker

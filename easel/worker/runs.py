@@ -51,6 +51,10 @@ _EVENT_KINDS = frozenset({
 _MAX_TIMEOUT = 86400
 _DEFAULT_TIMEOUT = 1800
 
+
+def _placeholders(values: tuple | list) -> str:
+    return ", ".join("?" * len(values))
+
 Emit = Callable[[str, str], None]
 Ask = Callable[[list[dict]], Awaitable[dict[str, list[str]]]]
 Bind = Callable[[str], None]
@@ -224,6 +228,69 @@ def _scrub(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
+def _scrub_payload(value: object, secrets: tuple[str, ...]) -> object:
+    """递归脱敏问题正文/选项/标题等嵌套文本；键名（ID）保持不变。"""
+    if isinstance(value, str):
+        return _scrub(value, secrets)
+    if isinstance(value, list):
+        return [_scrub_payload(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {key: _scrub_payload(item, secrets)
+                for key, item in value.items()}
+    return value
+
+
+def _public_questions(questions: list[dict], secrets: tuple[str, ...]
+                      ) -> tuple[list[dict], dict[str, str]]:
+    """生成公开问题与授权映射。
+
+    公开选项带 opaque ``value``；浏览器可回传 ``value`` 或脱敏后的 label，
+    worker 再映射回适配器使用的原始选项文本。脱敏后重复的 label 通过
+    序号区分，绝不因隐藏文本而混淆两个不同授权选项。
+    """
+    public: list[dict] = []
+    selections: dict[str, str] = {}
+    used: set[tuple[int, str]] = set()
+    for question_index, question in enumerate(questions):
+        item = _scrub_payload(question, secrets)
+        if not isinstance(item, dict):
+            raise _invalid("question_invalid")
+        options = question.get("options")
+        if isinstance(options, list):
+            public_options: list[object] = []
+            for option_index, option in enumerate(options):
+                if isinstance(option, dict):
+                    original = option.get("label",
+                                          option.get("name", ""))
+                    original_text = (
+                        original if isinstance(original, str) else str(original))
+                    label = _scrub(original_text, secrets) or (
+                        f"option {option_index + 1}")
+                    while (question_index, label) in used:
+                        label = f"{label} #{option_index + 1}"
+                    used.add((question_index, label))
+                    value = f"opt_{question_index}_{option_index}"
+                    selections[value] = original_text
+                    selections[label] = original_text
+                    public_options.append({
+                        **{key: _scrub_payload(field_value, secrets)
+                           for key, field_value in option.items()},
+                        "label": label,
+                        "value": value,
+                    })
+                else:
+                    original_text = (
+                        option if isinstance(option, str) else str(option))
+                    label = _scrub(original_text, secrets)
+                    value = f"opt_{question_index}_{option_index}"
+                    selections[value] = original_text
+                    selections[label] = original_text
+                    public_options.append({"label": label, "value": value})
+            item["options"] = public_options
+        public.append(item)
+    return public, selections
+
+
 @dataclass(frozen=True)
 class RunContext:
     """一次执行的不可变身份；适配器只能看到本 Run 的内容。"""
@@ -256,6 +323,7 @@ CREATE TABLE IF NOT EXISTS run_admissions (
     fingerprint TEXT NOT NULL,
     state TEXT NOT NULL,
     reason TEXT,
+    finalizing INTEGER NOT NULL DEFAULT 0,
     snapshot_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -295,6 +363,13 @@ class RunRegistry:
         self._clock = clock
         with closing(self._connect()) as connection:
             connection.executescript(_SCHEMA)
+            # 旧 worker 库只追加列：不重建、不覆盖既有接纳与事件。
+            columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(run_admissions)")}
+            if "finalizing" not in columns:
+                connection.execute(
+                    "ALTER TABLE run_admissions ADD COLUMN finalizing"
+                    " INTEGER NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -436,12 +511,19 @@ class RunRegistry:
                     return False
                 connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
+                    " finalizing = 0, updated_at = ?"
+                    " WHERE workspace_id = ? AND run_id = ?",
                     (state, reason, now, self.workspace_id, run_id))
                 data: dict[str, object] = {"state": state}
                 if reason:
                     data["reason"] = reason
                 self._append_locked(connection, run_id, "state", data, now)
+                if state in TERMINAL_STATES:
+                    connection.execute(
+                        "UPDATE run_questions SET status = 'expired',"
+                        " updated_at = ? WHERE workspace_id = ?"
+                        " AND run_id = ? AND status = 'pending'",
+                        (now, self.workspace_id, run_id))
                 connection.execute("COMMIT")
                 return True
             except BaseException:
@@ -451,38 +533,113 @@ class RunRegistry:
 
     def finish_if_active(self, run_id: str, state: str,
                          reason: str | None = None) -> bool:
+        """仅活跃且未进入收尾的 Run 可终止；收尾中的输出已开始落盘。
+
+        条件与写入在同一事务内完成，避免检查后恰好被 ``begin_finalize``
+        抢占，把正在保存的 run 取消。
+        """
         if state not in TERMINAL_STATES:
             raise ValueError("finish_if_active requires a terminal state")
-        return self.transition(run_id, ACTIVE_STATES, state, reason)
-
-    def fail_after_output_error(self, run_id: str) -> bool:
-        """输出落盘失败：把已完成的 done 明确降级为 failed。"""
         now = self._now()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    "SELECT state FROM run_admissions"
-                    " WHERE workspace_id = ? AND run_id = ?",
-                    (self.workspace_id, run_id)).fetchone()
-                if row is None or row["state"] != "done":
+                cursor = connection.execute(
+                    "UPDATE run_admissions SET state = ?, reason = ?,"
+                    " finalizing = 0, updated_at = ?"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND finalizing = 0 AND state IN"
+                    f" ({_placeholders(ACTIVE_STATES)})",
+                    (state, reason, now, self.workspace_id, run_id,
+                     *ACTIVE_STATES))
+                if cursor.rowcount != 1:
                     connection.execute("COMMIT")
                     return False
+                data: dict[str, object] = {"state": state}
+                if reason:
+                    data["reason"] = reason
+                self._append_locked(connection, run_id, "state", data, now)
                 connection.execute(
-                    "UPDATE run_admissions SET state = 'failed',"
-                    " reason = 'output_storage_failed', updated_at = ?"
-                    " WHERE workspace_id = ? AND run_id = ?",
+                    "UPDATE run_questions SET status = 'expired',"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND status = 'pending'",
                     (now, self.workspace_id, run_id))
-                self._append_locked(
-                    connection, run_id, "state",
-                    {"state": "failed", "reason": "output_storage_failed"},
-                    now)
                 connection.execute("COMMIT")
                 return True
             except BaseException:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise
+
+    # -- 输出收尾协议 ------------------------------------------------------
+
+    def begin_finalize(self, run_id: str) -> bool:
+        """声明唯一成功收尾；停止不能再把正在保存输出的 Run 取消。
+
+        该标记与运行状态分离：公开状态仍为 running，只有输出写入成功后才
+        提交终态，因此消费者不会在消息落盘前看到 done。
+        """
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE run_admissions SET finalizing = 1,"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND finalizing = 0 AND state IN"
+                    f" ({_placeholders(ACTIVE_STATES)})",
+                    (now, self.workspace_id, run_id, *ACTIVE_STATES))
+                connection.execute("COMMIT")
+                return cursor.rowcount == 1
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def finish_finalizing(self, run_id: str, state: str,
+                          reason: str | None = None) -> bool:
+        """输出已落盘后提交唯一成功/失败终态；只由收尾声明者调用。"""
+        if state not in TERMINAL_STATES:
+            raise ValueError("finish_finalizing requires a terminal state")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state, finalizing FROM run_admissions"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (self.workspace_id, run_id)).fetchone()
+                if row is None or not row["finalizing"]:
+                    connection.execute("COMMIT")
+                    return False
+                connection.execute(
+                    "UPDATE run_admissions SET state = ?, reason = ?,"
+                    " finalizing = 0, updated_at = ?"
+                    " WHERE workspace_id = ? AND run_id = ?",
+                    (state, reason, now, self.workspace_id, run_id))
+                data: dict[str, object] = {"state": state}
+                if reason:
+                    data["reason"] = reason
+                self._append_locked(connection, run_id, "state", data, now)
+                connection.execute(
+                    "UPDATE run_questions SET status = 'expired',"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND status = 'pending'",
+                    (now, self.workspace_id, run_id))
+                connection.execute("COMMIT")
+                return True
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def finalizing_runs(self) -> list[str]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM run_admissions"
+                " WHERE workspace_id = ? AND finalizing = 1",
+                (self.workspace_id,)).fetchall()
+        return [str(row["run_id"]) for row in rows]
 
     def append_event(self, run_id: str, event: str, data: object) -> int | None:
         """终态后冻结业务事件；返回 None 表示被终态拦截。"""
@@ -605,7 +762,8 @@ class RunRegistry:
                     "SELECT state FROM run_admissions"
                     " WHERE workspace_id = ? AND run_id = ?",
                     (self.workspace_id, run_id)).fetchone()
-                if run is None or run["state"] != "awaiting_permission":
+                if (run is None or run["state"] not in
+                        ("running", "awaiting_permission")):
                     connection.execute(
                         "UPDATE run_questions SET status = 'expired',"
                         " updated_at = ? WHERE workspace_id = ?"
@@ -626,12 +784,20 @@ class RunRegistry:
                     (json.dumps(dict(answers), ensure_ascii=False,
                                 separators=(",", ":")),
                      now, self.workspace_id, run_id, question_id))
-                connection.execute(
-                    "UPDATE run_admissions SET state = 'running',"
-                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
-                    (now, self.workspace_id, run_id))
-                self._append_locked(
-                    connection, run_id, "state", {"state": "running"}, now)
+                # 同一 Run 可以同时存在多个权限问题；只有最后一个未决问题
+                # 结束后才恢复 running，否则其它问题的 answer 会被误判过期。
+                pending = connection.execute(
+                    "SELECT COUNT(*) AS total FROM run_questions"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND status = 'pending'",
+                    (self.workspace_id, run_id)).fetchone()["total"]
+                if int(pending) == 0 and run["state"] == "awaiting_permission":
+                    connection.execute(
+                        "UPDATE run_admissions SET state = 'running',"
+                        " updated_at = ? WHERE workspace_id = ? AND run_id = ?",
+                        (now, self.workspace_id, run_id))
+                    self._append_locked(
+                        connection, run_id, "state", {"state": "running"}, now)
                 connection.execute("COMMIT")
                 return {"ok": True, "status": "resolved"}
             except BaseException:
@@ -649,6 +815,25 @@ class RunRegistry:
                     " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
                     " AND question_id = ? AND status = 'pending'",
                     (now, self.workspace_id, run_id, question_id))
+                pending = connection.execute(
+                    "SELECT COUNT(*) AS total FROM run_questions"
+                    " WHERE workspace_id = ? AND run_id = ?"
+                    " AND status = 'pending'",
+                    (self.workspace_id, run_id)).fetchone()["total"]
+                if int(pending) == 0:
+                    row = connection.execute(
+                        "SELECT state FROM run_admissions"
+                        " WHERE workspace_id = ? AND run_id = ?",
+                        (self.workspace_id, run_id)).fetchone()
+                    if row is not None and row["state"] == "awaiting_permission":
+                        connection.execute(
+                            "UPDATE run_admissions SET state = 'running',"
+                            " updated_at = ? WHERE workspace_id = ?"
+                            " AND run_id = ?",
+                            (now, self.workspace_id, run_id))
+                        self._append_locked(
+                            connection, run_id, "state",
+                            {"state": "running"}, now)
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -680,18 +865,24 @@ class RunRegistry:
     # -- 恢复 --------------------------------------------------------------
 
     def recover_inflight(self, reason: str = "worker_restarted") -> list[str]:
-        """进程重载：残留活跃 Run 明确转 interrupted，问题作废。"""
+        """进程重载：残留活跃 Run 明确转 interrupted，问题作废。
+
+        已进入输出收尾（``finalizing=1``）的 Run 不在本方法处理；调用方读取
+        暂存输出后提交 done/failed，避免把已保存的输出当作崩溃丢弃。
+        """
         now = self._now()
         recovered: list[str] = []
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 rows = connection.execute(
-                    "SELECT run_id FROM run_admissions"
+                    "SELECT run_id, finalizing FROM run_admissions"
                     " WHERE workspace_id = ? AND state IN"
                     " ('accepted', 'running', 'awaiting_permission')",
                     (self.workspace_id,)).fetchall()
                 for row in rows:
+                    if row["finalizing"]:
+                        continue
                     run_id = str(row["run_id"])
                     connection.execute(
                         "UPDATE run_admissions SET state = 'interrupted',"
@@ -702,11 +893,13 @@ class RunRegistry:
                         connection, run_id, "state",
                         {"state": "interrupted", "reason": reason}, now)
                     recovered.append(run_id)
-                connection.execute(
-                    "UPDATE run_questions SET status = 'expired',"
-                    " updated_at = ? WHERE workspace_id = ?"
-                    " AND status = 'pending'",
-                    (now, self.workspace_id))
+                if recovered:
+                    connection.execute(
+                        "UPDATE run_questions SET status = 'expired',"
+                        " updated_at = ? WHERE workspace_id = ?"
+                        " AND status = 'pending' AND run_id IN"
+                        f" ({_placeholders(recovered)})",
+                        (now, self.workspace_id, *recovered))
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -768,6 +961,8 @@ class RunManager:
         self._closing = False
         if recover:
             self.registry.recover_inflight()
+            # 已保存输出但尚未提交 done 的 Run：补提交，消息按 runId 去重。
+            self._recover_finalizing()
 
     # -- 公开只读接口 ------------------------------------------------------
 
@@ -777,7 +972,17 @@ class RunManager:
     def admission(self, run_id: str) -> dict | None:
         return self.registry.admission(run_id)
 
-    def events(self, run_id: str, after: int = 0) -> dict:
+    def events(self, run_id: str, after: int = 0,
+               nonce: str | None = None) -> dict:
+        """读取持久事件；对账可携带原派发 nonce 复核接纳身份。"""
+        if nonce is not None:
+            if not isinstance(nonce, str) or not nonce or len(nonce) > 128:
+                raise DomainError("run_binding_mismatch", 403)
+            admission = self.registry.admission(run_id)
+            if admission is None:
+                raise DomainError("run_not_found", 404)
+            if admission.get("nonce") != nonce:
+                raise DomainError("run_binding_mismatch", 403)
         return self.registry.events(run_id, after)
 
     def question_status(self, run_id: str,
@@ -985,6 +1190,8 @@ class RunManager:
         return bind
 
     def _ask_for(self, context: RunContext) -> Ask:
+        secrets = _sensitive_values(context.snapshot)
+
         async def ask(questions: list[dict]) -> dict[str, list[str]]:
             if (not isinstance(questions, list) or not questions
                     or len(questions) > 20):
@@ -993,10 +1200,14 @@ class RunManager:
                 raise _invalid("question_invalid")
             _question_keys(questions)
             question_id = "runq_" + uuid.uuid4().hex
-            payload = {"id": question_id, "questions": questions}
+            public_questions, selections = _public_questions(questions, secrets)
+            payload = {"id": question_id, "questions": public_questions}
             key = (context.run_id, question_id)
             future = asyncio.get_running_loop().create_future()
-            self._questions[key] = future
+            # 公开文本已脱敏；浏览器只能返回 value/label，内部映射回原选项，
+            # 不能把展示文本当作授权值，也不能借问题正文泄漏 Run token。
+            self._questions[key] = {"future": future,
+                                    "selections": selections}
             opened = self.registry.open_question(
                 context.run_id, question_id, payload,
                 json.dumps(payload, ensure_ascii=False))
@@ -1051,18 +1262,124 @@ class RunManager:
             return
 
         try:
-            text = result if isinstance(result, str) else "".join(chunks)
-            if not self.registry.finish_if_active(run_id, "done", "completed"):
-                self._release(context)
-                return
-            self._sessions.append_message(
-                context.conversation_id,
-                {"role": "assistant", "content": text})
-        except DomainError:
-            self.registry.fail_after_output_error(run_id)
-            self.registry.append_event(run_id, "error", "输出保存失败")
+            self._complete(context, result, chunks)
         finally:
             self._release(context)
+
+    def _complete(self, context: RunContext, result: str | None,
+                  chunks: list[str]) -> None:
+        """成功终态协议：暂存输出 → 声明收尾 → 幂等落盘 → 唯一 done。
+
+        失败只发布 failed；停止与保存竞争时由 ``begin_finalize`` 原子的
+        ``finalizing`` 标记裁决，已开始收尾的 Run 不会再被取消伪造成功。
+        """
+        run_id = context.run_id
+        text = result if isinstance(result, str) else "".join(chunks)
+        try:
+            self._stage_output(run_id, text)
+        except DomainError:
+            self.registry.finish_if_active(
+                run_id, "failed", "output_storage_failed")
+            return
+        if not self.registry.begin_finalize(run_id):
+            # 停止/中断先取得终态：不追加助手输出，也不覆盖终态
+            self._discard_output(run_id)
+            return
+        try:
+            self._sessions.append_message_once(
+                context.conversation_id, run_id,
+                {"role": "assistant", "content": text, "runId": run_id})
+        except Exception:
+            self.registry.append_event(run_id, "error", "输出保存失败")
+            self.registry.finish_finalizing(
+                run_id, "failed", "output_storage_failed")
+            self._discard_output(run_id)
+            return
+        self.registry.finish_finalizing(run_id, "done", "completed")
+        self._discard_output(run_id)
+
+    # -- 输出暂存与崩溃恢复 ------------------------------------------------
+
+    def _finalizing_dir(self) -> Path:
+        return self._paths.state_root / "finalizing"
+
+    def _finalizing_path(self, run_id: str) -> Path:
+        if (not isinstance(run_id, str) or not run_id or len(run_id) > 128
+                or any(not (character.isalnum()
+                            or character in "-_.:")
+                        for character in run_id)):
+            raise DomainError("output_storage_failed", 500)
+        return self._finalizing_dir() / f"{run_id}.json"
+
+    def _stage_output(self, run_id: str, text: str) -> None:
+        """原子暂存最终输出；崩溃后仍能凭它补提交 done。"""
+        import tempfile
+
+        path = self._finalizing_path(run_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, name = tempfile.mkstemp(
+                dir=path.parent, prefix=".stage-", suffix=".tmp")
+            temporary = Path(name)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump({"runId": run_id, "content": text}, stream,
+                              ensure_ascii=False, separators=(",", ":"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            raise DomainError("output_storage_failed", 500) from None
+
+    def _discard_output(self, run_id: str) -> None:
+        try:
+            self._finalizing_path(run_id).unlink(missing_ok=True)
+        except (OSError, DomainError):
+            pass
+
+    def _recover_finalizing(self) -> None:
+        """重开时补提交已暂存输出；消息按 runId 去重，不重复追加。"""
+        finalizing = set(self.registry.finalizing_runs())
+        for run_id in sorted(finalizing):
+            admission = self.registry.admission(run_id) or {}
+            conversation_id = admission.get("conversationId")
+            path = self._finalizing_path(run_id)
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                content = data.get("content")
+                if (data.get("runId") != run_id
+                        or not isinstance(content, str)
+                        or not isinstance(conversation_id, str)
+                        or not conversation_id):
+                    raise ValueError
+            except (OSError, ValueError):
+                self.registry.finish_finalizing(
+                    run_id, "failed", "output_missing")
+                path.unlink(missing_ok=True)
+                continue
+            try:
+                self._sessions.append_message_once(
+                    conversation_id, run_id,
+                    {"role": "assistant", "content": content,
+                     "runId": run_id})
+            except Exception:
+                self.registry.finish_finalizing(
+                    run_id, "failed", "output_storage_failed")
+            else:
+                self.registry.finish_finalizing(
+                    run_id, "done", "completed")
+            path.unlink(missing_ok=True)
+        # 清理不处于收尾的孤儿暂存文件（例如 done 提交后、删除前崩溃）
+        directory = self._finalizing_dir()
+        if directory.exists():
+            remaining = set(self.registry.finalizing_runs())
+            for path in directory.glob("*.json"):
+                if path.stem not in remaining:
+                    path.unlink(missing_ok=True)
 
     def _release(self, context: RunContext) -> None:
         if self._active_conversations.get(context.conversation_id) == \
@@ -1084,7 +1401,9 @@ class RunManager:
             # 取消消息只是排队；必须等 supervisor 收尾，返回后同会话才真正
             # 释放。否则调用方紧接着提交下一 Run 会读到过期的 conversation_busy。
             await asyncio.gather(task, return_exceptions=True)
-        return {"runId": run_id, "state": "cancelled"}
+        # 输出收尾已取得 finalizing：返回真实终态，不能伪报 cancelled
+        return {"runId": run_id,
+                "state": self.registry.state(run_id) or "cancelled"}
 
     async def answer(self, run_id: str, question_id: str,
                      answers: object) -> dict:
@@ -1096,16 +1415,22 @@ class RunManager:
                     or not all(isinstance(item, str) for item in values)):
                 raise _invalid("question_answer_invalid")
         key = (run_id, question_id)
-        if key not in self._questions:
+        entry = self._questions.get(key)
+        if entry is None:
             raise DomainError("question_unavailable", 409)
         result = self.registry.answer(
             run_id, question_id, {str(k): list(v)
                                   for k, v in answers.items()})
-        future = self._questions.pop(key, None)
+        future = entry["future"]
+        selections = entry["selections"]
+        translated = {
+            str(k): [selections.get(item, item) for item in values]
+            for k, values in answers.items()
+        }
+        self._questions.pop(key, None)
         if future is not None and not future.done():
-            future.set_result({str(k): list(v)
-                               for k, v in answers.items()})
-        return result
+            future.set_result(translated)
+        return {**result, "state": self.registry.state(run_id)}
 
     async def aclose(self) -> None:
         """worker 关闭：取消在途 supervisor，并把残留 Run 标 interrupted。"""
@@ -1115,6 +1440,10 @@ class RunManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # 同时关闭本 workspace 的空闲 ACP/CLI 子进程，避免测试或重载时
+        # 留下跨事件循环的僵死句柄。
+        from ..harnesses.rpc import close_sessions
+        await close_sessions(workspace_id=self.workspace_id)
         self.registry.recover_inflight("worker_shutdown")
         self._tasks.clear()
         self._questions.clear()

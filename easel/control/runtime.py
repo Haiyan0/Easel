@@ -136,6 +136,23 @@ class RuntimeManager:
                 raise RuntimeUnavailable("worker_draining", 503, retry_after=1)
             raise RuntimeUnavailable("worker_unavailable", 503)
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        """按不可复用实例 ID 取得既有 Run 的句柄；绝不启动或替换实例。
+
+        ``draining`` 仍允许结束/回答/回放；实例 ID 或配置代次不匹配时返回
+        ``None``，调用方按中断收尾，不能把操作发到新代次伪装成原 Run。
+        """
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
+        if (lease is None or lease.container_id != container_id
+                or lease.state not in ("ready", "draining")
+                or lease.config_version != config_version
+                or not lease.upstream or not lease.service_token):
+            return None
+        return WorkerHandle(lease.workspace_id, lease.container_id,
+                            lease.upstream, lease.service_token,
+                            lease.config_version)
+
     async def drain(self, workspace_id: str) -> None:
         """拒绝新任务，等活动任务与请求归零后停止容器；超时保留 draining。
 

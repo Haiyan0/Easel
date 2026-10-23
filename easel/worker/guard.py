@@ -124,12 +124,20 @@ def build_worker_headers(headers: Mapping[str, str], *,
     return cleaned
 
 
-def _strip_request_headers(headers: httpx.Headers) -> None:
-    """删除最终 Request 上由 client 默认 headers/cookies 合并进来的禁用头。"""
+def strip_request_headers(headers: httpx.Headers) -> None:
+    """删除最终 Request 上由 client 默认 headers/cookies 合并进来的禁用头。
+
+    同步与异步转发共用同一条终态清洗规则，避免两套实现漂移。
+    """
     for key in {name.lower() for name in headers.keys()}:
         if (key in _STRIPPED_HEADERS
                 or key.startswith(_STRIPPED_PREFIXES)):
             del headers[key]
+
+
+def no_client_auth() -> httpx.Auth:
+    """返回不注入任何凭证的 auth 覆盖，供 ``send(auth=...)`` 使用。"""
+    return _NO_AUTH
 
 
 def forward_to_worker(client: httpx.Client, method: str, url: str, *,
@@ -150,7 +158,7 @@ def forward_to_worker(client: httpx.Client, method: str, url: str, *,
     request = client.build_request(method, url, headers=headers,
                                    content=content, params=params)
     # 默认 headers/cookies 已合并；统一删除后再从服务端固定身份重建内部头
-    _strip_request_headers(request.headers)
+    strip_request_headers(request.headers)
     request.headers[WORKSPACE_HEADER] = workspace_id
     request.headers[SERVICE_TOKEN_HEADER] = service_token
     return client.send(request, auth=_NO_AUTH, follow_redirects=False)

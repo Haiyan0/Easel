@@ -37,16 +37,24 @@ def reply(message, result):
 
 
 def permission():
+    # 权限问题文本故意带上本 Run 的 broker token：用于验证 worker 在持久化
+    # 公开问题事件前统一脱敏，同时仍按原选项映射授权。
+    secret = (os.environ.get("EASEL_BROKER_TOKEN", "")
+              if mode == "permission-secret" else "")
+    title = f"read public file {secret}".strip()
     if runtime == "codex":
         send({"id": "permission-request", "method": "item/commandExecution/requestApproval",
               "params": {"threadId": thread_id, "turnId": turn_id, "itemId": "tool",
-                         "command": os.environ.get("FAKE_HARNESS_COMMAND", "read public file")}})
+                         "command": os.environ.get("FAKE_HARNESS_COMMAND", title)}})
     else:
         send({"id": "permission-request", "method": "session/request_permission",
-              "params": {"sessionId": session_id, "toolCall": {"title": "read public file"},
-                         "options": [{"optionId": "always", "name": "Always", "kind": "allow_always"},
-                                     {"optionId": "once", "name": "Allow", "kind": "allow_once"},
-                                     {"optionId": "deny", "name": "Reject", "kind": "reject_once"}]}})
+              "params": {"sessionId": session_id, "toolCall": {"title": title},
+                         "options": [{"optionId": "always", "name": f"Always {secret}".strip(),
+                                      "kind": "allow_always"},
+                                     {"optionId": "once", "name": f"Allow {secret}".strip(),
+                                      "kind": "allow_once"},
+                                     {"optionId": "deny", "name": f"Reject {secret}".strip(),
+                                      "kind": "reject_once"}]}})
     while receive().get("id") != "permission-request":
         pass
 
@@ -97,7 +105,7 @@ while True:
         if "id" in message:
             reply(message, {})
     elif method in ("turn/start", "session/prompt"):
-        if mode == "permission":
+        if mode in ("permission", "permission-secret"):
             permission()
         if mode in ("hang", "slow-cancel", "ignore-cancel"):
             pending_prompt = message

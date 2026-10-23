@@ -527,3 +527,425 @@ def test_attachment_manifest_is_session_scoped(tmp_path):
         await manager2.aclose()
 
     asyncio.run(rejected())
+
+
+# ---------------------------------------------------------------------------
+# R1 返工：输出终态顺序、并发问题与权限文本脱敏
+# ---------------------------------------------------------------------------
+
+
+class ImmediateAnswerExecutor:
+    """立即返回固定文本；用于验证终态与消息的持久顺序。"""
+
+    def __init__(self, answer: str = "完成") -> None:
+        self.answer = answer
+        self.prompts = 0
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+        return self.answer
+
+
+class AssistantWriteFailSessions(WorkspaceSessionStore):
+    """助手消息落盘失败；用户消息仍正常写入。"""
+
+    def append_message(self, session_id, message):
+        if message.get("role") == "assistant":
+            raise DomainError("session_write_failed", 500)
+        return super().append_message(session_id, message)
+
+    def append_message_once(self, session_id, run_id, message):
+        raise DomainError("session_write_failed", 500)
+
+
+class ObservingSessions(WorkspaceSessionStore):
+    """在追加助手输出时记录 Run 持久状态，证明 done 尚未提前发布。"""
+
+    def __init__(self, root, workspace_id, observes, manager_ref):
+        super().__init__(root, workspace_id)
+        self._observes = observes
+        self._manager_ref = manager_ref
+
+    def _record(self, session_id: str) -> None:
+        manager = self._manager_ref[0]
+        run_id = manager._active_conversations.get(session_id)
+        self._observes.append(
+            None if run_id is None else manager.state(run_id))
+
+    def append_message(self, session_id, message):
+        if message.get("role") == "assistant":
+            self._record(session_id)
+        return super().append_message(session_id, message)
+
+    def append_message_once(self, session_id, run_id, message):
+        self._record(session_id)
+        return super().append_message_once(session_id, run_id, message)
+
+
+def test_output_storage_failure_never_publishes_done(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = ImmediateAnswerExecutor("回答")
+    manager = make_manager(paths, key, executor)
+    manager._sessions = AssistantWriteFailSessions(paths.state_root, WORKSPACE)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(
+            lambda: manager.state("run-a") in ("failed", "done"))
+        payload = manager.events("run-a", after=0)
+        states = [event["data"]["state"] for event in payload["events"]
+                  if event["event"] == "state"]
+        assert "done" not in states, "输出保存失败时不得先发布成功终态"
+        assert payload["state"] == "failed"
+        assert states[-1] == "failed"
+        assert payload["events"][-1]["data"].get("reason") == \
+            "output_storage_failed"
+        assert [item["role"] for item in
+                manager.messages("conversation-a")["messages"]] == ["user"]
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_assistant_output_is_persisted_before_done_state(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = ImmediateAnswerExecutor("回答")
+    manager = make_manager(paths, key, executor)
+    observes: list[str | None] = []
+    manager._sessions = ObservingSessions(
+        paths.state_root, WORKSPACE, observes, [manager])
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(lambda: manager.state("run-a") == "done")
+        assert observes == ["running"], observes
+        messages = manager.messages("conversation-a")["messages"]
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        assert messages[-1]["content"] == "回答"
+        assert manager.events("run-a", after=0)["state"] == "done"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_finalizing_output_recovers_without_duplicate(tmp_path):
+    """保存输出后、提交 done 前崩溃：重开补提交，消息不重复。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"conversation-a": "native-a"}, answers={"run-a": None},
+        chunks={})
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await asyncio.wait_for(executor.event("run-a").wait(), timeout=5)
+
+        # 模拟 supervisor 在 begin_finalize 后、done 前崩溃
+        assert manager.registry.begin_finalize("run-a") is True
+        manager._stage_output("run-a", "回答")
+        manager._sessions.append_message_once(
+            "conversation-a", "run-a",
+            {"role": "assistant", "content": "回答", "runId": "run-a"})
+
+        reopened = make_manager(paths, key, NeverExecutor())
+        assert reopened.state("run-a") == "done"
+        messages = reopened.messages("conversation-a")["messages"]
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        assert [item["content"] for item in messages] == ["问题", "回答"]
+        assert reopened.events("run-a", after=0)["state"] == "done"
+        await reopened.aclose()
+
+        executor.gate("run-a").set()
+        await asyncio.wait_for(executor.done("run-a").wait(), timeout=5)
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+class TwoQuestionsExecutor:
+    """同一 Run 并发等待两个权限问题。"""
+
+    def __init__(self) -> None:
+        self.answers = None
+        self.prompts = 0
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+
+        async def one(question_id: str):
+            return await ask([{
+                "questionId": question_id,
+                "question": f"允许 {question_id}？",
+                "options": [{"label": "yes"}, {"label": "no"}],
+            }])
+
+        self.answers = await asyncio.gather(one("first"), one("second"))
+        return "完成"
+
+
+def available_questions(manager: RunManager, run_id: str) -> list[dict]:
+    payload = manager.events(run_id, after=0)
+    return [json.loads(event["data"]) for event in payload["events"]
+            if event["event"] == "question"]
+
+
+def test_concurrent_questions_keep_awaiting_until_last_resolved(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = TwoQuestionsExecutor()
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(lambda: manager.state("run-a") == "awaiting_permission"
+                         and len(available_questions(manager, "run-a")) == 2)
+        questions = available_questions(manager, "run-a")
+        first_id = questions[0]["id"]
+        second_id = questions[1]["id"]
+
+        await manager.answer("run-a", first_id, {"first": ["yes"]})
+        # 还有未决问题时不得提前恢复 running
+        assert manager.state("run-a") == "awaiting_permission"
+        statuses = manager.question_status(
+            "run-a", [first_id, second_id])["questions"]
+        assert statuses[first_id]["status"] == "resolved"
+        assert statuses[second_id]["status"] == "pending"
+        with pytest.raises(DomainError) as repeated:
+            await manager.answer("run-a", first_id, {"first": ["yes"]})
+        assert repeated.value.status == 409
+
+        await manager.answer("run-a", second_id, {"second": ["no"]})
+        await wait_until(lambda: manager.state("run-a") == "done")
+        assert executor.answers == [{"first": ["yes"]},
+                                    {"second": ["no"]}]
+        states = [event["data"]["state"] for event in
+                  manager.events("run-a", after=0)["events"]
+                  if event["event"] == "state"]
+        assert states == ["accepted", "running", "awaiting_permission",
+                          "running", "done"]
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_stop_expires_all_pending_questions(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = TwoQuestionsExecutor()
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(
+            lambda: len(available_questions(manager, "run-a")) == 2)
+        questions = available_questions(manager, "run-a")
+        ids = [item["id"] for item in questions]
+        assert (await manager.stop("run-a"))["state"] == "cancelled"
+        statuses = manager.question_status("run-a", ids)["questions"]
+        assert [statuses[item]["status"] for item in ids] == \
+            ["expired", "expired"]
+        with pytest.raises(DomainError):
+            await manager.answer("run-a", ids[0], {"first": ["yes"]})
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_stop_cannot_cancel_finalizing_run(tmp_path):
+    """输出收尾已开始后，停止不能把 Run 改成 cancelled 伪造失败。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"conversation-a": "native-a"}, answers={"run-a": None},
+        chunks={})
+    manager = make_manager(paths, key, executor)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await asyncio.wait_for(executor.event("run-a").wait(), timeout=5)
+        assert manager.registry.begin_finalize("run-a") is True
+        assert manager.registry.finish_if_active(
+            "run-a", "cancelled", "stop_requested") is False
+        assert manager.registry.state("run-a") == "running"
+        assert manager.registry.finish_finalizing(
+            "run-a", "done", "completed") is True
+        assert manager.registry.state("run-a") == "done"
+        executor.gate("run-a").set()
+        await asyncio.wait_for(executor.done("run-a").wait(), timeout=5)
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_question_timeout_does_not_expire_answered_question(tmp_path):
+    """同一 Run 一个问题已回答、另一个超时：状态恢复后明确失败。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = TwoQuestionsExecutor()
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths, public_key=key.public_key(),
+        sessions=WorkspaceSessionStore(paths.state_root, WORKSPACE),
+        executor=executor, base_env={"PATH": "C:\\bin"},
+        clock=lambda: CLOCK, question_timeout=1)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(
+            lambda: len(available_questions(manager, "run-a")) == 2)
+        questions = available_questions(manager, "run-a")
+        first_id = questions[0]["id"]
+        second_id = questions[1]["id"]
+        await manager.answer("run-a", first_id, {"first": ["yes"]})
+        await wait_until(lambda: manager.state("run-a") == "failed")
+        statuses = manager.question_status(
+            "run-a", [first_id, second_id])["questions"]
+        assert statuses[first_id]["status"] == "resolved"
+        assert statuses[second_id]["status"] == "expired"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_events_nonce_is_checked_against_admission(tmp_path):
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    manager = make_manager(paths, key, ImmediateAnswerExecutor("完成"))
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="问题", routes={"broker_token": "token"},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "问题", envelope))
+        await wait_until(lambda: manager.state("run-a") == "done")
+        with pytest.raises(DomainError) as mismatch:
+            manager.events("run-a", 0, nonce="wrong-nonce")
+        assert mismatch.value.status == 403
+        payload = manager.events(
+            "run-a", 0, nonce=envelope["nonce"])
+        assert payload["state"] == "done"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_acp_permission_text_is_scrubbed_but_choice_maps(tmp_path):
+    """真实 ACP 夹具把 Run token 放进 toolCall.title/选项：公开文本必须脱敏。"""
+    import os
+    import sys
+
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "harness_rpc.py"
+    audit = tmp_path / "permission-audit.jsonl"
+    launcher = tmp_path / "permission_launcher.py"
+    launcher.write_text(
+        "import os, runpy, sys\n"
+        "os.environ['FAKE_HARNESS_MODE'] = 'permission-secret'\n"
+        f"os.environ['FAKE_HARNESS_AUDIT'] = {str(audit)!r}\n"
+        f"sys.argv = [{str(fixture)!r}, 'acp']\n"
+        f"runpy.run_path({str(fixture)!r}, run_name='__main__')\n",
+        encoding="utf-8")
+    base_env = {
+        name: os.environ[name]
+        for name in ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "WINDIR")
+        if name in os.environ
+    }
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths, public_key=key.public_key(),
+        sessions=WorkspaceSessionStore(paths.state_root, WORKSPACE),
+        base_env=base_env, clock=lambda: CLOCK, question_timeout=30)
+    secret = "acp-broker-token-sentinel-0123456789"
+    agent = {"runtime": "acp", "command": [sys.executable, str(launcher)],
+             "sandbox": "read-only", "timeout": 60}
+    envelope = sign(key, run_id="run-a", session_id="conversation-a",
+                    message="看权限", routes={"broker_token": secret},
+                    agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-a", envelope,
+            request_for("conversation-a", "看权限", envelope))
+        await wait_until(
+            lambda: manager.state("run-a") == "awaiting_permission")
+        questions = available_questions(manager, "run-a")
+        assert questions, "实际 ACP 适配器应打开权限问题"
+        payload = questions[0]
+        public_text = json.dumps(payload, ensure_ascii=False)
+        assert secret not in public_text, "问题正文/选项不得泄漏 Run token"
+        options = payload["questions"][0]["options"]
+        allow = next(option for option in options
+                     if str(option.get("label", "")).startswith("1."))
+        assert allow.get("value"), "公开选项必须带内部安全映射值"
+
+        await manager.answer("run-a", payload["id"],
+                             {"permission": [allow["value"]]})
+        await wait_until(lambda: manager.state("run-a") == "done")
+
+        events_text = json.dumps(manager.events("run-a", after=0),
+                                 ensure_ascii=False)
+        messages = manager.messages("conversation-a")["messages"]
+        messages_text = json.dumps(messages, ensure_ascii=False)
+        audit_text = audit.read_text(encoding="utf-8")
+        assert secret not in events_text
+        assert secret not in messages_text
+        assert secret not in audit_text
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        await manager.aclose()
+
+    asyncio.run(scenario())

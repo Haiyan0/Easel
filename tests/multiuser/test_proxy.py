@@ -68,6 +68,14 @@ class StaticRuntime:
         assert config_version == self.handle.config_version
         return self.handle
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        if (workspace_id != self.handle.workspace_id
+                or container_id != self.handle.container_id
+                or config_version != self.handle.config_version):
+            return None
+        return self.handle
+
 
 def provider(_actor: Identity) -> PinnedRunConfig:
     return PinnedRunConfig(

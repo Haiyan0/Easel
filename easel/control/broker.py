@@ -667,6 +667,20 @@ class BrokerService:
     # 签发与授权
     # ------------------------------------------------------------------
 
+    def ensure_issuable(self, actor: Identity, channel: str) -> None:
+        """接纳前检查该 channel 是否可签发；不创建 Run、token 或凭证。
+
+        缺受管路由、协议不支持或出口策略拒绝时明确失败，避免先占用
+        容量再发现能力不可用。
+        """
+        if not isinstance(channel, str) or not channel:
+            raise DomainError("invalid_channel", 400)
+        route = self._config.resolve(actor, channel)
+        adapter_cls = adapter_for_route(route)
+        if route.protocol not in adapter_cls.protocols:
+            raise DomainError("capability_unavailable", 503)
+        self._egress.policy.validate_url(route.base_url, resolve=False)
+
     def issue(self, actor: Identity, run_id: str, channel: str) -> str:
         """为本人活跃 Run 签发调用令牌；不创建 Run、不下发任何凭证。
 

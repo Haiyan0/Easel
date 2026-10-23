@@ -41,6 +41,14 @@ class StaticRuntime:
                             upstream, "service-token-" + workspace_id,
                             config_version)
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        if container_id != "container-" + workspace_id:
+            return None
+        return WorkerHandle(
+            workspace_id, container_id, self._workspaces[workspace_id],
+            "service-token-" + workspace_id, config_version)
+
 
 class SnapshotTransport(httpx.AsyncBaseTransport):
     """只实现内部快照读取；任何任务 POST 都会记录以便断言未发生。"""

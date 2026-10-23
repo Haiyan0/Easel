@@ -164,6 +164,14 @@ class WorkspaceRuntime:
             "http://worker.test:7860", "service-token-" + workspace_id[:8],
             config_version)
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        if container_id != "container-" + workspace_id[:8]:
+            return None
+        return WorkerHandle(
+            workspace_id, container_id, "http://worker.test:7860",
+            "service-token-" + workspace_id[:8], config_version)
+
 
 class FakeProvisioner:
     def __init__(self) -> None:

@@ -85,6 +85,14 @@ class WorkspaceRuntime:
             workspace_id, "container-" + workspace_id[:8], UPSTREAM,
             "service-token-" + workspace_id[:8], config_version)
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        if container_id != "container-" + workspace_id[:8]:
+            return None
+        return WorkerHandle(
+            workspace_id, container_id, UPSTREAM,
+            "service-token-" + workspace_id[:8], config_version)
+
 
 class FakeProvisioner:
     """最小 provisioner：只记录生命周期动作，供 drain/回收测试观察。"""
@@ -440,6 +448,10 @@ def test_relay_releases_request_lease_when_upstream_fails(tmp_path):
         run = store.reserve_run(
             user, conversation.id, "request-failure", "digest-failure",
             REVISION)
+        # 已绑定的 Run 才会走实例句柄；本测试验证上游失败时租约释放
+        assert store.claim_run_dispatch(
+            user, run.id, "nonce-failure",
+            "container-" + user.workspace_id[:8])
         transport = CountingTransport(httpx.ConnectError("upstream down"))
 
         async def scenario() -> None:

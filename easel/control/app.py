@@ -468,9 +468,21 @@ def create_app(*, store: Store, auth: AuthService,
                     http_client, app.state.broker, control_db_runner)
             else:
                 app.state.relay = None
+            # 后台对账与 SSE/登录解耦：应用启动即恢复扫描，退出时先停止
+            # 循环再关闭它使用的 HTTP 连接池。
+            app.state.reconciler = None
+            if (app.state.relay is not None
+                    and callable(getattr(
+                        app.state.relay, "reconcile_once", None))):
+                from .reconcile import RunReconciler
+                app.state.reconciler = RunReconciler(app.state.relay)
+                await app.state.reconciler.start()
             yield
         finally:
             try:
+                reconciler = getattr(app.state, "reconciler", None)
+                if reconciler is not None:
+                    await reconciler.stop()
                 if http_client is not None:
                     await http_client.aclose()
                 current_store = getattr(app.state, "control_store", None)

@@ -337,6 +337,44 @@ class WorkspaceSessionStore:
         """纯输入校验：不建目录、不读写历史，供 Run 认领前调用。"""
         _validate_message(message)
 
+    def _append_locked(self, session_id: str, message: dict) -> None:
+        """在会话锁内追加一行消息；失败回滚到原长度，不留半行。"""
+        path = self.messages_path(session_id)
+        if path.exists():
+            _validate_messages_file(
+                path, self.workspace_id, session_id)
+        original_size: int | None = None
+        try:
+            if path.exists():
+                original_size = path.stat().st_size
+            else:
+                original_size = 0
+            record = _message_record(
+                self.workspace_id, session_id, message)
+            encoded = json.dumps(
+                record, ensure_ascii=False,
+                separators=(",", ":")).encode("utf-8") + b"\n"
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            # 失败不能留下半行；已知原长度时尽力恢复。
+            if original_size is not None:
+                try:
+                    os.truncate(path, original_size)
+                except OSError:
+                    pass
+            raise DomainError("session_write_failed", 500) from None
+
     def append_message(self, session_id: str, message: dict) -> None:
         _session_id(session_id)
         self.validate_message(message)
@@ -344,41 +382,36 @@ class WorkspaceSessionStore:
         with self._locked(session_dir):
             if self._read_binding_locked(session_id) is None:
                 raise DomainError("session_unbound", 409)
+            self._append_locked(session_id, message)
+
+    def append_message_once(self, session_id: str, run_id: str,
+                            message: dict) -> bool:
+        """按 Run 幂等追加最终助手输出；返回是否真正写入。
+
+        落盘后、提交 done 前崩溃时，恢复流程会再次调用本方法；扫描已有
+        ``runId`` 标记可避免重复追加。标记只存在消息内部，不改变文件格式。
+        """
+        _session_id(session_id)
+        run_id = _identifier(run_id)
+        self.validate_message(message)
+        session_dir = self._session_dir(session_id)
+        with self._locked(session_dir):
+            if self._read_binding_locked(session_id) is None:
+                raise DomainError("session_unbound", 409)
             path = self.messages_path(session_id)
             if path.exists():
-                _validate_messages_file(
-                    path, self.workspace_id, session_id)
-            original_size: int | None = None
-            try:
-                if path.exists():
-                    original_size = path.stat().st_size
-                else:
-                    original_size = 0
-                record = _message_record(
-                    self.workspace_id, session_id, message)
-                encoded = json.dumps(
-                    record, ensure_ascii=False,
-                    separators=(",", ":")).encode("utf-8") + b"\n"
-                descriptor = os.open(
-                    path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 try:
-                    view = memoryview(encoded)
-                    while view:
-                        written = os.write(descriptor, view)
-                        if written <= 0:
-                            raise OSError("short write")
-                        view = view[written:]
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            except OSError:
-                # 失败不能留下半行；已知原长度时尽力恢复。
-                if original_size is not None:
-                    try:
-                        os.truncate(path, original_size)
-                    except OSError:
-                        pass
-                raise DomainError("session_write_failed", 500) from None
+                    with path.open("rb") as stream:
+                        for line in stream:
+                            existing = _message_from_line(
+                                line, workspace_id=self.workspace_id,
+                                session_id=session_id)
+                            if existing.get("runId") == run_id:
+                                return False
+                except OSError:
+                    raise DomainError("session_corrupt", 500) from None
+            self._append_locked(session_id, message)
+            return True
 
     def messages(self, session_id: str, *, limit: int = 100,
                  offset: int = 0) -> list[dict]:

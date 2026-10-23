@@ -15,7 +15,7 @@ from .auth import AuthService
 from .broker import BrokerService
 from .config import ConfigService, load_master_key
 from .egress import EgressGateway, load_policy
-from .proxy import PinnedRunConfig, WorkerRelay
+from .proxy import BrokerDestination, PinnedRunConfig, WorkerRelay
 from .runtime import UnixProvisionerClient
 from .snapshot import load_managed_agent_config, load_signing_key
 from .store import Store
@@ -32,6 +32,29 @@ def _report(error: DomainError) -> int:
     """只输出错误码，不回显令牌或内部细节。"""
     print(f"错误：{error.code}", file=sys.stderr)
     return 1
+
+
+def build_relay_factory(*, signing_key, revision: int, agent: dict,
+                        broker_destination: BrokerDestination):
+    """正式 control 装配：接纳后为每个 Run 签发最小 broker token。
+
+    该函数被 CLI 与装配测试共同使用；不得在测试里用自造 provider 另起
+    一条与生产不同的签发路径。
+    """
+    def pinned_config(_actor):
+        return PinnedRunConfig(
+            revision=revision, routes={}, agent=agent,
+            broker=broker_destination)
+
+    def relay_factory(runtime, sessions, auth, store, http_client,
+                      broker, db_runner):
+        return WorkerRelay(
+            runtime, sessions, auth, store=store,
+            signing_key=signing_key, config_provider=pinned_config,
+            http_client=http_client, broker=broker,
+            db_runner=db_runner)
+
+    return relay_factory
 
 
 def cmd_admin_bootstrap(args) -> int:
@@ -107,20 +130,16 @@ def cmd_serve_control(args) -> int:
 
     relay_factory = None
     if signing_key is not None:
-        revision, agent = managed_agent
-
-        def pinned_config(_actor):
-            # 本任务只装配受管底座命令；逐 Run broker token 仍由后续
-            # 受管路由任务签发，此处不下发任何共享秘密。
-            return PinnedRunConfig(revision=revision, routes={}, agent=agent)
-
-        def relay_factory(runtime, sessions, auth, store, http_client,
-                          broker, db_runner):
-            return WorkerRelay(
-                runtime, sessions, auth, store=store,
-                signing_key=signing_key, config_provider=pinned_config,
-                http_client=http_client, broker=broker,
-                db_runner=db_runner)
+        revision, agent, broker_config = managed_agent
+        try:
+            destination = BrokerDestination(
+                broker_config["url"], broker_config["channel"])
+        except (KeyError, ValueError):
+            print("错误：managed_config_invalid", file=sys.stderr)
+            return 2
+        relay_factory = build_relay_factory(
+            signing_key=signing_key, revision=revision, agent=agent,
+            broker_destination=destination)
 
     # 出口策略必须在打开控制库、启动 HTTP 之前校验失败
     policy_path = getattr(args, "egress_policy", None)

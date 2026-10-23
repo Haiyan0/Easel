@@ -304,6 +304,14 @@ class StaticRuntime:
             raise RuntimeUnavailable("worker_config_mismatch")
         return handle
 
+    async def bound_handle(self, workspace_id: str, container_id: str,
+                           config_version: int) -> WorkerHandle | None:
+        handle = self._handles.get(workspace_id)
+        if (handle is None or handle.container_id != container_id
+                or handle.config_version != config_version):
+            return None
+        return handle
+
     def count(self, workspace_id: str) -> int:
         with self._lock:
             return sum(1 for workspace, _ in self.calls
@@ -1180,8 +1188,9 @@ def test_two_worker_authorized_relay_end_to_end(tmp_path, monkeypatch):
                     conversation_id=session_a, task_type="chat",
                     message="你好", attachments=[], persona=None),
                 expected_task_type="chat", expected_revision=REVISION)
+            # 同请求重试（含 control 重启）复用原签名包：不再铸造第二个 token
+            assert len(mints[ws_a].tokens) == 1
             assert snapshot.routes["broker_token"] == mints[ws_a].tokens[0]
-            assert snapshot.routes["broker_token"] != mints[ws_a].tokens[1]
             tampered = dict(envelope, conversation_id=session_b1)
             with pytest.raises(DomainError):
                 verify_run_snapshot(

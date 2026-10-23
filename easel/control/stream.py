@@ -49,34 +49,74 @@ async def run_event_stream(
     读取。``recheck`` 抛 ``DomainError`` 表示登录已撤销或资源不再属于本人。
     """
     cursor = 0
-    last_auth_check = clock()
-    last_heartbeat = clock()
-    while True:
-        events = page.get("events") or []
-        for event in events:
-            event_id = event.get("eventId")
-            if type(event_id) is not int or event_id <= cursor:
-                continue
-            cursor = event_id
-            yield _frame(event)
-        last_event_id = page.get("lastEventId")
-        if type(last_event_id) is int and last_event_id > cursor:
-            cursor = last_event_id
-        state = page.get("state")
-        if state in TERMINAL_STATES and cursor >= (last_event_id or 0):
-            return
-
-        now = clock()
-        if now - last_auth_check >= auth_check_seconds:
-            # 撤销会抛 DomainError；只关闭连接，后台任务保持原状
-            try:
-                await recheck()
-            except DomainError:
+    now = clock()
+    last_auth_check = now
+    last_heartbeat = now
+    next_fetch = now
+    pending: asyncio.Task | None = None
+    try:
+        while True:
+            events = page.get("events") or []
+            for event in events:
+                event_id = event.get("eventId")
+                if type(event_id) is not int or event_id <= cursor:
+                    continue
+                # 逐帧复查：大页回放或慢消费者也不能把撤销推迟到 5 秒后
+                now = clock()
+                if now - last_auth_check >= auth_check_seconds:
+                    try:
+                        await recheck()
+                    except DomainError:
+                        return
+                    last_auth_check = clock()
+                cursor = event_id
+                yield _frame(event)
+            last_event_id = page.get("lastEventId")
+            if type(last_event_id) is int and last_event_id > cursor:
+                cursor = last_event_id
+            state = page.get("state")
+            if state in TERMINAL_STATES and cursor >= (last_event_id or 0):
                 return
-            last_auth_check = now
-        if now - last_heartbeat >= heartbeat_seconds:
-            yield b": keepalive\n\n"
-            last_heartbeat = now
 
-        await asyncio.sleep(poll_interval)
-        page = await relay.events(actor, run_id, after=cursor)
+            while True:
+                now = clock()
+                # 认证截止与事件请求竞速：慢上游/心跳/轮询都不能推迟撤销。
+                if pending is None and now >= next_fetch:
+                    pending = asyncio.create_task(
+                        relay.events(actor, run_id, after=cursor))
+                auth_due = last_auth_check + auth_check_seconds
+                heartbeat_due = last_heartbeat + heartbeat_seconds
+                deadlines = [auth_due, heartbeat_due]
+                if pending is None:
+                    deadlines.append(next_fetch)
+                timeout = max(0.0, min(deadlines) - now)
+                if pending is not None:
+                    done, _ = await asyncio.wait({pending}, timeout=timeout)
+                else:
+                    await asyncio.sleep(timeout)
+                    done = set()
+                now = clock()
+
+                if pending is not None and pending in done:
+                    try:
+                        page = pending.result()
+                    finally:
+                        pending = None
+                    next_fetch = now + poll_interval
+                    break  # 处理新事件页
+
+                if now >= last_auth_check + auth_check_seconds:
+                    # 撤销会抛 DomainError；关闭连接与在途读取，后台任务保留
+                    try:
+                        await recheck()
+                    except DomainError:
+                        return
+                    last_auth_check = clock()
+                if now >= last_heartbeat + heartbeat_seconds:
+                    yield b": keepalive\n\n"
+                    last_heartbeat = clock()
+    finally:
+        # 客户端断开或撤销：取消并等待在途事件请求，释放其请求租约。
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)

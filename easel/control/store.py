@@ -964,6 +964,9 @@ class Store:
                 " WHERE workspace_id = ? AND id IN"
                 f" ({','.join('?' for _ in run_ids)})",
                 (now, now, workspace_id, *run_ids))
+            for run_id in run_ids:
+                # 终态与 token 撤销同事务提交，崩溃窗口内也不会留下可用凭证
+                self._revoke_tokens_locked(workspace_id, run_id, now)
         return run_ids
 
     def _worker_lease_row(self, workspace_id: str) -> WorkerLease | None:
@@ -1377,8 +1380,7 @@ class Store:
         失败信息只含错误码，不回显摘要、令牌或凭证。
         """
         row = self._broker_token_row(token_digest)
-        if (row is None or row["revoked_at"] is not None
-                or int(now) >= int(row["expires_at"])):
+        if row is None or int(now) >= int(row["expires_at"]):
             raise DomainError("invalid_token", 401)
         # 外空间/外 Run 资源统一 404，避免泄露令牌归属
         if row["workspace_id"] != workspace_id or row["run_id"] != run_id:
@@ -1388,7 +1390,10 @@ class Store:
         if row["user_disabled_at"] is not None:
             raise DomainError("user_disabled", 403)
         if row["run_status"] not in ACTIVE_RUN_STATUSES:
+            # 终态与撤销在同一事务写入；先报终态，保持既有 API 契约
             raise DomainError("terminal_run", 409)
+        if row["revoked_at"] is not None:
+            raise DomainError("invalid_token", 401)
         if (row["snapshot_id"] is None or row["route_json"] is None
                 or row["encrypted_secrets"] is None):
             raise DomainError("invalid_token", 401)
@@ -1400,15 +1405,19 @@ class Store:
         return self._require_broker_token_locked(
             token_digest, workspace_id, run_id, channel, int(now))
 
+    def _revoke_tokens_locked(self, workspace_id: str, run_id: str,
+                              now: int) -> int:
+        cursor = self._connection.execute(
+            "UPDATE broker_tokens SET revoked_at = ?"
+            " WHERE workspace_id = ? AND run_id = ? AND revoked_at IS NULL",
+            (int(now), _text(workspace_id), _text(run_id)))
+        return cursor.rowcount
+
     def revoke_broker_tokens(self, workspace_id: str, run_id: str,
                              now: int) -> int:
         """撤销某 Run 的全部令牌；跨连接立即生效。"""
         with self._transaction():
-            cursor = self._connection.execute(
-                "UPDATE broker_tokens SET revoked_at = ?"
-                " WHERE workspace_id = ? AND run_id = ? AND revoked_at IS NULL",
-                (int(now), _text(workspace_id), _text(run_id)))
-        return cursor.rowcount
+            return self._revoke_tokens_locked(workspace_id, run_id, now)
 
     def acquire_broker_lease(self, token_digest: str, workspace_id: str,
                              run_id: str, channel: str, token_now: int,
@@ -1685,6 +1694,35 @@ class Store:
     # 任务接纳
     # ------------------------------------------------------------------
 
+    def lookup_run(self, actor: Identity, conversation_id: str,
+                   client_request_id: str,
+                   input_digest: str) -> RunRecord | None:
+        """先按幂等键查询原 Run；同输入返回原记录，异输入 409。
+
+        查询只发生在当前 actor/会话归属校验之后，不能借已有 request_id
+        跳过身份检查；也不需要读取最新配置或要求新 worker 可用。
+        """
+        workspace_id = self._require_actor(actor)
+        self._require_ready_workspace(workspace_id)
+        conversation_id = _text(conversation_id)
+        client_request_id = _text(client_request_id)
+        input_digest = _text(input_digest)
+        with self._transaction():
+            self._require_actor(actor)
+            self._require_ready_workspace(workspace_id)
+            self._require_conversation(workspace_id, conversation_id)
+            existing = self._connection.execute(
+                "SELECT workspace_id, id, conversation_id, client_request_id,"
+                " input_digest, status, config_version FROM runs"
+                " WHERE workspace_id = ? AND client_request_id = ?",
+                (workspace_id, client_request_id)).fetchone()
+            if existing is None:
+                return None
+            if (existing["conversation_id"] != conversation_id
+                    or existing["input_digest"] != input_digest):
+                raise DomainError("request_conflict", 409)
+            return _run_record(existing)
+
     def reserve_run(self, actor: Identity, conversation_id: str, client_request_id: str,
                     input_digest: str, config_version: int) -> RunRecord:
         """幂等接纳一次任务；重复请求返回原 Run，不重复占用并发预算。
@@ -1808,7 +1846,7 @@ class Store:
         workspace_id = self._require_actor(actor, allow_disabled=True)
         row = self._connection.execute(
             "SELECT id, status, dispatch_state, dispatch_nonce, config_version,"
-            " input_digest, client_request_id FROM runs"
+            " input_digest, client_request_id, worker_container_id FROM runs"
             " WHERE workspace_id = ? AND id = ?",
             (workspace_id, _text(run_id))).fetchone()
         if row is None:
@@ -1818,6 +1856,7 @@ class Store:
             "status": row["status"],
             "dispatchState": row["dispatch_state"],
             "dispatchNonce": row["dispatch_nonce"] or "",
+            "workerContainerId": row["worker_container_id"] or "",
             "configVersion": int(row["config_version"]),
             "inputDigest": row["input_digest"],
             "clientRequestId": row["client_request_id"],
@@ -1854,6 +1893,79 @@ class Store:
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (workspace_id, _text(conversation_id))).fetchone()
         return _run_record(row) if row is not None else None
+
+    def latest_dispatched_run_for_conversation(
+            self, actor: Identity, conversation_id: str) -> RunRecord | None:
+        """最近一次已绑定 worker 实例的 Run；用于读取无副作用的消息快照。"""
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, client_request_id,"
+            " input_digest, status, config_version FROM runs"
+            " WHERE workspace_id = ? AND conversation_id = ?"
+            " AND worker_container_id IS NOT NULL AND worker_container_id != ''"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (workspace_id, _text(conversation_id))).fetchone()
+        return _run_record(row) if row is not None else None
+
+    def list_active_run_bindings(self) -> list[dict]:
+        """后台对账的窄视图；跨 workspace 列出未终态 Run 与原实例绑定。
+
+        仅供 control 进程内的持久对账使用，不经 HTTP 暴露；不返回凭证。
+        """
+        rows = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, status, config_version,"
+            " dispatch_state, dispatch_nonce, worker_container_id, created_at,"
+            " dispatched_at, snapshot_json FROM runs"
+            f" WHERE status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)})"
+            " ORDER BY created_at, rowid",
+            TERMINAL_RUN_STATUSES).fetchall()
+        return [{
+            "workspaceId": row["workspace_id"],
+            "runId": row["id"],
+            "conversationId": row["conversation_id"],
+            "status": row["status"],
+            "configVersion": int(row["config_version"]),
+            "dispatchState": row["dispatch_state"],
+            "dispatchNonce": row["dispatch_nonce"] or "",
+            "workerContainerId": row["worker_container_id"] or "",
+            "createdAt": int(row["created_at"]),
+            "dispatchedAt": (int(row["dispatched_at"])
+                             if row["dispatched_at"] is not None else None),
+            "snapshotJson": row["snapshot_json"],
+        } for row in rows]
+
+    def sync_run_status(self, workspace_id: str, run_id: str,
+                        status: str) -> bool:
+        """后台对账写回状态；终态只释放一次容量，非终态不回退终态。
+
+        无 actor 的系统路径：只有监视器调用，所有条件仍在单个事务内判定。
+        """
+        if status not in (*ACTIVE_RUN_STATUSES, *TERMINAL_RUN_STATUSES):
+            raise DomainError("invalid_status", 400)
+        workspace_id = _text(workspace_id)
+        run_id = _text(run_id)
+        stamp = _now()
+        with self._transaction():
+            if status in TERMINAL_RUN_STATUSES:
+                cursor = self._connection.execute(
+                    "UPDATE runs SET status = ?, finished_at = ?,"
+                    " capacity_released_at = ?,"
+                    " release_count = release_count + 1"
+                    " WHERE workspace_id = ? AND id = ?"
+                    " AND capacity_released_at IS NULL AND status NOT IN"
+                    f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                    (status, stamp, stamp, workspace_id, run_id,
+                     *TERMINAL_RUN_STATUSES))
+                if cursor.rowcount == 1:
+                    self._revoke_tokens_locked(
+                        workspace_id, run_id, stamp)
+            else:
+                cursor = self._connection.execute(
+                    "UPDATE runs SET status = ? WHERE workspace_id = ?"
+                    " AND id = ? AND status NOT IN"
+                    f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
+                    (status, workspace_id, run_id, *TERMINAL_RUN_STATUSES))
+            return cursor.rowcount == 1
 
     def count_active_runs(self) -> int:
         """整机当前活跃任务数。"""
@@ -1914,6 +2026,7 @@ class Store:
                 " WHERE workspace_id = ? AND id = ? AND status NOT IN"
                 f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
                 (stamp, stamp, workspace_id, run_id, *TERMINAL_RUN_STATUSES))
+            self._revoke_tokens_locked(workspace_id, run_id, stamp)
         return True
 
     def finish_run(self, actor: Identity, run_id: str, status: str) -> None:
@@ -1926,13 +2039,17 @@ class Store:
         with self._transaction():
             self._fetch_run(workspace_id, run_id)
             # 只有尚未释放容量的行会被改写：重复调用既不换状态也不重复释放
-            self._connection.execute(
+            cursor = self._connection.execute(
                 "UPDATE runs SET status = ?, finished_at = ?, capacity_released_at = ?,"
                 " release_count = release_count + 1"
                 " WHERE workspace_id = ? AND id = ? AND capacity_released_at IS NULL"
                 " AND status NOT IN"
                 f" ({_placeholders(TERMINAL_RUN_STATUSES)})",
                 (status, stamp, stamp, workspace_id, run_id, *TERMINAL_RUN_STATUSES))
+            if cursor.rowcount == 1:
+                # 终态与 token 撤销同事务：控制进程在两者之间崩溃也不会
+                # 留下仍可调用的 Run 凭证。
+                self._revoke_tokens_locked(workspace_id, run_id, stamp)
 
     # ------------------------------------------------------------------
     # 内部校验

@@ -6174,10 +6174,11 @@ async def api_internal_run_submit(run_id: str, request: Request):
 
 
 @app.get("/internal/runs/{run_id}/events")
-async def api_internal_run_events(run_id: str, after: int = 0):
+async def api_internal_run_events(run_id: str, after: int = 0,
+                                  nonce: str | None = None):
     manager = _run_manager()
     try:
-        return manager.events(run_id, after)
+        return manager.events(run_id, after, nonce=nonce)
     except DomainError as error:
         raise _run_http_error(error) from error
 
