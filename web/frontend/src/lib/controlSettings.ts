@@ -25,14 +25,35 @@ export interface ChannelSettings {
   protocol: string | null;
   options: Record<string, unknown>;
   allowed_models?: string[];
+  personal_model?: string | null;
+  personal_options?: Record<string, unknown>;
   broker_adapter: string | null;
   broker_supported: boolean;
   override_allowed: boolean;
 }
 
+export interface ProviderKeySchema {
+  env: string;
+  label: string;
+  required: boolean;
+  secret: boolean;
+  choices: string[];
+}
+
+export interface ProviderSchema {
+  name: string;
+  keys: ProviderKeySchema[];
+  override_allowed: boolean;
+  broker_adapter: string | null;
+}
+
+export type ProviderCatalog =
+  Partial<Record<AdminChannel, Record<string, ProviderSchema>>>;
+
 export interface ModelSettings {
   version: number;
   channels: Record<AdminChannel, ChannelSettings>;
+  providers: ProviderCatalog;
 }
 
 export interface HarnessSummary {
@@ -103,6 +124,7 @@ export interface RouteForm {
   baseUrl: string;
   protocol: string;
   secret: string;
+  secretFields: Record<string, string>;
   options: string;
   allowedModels: string;
 }
@@ -117,6 +139,7 @@ export function emptyRouteForm(): RouteForm {
     baseUrl: '',
     protocol: '',
     secret: '',
+    secretFields: {},
     options: '',
     allowedModels: '',
   };
@@ -175,6 +198,44 @@ function stringList(value: unknown): string[] {
   });
 }
 
+function parseProviderSchema(value: unknown): ProviderSchema {
+  const row = objectOf(value);
+  if (!Array.isArray(row.keys)) invalid();
+  const keys: ProviderKeySchema[] = row.keys.map((item) => {
+    const key = objectOf(item);
+    return {
+      env: stringOf(key.env),
+      label: stringOf(key.label),
+      required: boolOf(key.required),
+      secret: boolOf(key.secret),
+      choices: key.choices === undefined ? [] : stringList(key.choices),
+    };
+  });
+  return {
+    name: stringOf(row.name),
+    keys,
+    override_allowed: boolOf(row.override_allowed),
+    broker_adapter: nullableString(row.broker_adapter),
+  };
+}
+
+function parseProviders(value: unknown): ProviderCatalog {
+  if (value === undefined) return {};
+  const row = objectOf(value);
+  const result: ProviderCatalog = {};
+  for (const channel of ADMIN_CHANNELS) {
+    if (!(channel in row)) continue;
+    const providers = objectOf(row[channel]);
+    const parsed: Record<string, ProviderSchema> = {};
+    for (const [providerId, schema] of Object.entries(providers)) {
+      if (!providerId) invalid();
+      parsed[providerId] = parseProviderSchema(schema);
+    }
+    result[channel] = parsed;
+  }
+  return result;
+}
+
 function sourceOf(value: unknown): ChannelSource {
   if (value !== 'none' && value !== 'admin' && value !== 'user') invalid();
   return value;
@@ -191,6 +252,10 @@ export function parseChannelSettings(value: unknown): ChannelSettings {
   const allowed = row.allowed_models === undefined
     || row.allowed_models === null
     ? {} : { allowed_models: stringList(row.allowed_models) };
+  const personalModel = row.personal_model === undefined
+    ? {} : { personal_model: nullableString(row.personal_model) };
+  const personalOptions = row.personal_options === undefined
+    ? {} : { personal_options: optionsOf(row.personal_options) };
   return {
     configured: boolOf(row.configured),
     source: sourceOf(row.source),
@@ -202,6 +267,8 @@ export function parseChannelSettings(value: unknown): ChannelSettings {
     protocol: nullableString(row.protocol),
     options: optionsOf(row.options),
     ...allowed,
+    ...personalModel,
+    ...personalOptions,
     broker_adapter: nullableString(row.broker_adapter),
     broker_supported: boolOf(row.broker_supported),
     override_allowed: boolOf(row.override_allowed),
@@ -216,7 +283,11 @@ export function parseModelSettings(value: unknown): ModelSettings {
     if (!(channel in channels)) invalid();
     parsed[channel] = parseChannelSettings(channels[channel]);
   }
-  return { version: intOf(row.version), channels: parsed };
+  return {
+    version: intOf(row.version),
+    channels: parsed,
+    providers: parseProviders(row.providers),
+  };
 }
 
 export function parseHarnessSummary(value: unknown): HarnessSummary {
@@ -371,7 +442,49 @@ function completeRoute(form: RouteForm,
   return route;
 }
 
-export function buildPersonalRoute(form: RouteForm): Record<string, unknown> {
+export function isBaseUrlEnv(env: string): boolean {
+  return env.endsWith('BASE_URL') || env.endsWith('_BASE');
+}
+
+/** 需要用户输入的凭证字段：必需秘密字段 + 必需非秘密字段（排除地址）。 */
+export function credentialFields(
+  schema?: ProviderSchema | null,
+): ProviderKeySchema[] {
+  if (!schema) return [];
+  return schema.keys.filter((key) => key.required
+    && (key.secret || !isBaseUrlEnv(key.env)));
+}
+
+/**
+ * 单 Key 继续提交字符串；多字段/含必填非秘密字段时提交对象。
+ * 全部留空表示复用本人同作用域旧凭证；部分填写明确拒绝。
+ */
+export function buildCredentialSecret(
+  form: RouteForm,
+  schema?: ProviderSchema | null,
+): string | Record<string, string> | undefined {
+  const fields = credentialFields(schema);
+  if (!fields.length) return form.secret || undefined;
+  if (fields.length === 1 && fields[0].secret) {
+    return form.secret || undefined;
+  }
+  const values: Array<[string, string]> = [];
+  let filled = 0;
+  for (const field of fields) {
+    const raw = form.secretFields[field.env] || '';
+    if (!raw.trim()) continue;
+    filled += 1;
+    values.push([field.env, field.secret ? raw : raw.trim()]);
+  }
+  if (filled === 0) return undefined;
+  if (filled !== fields.length) throw new Error('credentials_incomplete');
+  return Object.fromEntries(values);
+}
+
+export function buildPersonalRoute(
+  form: RouteForm,
+  schema?: ProviderSchema | null,
+): Record<string, unknown> {
   if (form.routeKind === 'managed-model') {
     const route: Record<string, unknown> = {
       route_kind: 'managed-model',
@@ -380,7 +493,12 @@ export function buildPersonalRoute(form: RouteForm): Record<string, unknown> {
     if (form.model.trim()) route.model = form.model.trim();
     return route;
   }
-  return completeRoute(form);
+  const route = completeRoute(form);
+  // 个人凭证由 schema 决定的字符串/对象统一生成，避免残留旧的单 Key 值
+  delete route.secret;
+  const secret = buildCredentialSecret(form, schema);
+  if (secret !== undefined) route.secret = secret;
+  return route;
 }
 
 export function buildManagedDefault(form: RouteForm): Record<string, unknown> {
@@ -400,11 +518,17 @@ export function formFromChannel(settings: ModelSettings,
   return {
     routeKind: managed ? 'managed-model' : 'complete',
     provider: entry.provider || '',
-    model: entry.model || '',
+    // managed-model 只编辑个人显式值：省略 model 时保持空并继续跟随默认
+    model: managed
+      ? (entry.personal_model ?? '')
+      : (entry.model || ''),
     baseUrl: entry.base_url || '',
     protocol: entry.protocol || '',
     secret: '',
-    options: managed ? '' : prettyOptions(entry.options),
+    secretFields: {},
+    options: managed
+      ? prettyOptions(entry.personal_options || {})
+      : prettyOptions(entry.options),
     allowedModels: '',
   };
 }
@@ -420,6 +544,7 @@ export function formFromManaged(managed: ManagedSettings,
     baseUrl: entry.base_url,
     protocol: entry.protocol,
     secret: '',
+    secretFields: {},
     options: prettyOptions(entry.options),
     allowedModels: (entry.allowed_models || []).join(', '),
   };

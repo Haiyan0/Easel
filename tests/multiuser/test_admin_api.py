@@ -700,6 +700,73 @@ def test_public_responses_and_logs_never_contain_secret_sentinels(
         assert PERSONAL_SECRET not in caplog.text
 
 
+def test_admin_users_and_invites_reach_second_page_over_http(tmp_path):
+    with admin_api(tmp_path) as (admin_client, member_client, store, auth,
+                                 service, admin, second_admin, member, other):
+        csrf = login(admin_client, auth, admin, admin)
+        headers = write_headers(csrf)
+        members = []
+        for index in range(55):
+            response = admin_client.post(
+                "/api/admin/users",
+                json={"displayName": f"批量成员 {index:02d}"},
+                headers=headers)
+            assert response.status_code == 201, response.text
+            members.append(response.json())
+        invites = []
+        for _ in range(55):
+            response = admin_client.post(
+                "/api/admin/invites",
+                json={"userId": members[0]["userId"]},
+                headers=headers)
+            assert response.status_code == 201, response.text
+            invites.append(response.json())
+
+        first = admin_client.get(
+            "/api/admin/users?limit=50&offset=0").json()
+        assert len(first["users"]) == 50
+        assert first["nextOffset"] == 50
+        assert members[-1]["userId"] not in {
+            item["userId"] for item in first["users"]}
+        second = admin_client.get(
+            "/api/admin/users?limit=50&offset=50").json()
+        assert members[-1]["userId"] in {
+            item["userId"] for item in second["users"]}
+        assert second["nextOffset"] is None
+
+        first_invites = admin_client.get(
+            "/api/admin/invites?limit=50&offset=0").json()
+        assert len(first_invites["invites"]) == 50
+        assert first_invites["nextOffset"] == 50
+        assert invites[0]["id"] not in {
+            item["id"] for item in first_invites["invites"]}
+        second_invites = admin_client.get(
+            "/api/admin/invites?limit=50&offset=50").json()
+        assert invites[0]["id"] in {
+            item["id"] for item in second_invites["invites"]}
+        assert second_invites["nextOffset"] is None
+        assert invites[0]["token"] not in admin_client.get(
+            "/api/admin/invites?limit=200").text
+
+        # 后页成员仍可管理、可签发邀请；后页旧邀请可撤销
+        assert admin_client.patch(
+            f"/api/admin/users/{members[-1]['userId']}",
+            json={"disabled": True}, headers=headers).status_code == 200
+        assert admin_client.patch(
+            f"/api/admin/users/{members[-1]['userId']}",
+            json={"disabled": False}, headers=headers).status_code == 200
+        assert admin_client.post(
+            f"/api/admin/users/{members[-1]['userId']}/revoke-sessions",
+            headers=headers).status_code == 200
+        issued = admin_client.post(
+            "/api/admin/invites", json={"userId": members[-1]["userId"]},
+            headers=headers)
+        assert issued.status_code == 201
+        assert admin_client.delete(
+            f"/api/admin/invites/{invites[0]['id']}",
+            headers=headers).status_code == 204
+
+
 def test_admin_routes_503_without_config_service_but_manage_users(tmp_path):
     with admin_api(tmp_path, with_service=False) as (
             admin_client, member_client, store, auth, service, admin,

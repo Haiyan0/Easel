@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AuthContext } from '../lib/auth';
 import {
-  PERSONAL_CHANNELS, buildPersonalRoute, channelLabel, emptyRouteForm,
-  errorText, formFromChannel, parseHarnessSummary, parseModelSettings,
-  sourceLabel,
+  PERSONAL_CHANNELS, buildPersonalRoute, channelLabel, credentialFields,
+  emptyRouteForm, errorText, formFromChannel, parseHarnessSummary,
+  parseModelSettings, sourceLabel,
 } from '../lib/controlSettings';
 import type {
-  ControlCall, HarnessSummary, ModelSettings, RouteForm, SettingsChannel,
+  ControlCall, HarnessSummary, ModelSettings, ProviderSchema, RouteForm,
+  SettingsChannel,
 } from '../lib/controlSettings';
 
 const panelStyle = {
@@ -121,6 +122,14 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
     setForm((current) => ({ ...current, ...patch }));
   };
 
+  const changeProvider = (value: string) => {
+    // 切换供应商时清空本次输入的凭证，避免环境变量名相同造成串用
+    formSeq.current += 1;
+    setForm((current) => ({
+      ...current, provider: value, secret: '', secretFields: {},
+    }));
+  };
+
   const save = async () => {
     if (!settings) return;
     const seq = ++saveSeq.current;
@@ -130,7 +139,7 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
     setBusy(true);
     setNotice('');
     try {
-      const route = buildPersonalRoute(form);
+      const route = buildPersonalRoute(form, providerSchema);
       await call('/api/settings/models/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -144,13 +153,19 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
         setNotice('已保存上一份配置；当前表单未被覆盖。');
         return;
       }
-      setForm((current) => ({ ...current, secret: '' }));
+      setForm((current) => ({
+        ...current, secret: '', secretFields: {},
+      }));
       setNotice('已保存个人配置。');
       setReload((value) => value + 1);
     } catch (error: unknown) {
       if (!mounted.current || seq !== saveSeq.current
           || ownerRef.current !== owner) return;
-      setNotice(`保存失败：${errorText(error)}`);
+      const message = error instanceof Error
+        && error.message === 'credentials_incomplete'
+        ? '请填写全部必需凭证后再保存。'
+        : errorText(error);
+      setNotice(`保存失败：${message}`);
     } finally {
       if (mounted.current && seq === saveSeq.current) setBusy(false);
     }
@@ -174,6 +189,9 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
         setNotice('已恢复上一通道的继承设置；当前表单未刷新。');
         return;
       }
+      setForm((current) => ({
+        ...current, secret: '', secretFields: {},
+      }));
       setNotice('已恢复继承管理员默认。');
       setReload((value) => value + 1);
     } catch (error: unknown) {
@@ -187,6 +205,11 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
 
   const entry = settings?.channels[channel];
   const managedMode = form.routeKind === 'managed-model';
+  const providerSchema: ProviderSchema | undefined =
+    settings?.providers?.[channel]?.[form.provider.trim()];
+  const credentialInputs = credentialFields(providerSchema);
+  const multifieldCredentials = credentialInputs.length > 0
+    && !(credentialInputs.length === 1 && credentialInputs[0].secret);
 
   return (
     <section style={panelStyle} aria-label="个人设置">
@@ -279,9 +302,15 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
             <select aria-label="个人配置方式" style={inputStyle}
               disabled={busy || loading}
               value={form.routeKind}
-              onChange={(event) => updateForm({
-                routeKind: event.target.value as RouteForm['routeKind'],
-              })}>
+              onChange={(event) => {
+                const next = event.target.value as RouteForm['routeKind'];
+                updateForm(next === 'managed-model'
+                  ? {
+                    routeKind: next, model: '', options: '',
+                    secret: '', secretFields: {},
+                  }
+                  : { routeKind: next, secret: '', secretFields: {} });
+              }}>
               <option value="complete">个人完整路由</option>
               <option value="managed-model">使用管理员受管模型</option>
             </select>
@@ -301,6 +330,12 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                     {entry.allowed_models.map((model) => (
                       <option key={model} value={model}>{model}</option>
                     ))}
+                    {form.model
+                      && !entry.allowed_models.includes(form.model) ? (
+                        <option value={form.model}>
+                          {form.model}（当前固定）
+                        </option>
+                      ) : null}
                   </select>
                 </label>
               ) : (
@@ -332,8 +367,8 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                 <input aria-label="供应商" style={inputStyle}
                   disabled={busy || loading}
                   value={form.provider}
-                  onChange={(event) => updateForm({
-                    provider: event.target.value })} />
+                  onChange={(event) => changeProvider(
+                    event.target.value)} />
               </label>
               <label style={{ display: 'grid', gap: '4px', fontSize: '13px' }}>
                 模型
@@ -359,15 +394,41 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                   onChange={(event) => updateForm({
                     protocol: event.target.value })} />
               </label>
-              <label style={{ display: 'grid', gap: '4px', fontSize: '13px' }}>
-                API Key
-                <input aria-label="API Key" type="password"
-                  autoComplete="new-password" style={inputStyle}
-                  disabled={busy || loading}
-                  value={form.secret}
-                  onChange={(event) => updateForm({
-                    secret: event.target.value })} />
-              </label>
+              {multifieldCredentials ? credentialInputs.map((field) => (
+                <label key={field.env} style={{
+                  display: 'grid', gap: '4px', fontSize: '13px',
+                }}>
+                  {`凭证 · ${field.label}（必填）`}
+                  <input aria-label={`凭证 ${field.label}`}
+                    type={field.secret ? 'password' : 'text'}
+                    autoComplete="new-password" style={inputStyle}
+                    disabled={busy || loading}
+                    value={form.secretFields[field.env] || ''}
+                    onChange={(event) => {
+                      formSeq.current += 1;
+                      const value = event.target.value;
+                      setForm((current) => ({
+                        ...current,
+                        secretFields: {
+                          ...current.secretFields,
+                          [field.env]: value,
+                        },
+                      }));
+                    }} />
+                </label>
+              )) : (
+                <label style={{
+                  display: 'grid', gap: '4px', fontSize: '13px',
+                }}>
+                  API Key
+                  <input aria-label="API Key" type="password"
+                    autoComplete="new-password" style={inputStyle}
+                    disabled={busy || loading}
+                    value={form.secret}
+                    onChange={(event) => updateForm({
+                      secret: event.target.value })} />
+                </label>
+              )}
               <label style={{ display: 'grid', gap: '4px', fontSize: '13px' }}>
                 非敏感参数（JSON）
                 <textarea aria-label="非敏感参数（JSON）" rows={3}
@@ -377,8 +438,11 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                     options: event.target.value })} />
               </label>
               <p style={{ margin: 0, color: '#6f7785', fontSize: '12px' }}>
-                留空 Key 只复用本人同供应商、地址与协议的已有凭证；不会复制管理员 Key。
-                更换地址/协议/供应商时必须重新输入。
+                {multifieldCredentials
+                  ? '全部留空只复用本人同供应商、地址与协议的已有凭证；'
+                    + '更换地址/协议/供应商或轮换时必须填写全部必需字段。'
+                  : '留空 Key 只复用本人同供应商、地址与协议的已有凭证；'
+                    + '不会复制管理员 Key。更换地址/协议/供应商时必须重新输入。'}
               </p>
             </>
           )}

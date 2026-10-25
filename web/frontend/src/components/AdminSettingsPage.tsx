@@ -61,6 +61,10 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   const [managed, setManaged] = useState<ManagedSettings | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [invites, setInvites] = useState<AdminInvite[]>([]);
+  const [userNextOffset, setUserNextOffset] = useState<number | null>(null);
+  const [inviteNextOffset, setInviteNextOffset] = useState<number | null>(null);
+  const [usersLoadingMore, setUsersLoadingMore] = useState(false);
+  const [invitesLoadingMore, setInvitesLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [channel, setChannel] = useState<AdminChannel>('speech');
@@ -74,6 +78,8 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   const loadSeq = useRef(0);
   const actionSeq = useRef(0);
   const formSeq = useRef(0);
+  const usersLoadingRef = useRef(false);
+  const invitesLoadingRef = useRef(false);
   const mounted = useRef(true);
   const ownerRef = useRef(`${ctx.userId}:${ctx.workspaceId}`);
   const channelRef = useRef<AdminChannel>('speech');
@@ -121,6 +127,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
         try {
           const parsedUsers = parseAdminUserPage(usersResult.value);
           setUsers(parsedUsers.users);
+          setUserNextOffset(parsedUsers.nextOffset);
           const firstMember = parsedUsers.users.find((item) =>
             item.role === 'member' && !item.disabled);
           setInviteUserId((current) => current || firstMember?.userId || '');
@@ -132,7 +139,9 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
       }
       if (invitesResult.status === 'fulfilled') {
         try {
-          setInvites(parseAdminInvitePage(invitesResult.value).invites);
+          const parsedInvites = parseAdminInvitePage(invitesResult.value);
+          setInvites(parsedInvites.invites);
+          setInviteNextOffset(parsedInvites.nextOffset);
         } catch (error: unknown) {
           errors.push(`邀请：${errorText(error)}`);
         }
@@ -215,12 +224,70 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
     setBusy(false);
   };
 
+  const loadMoreUsers = async () => {
+    if (userNextOffset === null || usersLoadingRef.current) return;
+    usersLoadingRef.current = true;
+    setUsersLoadingMore(true);
+    const owner = ownerRef.current;
+    const seq = loadSeq.current;
+    try {
+      const raw = await call<unknown>(
+        `/api/admin/users?limit=50&offset=${userNextOffset}`);
+      if (!mounted.current || ownerRef.current !== owner
+          || seq !== loadSeq.current) return;
+      const page = parseAdminUserPage(raw);
+      setUsers((current) => {
+        const seen = new Set(current.map((item) => item.userId));
+        return [...current,
+          ...page.users.filter((item) => !seen.has(item.userId))];
+      });
+      setUserNextOffset(page.nextOffset);
+    } catch (error: unknown) {
+      if (mounted.current) {
+        setNotice(`成员列表读取失败：${errorText(error)}`);
+      }
+    } finally {
+      usersLoadingRef.current = false;
+      if (mounted.current) setUsersLoadingMore(false);
+    }
+  };
+
+  const loadMoreInvites = async () => {
+    if (inviteNextOffset === null || invitesLoadingRef.current) return;
+    invitesLoadingRef.current = true;
+    setInvitesLoadingMore(true);
+    const owner = ownerRef.current;
+    const seq = loadSeq.current;
+    try {
+      const raw = await call<unknown>(
+        `/api/admin/invites?limit=50&offset=${inviteNextOffset}`);
+      if (!mounted.current || ownerRef.current !== owner
+          || seq !== loadSeq.current) return;
+      const page = parseAdminInvitePage(raw);
+      setInvites((current) => {
+        const seen = new Set(current.map((item) => item.id));
+        return [...current,
+          ...page.invites.filter((item) => !seen.has(item.id))];
+      });
+      setInviteNextOffset(page.nextOffset);
+    } catch (error: unknown) {
+      if (mounted.current) {
+        setNotice(`邀请列表读取失败：${errorText(error)}`);
+      }
+    } finally {
+      invitesLoadingRef.current = false;
+      if (mounted.current) setInvitesLoadingMore(false);
+    }
+  };
+
   const refreshInvites = async () => {
     try {
       const raw = await call<unknown>(
         '/api/admin/invites?limit=50&offset=0');
       if (!mounted.current) return;
-      setInvites(parseAdminInvitePage(raw).invites);
+      const page = parseAdminInvitePage(raw);
+      setInvites(page.invites);
+      setInviteNextOffset(page.nextOffset);
     } catch (error: unknown) {
       if (mounted.current) {
         setNotice(`邀请列表读取失败：${errorText(error)}`);
@@ -339,9 +406,13 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   const entry = managed?.defaults[channel];
   const memberOptions = users.filter((item) =>
     item.role === 'member' && !item.disabled);
-  const inviteTarget = memberOptions.find((item) =>
-    item.userId === inviteUserId)?.userId
+  const selectedUser = users.find((item) => item.userId === inviteUserId);
+  const activeInviteUserId = selectedUser?.disabled ? '' : inviteUserId;
+  const loadedTarget = memberOptions.find((item) =>
+    item.userId === activeInviteUserId);
+  const inviteTarget = activeInviteUserId
     || memberOptions[0]?.userId || '';
+  const missingInviteTarget = activeInviteUserId !== '' && !loadedTarget;
 
   return (
     <section style={panelStyle} aria-label="管理员设置">
@@ -504,6 +575,12 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
               ) : null}
             </div>
           ))}
+          {userNextOffset !== null ? (
+            <button style={buttonStyle} disabled={busy || usersLoadingMore}
+              onClick={() => { void loadMoreUsers(); }}>
+              {usersLoadingMore ? '加载中…' : '加载更多成员'}
+            </button>
+          ) : null}
         </div>
 
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -511,6 +588,9 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
             value={inviteTarget}
             onChange={(event) => setInviteUserId(event.target.value)}>
             <option value="">选择成员</option>
+            {missingInviteTarget ? (
+              <option value={inviteTarget}>已选成员（后页）</option>
+            ) : null}
             {memberOptions.map((item) => (
               <option key={item.userId} value={item.userId}>
                 {item.displayName}
@@ -561,6 +641,12 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
               ) : null}
             </div>
           ))}
+          {inviteNextOffset !== null ? (
+            <button style={buttonStyle} disabled={busy || invitesLoadingMore}
+              onClick={() => { void loadMoreInvites(); }}>
+              {invitesLoadingMore ? '加载中…' : '加载更多邀请'}
+            </button>
+          ) : null}
         </div>
       </section>
     </section>

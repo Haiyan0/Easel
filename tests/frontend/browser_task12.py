@@ -11,6 +11,7 @@ GET/保存响应不回填新身份。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -121,8 +122,10 @@ def seed_control(db_path: Path):
         members = {"A": store.create_user("A"), "B": store.create_user("B")}
         invites = {"admin1": admin_invite,
                    "admin2": auth.create_invite(admin, admin.user_id),
-                   "admin3": auth.create_invite(admin, admin.user_id)}
-        for name, count in (("A", 5), ("B", 3)):
+                   "admin3": auth.create_invite(admin, admin.user_id),
+                   "admin4": auth.create_invite(admin, admin.user_id),
+                   "admin5": auth.create_invite(admin, admin.user_id)}
+        for name, count in (("A", 8), ("B", 3)):
             invites[name] = [auth.create_invite(
                 admin, members[name].user_id) for _ in range(count)]
         config = ConfigService(store, MASTER_KEY)
@@ -137,6 +140,48 @@ def save_personal(db_path: Path, identity, route: dict) -> None:
     try:
         ConfigService(store, MASTER_KEY).save_override(
             identity, "speech", route)
+    finally:
+        store.close()
+
+
+def seed_bulk(db_path: Path, admin):
+    """在分页验收前写入 55 个成员与 56 个邀请（含最旧待兑换邀请）。"""
+    store = Store.connect(db_path)
+    try:
+        auth = AuthService(store)
+        members = []
+        for index in range(55):
+            name = "末尾成员" if index == 54 else f"分页成员{index:02d}"
+            members.append(store.create_user(name))
+        old_id, old_token, _expires = auth.issue_invite(
+            admin, members[0].user_id)
+        for _ in range(55):
+            auth.create_invite(admin, members[0].user_id)
+        return members[-1], old_id, old_token
+    finally:
+        store.close()
+
+
+def read_override_blob(db_path: Path, workspace_id: str,
+                       channel: str) -> bytes:
+    store = Store.connect(db_path)
+    try:
+        row = store.get_workspace_override(workspace_id, channel)
+        assert row is not None and row["encrypted_secrets"] is not None
+        return bytes(row["encrypted_secrets"])
+    finally:
+        store.close()
+
+
+def invite_user_id(db_path: Path, token: str) -> str:
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    store = Store.connect(db_path)
+    try:
+        row = store._connection.execute(
+            "SELECT user_id FROM invites WHERE token_digest = ?",
+            (digest,)).fetchone()
+        assert row is not None
+        return str(row["user_id"])
     finally:
         store.close()
 
@@ -190,6 +235,15 @@ async def page_excerpt(page) -> str:
         return (await page.locator("body").inner_text())[:600]
     except Exception:  # noqa: BLE001
         return "<unavailable>"
+
+
+async def settings_channel(capture, context, origin: str,
+                           channel: str = "speech") -> dict:
+    cookie = await cookie_header(context, origin)
+    response = await capture.get(
+        f"{origin}/api/settings/models", headers={"Cookie": cookie})
+    assert response.status_code == 200, response.text
+    return response.json()["channels"][channel]
 
 
 async def fill(page, label: str, value: str) -> None:
@@ -587,6 +641,250 @@ async def scenario_stale_identity(browser, origin, invites, db, members,
                 await context.close()
 
 
+async def scenario_managed_model_precision(browser, origin, invites, capture,
+                                           results, failures,
+                                           screenshots) -> None:
+    contexts: list = []
+    page_admin = page_member = None
+    try:
+        context_admin, page_admin = await login_app(
+            browser, origin, invites["admin4"])
+        context_member, page_member = await login_app(
+            browser, origin, invites["A"][5])
+        contexts.extend([context_admin, context_member])
+        await open_admin(page_admin)
+        await wait_text(page_admin, "受管默认模型 · 版本")
+        await fill(page_admin, "模型", "admin-v4")
+        await fill(page_admin, "非敏感参数（JSON）",
+                   '{"speed": 1.3, "voice": "admin"}')
+        await fill(page_admin, "允许的模型（逗号分隔）",
+                   "admin-v4, admin-v5, admin-v6")
+        await page_admin.get_by_role("button", name="保存全体默认").click()
+        await wait_text(page_admin, "全体默认已保存为新版本")
+        await wait_text(page_admin, "openai-compatible/admin-v4")
+
+        await open_personal(page_member)
+        await wait_text(page_member, "管理员默认（inherited · v[0-9]+）")
+        await field(page_member, "个人配置方式").select_option(
+            "managed-model")
+        tree_model = await field(page_member, "受管模型").input_value()
+        assert tree_model == "", tree_model
+        assert await field(
+            page_member, "非敏感参数（JSON）").input_value() == ""
+        await fill(page_member, "非敏感参数（JSON）", '{"speed": 1.4}')
+        await page_member.get_by_role(
+            "button", name="保存个人配置").click()
+        await wait_text(page_member, "个人配置（managed-model · v[0-9]+）")
+
+        await page_member.get_by_role(
+            "button", name="重新读取").click()
+        await wait_text(page_member, "个人配置（managed-model · v[0-9]+）")
+        assert await field(page_member, "受管模型").input_value() == ""
+        assert json.loads(await field(
+            page_member, "非敏感参数（JSON）").input_value()) == {
+                "speed": 1.4}
+        speech = await settings_channel(capture, context_member, origin)
+        assert speech["model"] == "admin-v4"
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.4}
+        assert speech["options"] == {"speed": 1.4, "voice": "admin"}
+
+        # 原样保存：删除原先会把生效 model 固化成个人值
+        await page_member.get_by_role(
+            "button", name="保存个人配置").click()
+        await wait_text(page_member, "已保存个人配置")
+        speech = await settings_channel(capture, context_member, origin)
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.4}
+
+        # 管理员更新默认：跟随新 model，个人 speed 继续覆盖
+        await fill(page_admin, "模型", "admin-v5")
+        await fill(page_admin, "非敏感参数（JSON）",
+                   '{"speed": 1.8, "voice": "nova"}')
+        await page_admin.get_by_role("button", name="保存全体默认").click()
+        await wait_text(page_admin, "openai-compatible/admin-v5")
+        await page_member.get_by_role("button", name="重新读取").click()
+        await wait_text(page_member, "openai-compatible/admin-v5")
+        speech = await settings_channel(capture, context_member, origin)
+        assert speech["model"] == "admin-v5"
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.4}
+        assert speech["options"]["speed"] == 1.4
+        assert speech["options"]["voice"] == "nova"
+
+        # 显式固定 model，且显式 voice 与当时默认相同也不得视为未覆盖
+        await field(page_member, "受管模型").select_option("admin-v5")
+        await fill(page_member, "非敏感参数（JSON）", '{"voice": "nova"}')
+        await page_member.get_by_role(
+            "button", name="保存个人配置").click()
+        await wait_text(page_member, "已保存个人配置")
+        speech = await settings_channel(capture, context_member, origin)
+        assert speech["personal_model"] == "admin-v5"
+        assert speech["personal_options"] == {"voice": "nova"}
+
+        await fill(page_admin, "模型", "admin-v6")
+        await fill(page_admin, "非敏感参数（JSON）",
+                   '{"voice": "other", "speed": 2.0}')
+        await page_admin.get_by_role("button", name="保存全体默认").click()
+        await wait_text(page_admin, "openai-compatible/admin-v6")
+        await page_member.get_by_role("button", name="重新读取").click()
+        await wait_text(page_member, "openai-compatible/admin-v5")
+        speech = await settings_channel(capture, context_member, origin)
+        assert speech["model"] == "admin-v5"
+        assert speech["personal_model"] == "admin-v5"
+        assert speech["personal_options"] == {"voice": "nova"}
+        assert speech["options"] == {"voice": "nova", "speed": 2.0}
+        path = SCREENSHOTS / "t12-managed-model-follow.png"
+        await page_member.screenshot(path=str(path))
+        screenshots.append(str(path))
+        results["t12_managed_model_follow_precision"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(
+            f"T12-受管模型原值: {error!r} BODY="
+            f"{await page_excerpt(page_member or page_admin)}")
+    finally:
+        for context in contexts:
+            await context.close()
+
+
+async def scenario_multifield_credentials(browser, origin, invites, db_path,
+                                          members, capture, results,
+                                          failures, screenshots) -> None:
+    context = page = None
+    try:
+        context, page = await login_app(browser, origin, invites["A"][6])
+        save_posts: list[str] = []
+        page.on("request", lambda request: save_posts.append(request.url)
+                if request.method == "POST"
+                and request.url.endswith("/api/settings/models/save") else None)
+        await open_personal(page)
+        await field(page, "个人配置方式").select_option("complete")
+        await fill(page, "供应商", "minimax")
+        await fill(page, "模型", "speech-01")
+        await fill(page, "API 地址", "https://minimax.example/v1")
+        await fill(page, "协议", "minimax")
+        await field(page, "凭证 API Key").wait_for(timeout=20000)
+        await fill(page, "凭证 API Key", "task12-minimax-key-sentinel")
+        await fill(page, "凭证 Group ID", "task12-minimax-group-sentinel")
+        await page.get_by_role("button", name="保存个人配置").click()
+        await wait_text(page, "个人配置（complete · v[0-9]+）")
+        blob = read_override_blob(
+            db_path, members["A"].workspace_id, "speech")
+        body = await page.locator("body").inner_text()
+        assert "task12-minimax-key-sentinel" not in body, body
+        assert "task12-minimax-group-sentinel" not in body, body
+        speech = await settings_channel(capture, context, origin)
+        assert speech["source"] == "user"
+        assert speech["mode"] == "complete"
+        assert speech["provider"] == "minimax"
+        assert speech["broker_supported"] is False
+
+        # 重新打开：凭证字段不得从服务端读回
+        await page.get_by_role("button", name="重新读取").click()
+        await wait_text(page, "个人配置（complete · v[0-9]+）")
+        assert await field(page, "凭证 API Key").input_value() == ""
+        assert await field(page, "凭证 Group ID").input_value() == ""
+
+        # 全部留空：同作用域复用，密文逐字节不变
+        await page.get_by_role("button", name="保存个人配置").click()
+        await wait_text(page, "已保存个人配置")
+        assert read_override_blob(
+            db_path, members["A"].workspace_id, "speech") == blob
+
+        # 只填一个必需字段：本地拒绝，不发请求
+        before_posts = len(save_posts)
+        await fill(page, "凭证 API Key", "partial-key")
+        await page.get_by_role("button", name="保存个人配置").click()
+        await wait_text(page, "请填写全部必需凭证")
+        assert len(save_posts) == before_posts, save_posts
+        assert read_override_blob(
+            db_path, members["A"].workspace_id, "speech") == blob
+
+        # 合法全量轮换
+        await fill(page, "凭证 API Key", "task12-minimax-key-rotated")
+        await fill(page, "凭证 Group ID", "task12-minimax-group-rotated")
+        await page.get_by_role("button", name="保存个人配置").click()
+        await wait_text(page, "已保存个人配置")
+        rotated = read_override_blob(
+            db_path, members["A"].workspace_id, "speech")
+        assert rotated != blob
+        path = SCREENSHOTS / "t12-multifield-credentials.png"
+        await page.screenshot(path=str(path))
+        screenshots.append(str(path))
+
+        # 换目的地址但全部留空：明确拒绝，密文不变
+        await fill(page, "API 地址", "https://minimax-other.example/v1")
+        await page.get_by_role("button", name="保存个人配置").click()
+        await wait_text(page, "保存失败")
+        assert read_override_blob(
+            db_path, members["A"].workspace_id, "speech") == rotated
+        body = await page.locator("body").inner_text()
+        assert "task12-minimax-key" not in body, body
+        assert "task12-minimax-group" not in body, body
+        results["t12_personal_multifield_credentials"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(
+            f"T12-多字段凭证: {error!r} BODY={await page_excerpt(page)}")
+    finally:
+        if context is not None:
+            await context.close()
+
+
+async def scenario_pagination(browser, origin, invites, db_path, admin,
+                              results, failures, screenshots) -> None:
+    context = page = None
+    try:
+        last_member, old_invite_id, old_token = seed_bulk(db_path, admin)
+        assert last_member.user_id
+        context, page = await login_app(
+            browser, origin, invites["admin5"])
+        await open_admin(page)
+        await wait_text(page, "成员与邀请")
+        await wait_text(page, "分页成员00")
+        assert await page.get_by_role(
+            "button", name="加载更多成员").count() == 1
+        assert await page.get_by_role(
+            "button", name="加载更多邀请").count() == 1
+
+        await page.get_by_role("button", name="加载更多成员").click()
+        await wait_text(page, "末尾成员")
+        await page.get_by_role("button", name="禁用 末尾成员").click()
+        await wait_text(page, "已禁用 末尾成员")
+        await page.get_by_role("button", name="启用 末尾成员").click()
+        await wait_text(page, "已启用 末尾成员")
+        await page.get_by_role("button", name="撤销登录 末尾成员").click()
+        await wait_text(page, "已撤销")
+
+        await field(page, "邀请成员").select_option(label="末尾成员")
+        # 重新读取会把成员列表退回第一页；已选目标不能被悄悄替换
+        await page.get_by_role("button", name="重新读取").first.click()
+        await wait_text(page, "分页成员00")
+        await page.get_by_role("button", name="创建邀请").click()
+        section = page.locator('section[aria-label="邀请签发结果"]')
+        await section.wait_for(timeout=20000)
+        token = (await section.locator("code").text_content() or "").strip()
+        assert token
+        assert invite_user_id(db_path, token) == last_member.user_id
+        await page.get_by_role("button", name="关闭邀请结果").click()
+
+        await page.get_by_role("button", name="加载更多邀请").click()
+        await page.get_by_role(
+            "button", name=f"撤销邀请 {old_invite_id}").click()
+        await wait_text(page, "邀请已撤销")
+        body = await page.locator("body").inner_text()
+        assert old_token not in body, body
+        path = SCREENSHOTS / "t12-pagination.png"
+        await page.screenshot(path=str(path))
+        screenshots.append(str(path))
+        results["t12_pagination_reaches_later_rows"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(
+            f"T12-分页管理: {error!r} BODY={await page_excerpt(page)}")
+    finally:
+        if context is not None:
+            await context.close()
+
+
 async def main() -> int:
     SCREENSHOTS.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(tempfile.mkdtemp(prefix="easel-task12-"))
@@ -647,6 +945,15 @@ async def main() -> int:
                 ("stale-identity", lambda: scenario_stale_identity(
                     browser, origin, invites, db_path, members, capture,
                     results, failures)),
+                ("managed-model", lambda: scenario_managed_model_precision(
+                    browser, origin, invites, capture, results, failures,
+                    screenshots)),
+                ("multifield", lambda: scenario_multifield_credentials(
+                    browser, origin, invites, db_path, members, capture,
+                    results, failures, screenshots)),
+                ("pagination", lambda: scenario_pagination(
+                    browser, origin, invites, db_path, admin, results,
+                    failures, screenshots)),
             ):
                 only = {item.strip() for item in
                         os.environ.get("EASEL_TASK12_ONLY", "").split(",")
@@ -685,7 +992,7 @@ async def main() -> int:
     import shutil as _shutil
     _shutil.rmtree(tmp_path, ignore_errors=True)
     print("TMP_CLEANED", not tmp_path.exists())
-    if failures or len(results) != 5 or not all(results.values()):
+    if failures or len(results) != 8 or not all(results.values()):
         return 1
     return 0
 

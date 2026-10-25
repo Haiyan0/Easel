@@ -792,6 +792,30 @@ class ConfigService:
             identity.workspace_id, channel, managed_row, override_row)
         return route
 
+    @staticmethod
+    def _provider_schema(channel: str) -> dict[str, dict]:
+        """公开能力目录的凭证字段描述；只含 env/label/必填/是否秘密/choices。"""
+        group = _REGISTRY_GROUP[channel]
+        schema: dict[str, dict] = {}
+        for provider in MODEL_GROUPS[group]["providers"]:
+            metadata = provider_metadata(group, provider["id"])
+            schema[provider["id"]] = {
+                "name": provider["name"],
+                "keys": [
+                    {
+                        "env": key["env"],
+                        "label": key["label"],
+                        "required": bool(key["required"]),
+                        "secret": bool(key["secret"]),
+                        "choices": list(key.get("choices") or ()),
+                    }
+                    for key in provider["keys"]
+                ],
+                "override_allowed": metadata["override_allowed"],
+                "broker_adapter": metadata["broker_adapter"],
+            }
+        return schema
+
     def public_settings(self, actor: Identity) -> dict:
         identity = self._store.require_identity(actor)
         latest = self._store.latest_managed_revision()
@@ -836,6 +860,12 @@ class ConfigService:
                     raise DomainError("configuration_invalid", 500) from None
                 entry["source"] = "user"
                 entry["version"] = int(override["version"])
+                if override["route_kind"] == "managed-model":
+                    # 区分“生效摘要”与个人编辑原值：前端重开表单时只编辑
+                    # 个人显式 model/options，不能把合并后的默认值当成个人覆盖。
+                    entry["personal_model"] = public.get("model")
+                    entry["personal_options"] = dict(
+                        public.get("options") or {})
                 if override["route_kind"] == "complete":
                     self._decrypt(
                         override["encrypted_secrets"],
@@ -903,4 +933,11 @@ class ConfigService:
                     entry["broker_supported"] = False
             channels[channel] = entry
 
-        return {"version": latest_version, "channels": channels}
+        return {
+            "version": latest_version,
+            "channels": channels,
+            "providers": {
+                channel: self._provider_schema(channel)
+                for channel in ADMIN_CHANNELS
+            },
+        }

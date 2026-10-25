@@ -357,6 +357,178 @@ def test_personal_managed_model_and_restore_inheritance(tmp_path):
         assert chat.json()["code"] == "override_not_allowed"
 
 
+def test_managed_model_public_view_preserves_personal_raw_values(tmp_path):
+    def publish_default(expected: int, model: str, options: dict) -> None:
+        admin_csrf = login(client, auth, admin, admin)
+        response = client.post(
+            "/api/admin/managed-config",
+            json={"defaults": {"speech": speech_route(
+                model=model, options=options, secret=(
+                    ADMIN_SECRET if expected == 0 else ""),
+                allowed_models=["tts-default", "tts-alt", "tts-v2"])}},
+            headers={**write_headers(admin_csrf), "If-Match": str(expected)})
+        assert response.status_code == 200, response.text
+
+    with settings_api(tmp_path) as (client, store, auth, service, admin,
+                                    member):
+        publish_default(0, "tts-default",
+                        {"speed": 1.3, "voice": "admin"})
+        csrf = login(client, auth, admin, member)
+
+        saved = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech",
+                  "route": {"route_kind": "managed-model",
+                            "options": {"speed": 1.7,
+                                        "voice": "alloy"}}},
+            headers=write_headers(csrf))
+        assert saved.status_code == 200, saved.text
+
+        speech = client.get("/api/settings/models").json()["channels"]["speech"]
+        assert speech["model"] == "tts-default"
+        assert speech["options"] == {"speed": 1.7, "voice": "alloy"}
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.7, "voice": "alloy"}
+
+        # 原样再次保存：省略 model 仍省略，个人原始参数不丢
+        resaved = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech",
+                  "route": {"route_kind": "managed-model",
+                            "options": {"speed": 1.7,
+                                        "voice": "alloy"}}},
+            headers=write_headers(csrf))
+        assert resaved.status_code == 200, resaved.text
+        speech = client.get("/api/settings/models").json()["channels"]["speech"]
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.7, "voice": "alloy"}
+
+        # 管理员更新默认：未显式固定的 model 跟随；个人参数继续覆盖
+        publish_default(1, "tts-alt",
+                        {"speed": 1.8, "voice": "nova"})
+        csrf = login(client, auth, admin, member)
+        speech = client.get("/api/settings/models").json()["channels"]["speech"]
+        assert speech["model"] == "tts-alt"
+        assert speech["options"] == {"speed": 1.7, "voice": "alloy"}
+        assert speech["personal_model"] is None
+        assert speech["personal_options"] == {"speed": 1.7, "voice": "alloy"}
+
+        # 显式值与当时默认相同也必须保持“显式”
+        explicit = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech",
+                  "route": {"route_kind": "managed-model",
+                            "model": "tts-alt",
+                            "options": {"voice": "nova"}}},
+            headers=write_headers(csrf))
+        assert explicit.status_code == 200, explicit.text
+        publish_default(2, "tts-v2",
+                        {"voice": "other", "speed": 2.0})
+        login(client, auth, admin, member)
+        speech = client.get("/api/settings/models").json()["channels"]["speech"]
+        assert speech["model"] == "tts-alt"
+        assert speech["options"] == {"voice": "nova", "speed": 2.0}
+        assert speech["personal_model"] == "tts-alt"
+        assert speech["personal_options"] == {"voice": "nova"}
+        assert ADMIN_SECRET not in client.get(
+            "/api/settings/models").text
+
+
+def test_public_settings_exposes_provider_credential_schema_only(tmp_path):
+    with settings_api(tmp_path) as (client, store, auth, service, admin,
+                                    member):
+        login(client, auth, admin, member)
+        response = client.get("/api/settings/models")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        providers = body["providers"]
+        assert {"speech", "image", "video", "music", "chat"} <= set(providers)
+        minimax = providers["speech"]["minimax"]
+        keys = {item["env"]: item for item in minimax["keys"]}
+        assert keys["MINIMAX_API_KEY"]["required"] is True
+        assert keys["MINIMAX_API_KEY"]["secret"] is True
+        assert keys["MINIMAX_GROUP_ID"]["required"] is True
+        assert keys["MINIMAX_GROUP_ID"]["secret"] is False
+        assert keys["MINIMAX_GROUP_ID"]["label"] == "Group ID"
+        assert "aliases" not in keys["MINIMAX_API_KEY"]
+        assert isinstance(keys["MINIMAX_API_KEY"]["choices"], list)
+        assert minimax["override_allowed"] is True
+        # 只有能力目录元数据，不含真实凭证/密文/数据库行
+        assert "minimax-key-sentinel" not in response.text
+        assert "encrypted" not in response.text
+        assert "credential_ref" not in response.text
+
+
+def test_personal_multifield_credentials_new_rotate_and_reuse(tmp_path):
+    with settings_api(tmp_path) as (client, store, auth, service, admin,
+                                    member):
+        csrf = login(client, auth, admin, member)
+        saved = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech", "route": personal_minimax()},
+            headers=write_headers(csrf))
+        assert saved.status_code == 200, saved.text
+        blob = store.get_workspace_override(
+            member.workspace_id, "speech")["encrypted_secrets"]
+
+        # 全部留空：同作用域复用本人原凭证，密文逐字节不变
+        reuse_route = personal_minimax(model="speech-02")
+        reuse_route.pop("secret")
+        reused = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech", "route": reuse_route},
+            headers=write_headers(csrf))
+        assert reused.status_code == 200, reused.text
+        assert store.get_workspace_override(
+            member.workspace_id, "speech")["encrypted_secrets"] == blob
+
+        # 只给部分新字段：明确拒绝，不拼接未知旧密钥
+        partial = personal_minimax(secret={"MINIMAX_API_KEY": "only-key"})
+        rejected = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech", "route": partial},
+            headers=write_headers(csrf))
+        assert rejected.status_code == 400, rejected.text
+        assert rejected.json()["code"] == "invalid_secret_bundle"
+        assert store.get_workspace_override(
+            member.workspace_id, "speech")["encrypted_secrets"] == blob
+
+        # 换目的地址但全部留空：拒绝且不改原配置/密文
+        changed = personal_minimax(
+            base_url="https://minimax-other.example/v1")
+        changed.pop("secret")
+        rejected_scope = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech", "route": changed},
+            headers=write_headers(csrf))
+        assert rejected_scope.status_code == 400
+        assert rejected_scope.json()["code"] == "personal_credentials_required"
+        assert store.get_workspace_override(
+            member.workspace_id, "speech")["encrypted_secrets"] == blob
+
+        # 合法全量轮换：两个字段都变化，密文更新
+        rotated = personal_minimax(
+            model="speech-03",
+            secret={"MINIMAX_API_KEY": "rotated-key-sentinel",
+                    "MINIMAX_GROUP_ID": "rotated-group-sentinel"})
+        rotated_response = client.post(
+            "/api/settings/models/save",
+            json={"channel": "speech", "route": rotated},
+            headers=write_headers(csrf))
+        assert rotated_response.status_code == 200, rotated_response.text
+        rotated_blob = store.get_workspace_override(
+            member.workspace_id, "speech")["encrypted_secrets"]
+        assert rotated_blob != blob
+        assert service.credentials_for_ref(
+            f"workspace:{member.workspace_id}:speech:"
+            f"{store.get_workspace_override(member.workspace_id, 'speech')['version']}"
+        ) == {"MINIMAX_API_KEY": "rotated-key-sentinel",
+              "MINIMAX_GROUP_ID": "rotated-group-sentinel"}
+        public = client.get("/api/settings/models")
+        assert "rotated-key-sentinel" not in public.text
+        assert "rotated-group-sentinel" not in public.text
+
+
 def test_settings_routes_stay_503_without_config_service(tmp_path):
     with settings_api(tmp_path, with_service=False) as (
             client, store, auth, service, admin, member):

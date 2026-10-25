@@ -185,6 +185,49 @@ function channel(overrides = {}) {
   };
 }
 
+function key(env, label, overrides = {}) {
+  return {
+    env,
+    label,
+    required: true,
+    secret: true,
+    choices: [],
+    ...overrides,
+  };
+}
+
+function provider(name, keys, overrides = {}) {
+  return {
+    name,
+    keys,
+    override_allowed: true,
+    broker_adapter: null,
+    ...overrides,
+  };
+}
+
+function providers() {
+  return {
+    speech: {
+      'openai-compatible': provider('OpenAI 兼容', [
+        key('VOICE_API_KEY', 'API Key'),
+        key('VOICE_BASE_URL', 'API 根地址', { secret: false }),
+      ], { broker_adapter: 'openai-compatible' }),
+      minimax: provider('MiniMax', [
+        key('MINIMAX_API_KEY', 'API Key'),
+        key('MINIMAX_GROUP_ID', 'Group ID', { secret: false }),
+        key('MINIMAX_BASE_URL', '根地址', {
+          required: false, secret: false,
+        }),
+      ]),
+    },
+    image: {},
+    video: {},
+    music: {},
+    chat: {},
+  };
+}
+
 function modelSettings(channels = {}) {
   return {
     version: 3,
@@ -196,6 +239,7 @@ function modelSettings(channels = {}) {
       chat: channel({ override_allowed: false }),
       ...channels,
     },
+    providers: providers(),
   };
 }
 
@@ -524,6 +568,229 @@ test('a stale A settings response cannot fill the B form', async () => {
 // --------------------------------------------------------------------------
 // 管理员设置组件
 // --------------------------------------------------------------------------
+
+test('managed-model form edits only personal raw values and keeps following', async () => {
+  const settings = modelSettings({
+    speech: channel({
+      configured: true, source: 'user', version: 2, mode: 'managed-model',
+      provider: 'openai-compatible', model: 'admin-v2',
+      base_url: 'https://provider.example/v1', protocol: 'openai',
+      options: { speed: 1.7, voice: 'alloy' },
+      allowed_models: ['admin-v2', 'admin-v3'],
+      personal_model: null,
+      personal_options: { speed: 1.7 },
+    }),
+  });
+  const { call, requests } = recorder((path) => {
+    if (path === '/api/settings/models') return settings;
+    if (path === '/api/settings/harness') return harnessSummary;
+    if (path === '/api/settings/models/save') return { ok: true };
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/ControlSettingsPage.tsx');
+  view.render({ ctx: ctx(), call });
+  await settle();
+  let tree = view.render({ ctx: ctx(), call });
+  assert.equal(select(tree, '受管模型').props.value, '');
+  assert.deepEqual(JSON.parse(area(tree, '非敏感参数（JSON）').props.value),
+    { speed: 1.7 });
+
+  button(tree, '保存个人配置').props.onClick();
+  await settle();
+  const save = requests.find((item) => item.path === '/api/settings/models/save');
+  const route = JSON.parse(save.init.body).route;
+  assert.deepEqual(route, {
+    route_kind: 'managed-model',
+    options: { speed: 1.7 },
+  });
+  assert.equal('model' in route, false);
+});
+
+test('explicit managed model is preserved even when equal to the default', async () => {
+  const settings = modelSettings({
+    speech: channel({
+      configured: true, source: 'user', version: 3, mode: 'managed-model',
+      provider: 'openai-compatible', model: 'admin-v2',
+      base_url: 'https://provider.example/v1', protocol: 'openai',
+      options: { voice: 'nova' },
+      allowed_models: ['admin-v2', 'admin-v3'],
+      personal_model: 'admin-v2',
+      personal_options: { voice: 'nova' },
+    }),
+  });
+  const { call, requests } = recorder((path) => {
+    if (path === '/api/settings/models') return settings;
+    if (path === '/api/settings/harness') return harnessSummary;
+    if (path === '/api/settings/models/save') return { ok: true };
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/ControlSettingsPage.tsx');
+  view.render({ ctx: ctx(), call });
+  await settle();
+  const tree = view.render({ ctx: ctx(), call });
+  assert.equal(select(tree, '受管模型').props.value, 'admin-v2');
+  button(tree, '保存个人配置').props.onClick();
+  await settle();
+  const route = JSON.parse(requests.find(
+    (item) => item.path === '/api/settings/models/save').init.body).route;
+  assert.equal(route.model, 'admin-v2');
+  assert.deepEqual(route.options, { voice: 'nova' });
+});
+
+test('multi-field provider sends a typed bundle and never reads secrets back', async () => {
+  const { call, requests } = recorder((path) => {
+    if (path === '/api/settings/models') return modelSettings();
+    if (path === '/api/settings/harness') return harnessSummary;
+    if (path === '/api/settings/models/save') return { ok: true };
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/ControlSettingsPage.tsx');
+  view.render({ ctx: ctx(), call });
+  await settle();
+  let tree = view.render({ ctx: ctx(), call });
+  change(field(tree, '供应商'), ' minimax ');
+  change(field(tree, '模型'), 'speech-01');
+  change(field(tree, 'API 地址'), 'https://minimax.example/v1');
+  change(field(tree, '协议'), 'minimax');
+  tree = view.render({ ctx: ctx(), call });
+  assert.ok(field(tree, '凭证 API Key'), '缺少 API Key 凭证输入');
+  assert.ok(field(tree, '凭证 Group ID'), '缺少 Group ID 凭证输入');
+  assert.equal(field(tree, 'API Key'), undefined,
+    '多字段凭证不得退回单个字符串输入');
+
+  change(field(tree, '凭证 API Key'), 'minimax-key-value');
+  change(field(tree, '凭证 Group ID'), 'minimax-group-value');
+  tree = view.render({ ctx: ctx(), call });
+  button(tree, '保存个人配置').props.onClick();
+  await settle();
+  const route = JSON.parse(requests.find(
+    (item) => item.path === '/api/settings/models/save').init.body).route;
+  assert.deepEqual(route.secret, {
+    MINIMAX_API_KEY: 'minimax-key-value',
+    MINIMAX_GROUP_ID: 'minimax-group-value',
+  });
+});
+
+test('multi-field credentials reject partial input and allow all blank reuse', async () => {
+  const settings = modelSettings({
+    speech: channel({
+      configured: true, source: 'user', version: 1, mode: 'complete',
+      provider: 'minimax', model: 'speech-01',
+      base_url: 'https://minimax.example/v1', protocol: 'minimax',
+      options: {},
+    }),
+  });
+  const { call, requests } = recorder((path) => {
+    if (path === '/api/settings/models') return settings;
+    if (path === '/api/settings/harness') return harnessSummary;
+    if (path === '/api/settings/models/save') return { ok: true };
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/ControlSettingsPage.tsx');
+  view.render({ ctx: ctx(), call });
+  await settle();
+  let tree = view.render({ ctx: ctx(), call });
+  assert.ok(field(tree, '凭证 API Key'));
+  assert.ok(field(tree, '凭证 Group ID'));
+
+  change(field(tree, '凭证 API Key'), 'only-one-field');
+  tree = view.render({ ctx: ctx(), call });
+  button(tree, '保存个人配置').props.onClick();
+  await settle();
+  assert.equal(requests.filter(
+    (item) => item.path === '/api/settings/models/save').length, 0);
+  tree = view.render({ ctx: ctx(), call });
+  assert.match(text(tree), /请填写全部必需凭证/);
+
+  change(field(tree, '凭证 API Key'), '');
+  tree = view.render({ ctx: ctx(), call });
+  button(tree, '保存个人配置').props.onClick();
+  await settle();
+  const route = JSON.parse(requests.find(
+    (item) => item.path === '/api/settings/models/save').init.body).route;
+  assert.equal('secret' in route, false);
+});
+
+test('admin member and invite pages can load later rows', async () => {
+  const firstUsers = Array.from({ length: 50 }, (_, index) => user({
+    userId: `user-${index}`, displayName: `成员 ${index}`,
+  }));
+  const lastUser = user({ userId: 'user-last', displayName: '末尾成员' });
+  const firstInvites = Array.from({ length: 50 }, (_, index) => invite({
+    id: `invite-${index}`, userId: firstUsers[index].userId,
+  }));
+  const oldInvite = invite({ id: 'old-invite', userId: 'user-last' });
+  const { call, requests } = recorder((path) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path === '/api/admin/users?limit=50&offset=0') {
+      return { users: firstUsers, nextOffset: 50 };
+    }
+    if (path === '/api/admin/users?limit=50&offset=50') {
+      return { users: [lastUser], nextOffset: null };
+    }
+    if (path === '/api/admin/invites?limit=50&offset=0') {
+      return { invites: firstInvites, nextOffset: 50 };
+    }
+    if (path === '/api/admin/invites?limit=50&offset=50') {
+      return { invites: [oldInvite], nextOffset: null };
+    }
+    if (path === '/api/admin/invites' && init?.method === 'POST') {
+      return { id: 'new-invite', token: 'new-token', expiresAt: 9999999999 };
+    }
+    if (path.startsWith('/api/admin/users/') && path.endsWith('/revoke-sessions')) {
+      return { revoked: 0 };
+    }
+    if (path.startsWith('/api/admin/invites/') && path.endsWith('old-invite')) {
+      return undefined;
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  let tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '加载更多成员'));
+  assert.ok(button(tree, '加载更多邀请'));
+  assert.equal(text(tree).includes('末尾成员'), false);
+  assert.equal(text(tree).includes('old-invite'), false);
+
+  button(tree, '加载更多成员').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.match(text(tree), /末尾成员/);
+  assert.ok(button(tree, '禁用 末尾成员'));
+  assert.ok(nodes(tree, 'option').some((node) =>
+    node.props.value === 'user-last'), '邀请目标选择未包含后页成员');
+
+  // 选择后页成员后重新读取：目标不能被第一页悄悄替换
+  const inviteSelect = select(tree, '邀请成员');
+  inviteSelect.props.onChange({ target: { value: 'user-last' } });
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  button(tree, '重新读取').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(select(tree, '邀请成员').props.value, 'user-last');
+  assert.ok(nodes(tree, 'option').some((node) =>
+    node.props.value === 'user-last'));
+  button(tree, '创建邀请').props.onClick();
+  await settle();
+  const issued = requests.find((item) =>
+    item.path === '/api/admin/invites' && item.init?.method === 'POST');
+  assert.deepEqual(JSON.parse(issued.init.body), { userId: 'user-last' });
+
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  button(tree, '加载更多邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-invite'));
+  assert.ok(requests.some((item) =>
+    item.path === '/api/admin/users?limit=50&offset=50'));
+  assert.ok(requests.some((item) =>
+    item.path === '/api/admin/invites?limit=50&offset=50'));
+  assert.equal(requests.some((item) =>
+    item.path.includes('limit=200') || item.path.includes('limit=1000')),
+  false);
+});
 
 test('member never renders admin write controls or calls admin APIs', async () => {
   const { call, requests } = recorder(() => {
