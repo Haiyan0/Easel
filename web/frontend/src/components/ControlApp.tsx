@@ -838,7 +838,8 @@ function ControlWorkspace({
     setMessageStart(0);
     setMessageTotal(0);
     setMessageLoadingMore(false);
-    messageSeq.current += 1;
+    // 初次读取也占用消息窗口代次；晚到的旧初次快照不得覆盖较新的提交。
+    const generation = ++messageSeq.current;
     let cancelled = false;
     const sendAtStart = sendSeq.current;
     // 只按加载开始前已接纳的 Run 清理；加载期间新接纳的 Run 不误删。
@@ -849,7 +850,8 @@ function ControlWorkspace({
       try {
         const runs = await loadActiveRuns(sessionId);
         const latest = await fetchLatestMessages(sessionId);
-        if (cancelled || !isSelected(sessionId, seq)) return;
+        if (cancelled || !isSelected(sessionId, seq)
+            || generation !== messageSeq.current) return;
         apply(() => {
           setMessages(latest.messages);
           setMessageStart(latest.start);
@@ -870,7 +872,8 @@ function ControlWorkspace({
           clearRecovery(ctx, sessionId);
         }
       } catch (error) {
-        if (cancelled || !isSelected(sessionId, seq)) return;
+        if (cancelled || !isSelected(sessionId, seq)
+            || generation !== messageSeq.current) return;
         apply(() => setHistoryError(error instanceof AuthError
           ? `历史读取失败（${error.status}）`
           : '历史读取失败，请稍后重试。'));
