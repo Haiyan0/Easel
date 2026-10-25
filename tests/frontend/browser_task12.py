@@ -215,6 +215,16 @@ async def wait_text(page, pattern: str, timeout: float = 30000) -> None:
     await page.get_by_text(re.compile(pattern)).first.wait_for(timeout=timeout)
 
 
+async def wait_enabled(page, name: str, timeout: float = 30000):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        locator = page.get_by_role("button", name=name)
+        if await locator.count() and await locator.first.is_enabled():
+            return locator.first
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"按钮未恢复可用：{name}")
+
+
 async def cookie_header(context, origin: str) -> str:
     cookies = await context.cookies(origin)
     return "; ".join(f"{item['name']}={item['value']}" for item in cookies)
@@ -831,7 +841,8 @@ async def scenario_multifield_credentials(browser, origin, invites, db_path,
 
 
 async def scenario_pagination(browser, origin, invites, db_path, admin,
-                              results, failures, screenshots) -> None:
+                              capture, results, failures,
+                              screenshots) -> None:
     context = page = None
     try:
         last_member, old_invite_id, old_token = seed_bulk(db_path, admin)
@@ -866,6 +877,54 @@ async def scenario_pagination(browser, origin, invites, db_path, admin,
         assert token
         assert invite_user_id(db_path, token) == last_member.user_id
         await page.get_by_role("button", name="关闭邀请结果").click()
+
+        # 加载更多挂起时创建邀请：刷新第一页必须使旧分页失效
+        captured = asyncio.Event()
+        delivered = asyncio.Event()
+        gate = asyncio.Event()
+        state = {"used": False, "body": b"", "status": 0, "headers": {}}
+
+        async def hold_old_page(route):
+            if state["used"]:
+                await route.continue_()
+                return
+            state["used"] = True
+            cookie = await cookie_header(context, origin)
+            response = await capture.get(
+                route.request.url, headers={"Cookie": cookie})
+            state["body"] = response.content
+            state["status"] = response.status_code
+            state["headers"] = simple_headers(response)
+            captured.set()
+            await asyncio.wait_for(gate.wait(), timeout=60)
+            try:
+                await route.fulfill(
+                    status=state["status"], headers=state["headers"],
+                    body=state["body"])
+            finally:
+                delivered.set()
+
+        await page.route(
+            re.compile(r"/api/admin/invites\?limit=50&offset=50$"),
+            hold_old_page)
+        await page.get_by_role("button", name="加载更多邀请").click()
+        await asyncio.wait_for(captured.wait(), timeout=30)
+        await page.get_by_role("button", name="创建邀请").click()
+        section2 = page.locator('section[aria-label="邀请签发结果"]')
+        await section2.wait_for(timeout=20000)
+        await wait_enabled(page, "加载更多邀请")
+        await page.get_by_role("button", name="关闭邀请结果").click()
+        gate.set()
+        await asyncio.wait_for(delivered.wait(), timeout=30)
+        await asyncio.sleep(0.3)
+
+        names = await page.get_by_role("button").all_inner_texts()
+        invite_ids = [name.split("撤销邀请 ", 1)[1] for name in names
+                      if name.startswith("撤销邀请 ")]
+        assert len(invite_ids) == len(set(invite_ids)), invite_ids
+        assert await page.get_by_role(
+            "button", name="加载更多邀请").count() == 1, \
+            "旧分页不得清除刷新后的游标"
 
         await page.get_by_role("button", name="加载更多邀请").click()
         await page.get_by_role(
@@ -952,7 +1011,7 @@ async def main() -> int:
                     browser, origin, invites, db_path, members, capture,
                     results, failures, screenshots)),
                 ("pagination", lambda: scenario_pagination(
-                    browser, origin, invites, db_path, admin, results,
+                    browser, origin, invites, db_path, admin, capture, results,
                     failures, screenshots)),
             ):
                 only = {item.strip() for item in

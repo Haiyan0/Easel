@@ -133,6 +133,27 @@ const settle = async () => {
   }
 };
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function inviteRange(start, end) {
+  const items = [];
+  for (let index = start; index <= end; index += 1) {
+    items.push(invite({
+      id: `old-${index}`,
+      userId: 'user-1',
+    }));
+  }
+  return items;
+}
+
 function nodes(tree, type) {
   if (!tree || typeof tree !== 'object') return [];
   return [
@@ -790,6 +811,252 @@ test('admin member and invite pages can load later rows', async () => {
   assert.equal(requests.some((item) =>
     item.path.includes('limit=200') || item.path.includes('limit=1000')),
   false);
+});
+
+test('stale invite load-more cannot override a create refresh or cursor', async () => {
+  const first = inviteRange(0, 49);
+  const staleInvite = inviteRange(50, 50)[0];
+  const boundary = first[49];
+  const staleMore = deferred();
+  let created = false;
+  let moreCalls = 0;
+  const { call, requests } = recorder((path, init) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      if (path.endsWith('offset=0')) {
+        return created
+          ? { invites: [invite({ id: 'new-invite' }), ...first.slice(0, 49)],
+              nextOffset: 50 }
+          : { invites: first, nextOffset: 50 };
+      }
+      if (path.endsWith('offset=50')) {
+        moreCalls += 1;
+        return moreCalls === 1
+          ? staleMore.promise
+          : { invites: [boundary, staleInvite], nextOffset: null };
+      }
+    }
+    if (path === '/api/admin/invites' && init?.method === 'POST') {
+      created = true;
+      return { id: 'new-invite', token: 'new-token',
+               expiresAt: 9999999999 };
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  let tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-49'));
+
+  button(tree, '加载更多邀请').props.onClick();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.match(text(tree), /加载中/);
+
+  // 加载更多挂起时创建邀请：刷新第一页并使旧 offset 失效
+  button(tree, '创建邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(button(tree, '撤销邀请 old-49'), undefined);
+  assert.ok(button(tree, '加载更多邀请'));
+
+  staleMore.resolve({ invites: [staleInvite], nextOffset: null });
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(button(tree, '撤销邀请 old-50'), undefined,
+    '旧分页不得追加到刷新后的列表');
+  assert.equal(button(tree, '撤销邀请 old-49'), undefined,
+    '边界邀请应留待新游标加载');
+  assert.ok(button(tree, '加载更多邀请'),
+    '旧分页不得清除刷新后的游标');
+
+  button(tree, '加载更多邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-49'));
+  assert.ok(button(tree, '撤销邀请 old-50'));
+  assert.equal(button(tree, '加载更多邀请'), undefined);
+  assert.equal(requests.filter((item) =>
+    item.path.endsWith('offset=50')).length, 2);
+});
+
+test('stale invite load-more cannot override a revoke refresh', async () => {
+  const first = inviteRange(0, 49);
+  const secondPage = inviteRange(50, 51);
+  const staleMore = deferred();
+  let revoked = false;
+  let moreCalls = 0;
+  const { call } = recorder((path, init) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      if (path.endsWith('offset=0')) {
+        return revoked
+          ? { invites: inviteRange(1, 50), nextOffset: 50 }
+          : { invites: first, nextOffset: 50 };
+      }
+      if (path.endsWith('offset=50')) {
+        moreCalls += 1;
+        return moreCalls === 1
+          ? staleMore.promise
+          : { invites: [secondPage[1]], nextOffset: null };
+      }
+    }
+    if (path === '/api/admin/invites/old-0' && init?.method === 'DELETE') {
+      revoked = true;
+      return undefined;
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  let tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+
+  button(tree, '加载更多邀请').props.onClick();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  button(tree, '撤销邀请 old-0').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-50'), '刷新后的第一页应包含后移边界');
+  assert.equal(button(tree, '撤销邀请 old-51'), undefined);
+  assert.ok(button(tree, '加载更多邀请'));
+
+  staleMore.resolve({ invites: secondPage, nextOffset: null });
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(button(tree, '撤销邀请 old-51'), undefined,
+    '旧分页不得追加到撤销刷新后的列表');
+  assert.ok(button(tree, '加载更多邀请'));
+
+  button(tree, '加载更多邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-51'));
+  assert.equal(button(tree, '加载更多邀请'), undefined);
+});
+
+test('stale invite failure and finally cannot disturb a newer page request', async () => {
+  const first = inviteRange(0, 49);
+  const staleMore = deferred();
+  const newMore = deferred();
+  let created = false;
+  let moreCalls = 0;
+  const { call } = recorder((path, init) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      if (path.endsWith('offset=0')) {
+        return created
+          ? { invites: [invite({ id: 'new-invite' }), ...first.slice(0, 49)],
+              nextOffset: 50 }
+          : { invites: first, nextOffset: 50 };
+      }
+      if (path.endsWith('offset=50')) {
+        moreCalls += 1;
+        if (moreCalls === 1) return staleMore.promise;
+        return newMore.promise;
+      }
+    }
+    if (path === '/api/admin/invites' && init?.method === 'POST') {
+      created = true;
+      return { id: 'new-invite', token: 'new-token',
+               expiresAt: 9999999999 };
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  let tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+
+  button(tree, '加载更多邀请').props.onClick();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  button(tree, '创建邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '加载更多邀请'));
+
+  // 刷新已使旧分页失效，应立即允许新的继续请求
+  button(tree, '加载更多邀请').props.onClick();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(moreCalls, 2, '旧请求不得阻塞新分页');
+  assert.match(text(tree), /加载中/);
+
+  staleMore.reject(new Error('stale page failure'));
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.doesNotMatch(text(tree), /邀请列表读取失败/,
+    '旧请求失败不得覆盖新列表/提示');
+  assert.match(text(tree), /加载中/,
+    '旧请求收尾不得清除新请求的加载状态');
+
+  newMore.resolve({ invites: inviteRange(49, 50), nextOffset: null });
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-49'));
+  assert.ok(button(tree, '撤销邀请 old-50'));
+  assert.equal(button(tree, '加载更多邀请'), undefined);
+});
+
+test('full reload invalidates an in-flight invite page and its loading state', async () => {
+  const first = inviteRange(0, 49);
+  const second = inviteRange(50, 50)[0];
+  const staleMore = deferred();
+  let moreCalls = 0;
+  const { call } = recorder((path) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      if (path.endsWith('offset=0')) {
+        return { invites: first, nextOffset: 50 };
+      }
+      if (path.endsWith('offset=50')) {
+        moreCalls += 1;
+        return moreCalls === 1
+          ? staleMore.promise
+          : { invites: [second], nextOffset: null };
+      }
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  let tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+
+  button(tree, '加载更多邀请').props.onClick();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.match(text(tree), /加载中/);
+
+  // 整页重读：旧分页必须失效，加载状态不得被旧请求卡住
+  button(tree, '重新读取').props.onClick();
+  await settle();
+  view.render({ ctx: ctx({ role: 'admin' }), call });
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '加载更多邀请'),
+    '整页重读后应可继续分页');
+  staleMore.resolve({ invites: [second], nextOffset: null });
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.equal(button(tree, '撤销邀请 old-50'), undefined);
+  assert.ok(button(tree, '加载更多邀请'));
+
+  button(tree, '加载更多邀请').props.onClick();
+  await settle();
+  tree = view.render({ ctx: ctx({ role: 'admin' }), call });
+  assert.ok(button(tree, '撤销邀请 old-50'));
+  assert.equal(button(tree, '加载更多邀请'), undefined);
 });
 
 test('member never renders admin write controls or calls admin APIs', async () => {

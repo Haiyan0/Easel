@@ -78,8 +78,10 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   const loadSeq = useRef(0);
   const actionSeq = useRef(0);
   const formSeq = useRef(0);
+  const inviteSeq = useRef(0);
   const usersLoadingRef = useRef(false);
   const invitesLoadingRef = useRef(false);
+  const invitesRefreshingRef = useRef(false);
   const mounted = useRef(true);
   const ownerRef = useRef(`${ctx.userId}:${ctx.workspaceId}`);
   const channelRef = useRef<AdminChannel>('speech');
@@ -91,6 +93,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
       mounted.current = false;
       loadSeq.current += 1;
       actionSeq.current += 1;
+      inviteSeq.current += 1;
     };
   }, []);
 
@@ -101,6 +104,11 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
     }
     let alive = true;
     const seq = ++loadSeq.current;
+    const inviteSeqAtStart = ++inviteSeq.current;
+    invitesRefreshingRef.current = true;
+    // 整页重读也是第一页刷新：使旧分页失效并回收其加载状态
+    invitesLoadingRef.current = false;
+    setInvitesLoadingMore(false);
     const owner = `${ctx.userId}:${ctx.workspaceId}`;
     setLoading(true);
     setLoadError('');
@@ -137,19 +145,24 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
       } else {
         errors.push(`成员：${errorText(usersResult.reason)}`);
       }
-      if (invitesResult.status === 'fulfilled') {
-        try {
-          const parsedInvites = parseAdminInvitePage(invitesResult.value);
-          setInvites(parsedInvites.invites);
-          setInviteNextOffset(parsedInvites.nextOffset);
-        } catch (error: unknown) {
-          errors.push(`邀请：${errorText(error)}`);
+      if (inviteSeqAtStart === inviteSeq.current) {
+        if (invitesResult.status === 'fulfilled') {
+          try {
+            const parsedInvites = parseAdminInvitePage(invitesResult.value);
+            setInvites(parsedInvites.invites);
+            setInviteNextOffset(parsedInvites.nextOffset);
+          } catch (error: unknown) {
+            errors.push(`邀请：${errorText(error)}`);
+          }
+        } else {
+          errors.push(`邀请：${errorText(invitesResult.reason)}`);
         }
-      } else {
-        errors.push(`邀请：${errorText(invitesResult.reason)}`);
       }
       if (errors.length) setLoadError(`读取失败：${errors.join('；')}`);
     }).finally(() => {
+      if (inviteSeqAtStart === inviteSeq.current) {
+        invitesRefreshingRef.current = false;
+      }
       if (alive && mounted.current && seq === loadSeq.current) {
         setLoading(false);
       }
@@ -253,16 +266,17 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   };
 
   const loadMoreInvites = async () => {
-    if (inviteNextOffset === null || invitesLoadingRef.current) return;
+    if (inviteNextOffset === null || invitesLoadingRef.current
+        || invitesRefreshingRef.current) return;
     invitesLoadingRef.current = true;
     setInvitesLoadingMore(true);
     const owner = ownerRef.current;
-    const seq = loadSeq.current;
+    const seq = inviteSeq.current;
     try {
       const raw = await call<unknown>(
         `/api/admin/invites?limit=50&offset=${inviteNextOffset}`);
       if (!mounted.current || ownerRef.current !== owner
-          || seq !== loadSeq.current) return;
+          || seq !== inviteSeq.current) return;
       const page = parseAdminInvitePage(raw);
       setInvites((current) => {
         const seen = new Set(current.map((item) => item.id));
@@ -271,26 +285,41 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
       });
       setInviteNextOffset(page.nextOffset);
     } catch (error: unknown) {
-      if (mounted.current) {
+      if (mounted.current && ownerRef.current === owner
+          && seq === inviteSeq.current) {
         setNotice(`邀请列表读取失败：${errorText(error)}`);
       }
     } finally {
-      invitesLoadingRef.current = false;
-      if (mounted.current) setInvitesLoadingMore(false);
+      if (seq === inviteSeq.current) {
+        invitesLoadingRef.current = false;
+        if (mounted.current) setInvitesLoadingMore(false);
+      }
     }
   };
 
   const refreshInvites = async () => {
+    const owner = ownerRef.current;
+    const seq = ++inviteSeq.current;
+    invitesRefreshingRef.current = true;
+    // 刷新使旧分页立即失效，并回收旧请求的加载状态
+    invitesLoadingRef.current = false;
+    setInvitesLoadingMore(false);
     try {
       const raw = await call<unknown>(
         '/api/admin/invites?limit=50&offset=0');
-      if (!mounted.current) return;
+      if (!mounted.current || ownerRef.current !== owner
+          || seq !== inviteSeq.current) return;
       const page = parseAdminInvitePage(raw);
       setInvites(page.invites);
       setInviteNextOffset(page.nextOffset);
     } catch (error: unknown) {
-      if (mounted.current) {
+      if (mounted.current && ownerRef.current === owner
+          && seq === inviteSeq.current) {
         setNotice(`邀请列表读取失败：${errorText(error)}`);
+      }
+    } finally {
+      if (seq === inviteSeq.current) {
+        invitesRefreshingRef.current = false;
       }
     }
   };
@@ -642,7 +671,8 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
             </div>
           ))}
           {inviteNextOffset !== null ? (
-            <button style={buttonStyle} disabled={busy || invitesLoadingMore}
+            <button style={buttonStyle}
+              disabled={busy || loading || invitesLoadingMore}
               onClick={() => { void loadMoreInvites(); }}>
               {invitesLoadingMore ? '加载中…' : '加载更多邀请'}
             </button>
