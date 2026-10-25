@@ -467,8 +467,20 @@ class ConfigService:
         if not isinstance(defaults, dict):
             raise DomainError("invalid_settings", 400)
 
-        public_defaults: dict[str, dict] = {}
-        secret_bundle: dict[str, dict] = {}
+        current_defaults, current_bundle, current_version = \
+            self._load_managed_state()
+        if expected_version != current_version:
+            # 乐观锁在读取完整版本后立即拒绝，避免以旧完整版本覆盖他人新版本
+            raise DomainError("version_conflict", 409)
+        if set(current_defaults) != set(current_bundle):
+            raise DomainError("configuration_invalid", 500)
+
+        # 保存完整版本：未提交的通道沿用当前公共路由与凭证，编辑只改变
+        # 请求中出现的通道。所有凭证按新版本 AAD 重新加密。
+        merged_public = {channel: dict(route)
+                         for channel, route in current_defaults.items()}
+        merged_bundle = {channel: dict(bundle)
+                         for channel, bundle in current_bundle.items()}
         for channel, route in defaults.items():
             _require_admin_channel(channel)
             public = _validate_complete_route(
@@ -482,18 +494,81 @@ class ConfigService:
                 raise DomainError("adapter_unavailable", 400)
             secret = route.get("secret")
             if _secret_is_empty(secret):
-                raise DomainError("invalid_secret_bundle", 400)
-            secret_bundle[channel] = _normalize_secret(
-                channel, public["provider"], secret,
-                base_url=public["base_url"])
-            public_defaults[channel] = public
+                # 空凭证只允许在当前受管版本的同一凭证作用域内复用；
+                # 公共响应从不回传旧 Key，浏览器也无需再次提交明文。
+                previous = current_defaults.get(channel)
+                previous_bundle = current_bundle.get(channel)
+                if previous is None or previous_bundle is None:
+                    raise DomainError("invalid_secret_bundle", 400)
+                if any(previous.get(key) != public.get(key)
+                       for key in ("provider", "base_url", "protocol")):
+                    raise DomainError("invalid_secret_bundle", 400)
+                bundle = dict(previous_bundle)
+            else:
+                bundle = _normalize_secret(
+                    channel, public["provider"], secret,
+                    base_url=public["base_url"])
+            merged_public[channel] = public
+            merged_bundle[channel] = bundle
 
         new_version = expected_version + 1
-        encrypted = self._encrypt(secret_bundle,
+        encrypted = self._encrypt(merged_bundle,
                                   self._managed_scope(new_version))
-        public_json = _canonical({"defaults": public_defaults})
+        public_json = _canonical({"defaults": merged_public})
         return self._store.publish_managed_revision(
             actor, public_json, encrypted, expected_version, self._now())
+
+    def _validated_managed_bundle(self, value: Any) -> dict[str, dict]:
+        """受管凭证 bundle 只允许已知通道 → 非空字符串键值。"""
+        if not isinstance(value, dict):
+            raise DomainError("configuration_invalid", 500)
+        bundle: dict[str, dict] = {}
+        for channel, item in value.items():
+            if channel not in ADMIN_CHANNELS:
+                raise DomainError("configuration_invalid", 500)
+            bundle[channel] = self._validated_bundle(item)
+        return bundle
+
+    def _load_managed_state(self) -> tuple[dict, dict[str, dict], int]:
+        """读取当前完整公共版本与解密 bundle；缺失版本返回空状态。"""
+        latest = self._store.latest_managed_revision()
+        if latest is None:
+            return {}, {}, 0
+        version = int(latest["version"])
+        try:
+            payload = json.loads(latest["public_json"])
+            if not isinstance(payload, dict):
+                raise ValueError
+            defaults = payload.get("defaults")
+            if (not isinstance(defaults, dict)
+                    or set(defaults) - set(ADMIN_CHANNELS)):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise DomainError("configuration_invalid", 500) from None
+        decrypted = self._decrypt(latest["encrypted_secrets"],
+                                  self._managed_scope(version))
+        return defaults, self._validated_managed_bundle(decrypted), version
+
+    def public_managed_settings(self, actor: Identity) -> dict:
+        """管理员公共视图：只投影白名单字段与凭证是否已配置。"""
+        identity = self._store.require_identity(actor)
+        if identity.role != "admin":
+            raise DomainError("forbidden", 403)
+        defaults, bundle, version = self._load_managed_state()
+        public: dict[str, dict] = {}
+        for channel, route in defaults.items():
+            entry = {
+                "provider": route.get("provider"),
+                "model": route.get("model"),
+                "base_url": route.get("base_url"),
+                "protocol": route.get("protocol"),
+                "options": dict(route.get("options") or {}),
+                "credential_configured": bool(bundle.get(channel)),
+            }
+            if "allowed_models" in route:
+                entry["allowed_models"] = list(route["allowed_models"])
+            public[channel] = entry
+        return {"version": version, "defaults": public}
 
     def _load_managed_defaults(self, *, verify: bool) -> tuple[dict, int]:
         latest = self._store.latest_managed_revision()

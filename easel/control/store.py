@@ -535,6 +535,143 @@ class Store:
                 (_now(), user_id))
         return cursor.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # 管理员用户/邀请（HTTP 边界专用；内部无 actor 方法保持兼容）
+    # ------------------------------------------------------------------
+
+    _USER_ADMIN_COLUMNS = (
+        "users.id AS user_id, users.display_name, users.role,"
+        " users.created_at, users.disabled_at,"
+        " workspaces.id AS workspace_id")
+
+    def admin_list_users(self, actor: Identity, *, limit: int,
+                         offset: int) -> list[sqlite3.Row]:
+        """管理员分页列出公共用户视图来源；在事务内复查 actor。"""
+        with self._read_transaction():
+            self._require_admin(actor)
+            return self._connection.execute(
+                f"SELECT {self._USER_ADMIN_COLUMNS} FROM users"
+                " JOIN workspaces ON workspaces.owner_user_id = users.id"
+                " ORDER BY users.created_at ASC, users.rowid ASC"
+                " LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
+
+    def admin_create_member(self, actor: Identity,
+                            display_name: str) -> sqlite3.Row:
+        """创建 member 及其私有 workspace；角色固定为 member。"""
+        user_id = uuid.uuid4().hex
+        workspace_id = uuid.uuid4().hex
+        stamp = _now()
+        with self._transaction():
+            self._require_admin(actor)
+            self._connection.execute(
+                "INSERT INTO users (id, display_name, role, created_at)"
+                " VALUES (?, ?, 'member', ?)",
+                (user_id, _text(display_name), stamp))
+            self._connection.execute(
+                "INSERT INTO workspaces"
+                " (id, owner_user_id, state, config_version, created_at)"
+                " VALUES (?, ?, 'ready', 0, ?)",
+                (workspace_id, user_id, stamp))
+            return self._admin_user_row(user_id)
+
+    def admin_set_user_disabled(self, actor: Identity, user_id: str,
+                                disabled: bool) -> sqlite3.Row:
+        """禁用/启用成员；禁用时同步撤销登录与未兑换邀请。
+
+        管理员目标一律拒绝，避免 HTTP 管理入口被锁死。重新启用不会复活
+        已撤销的登录或邀请，成员必须取得新邀请。
+        """
+        target_user_id = _text(user_id)
+        stamp = _now()
+        with self._transaction():
+            self._require_admin(actor)
+            target = self._connection.execute(
+                "SELECT role, disabled_at FROM users WHERE id = ?",
+                (target_user_id,)).fetchone()
+            if target is None:
+                raise DomainError("not_found", 404)
+            if target["role"] == "admin":
+                raise DomainError("admin_protected", 409)
+            if disabled:
+                if target["disabled_at"] is None:
+                    self._connection.execute(
+                        "UPDATE users SET disabled_at = ? WHERE id = ?",
+                        (stamp, target_user_id))
+                self._connection.execute(
+                    "UPDATE logins SET revoked_at = ?"
+                    " WHERE user_id = ? AND revoked_at IS NULL",
+                    (stamp, target_user_id))
+                # 未兑换邀请同样撤销：重新启用后不能继续使用旧邀请
+                self._connection.execute(
+                    "UPDATE invites SET revoked_at = ?"
+                    " WHERE user_id = ? AND redeemed_at IS NULL"
+                    " AND revoked_at IS NULL",
+                    (stamp, target_user_id))
+            else:
+                self._connection.execute(
+                    "UPDATE users SET disabled_at = NULL WHERE id = ?",
+                    (target_user_id,))
+            return self._admin_user_row(target_user_id)
+
+    def admin_revoke_user_sessions(self, actor: Identity,
+                                   user_id: str) -> int:
+        """持久撤销成员全部登录；不删除 workspace、会话或 Run。"""
+        target_user_id = _text(user_id)
+        with self._transaction():
+            self._require_admin(actor)
+            target = self._connection.execute(
+                "SELECT role FROM users WHERE id = ?",
+                (target_user_id,)).fetchone()
+            if target is None:
+                raise DomainError("not_found", 404)
+            if target["role"] == "admin":
+                raise DomainError("admin_protected", 409)
+            cursor = self._connection.execute(
+                "UPDATE logins SET revoked_at = ?"
+                " WHERE user_id = ? AND revoked_at IS NULL",
+                (_now(), target_user_id))
+            return cursor.rowcount
+
+    def admin_list_invites(self, actor: Identity, *, limit: int,
+                           offset: int) -> list[sqlite3.Row]:
+        """管理员分页列出邀请公共元数据；不含 token 摘要或明文。"""
+        with self._read_transaction():
+            self._require_admin(actor)
+            return self._connection.execute(
+                "SELECT id, user_id, created_at, expires_at,"
+                " redeemed_at, revoked_at FROM invites"
+                " ORDER BY created_at DESC, rowid DESC"
+                " LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
+
+    def admin_revoke_invite(self, actor: Identity, invite_id: str) -> bool:
+        """按邀请 ID 撤销未兑换邀请；已兑换拒绝，已撤销幂等。"""
+        target_id = _text(invite_id)
+        with self._transaction():
+            self._require_admin(actor)
+            row = self._connection.execute(
+                "SELECT redeemed_at, revoked_at FROM invites WHERE id = ?",
+                (target_id,)).fetchone()
+            if row is None:
+                raise DomainError("not_found", 404)
+            if row["redeemed_at"] is not None:
+                raise DomainError("invite_redeemed", 409)
+            if row["revoked_at"] is not None:
+                return False
+            self._connection.execute(
+                "UPDATE invites SET revoked_at = ?"
+                " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+                (_now(), target_id))
+            return True
+
+    def _admin_user_row(self, user_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            f"SELECT {self._USER_ADMIN_COLUMNS} FROM users"
+            " JOIN workspaces ON workspaces.owner_user_id = users.id"
+            " WHERE users.id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise DomainError("not_found", 404)
+        return row
+
     def set_workspace_state(self, workspace_id: str, state: str) -> bool:
         """按状态机切换 workspace 状态；返回该 workspace 是否存在。
 
@@ -2259,6 +2396,14 @@ class Store:
         if workspace is None or workspace["owner_user_id"] != user_id:
             raise DomainError("unauthorized", 403)
         return workspace_id
+
+    def _require_admin(self, actor: Identity) -> None:
+        """在已持有事务时复查 actor 仍为启用的管理员。"""
+        self._require_actor(actor)
+        row = self._connection.execute(
+            "SELECT role FROM users WHERE id = ?", (actor.user_id,)).fetchone()
+        if row is None or row["role"] != "admin":
+            raise DomainError("forbidden", 403)
 
     def _require_ready_workspace(self, workspace_id: str) -> None:
         """只有 ready 空间接纳新任务；非 ready 不影响已接纳任务的收尾。"""

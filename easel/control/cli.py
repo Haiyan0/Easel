@@ -129,6 +129,7 @@ def cmd_serve_control(args) -> int:
             return 2
 
     relay_factory = None
+    harness_summary = None
     if signing_key is not None:
         revision, agent, broker_config = managed_agent
         try:
@@ -140,6 +141,15 @@ def cmd_serve_control(args) -> int:
         relay_factory = build_relay_factory(
             signing_key=signing_key, revision=revision, agent=agent,
             broker_destination=destination)
+        # 只投影可公开的只读元数据；argv、broker 地址与凭证不进入响应
+        harness_summary = {
+            "runtime": agent["runtime"],
+            "revision": revision,
+            "model": agent.get("model"),
+            "sandbox": agent.get("sandbox"),
+            "timeout": agent.get("timeout"),
+            "codexAutoApprove": agent.get("codex_auto_approve"),
+        }
 
     # 出口策略必须在打开控制库、启动 HTTP 之前校验失败
     policy_path = getattr(args, "egress_policy", None)
@@ -191,7 +201,8 @@ def cmd_serve_control(args) -> int:
         app = create_app(store=store, auth=AuthService(store), config=config,
                          config_service=config_service, broker=broker,
                          provisioner=provisioner, frontend_dir=frontend_dir,
-                         relay_factory=relay_factory)
+                         relay_factory=relay_factory,
+                         harness_summary=harness_summary)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
         store.close()

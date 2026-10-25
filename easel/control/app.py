@@ -31,6 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..providers.openai import BROKER_ROUTE_TABLE
 from ..worker.sessions import MAX_MESSAGE_BYTES
+from .admin import AdminService
 from .auth import AuthService
 from .config import ConfigService
 from .policy import authorize, public_route
@@ -53,8 +54,14 @@ _IMPLEMENTED_EXACT = frozenset({
     ("POST", "/api/auth/exchange"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
+    ("GET", "/api/admin/managed-config"),
     ("POST", "/api/admin/managed-config"),
+    ("GET", "/api/admin/users"),
+    ("POST", "/api/admin/users"),
+    ("GET", "/api/admin/invites"),
+    ("POST", "/api/admin/invites"),
     ("GET", "/api/settings/models"),
+    ("GET", "/api/settings/harness"),
     ("POST", "/api/settings/models/save"),
     ("GET", "/api/sessions"),
     ("POST", "/api/sessions"),
@@ -66,6 +73,9 @@ _IMPLEMENTED_EXACT = frozenset({
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
+    ("PATCH", re.compile(r"^/api/admin/users/[^/]+$")),
+    ("POST", re.compile(r"^/api/admin/users/[^/]+/revoke-sessions$")),
+    ("DELETE", re.compile(r"^/api/admin/invites/[^/]+$")),
     ("PATCH", re.compile(r"^/api/sessions/[^/]+$")),
     ("DELETE", re.compile(r"^/api/sessions/[^/]+$")),
     ("GET", re.compile(r"^/api/sessions/[^/]+/messages$")),
@@ -217,6 +227,63 @@ def _relay(request: Request):
     if service is None:
         raise DomainError("capability_unavailable", 503)
     return service
+
+
+_HARNESS_FIELDS = frozenset({
+    "runtime", "revision", "model", "sandbox", "timeout", "codexAutoApprove"})
+_HARNESS_RUNTIMES = ("acp", "opencode", "codex")
+_HARNESS_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+
+
+def _normalize_harness_summary(summary: dict | None) -> dict | None:
+    """校验 CLI 传入的只读受管底座摘要；拒绝 argv/env/路径等私有字段。"""
+    if summary is None:
+        return None
+    if not isinstance(summary, dict) or set(summary) - _HARNESS_FIELDS:
+        raise ValueError("harness summary fields are invalid")
+    runtime = summary.get("runtime")
+    revision = summary.get("revision")
+    if runtime not in _HARNESS_RUNTIMES:
+        raise ValueError("harness summary runtime is invalid")
+    if type(revision) is not int or revision < 0:
+        raise ValueError("harness summary revision is invalid")
+    result: dict = {"runtime": runtime, "revision": revision,
+                    "model": None, "sandbox": None, "timeout": None,
+                    "codexAutoApprove": None}
+    model = summary.get("model")
+    if model is not None:
+        if (not isinstance(model, str) or not model or len(model) > 256
+                or any(ord(character) < 32 for character in model)):
+            raise ValueError("harness summary model is invalid")
+        result["model"] = model
+    sandbox = summary.get("sandbox")
+    if sandbox is not None:
+        if sandbox not in _HARNESS_SANDBOXES:
+            raise ValueError("harness summary sandbox is invalid")
+        result["sandbox"] = sandbox
+    timeout = summary.get("timeout")
+    if timeout is not None:
+        if type(timeout) is not int or not 1 <= timeout <= 86400:
+            raise ValueError("harness summary timeout is invalid")
+        result["timeout"] = timeout
+    auto_approve = summary.get("codexAutoApprove")
+    if auto_approve is not None:
+        if type(auto_approve) is not bool:
+            raise ValueError("harness summary auto approve is invalid")
+        result["codexAutoApprove"] = auto_approve
+    return result
+
+
+def _harness_view(summary: dict | None) -> dict:
+    if summary is None:
+        return {
+            "locked": True, "configured": False, "runtime": None,
+            "revision": None, "model": None, "sandbox": None,
+            "timeout": None, "codexAutoApprove": None,
+            "unavailableReason": "managed_harness_not_configured",
+        }
+    return {"locked": True, "configured": True, **summary,
+            "unavailableReason": None}
 
 
 def _parse_if_match(value: str | None) -> int:
@@ -402,7 +469,8 @@ def create_app(*, store: Store, auth: AuthService,
                config_service: ConfigService | None = None,
                runtime=None, broker=None, provisioner=None,
                frontend_dir: str | Path | None = None,
-               relay_factory: Callable[..., object] | None = None) -> FastAPI:
+               relay_factory: Callable[..., object] | None = None,
+               harness_summary: dict | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
     传入的 ``store`` 提供控制库位置；应用在 lifespan 中用专用数据库线程打开
@@ -434,6 +502,7 @@ def create_app(*, store: Store, auth: AuthService,
     if public_origin is not None:
         # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
         public_origin = _normalize_public_origin(public_origin)
+    normalized_harness = _normalize_harness_summary(harness_summary)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -442,6 +511,7 @@ def create_app(*, store: Store, auth: AuthService,
         loop = asyncio.get_running_loop()
         app.state.db_executor = executor
         app.state.public_origin = public_origin
+        app.state.harness_summary = normalized_harness
         http_client: httpx.AsyncClient | None = None
         try:
             app.state.control_store = await loop.run_in_executor(
@@ -460,6 +530,8 @@ def create_app(*, store: Store, auth: AuthService,
             else:
                 app.state.runtime = runtime
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)
+            app.state.admin_service = AdminService(
+                app.state.control_store, app.state.auth)
             app.state.sessions = SessionService(app.state.control_store)
             if config_service is not None:
                 # with_store 会读取并校验已有密文，必须在数据库专用线程执行
@@ -811,6 +883,13 @@ def create_app(*, store: Store, auth: AuthService,
         return JSONResponse(settings,
                             headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/settings/harness")
+    async def get_harness_settings(request: Request):
+        """本人可读的受管底座脱敏摘要；不返回 argv/env/内部地址。"""
+        return JSONResponse(
+            _harness_view(request.app.state.harness_summary),
+            headers={"Cache-Control": "no-store"})
+
     @app.post("/api/settings/models/save")
     async def save_model_settings(request: Request):
         service = _config_service(request)
@@ -842,6 +921,93 @@ def create_app(*, store: Store, auth: AuthService,
             settings, expected_version)
         return JSONResponse({"version": version},
                             headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/admin/managed-config")
+    async def get_managed_config(request: Request):
+        service = _config_service(request)
+        settings = await _run_db(
+            request, service.public_managed_settings,
+            request.state.identity)
+        return JSONResponse(settings,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/admin/users")
+    async def list_admin_users(request: Request):
+        service: AdminService = request.app.state.admin_service
+        limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
+        offset = _query_int(request, "offset", 0,
+                            minimum=0, maximum=1_000_000)
+        result = await _run_db(
+            request, service.list_users, request.state.identity,
+            limit=limit, offset=offset)
+        return JSONResponse(result,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/admin/users")
+    async def create_admin_user(request: Request):
+        service: AdminService = request.app.state.admin_service
+        payload = await _read_json_body(request)
+        if set(payload) != {"displayName"}:
+            raise DomainError("invalid_argument", 400)
+        user = await _run_db(
+            request, service.create_member, request.state.identity,
+            payload.get("displayName"))
+        return JSONResponse(user, status_code=201,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.patch("/api/admin/users/{user_id}")
+    async def update_admin_user(request: Request, user_id: str):
+        service: AdminService = request.app.state.admin_service
+        payload = await _read_json_body(request)
+        if set(payload) != {"disabled"}:
+            raise DomainError("invalid_argument", 400)
+        user = await _run_db(
+            request, service.set_member_disabled, request.state.identity,
+            user_id, payload["disabled"])
+        return JSONResponse(user,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/admin/users/{user_id}/revoke-sessions")
+    async def revoke_admin_user_sessions(request: Request, user_id: str):
+        service: AdminService = request.app.state.admin_service
+        result = await _run_db(
+            request, service.revoke_member_sessions,
+            request.state.identity, user_id)
+        return JSONResponse(result,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/admin/invites")
+    async def list_admin_invites(request: Request):
+        service: AdminService = request.app.state.admin_service
+        limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
+        offset = _query_int(request, "offset", 0,
+                            minimum=0, maximum=1_000_000)
+        result = await _run_db(
+            request, service.list_invites, request.state.identity,
+            limit=limit, offset=offset)
+        return JSONResponse(result,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/admin/invites")
+    async def create_admin_invite(request: Request):
+        service: AdminService = request.app.state.admin_service
+        payload = await _read_json_body(request)
+        if set(payload) != {"userId"}:
+            raise DomainError("invalid_argument", 400)
+        invite = await _run_db(
+            request, service.create_invite, request.state.identity,
+            payload.get("userId"))
+        return JSONResponse(invite, status_code=201,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/admin/invites/{invite_id}")
+    async def revoke_admin_invite(request: Request, invite_id: str):
+        service: AdminService = request.app.state.admin_service
+        await _run_db(
+            request, service.revoke_invite, request.state.identity,
+            invite_id)
+        return Response(status_code=204,
+                        headers={"Cache-Control": "no-store"})
 
     # ------------------------------------------------------------------
     # 固定前端构建目录：只公开索引、assets/static 与两个根文件

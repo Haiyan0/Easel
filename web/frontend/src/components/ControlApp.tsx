@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import LoginPage from './LoginPage';
+import AdminSettingsPage from './AdminSettingsPage';
+import ControlSettingsPage from './ControlSettingsPage';
 import {
   AuthError, IdentityEpoch, commitIfCurrent, identityCacheKey,
   identityFetch, loadIdentity, logout,
@@ -336,6 +338,8 @@ function ControlWorkspace({
   const [notice, setNotice] = useState('');
   const [localSends, setLocalSends] = useState<LocalSend[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  // 页面视图只切换展示；聊天组件保持挂载，SSE/待确认输入不因导航重置。
+  const [view, setView] = useState<'chat' | 'settings' | 'admin'>('chat');
   const streamRef = useRef<AbortController | null>(null);
   const streamOwner = useRef<string | null>(null);
   const connectionSeq = useRef(0);
@@ -1128,6 +1132,22 @@ function ControlWorkspace({
           overflow: 'hidden', textOverflow: 'ellipsis' }}>
           {ctx.role === 'admin' ? '管理员' : '成员'} · {ctx.workspaceId.slice(0, 8)}
         </div>
+        <div style={{ display: 'grid', gap: '6px' }}>
+          <button style={{
+            ...styles.button,
+            borderColor: view === 'chat' ? '#8b5cf6' : '#333a47',
+          }} onClick={() => setView('chat')}>对话</button>
+          <button style={{
+            ...styles.button,
+            borderColor: view === 'settings' ? '#8b5cf6' : '#333a47',
+          }} onClick={() => setView('settings')}>个人设置</button>
+          {ctx.role === 'admin' ? (
+            <button style={{
+              ...styles.button,
+              borderColor: view === 'admin' ? '#8b5cf6' : '#333a47',
+            }} onClick={() => setView('admin')}>全体默认</button>
+          ) : null}
+        </div>
         <button style={styles.accent} onClick={() => void createSession()}>
           ＋ 新建会话
         </button>
@@ -1165,6 +1185,10 @@ function ControlWorkspace({
         </div>
       </aside>
       <main style={styles.main}>
+        <div style={{
+          display: view === 'chat' ? 'flex' : 'none',
+          flexDirection: 'column', minHeight: '100vh', minWidth: 0,
+        }}>
         <header style={{
           display: 'flex', alignItems: 'center', gap: '10px',
           padding: '14px 20px', borderBottom: '1px solid #242a35',
@@ -1319,9 +1343,16 @@ function ControlWorkspace({
           </div>
           <div style={{ fontSize: '12px', color: '#6f7785' }}>
             技能执行、发布、数据分析、画像与平台登录管理暂未开放；
-            本页只接入对话与服务端历史。
+            本页只接入对话、个人能力模型与管理员默认配置。
           </div>
         </footer>
+        </div>
+        {view === 'settings' ? (
+          <ControlSettingsPage ctx={ctx} call={call} />
+        ) : null}
+        {view === 'admin' && ctx.role === 'admin' ? (
+          <AdminSettingsPage ctx={ctx} call={call} />
+        ) : null}
       </main>
     </div>
   );

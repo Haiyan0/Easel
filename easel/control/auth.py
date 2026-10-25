@@ -116,9 +116,14 @@ class AuthService:
             display_name.strip(), _digest(token), now, now + self.INVITE_TTL_SECONDS)
         return identity, token
 
-    def create_invite(self, actor: Identity, user_id: str,
-                      ttl_seconds: int = INVITE_TTL_SECONDS) -> str:
-        """管理员签发邀请；返回仅输出一次的明文 token。"""
+    def issue_invite(self, actor: Identity, user_id: str,
+                     ttl_seconds: int = INVITE_TTL_SECONDS
+                     ) -> tuple[str, str, int]:
+        """管理员签发邀请，返回 ``(invite_id, 明文 token, expires_at)``。
+
+        明文只返回一次；Store 只保存摘要。方法签名保持内部能力，HTTP 必须
+        经 AdminService 的 actor-aware 事务边界调用。
+        """
         if (type(ttl_seconds) is not int
                 or not 1 <= ttl_seconds <= self.MAX_INVITE_TTL_SECONDS):
             raise DomainError("invalid_ttl", 400)
@@ -126,9 +131,15 @@ class AuthService:
             raise DomainError("invalid_argument", 400)
         token = _new_token()
         now = self._now()
-        self._store.create_invite(
-            actor, user_id, _digest(token), now, now + ttl_seconds)
-        return token
+        expires_at = now + ttl_seconds
+        invite_id = self._store.create_invite(
+            actor, user_id, _digest(token), now, expires_at)
+        return invite_id, token, expires_at
+
+    def create_invite(self, actor: Identity, user_id: str,
+                      ttl_seconds: int = INVITE_TTL_SECONDS) -> str:
+        """管理员签发邀请；返回仅输出一次的明文 token。"""
+        return self.issue_invite(actor, user_id, ttl_seconds)[1]
 
     def revoke_invite(self, invite: str) -> bool:
         """撤销尚未兑换的邀请；服务内部/管理操作，不暴露为公开 HTTP。"""

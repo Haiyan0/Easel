@@ -251,7 +251,10 @@ def test_member_sensitive_writes_and_admin_routes_are_denied(tmp_path):
             assert response.json()["code"] == "forbidden"
 
         assert client.get("/api/settings/local-agents").status_code == 403
-        assert client.get("/api/settings/harness").status_code == 503
+        harness = client.get("/api/settings/harness")
+        assert harness.status_code == 200
+        assert harness.json()["locked"] is True
+        assert harness.json()["configured"] is False
         assert client.get("/api/settings/models").status_code == 503
         assert client.get("/api/sessions").status_code == 200
         assert client.get("/api/unknown").status_code == 403
@@ -291,7 +294,9 @@ def test_admin_managed_writes_are_unavailable_not_success(tmp_path):
             assert response.status_code == 503, (method, path, response.text)
             assert response.json()["code"] == "capability_unavailable"
 
-        assert client.get("/api/settings/harness").status_code == 503
+        harness = client.get("/api/settings/harness")
+        assert harness.status_code == 200
+        assert harness.json()["configured"] is False
         assert client.get("/api/settings/local-agents").status_code == 503
         assert client.get("/api/unknown").status_code == 403
         assert client.post("/api/unknown", headers=headers, json={}).status_code == 403

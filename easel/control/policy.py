@@ -86,6 +86,8 @@ _RULES: tuple[_Route, ...] = (
     _route("GET", r"^/api/admin/users/([^/]+)$", ADMIN_READ, "user", 1),
     _route(("PATCH", "DELETE"), r"^/api/admin/users/([^/]+)$",
            ADMIN_WRITE, "user", 1),
+    _route("POST", r"^/api/admin/users/([^/]+)/revoke-sessions$",
+           ADMIN_WRITE, "user", 1),
     _route("GET", r"^/api/admin/invites$", ADMIN_READ),
     _route("POST", r"^/api/admin/invites$", ADMIN_WRITE),
     _route("DELETE", r"^/api/admin/invites/([^/]+)$", ADMIN_WRITE, "invite", 1),
