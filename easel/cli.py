@@ -22,8 +22,9 @@ from easel.commands.doctor import cmd_doctor
 from easel.commands.gateway import cmd_gateway
 from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
-from easel.control.cli import (cmd_admin_bootstrap, cmd_admin_invite,
-                               cmd_serve_control)
+from easel.control.cli import (cmd_admin_backup, cmd_admin_bootstrap,
+                               cmd_admin_invite, cmd_admin_migrate_local,
+                               cmd_admin_restore, cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
 from easel.persona import persona_prefix
@@ -304,6 +305,44 @@ def main(argv: list[str] | None = None) -> int:
     p_invite.add_argument("--ttl-seconds", type=int, default=604800,
                           help="邀请有效期秒数（默认 604800）")
     p_invite.set_defaults(func=cmd_admin_invite)
+    p_backup = admin_sub.add_parser(
+        "backup", help="备份控制库、master key 与 workspace 持久区")
+    p_backup.add_argument("--control-dir", required=True)
+    p_backup.add_argument("--destination", required=True,
+                          help="受管根内的新备份目录")
+    p_backup.add_argument("--master-key-file", required=True)
+    p_backup.add_argument("--workspace-root", default=None,
+                          help="workspace 持久区根；省略时只备份控制库与 key")
+    p_backup.add_argument("--image-digest", default="",
+                          help="记录到清单的 worker 镜像摘要")
+    p_backup.add_argument("--harness-revision", default="",
+                          help="记录到清单的 Harness 修订")
+    p_backup.add_argument("--provisioner-socket", default=None,
+                          help="有活动 worker 时必须提供，用于先 drain")
+    p_backup.set_defaults(func=cmd_admin_backup)
+
+    p_restore = admin_sub.add_parser(
+        "restore", help="把备份恢复到全新目录")
+    p_restore.add_argument("--source", required=True)
+    p_restore.add_argument("--destination", required=True,
+                           help="不存在或为空的新恢复根")
+    p_restore.add_argument("--managed-root", default=None,
+                           help="可选；恢复目标必须位于该受管根内")
+    p_restore.set_defaults(func=cmd_admin_restore)
+
+    p_migrate = admin_sub.add_parser(
+        "migrate-local", help="显式迁移本机 outputs 与旧会话")
+    p_migrate.add_argument("--source", required=True,
+                           help="本机 outputs 目录或含 outputs 的安装根")
+    p_migrate.add_argument("--workspace", required=True,
+                           help="目标 workspace ID（32 位小写十六进制）")
+    p_migrate.add_argument("--workspace-root", required=True,
+                           help="目标 workspace 持久区根")
+    p_migrate.add_argument("--dry-run", action="store_true",
+                           help="只输出清单，不写备份或目标")
+    p_migrate.add_argument("--backup-destination", default=None,
+                           help="可选；迁移前完整备份目录（默认写入 workspace 根）")
+    p_migrate.set_defaults(func=cmd_admin_migrate_local)
 
     args = parser.parse_args(argv)
     try:

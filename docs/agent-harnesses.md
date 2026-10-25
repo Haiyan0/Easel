@@ -7,6 +7,14 @@ Easel 将执行底座与模型供应商分开。Web **设置 → 模型配置 �
 已经保存的底座、旧版连接配置和已有 OpenClaw 安装继续生效，不自动切换。
 改动目前用于本地验证，不要求迁移原有凭证。
 
+多人部署不会自动导入本机历史。管理员只能在服务器本地显式执行
+`admin migrate-local`，并先 `--dry-run` 核对源、目标 workspace 与清单。命令
+只读取指定的 `outputs/` 或安装根；旧 `outputs/_sessions` 的 API 消息可导入为
+workspace 会话快照。原生绑定只有在记录明确包含 `cwd == /workspace` 且
+`native_id` 非空时才按可续接导入；缺少 cwd 或路径不兼容时只复制静态历史并
+报告为不可续接，绝不替换 `native_id`。`_harness/`、浏览器目录、`.env` 与
+`.credentials/` 不会被自动迁移，local 模式原工作流保持不变。
+
 底座决定谁负责执行对话和工具，连接由适配器自动管理。Codex、OpenCode、通用 ACP
 不需要再选择 API / OpenClaw 连接方式；模型供应商与认证沿用各自原生 CLI 配置。
 原有 API 直连整合为执行引擎列表中的 **仅聊天模式**，不再单独展示连接方式。

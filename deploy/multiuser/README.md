@@ -368,3 +368,40 @@ GET    /api/sessions/{id}/messages?limit=100&offset=0
   workspace/session 哈希分目录；绑定记录 workspace/runtime/native_id/
   agent_version，消息以加锁 JSONL 原子追加。旧无归属绑定/快照拒绝自动
   认领；local 模式继续使用原有 `_sessions` 格式。
+
+## 10. 备份、恢复与显式迁移
+
+完整前置、维护窗口、恢复演练和供应商矩阵见
+[docs/multiuser-deployment.zh-CN.md](../../docs/multiuser-deployment.zh-CN.md)。
+
+```bash
+# 控制库一致性快照 + master key + workspace 持久区；活动 worker 先 drain
+python -m easel admin backup \
+  --control-dir /srv/easel/control \
+  --destination /srv/easel/backups/2026-10-26 \
+  --master-key-file /run/secrets/easel-master.key \
+  --workspace-root /srv/easel/workspaces \
+  --image-digest sha256:<64hex> \
+  --harness-revision <revision> \
+  --provisioner-socket /srv/easel/run/provisioner.sock
+
+# 恢复到全新目录；非空目标、缺 key 或 key 不匹配都失败关闭
+python -m easel admin restore \
+  --source /srv/easel/backups/2026-10-26 \
+  --destination /srv/easel-restore/2026-10-26
+
+# 显式本机迁移：先 dry-run，再实际执行；源保持只读
+python -m easel admin migrate-local \
+  --source /home/operator/easel/outputs \
+  --workspace <32hex> \
+  --workspace-root /srv/easel/workspaces \
+  --dry-run
+```
+
+备份清单记录 schema、镜像/Harness/配置版本和每个文件的 SHA-256；不含邀请、
+登录或模型 Key 明文，排除 `.credentials/`，并清除快照中的 worker 服务
+token。恢复不会覆盖运行中的 control 目录，也不会在 key 缺失/不匹配时重置
+秘密。本机迁移只写入显式目标 workspace；
+`cwd` 不兼容或缺失的原生绑定只作为静态历史报告为不可续接，不替换
+`native_id`。上述能力不改变 Task 8 的真实防火墙/IPv6/配额/最终 Harness/
+浏览器沙箱门槛。

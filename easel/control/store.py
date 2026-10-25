@@ -426,6 +426,55 @@ class Store:
             raise
         return store
 
+    def backup_to(self, destination: Path | str) -> Path:
+        """使用 SQLite backup API 生成一致性快照，目标必须是新文件。
+
+        备份在同一连接上由 SQLite 自行协调读事务，包含 WAL 中已提交的数据；
+        调用方不需要、也不得暂停正在服务的控制库。目标已存在时拒绝覆盖，
+        避免误把已有备份或运行中的控制库当成输出。
+        """
+        target = Path(destination)
+        if not target.is_absolute():
+            raise DomainError("backup_destination_invalid", 400)
+        if target.exists():
+            raise DomainError("backup_exists", 409)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _restrict_directory(target.parent)
+            connection = sqlite3.connect(str(target))
+            try:
+                self._connection.backup(connection)
+                # worker 服务 token 是唯一明文访问令牌；备份不携带它，
+                # 恢复后由 provisioner 重新签发。secure_delete + VACUUM
+                # 避免旧页在快照空闲页中残留。
+                connection.execute("PRAGMA secure_delete = ON")
+                connection.execute(
+                    "UPDATE worker_leases SET service_token = ''"
+                    " WHERE service_token <> ''")
+                connection.commit()
+                connection.execute("VACUUM")
+                # 快照保持单文件：恢复到新目录后不应带 -wal/-shm 附属文件，
+                # 否则清单文件集合与恢复校验会不一致。
+                mode = connection.execute(
+                    "PRAGMA journal_mode = DELETE").fetchone()
+                if mode is None or str(mode[0]).lower() != "delete":
+                    raise DomainError("backup_integrity_failed", 500)
+                check = connection.execute(
+                    "PRAGMA integrity_check").fetchone()
+                if check is None or check[0] != "ok":
+                    raise DomainError("backup_integrity_failed", 500)
+            finally:
+                connection.close()
+            if os.name == "posix":
+                target.chmod(0o600)
+        except DomainError:
+            target.unlink(missing_ok=True)
+            raise
+        except (OSError, sqlite3.Error):
+            target.unlink(missing_ok=True)
+            raise DomainError("backup_failed", 500) from None
+        return target
+
     def close(self) -> None:
         self._connection.close()
 
@@ -526,6 +575,19 @@ class Store:
                 "INSERT INTO workspaces (id, owner_user_id, state, config_version, created_at)"
                 " VALUES (?, ?, 'ready', 0, ?)", (workspace_id, user_id, stamp))
         return Identity(user_id, workspace_id, role)
+
+    def list_workspace_ids(self) -> list[str]:
+        """按稳定顺序列出全部 workspace；仅供本地备份/迁移枚举。"""
+        return [row[0] for row in self._connection.execute(
+            "SELECT id FROM workspaces ORDER BY id").fetchall()]
+
+    def workspace_config_versions(self) -> dict[str, int]:
+        """返回各 workspace 当前配置版本，写进备份清单便于恢复核对。"""
+        return {
+            row[0]: int(row[1]) for row in self._connection.execute(
+                "SELECT id, config_version FROM workspaces ORDER BY id"
+            ).fetchall()
+        }
 
     def disable_user(self, user_id: str) -> bool:
         """禁用用户；已有数据保持不变。返回本次调用是否真的改变了状态。"""

@@ -217,6 +217,22 @@ class RuntimeManager:
                        generation=lease.generation,
                        expected_state="stopping")
 
+    async def drain_all(self) -> list[str]:
+        """为本地备份/升级顺序 drain 所有活动 workspace，返回已处理空间。
+
+        备份调用方必须在本方法返回后重新读取租约；仍处于 starting/stopping
+        等中间态时不得开始文件系统备份。单个空间 drain 的失败原样向上抛出，
+        不把“部分 drain”伪装成已完成。
+        """
+        leases = await self._db(self._store.list_worker_leases)
+        drained: list[str] = []
+        for lease in leases:
+            if lease.state not in ("starting", "ready", "draining", "stopping"):
+                continue
+            await self.drain(lease.workspace_id)
+            drained.append(lease.workspace_id)
+        return drained
+
     async def collect_idle(self, now: float) -> list[str]:
         """回收超过空闲阈值且无任务/请求的实例，返回真正停止的 workspace。
 
