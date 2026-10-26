@@ -114,6 +114,8 @@ def valid_container() -> dict:
     ]
     if inspect_scenario == "wrong_mount_source":
         mounts[0]["Name"] = f"{project}-foreign"
+    if inspect_scenario == "wrong_key_mount_source":
+        mounts[1]["Name"] = f"{project}-foreign-key"
     if inspect_scenario == "bind_mount":
         mounts[1] = {"Type": "bind", "Name": "", "Source": "C:/host/keys",
                      "Destination": "/keys", "RW": False}
@@ -501,7 +503,7 @@ def test_test_easel_rejects_volume_contract_before_container_inspect(
 
 
 def test_diagnose_accepts_expected_container(tmp_path):
-    _state, env = _fake_docker(tmp_path, scenario="owned")
+    state, env = _fake_docker(tmp_path, scenario="owned")
     result = _run_ps(
         TEST_SCRIPT, "-PublicOrigin", ORIGIN, "-Image", IMAGE,
         "-ProjectName", PROJECT, env=env)
@@ -515,10 +517,16 @@ def test_diagnose_accepts_expected_container(tmp_path):
     ):
         assert f"[ok] {name}" in output
     assert "diagnostics=ok" in output
+    calls = _calls(state)
+    helpers = [call for call in calls if call and call[0] == "run"]
+    assert len(helpers) == 1, "合法诊断只允许一次 key helper"
+    assert (f"type=volume,src={PROJECT}-keys,dst=/keys,readonly"
+            in helpers[0]), "helper 必须挂载预期 key 卷并显式 readonly"
 
 
 @pytest.mark.parametrize("inspect_scenario,expected", [
     ("wrong_mount_source", "[fail] control_volume_source"),
+    ("wrong_key_mount_source", "[fail] key_volume_source"),
     ("bind_mount", "[fail] key_volume_source"),
     ("key_writable", "[fail] key_volume_readonly"),
     ("wrong_origin", "[fail] command_matches"),
@@ -535,13 +543,16 @@ def test_diagnose_accepts_expected_container(tmp_path):
 ])
 def test_diagnose_rejects_actual_wiring_mismatch(
         tmp_path, inspect_scenario, expected):
-    _state, env = _fake_docker(
+    state, env = _fake_docker(
         tmp_path, scenario="owned", inspect_scenario=inspect_scenario)
     result = _run_ps(
         TEST_SCRIPT, "-PublicOrigin", ORIGIN, "-Image", IMAGE,
         "-ProjectName", PROJECT, env=env)
     assert result.returncode != 0
     assert expected in result.stdout + result.stderr
+    calls = _calls(state)
+    assert not any(call and call[0] == "run" for call in calls), (
+        "静态契约失败时不得运行 key helper")
 
 
 def _load_keygen():

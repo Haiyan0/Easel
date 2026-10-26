@@ -112,6 +112,28 @@ control 容器只挂载 `control` 数据卷与 master key 卷；没有 Docker so
 
 A1 R1 只修改脚本、测试和文档，未改变镜像应用内容/依赖；审计单允许保留已有 A1 浏览器证据，因此没有重做 ngrok HTTPS 双身份浏览器场景。真实 Docker 复跑使用同一最终镜像完成了 init/start/Test/重开。逐项失败/通过测试 ID 见 [r1-red-green.md](r1-red-green.md)。
 
+## A1 R2 定向返工（2026-10-27）
+
+### R2-01：key helper 调用门禁与 readonly 挂载
+
+- 静态契约检查先全部打印并汇总；任一失败立即退出，不运行 key helper。
+- 只有静态检查全部通过后，helper 才挂载**已验证的预期** `$ProjectName-keys` 卷，显式 `dst=/keys,readonly`。
+- 保留 `key_volume_source` 对运行容器实际 `/keys` 挂载 Name 与预期卷的一致性检查；不从实际 Name 生成 Docker 操作目标。
+- 不修改认证核心、Compose 拓扑或 key 生成逻辑。
+
+### R2 红绿与真实 Docker
+
+| 项目 | 实际结果 |
+|---|---|
+| 上一提交 `a2b83fa` 的 Test 脚本跑当前 45 项 | **10 failed、35 passed**，28.86 s |
+| 当前 Test 脚本跑同一 45 项 | **45 passed**，26.76 s |
+| R2 最终固定镜像 | `sha256:0f63a617aa1f95090edbc3073e6447dbfd1c2bc6b15e95f0c7e193e789bc917f` |
+| 真实合法初始化/启动/诊断 | `key=created`；start healthy；`Test-Easel.ps1` 20 项全部通过 |
+| 独立 readonly helper | 预期 `...-keys` 卷、`dst=/keys,readonly`，输出 `key=exists` |
+| 清理 | 随机测试容器/卷删除；无残留，未使用全局 prune |
+
+静态失败时不运行 helper 的测试覆盖：实际外来 key 卷、错挂载来源、bind 替代、key 可写、错误 Origin/命令/Entrypoint/项目/service、额外端口和非法容器结构。逐项红绿见 [r2-red-green.md](r2-red-green.md)。应用/镜像内容未变化，未重做 ngrok 双身份场景。
+
 ## 截图
 
 - `01-admin-members.png`：管理员设置页（无邀请明文）
@@ -165,7 +187,7 @@ docker compose -p $ProjectName -f .\deploy\desktop\compose.login.yaml stop
 
 ## 回归
 
-见交付说明与 `docs/windows-desktop-operations.zh-CN.md` 9.8。本次实际后端回归 111 passed（Desktop 44 passed）；完整 `tests/multiuser` 1048 passed、4 skipped；前端 lint/build 和 Compose 静态校验通过。
+见交付说明与 `docs/windows-desktop-operations.zh-CN.md` 9.8。本次实际后端回归 112 passed（Desktop 45 passed）；完整 `tests/multiuser` 1049 passed、4 skipped；前端 lint/build 和 Compose 静态校验通过。
 
 ## 不属于 A1 的剩余项
 

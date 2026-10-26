@@ -188,18 +188,6 @@ try {
         [string]$portBindings[0].HostPort -eq [string]$Port)
     $checks['health_ok'] = ($healthStatus -eq 'healthy')
 
-    $checks['master_key_present'] = $false
-    if ($keyVolumeName) {
-        $keyCheck = Invoke-EaselDocker -Arguments @(
-            'run', '--rm', '--user', '10001:10001',
-            '--entrypoint', 'python',
-            '--mount', "type=volume,src=$keyVolumeName,dst=/keys",
-            $Image,
-            '/opt/easel/deploy/desktop/keygen.py', '--check',
-            '--path', '/keys/master.key')
-        $checks['master_key_present'] = ($keyCheck.ExitCode -eq 0)
-    }
-
     $failed = @()
     foreach ($name in $checks.Keys) {
         if ($checks[$name]) {
@@ -210,10 +198,31 @@ try {
         }
     }
     if ($failed.Count -gt 0) {
+        # 静态身份/命令/挂载/端口契约未通过时，绝不运行 key helper。
         [Console]::Error.WriteLine(
             "错误：diagnostics_failed:$($failed -join ',')")
         exit 1
     }
+
+    # 只有静态契约全部通过才读取 key；目标固定为已验证的预期 key 卷，
+    # 不使用运行容器的实际 Name 现场生成操作，并显式声明只读挂载。
+    $checks['master_key_present'] = $false
+    $keyCheck = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--user', '10001:10001',
+        '--entrypoint', 'python',
+        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
+        $Image,
+        '/opt/easel/deploy/desktop/keygen.py', '--check',
+        '--path', '/keys/master.key')
+    $checks['master_key_present'] = ($keyCheck.ExitCode -eq 0)
+    if ($checks['master_key_present']) {
+        Write-Output '[ok] master_key_present'
+    } else {
+        Write-Output '[fail] master_key_present'
+        [Console]::Error.WriteLine('错误：diagnostics_failed:master_key_present')
+        exit 1
+    }
+
     Write-Output ("diagnostics=ok project={0} checks={1}" -f `
         $ProjectName, $checks.Count)
     exit 0

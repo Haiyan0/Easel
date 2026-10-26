@@ -124,5 +124,30 @@
       "specified": 111,
       "multiuser": "1048 passed/4 skipped"
     }
+  },
+  "r2": {
+    "red": {
+      "tests": 45,
+      "failed": 10,
+      "passed": 35,
+      "seconds": 28.86
+    },
+    "green": {
+      "tests": 45,
+      "passed": 45,
+      "seconds": 26.76
+    },
+    "real": {
+      "image": "sha256:0f63a617aa1f95090edbc3073e6447dbfd1c2bc6b15e95f0c7e193e789bc917f",
+      "initialization": "key=created",
+      "start": "healthy",
+      "diagnostics_checks": 20,
+      "readonly_helper": "expected keys volume, dst=/keys,readonly, key=exists",
+      "cleanup": "no containers/volumes; no global prune"
+    },
+    "regression": {
+      "specified": 112,
+      "multiuser": "1049 passed/4 skipped"
+    }
   }
 }

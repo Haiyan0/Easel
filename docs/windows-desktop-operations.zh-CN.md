@@ -521,7 +521,7 @@ curl.exe -fsS -o NUL -w "http=%{http_code} ssl_verify=%{ssl_verify_result}`n" `
   "$PublicOrigin/api/health"
 ```
 
-诊断从运行中容器读取实际 `docker inspect`，检查：Compose 项目/service 标签、镜像 ID、UID/GID、只读根、`cap_drop ALL`、`no-new-privileges`、非 privileged、非 host 网络、合并 Entrypoint/Cmd 后的完整 `serve-control` 命令（含实际 `--public-origin`、control/key/前端目录和 7861 端口）、恰好两个 volume 挂载（control 可写/key 只读、实际卷 Name 与项目匹配、拒绝 bind 替代）、无额外挂载、仅 `127.0.0.1:7861` 一个发布端口、健康状态，以及用实际 key 挂载卷检查 key。inspect 为空/多对象/结构缺失/非法 JSON 均失败。输出只有检查名/状态码，不解析或回显 key、邀请、Cookie、访问令牌或完整 env。
+诊断从运行中容器读取实际 `docker inspect`，检查：Compose 项目/service 标签、镜像 ID、UID/GID、只读根、`cap_drop ALL`、`no-new-privileges`、非 privileged、非 host 网络、合并 Entrypoint/Cmd 后的完整 `serve-control` 命令（含实际 `--public-origin`、control/key/前端目录和 7861 端口）、恰好两个 volume 挂载（control 可写/key 只读、实际卷 Name 与项目匹配、拒绝 bind 替代）、无额外挂载、仅 `127.0.0.1:7861` 一个发布端口、健康状态。上述静态契约全部通过后才运行 key helper；helper 固定挂载已验证的预期 `$ProjectName-keys` 卷并显式 `readonly`，不使用运行容器的实际 Name 生成 Docker 操作目标。静态失败时不会运行 helper；inspect 为空/多对象/结构缺失/非法 JSON 均失败。输出只有检查名/状态码，不解析或回显 key、邀请、Cookie、访问令牌或完整 env。
 
 ### 9.6 停止、重开与清理
 
@@ -562,6 +562,7 @@ docker volume rm "$ProjectName-control" "$ProjectName-keys"
 | 浏览器证据 control 镜像 | `sha256:d06578a3b011f6b06e9b3781414aae1757bbe41ffba7e7f3479e3302d4d3b49f` |
 | 最终脚本校验镜像（同源重建） | `sha256:c4a4c7f24462addff841f9b5b360e97654bd4cebaf89c48f113bcc57f8c4e6d1` |
 | R1 脚本校验镜像（同源重建） | `sha256:3df01c1d2072a05c757e2d00bc43a31bcff93d2db5622dd5654ff9f90975e335` |
+| R2 脚本校验镜像（同源重建） | `sha256:0f63a617aa1f95090edbc3073e6447dbfd1c2bc6b15e95f0c7e193e789bc917f` |
 | ngrok | 3.39.11，公网 HTTPS 可达 |
 | Chromium | 151.0.7922.34，headless，独立 browser context |
 | 管理员 HTTPS 登录 | 通过 |
@@ -580,6 +581,9 @@ docker volume rm "$ProjectName-control" "$ProjectName-keys"
 | R1 停止后重开 | `key=exists`，再次启动健康，20 项诊断全部通过 |
 | R1 诊断反例（fake Docker） | 错挂载来源、bind 替代、key 可写、Origin/命令/项目/service 错误、额外端口、空/多/非法 inspect 均失败 |
 | R1 红绿 | 旧脚本 44 项中 28 failed、16 passed；当前脚本 44 passed |
+| R2 静态失败时 key helper | 实际外来 key 卷/错挂载/命令/Origin/端口等均在 helper 前拒绝 |
+| R2 合法 readonly helper | 预期 `$ProjectName-keys` 卷、`dst=/keys,readonly`，`key=exists` |
+| R2 红绿 | 旧 Test 脚本 45 项中 10 failed、35 passed；当前 45 passed |
 
 截图见 `docs/evidence/desktop-a1/`，均不包含邀请令牌、Cookie、CSRF 或 master key。本次 ngrok 账户使用免费固定静态域名，无法在本机同时建立第二个公开 ngrok 主机；因此“ngrok 公开地址变化”本身标记为 **not-run**。Origin 变更子场景改用 `127.0.0.1:8443` 的真实 TLS 反向代理，并以 Chromium SPKI pin 校验该本地自签证书；它是范围受限的本地证书，不是公开 CA，也不冒充 ngrok 地址变化。核心双身份登录证据仍来自真实 ngrok 公网 HTTPS。
 
@@ -600,7 +604,7 @@ if ($LASTEXITCODE -ne 0) { throw '前端构建失败' }
 Pop-Location
 ```
 
-本次实际结果：上述后端 **111 passed**（Desktop 测试 44 passed）；前端 lint/build 通过；`docker compose config --quiet` 通过；完整 `tests/multiuser` 为 **1048 passed、4 skipped**。A1 R1 未改变镜像应用内容/依赖，因此没有重跑真实 HTTPS 双身份浏览器场景；审计单允许保留已有浏览器证据，但要求用最终固定镜像复跑 init/start/Test/重开，已完成并记录在 `docs/evidence/desktop-a1/report.md`。
+本次实际结果：上述后端 **112 passed**（Desktop 测试 45 passed）；前端 lint/build 通过；`docker compose config --quiet` 通过；完整 `tests/multiuser` 为 **1049 passed、4 skipped**。A1 R2 未改变镜像应用内容/依赖，因此没有重跑真实 HTTPS 双身份浏览器场景；审计单保留已有浏览器证据，并要求复跑合法真实 Test，已完成并记录在 `docs/evidence/desktop-a1/report.md`。
 
 仍有限制：没有执行 worker、Harness、真实供应商或聊天闭环；`/api/outputs` 等工作区业务继续 503；ngrok 公开地址变化未实测；本地 pinned TLS 只用于子场景；正式 Linux 发布检查器仍因固定证据 blockers 保持 blocked。本文不把本机登录管理面结果冒充正式上线。
 
