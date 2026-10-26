@@ -174,8 +174,7 @@ def test_empty_gate_is_a_failure():
 def test_unmarked_tests_are_a_failure():
     module = _load_module()
     result = module.classify_gate_result(
-        "live", 0, "1 passed, 2 deselected in 0.20s",
-        require_marker_coverage=True)
+        "live", 0, "1 passed, 2 deselected in 0.20s")
     assert result.status == "fail"
     assert result.code == "gate_unmarked"
 
@@ -286,6 +285,92 @@ def test_live_gate_rejects_deselected_marker_tests(tmp_path):
                 if result.name == "live_two_users")
     assert live.status == "fail"
     assert live.code == "gate_unmarked"
+
+
+def _real_runner(test_file: Path, *extra_args: str):
+    """忽略 gate 原命令，运行一个真实微型 pytest 并返回真实 CompletedProcess。"""
+    def run(argv, **kwargs):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", str(test_file), *extra_args,
+             "-q", "-rsxX", "-p", "no:cacheprovider"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=False)
+    return run
+
+
+def test_real_pytest_warning_zero_skipped_does_not_hide_actual_skip(
+        tmp_path):
+    module = _load_module()
+    test_file = tmp_path / "test_warning_skip.py"
+    test_file.write_text(
+        "import warnings\n"
+        "import pytest\n"
+        "def test_ok():\n"
+        "    warnings.warn('0 skipped')\n"
+        "def test_skip():\n"
+        "    pytest.skip('mandatory unavailable')\n",
+        encoding="utf-8")
+    results = module.run_release_gates(
+        _formal_env(tmp_path), run_command=_real_runner(test_file))
+    assert results
+    assert all(result.status == "fail" for result in results)
+    assert all(result.code == "gate_skipped" for result in results)
+    evidence = {item.name: item for item in module.evaluate_evidence(results)}
+    assert evidence["egress_proxy"].status == "blocked"
+
+
+def test_real_pytest_deselected_fails_every_mandatory_gate(tmp_path):
+    module = _load_module()
+    test_file = tmp_path / "test_selection.py"
+    test_file.write_text(
+        "def test_selected():\n"
+        "    assert True\n"
+        "def test_private_rejection():\n"
+        "    assert True\n",
+        encoding="utf-8")
+    results = module.run_release_gates(
+        _formal_env(tmp_path),
+        run_command=_real_runner(test_file, "-k", "test_selected"))
+    assert results
+    assert all(result.status == "fail" for result in results)
+    assert all(result.code == "gate_unmarked" for result in results)
+    evidence = {item.name: item for item in module.evaluate_evidence(results)}
+    assert evidence["egress_proxy"].status == "blocked"
+
+
+@pytest.mark.parametrize("body,code", [
+    (("import pytest\n"
+      "@pytest.mark.xfail\n"
+      "def test_xfail():\n"
+      "    assert False\n"), "gate_xfailed"),
+    (("import pytest\n"
+      "@pytest.mark.xfail\n"
+      "def test_xpass():\n"
+      "    assert True\n"), "gate_xpassed"),
+    ("# 没有测试\n", "gate_empty"),
+])
+def test_real_pytest_xfail_xpass_empty_are_rejected(
+        tmp_path, capsys, body, code):
+    module = _load_module()
+    result, captured = _run_real_pytest(module, tmp_path, body, capsys)
+    assert result.status == "fail"
+    assert result.code == code
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_gate_without_trustworthy_summary_fails_closed(
+        tmp_path, capsys):
+    module = _load_module()
+    result = module.execute_gate(
+        "unverified",
+        [sys.executable, "-c", "print('1 passed')"],
+        cwd=tmp_path, env=os.environ.copy(), run_command=subprocess.run)
+    captured = capsys.readouterr()
+    assert result.status == "fail"
+    assert result.code == "gate_unverified"
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_missing_egress_proxy_is_an_explicit_failure(tmp_path):

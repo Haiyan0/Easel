@@ -323,8 +323,8 @@ python -m pytest tests/multiuser -q
   假 ACP Harness；A/B 一次性邀请、同名会话、HTTP/SSE、连续追问续接、
   worker outputs 隔离、控制库/持久区备份恢复均为本机实际执行。
 - 本机结果：`test_two_users.py` 4 passed；`test_release_checker.py`
-  18 passed；`test_live_assertions.py` 4 passed；`tests/multiuser`
-  998 passed、4 skipped；真实 Chromium profile 测试 12 passed（含缓存值
+  24 passed；`test_live_assertions.py` 4 passed；`tests/multiuser`
+  1004 passed、4 skipped；真实 Chromium profile 测试 12 passed（含缓存值
   负向敏感性）；前端 Node 测试 118 passed，生产构建通过。另在
   本机 Docker Desktop 用已有 Task 8 执行镜像运行
   `smoke_worker.py --check-files` 得到 `WORKER_SMOKE_OK`；这不是从头
@@ -347,7 +347,8 @@ python -m pytest tests/integration/multiuser/test_two_users_live.py \
 key、固定 worker 镜像、HTTPS control/preview、A/B 一次性邀请、真实备份源、
 空恢复目标和 `EASEL_TEST_EGRESS_PROXY`；检查器设置 `EASEL_EGRESS_LIVE=1`
 并实际运行真实出口测试。所有选中的安全/发布门槛出现 skip/xfail/xpass、
-空集合或任一失败均退出 1，没有文件级宽松开关。
+空集合、漏选或任一失败均退出 1，没有文件级宽松开关。统计只取 pytest
+最终汇总行，警告/用例正文中的数字不参与；无法确认完整统计时失败关闭。
 
 检查器还区分已执行门槛与正式证据：真实出口通过才把 egress 标为已验证；
 XFS 只检查挂载/工具不算 10 GiB 配额建立与耗尽；宿主 DOCKER-USER/

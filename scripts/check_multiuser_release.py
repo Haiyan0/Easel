@@ -259,31 +259,66 @@ def check_prerequisites(
     return checks
 
 
-def _count(output: str, label: str) -> int:
-    match = re.search(rf"(\d+) {label}\b", output)
-    return int(match.group(1)) if match else 0
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_SUMMARY_TOKEN = (
+    r"\d+ (?:passed|failed|skipped|xfailed|xpassed|warning|warnings|"
+    r"error|errors|deselected)")
+_SUMMARY_LINE = re.compile(
+    rf"^(?P<body>{_SUMMARY_TOKEN}(?:, {_SUMMARY_TOKEN})*)"
+    rf" in \d+\.\d+s(?:\s+\([^)]*\))?$")
+_NO_TESTS_LINE = re.compile(
+    r"^no tests ran in \d+\.\d+s(?:\s+\([^)]*\))?$")
+_COUNT_TOKEN = re.compile(
+    r"(\d+) (passed|failed|skipped|xfailed|xpassed|error|errors|deselected)")
 
 
-def classify_gate_result(
-        name: str, returncode: int, output: str, *,
-        require_marker_coverage: bool = False) -> GateResult:
-    """把 pytest 结果映射为发布门槛；任何 skip/xfail/xpass 都失败。"""
-    text = output or ""
-    if returncode != 0:
+def _summary_counts(output: str) -> dict[str, int] | None:
+    """只读取 pytest 最终汇总行；警告/用例正文中的数字不参与统计。
+
+    找不到可信最终统计时返回 ``None``，由调用方失败关闭。
+    """
+    lines = _ANSI.sub("", output or "").replace("\r\n", "\n").replace(
+        "\r", "\n").splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith("=") and line.endswith("="):
+            line = line.strip("= ").strip()
+        if _NO_TESTS_LINE.fullmatch(line):
+            return {}
+        match = _SUMMARY_LINE.fullmatch(line)
+        if match is None:
+            continue
+        counts: dict[str, int] = {}
+        for number, label in _COUNT_TOKEN.findall(match.group("body")):
+            if label in ("error", "errors"):
+                label = "errors"
+            counts[label] = counts.get(label, 0) + int(number)
+        return counts
+    return None
+
+
+def classify_gate_result(name: str, returncode: int, output: str) -> GateResult:
+    """把真实 pytest 最终汇总映射为发布门槛；统计不可信即失败关闭。"""
+    counts = _summary_counts(output)
+    if counts is None:
+        return GateResult(
+            name, "fail", "gate_failed" if returncode != 0
+            else "gate_unverified")
+    if counts == {}:
+        return GateResult(name, "fail", "gate_empty")
+    if returncode != 0 or counts.get("failed") or counts.get("errors"):
         return GateResult(name, "fail", "gate_failed")
-    if "no tests ran" in text or "collected 0 items" in text:
-        return GateResult(name, "fail", "gate_empty")
-    # skip/xfail/xpass 优先于“passed 数为 0”：全跳过不能被误报为空集合。
-    if _count(text, "skipped"):
+    # skip/xfail/xpass/漏选都优先于 passed 数：不能用少数通过用例替代。
+    if counts.get("skipped"):
         return GateResult(name, "fail", "gate_skipped")
-    if _count(text, "xfailed"):
+    if counts.get("xfailed"):
         return GateResult(name, "fail", "gate_xfailed")
-    if _count(text, "xpassed"):
+    if counts.get("xpassed"):
         return GateResult(name, "fail", "gate_xpassed")
-    if _count(text, "passed") == 0:
-        return GateResult(name, "fail", "gate_empty")
-    if require_marker_coverage and _count(text, "deselected"):
+    if counts.get("deselected"):
         return GateResult(name, "fail", "gate_unmarked")
+    if counts.get("passed", 0) == 0:
+        return GateResult(name, "fail", "gate_empty")
     return GateResult(name, "pass")
 
 
@@ -295,8 +330,7 @@ def execute_gate(
         name: str, argv: Sequence[str], *,
         cwd: Path = ROOT,
         env: Mapping[str, str] | None = None,
-        run_command: Callable = subprocess.run,
-        require_marker_coverage: bool = False) -> GateResult:
+        run_command: Callable = subprocess.run) -> GateResult:
     """执行一个门槛并捕获输出；公开报告只接收脱敏状态。
 
     ``text=True`` + 明确 UTF-8 解码避免 locale 差异；``errors=replace``
@@ -309,10 +343,10 @@ def execute_gate(
         errors="replace")
     if result is None:
         return GateResult(name, "fail", "gate_unavailable")
-    output = (result.stdout or "") + (result.stderr or "")
+    # 只信任 pytest 的 stdout 最终汇总；stderr 可能有插件/警告噪声，不参与
+    # 计数。stdout 缺失或没有最终汇总时 classify 会失败关闭。
     return classify_gate_result(
-        name, result.returncode, output,
-        require_marker_coverage=require_marker_coverage)
+        name, result.returncode, result.stdout or "")
 
 
 def run_release_gates(
@@ -342,40 +376,40 @@ def run_release_gates(
         # 未打 marker；仍用 marker 和 deselected 检查防止新增 live 测试漏选。
         ("live_two_users",
          _pytest(python, *live_files, "--multiuser-live", "-m", LIVE_MARKER),
-         root, True),
+         root),
         ("egress_live",
          _pytest(python,
                  "tests/integration/multiuser/test_egress.py"),
-         root, False),
+         root),
         ("container_isolation",
          _pytest(python,
                  "tests/integration/multiuser/test_container_isolation.py"),
-         root, False),
+         root),
         ("network_wiring",
          _pytest(python,
                  "tests/integration/multiuser/test_network_wiring.py"),
-         root, False),
+         root),
         ("control_broker_topology",
          _pytest(python,
                  "tests/integration/multiuser/test_control_broker_topology.py"),
-         root, False),
+         root),
         ("browser_profiles_real",
          _pytest(python,
                  "tests/integration/multiuser/test_browser_profiles_real.py"),
-         root, False),
+         root),
         ("sidecar_provisioner_real",
          _pytest(python,
                  "tests/integration/multiuser/test_sidecar_provisioner_real.py"),
-         root, False),
+         root),
         ("backend_regression",
          _pytest(python, "tests/multiuser"),
-         root, False),
+         root),
     ]
     return [
         execute_gate(
-            name, argv, cwd=cwd, env=environment, run_command=run_command,
-            require_marker_coverage=marker_coverage)
-        for name, argv, cwd, marker_coverage in gates
+            name, argv, cwd=cwd, env=environment,
+            run_command=run_command)
+        for name, argv, cwd in gates
     ]
 
 

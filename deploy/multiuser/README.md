@@ -426,9 +426,9 @@ python -m pytest tests/multiuser/test_release_checker.py -q
   `test_live_assertions.py` 用 MockTransport 证明 live 测试拒绝
   failed/interrupted/cancelled 及部分输出。
 - 2026-10-26 本机（Windows，父基线 `ced2a64`）结果：
-  `test_two_users.py` 4 passed、`test_release_checker.py` 18 passed、
+  `test_two_users.py` 4 passed、`test_release_checker.py` 24 passed、
   `test_live_assertions.py` 4 passed；完整 `tests/multiuser` 为
-  `998 passed, 4 skipped`；真实 Chromium 的
+  `1004 passed, 4 skipped`；真实 Chromium 的
   `tests/integration/multiuser/test_browser_profiles_real.py` 为
   `12 passed`（含缓存值负向敏感性）；前端 Node 测试 `118 passed`，
   生产构建通过。另在本机
@@ -467,7 +467,8 @@ python -m pytest \
   IPv6 回环/元数据/DNS 重绑定拒绝）。
 
 所有选中的安全/发布门槛都必须真实执行；任一 skip/xfail/xpass、空集合
-或漏选均失败，没有文件级宽松开关。检查器还区分：
+或漏选均失败，没有文件级宽松开关。统计只取 pytest 最终汇总行，警告或
+用例正文中的数字不参与；找不到可信最终统计时失败关闭。检查器还区分：
 
 - **已验证证据**：真实出口测试通过；
 - **阻断证据**：XFS 挂载/工具存在不等于 10 GiB 配额建立与耗尽已实测；
