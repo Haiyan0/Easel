@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
+
+from tests.multiuser.cache_checks import assert_no_private_cache
 
 pytestmark = pytest.mark.multiuser_integration
 
@@ -77,10 +80,21 @@ def test_live_browser_contexts_do_not_share_login_or_cache(
                 assert cookies_b["__Host-easel_session"] == b.cookie_value
                 assert a.cookie_value != b.cookie_value
 
-                storage_b = page_b.evaluate(
-                    "Object.keys(localStorage).join('|')")
-                assert a.user_id not in storage_b
-                assert a.workspace_id not in storage_b
+                # A 的持久缓存写入测试 sentinel；B 的 localStorage/
+                # sessionStorage 键和值都不得出现 A 的身份或数据。
+                private_marker = "task14-private-" + uuid.uuid4().hex
+                page_a.evaluate(
+                    "v => { localStorage.setItem('task14-private', v);"
+                    " sessionStorage.setItem('task14-private', v); }",
+                    private_marker)
+                assert_no_private_cache(
+                    page_b, [a.user_id, a.workspace_id, private_marker],
+                    label="B")
+                assert_no_private_cache(
+                    page_a, [b.user_id, b.workspace_id], label="A")
+                visible_b = page_b.text_content("body") or ""
+                for marker in (a.user_id, a.workspace_id, private_marker):
+                    assert marker not in visible_b
             finally:
                 context_a.close()
                 context_b.close()

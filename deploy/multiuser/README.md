@@ -421,13 +421,17 @@ python -m pytest tests/multiuser/test_release_checker.py -q
   假 ACP Harness；验证 A/B 一次性邀请登录、同名会话、HTTP/SSE、连续追问
   续接、worker outputs 的 token/文件隔离，以及控制库 + 持久区在新目录的
   备份恢复。它不连接真实 Docker、目标 Linux、真实 DSH 或供应商。
-- `test_release_checker.py` 只验证检查器在缺前提、skip/xfail、空门槛和
-  未标记测试时失败，不访问真实环境。
-- 2026-10-26 本机（Windows，父基线 `5bebd87`）结果：两文件分别
-  `4 passed` 与 `11 passed`；完整 `tests/multiuser` 为
-  `987 passed, 4 skipped`；真实 Chromium 的
+- `test_release_checker.py` 只验证检查器在缺前提、skip/xfail、空门槛、
+  未标记测试、真实子进程输出捕获和未验证证据阻断时失败，不访问真实环境。
+  `test_live_assertions.py` 用 MockTransport 证明 live 测试拒绝
+  failed/interrupted/cancelled 及部分输出。
+- 2026-10-26 本机（Windows，父基线 `ced2a64`）结果：
+  `test_two_users.py` 4 passed、`test_release_checker.py` 18 passed、
+  `test_live_assertions.py` 4 passed；完整 `tests/multiuser` 为
+  `998 passed, 4 skipped`；真实 Chromium 的
   `tests/integration/multiuser/test_browser_profiles_real.py` 为
-  `11 passed`；前端 Node 测试 `118 passed`，生产构建通过。另在本机
+  `12 passed`（含缓存值负向敏感性）；前端 Node 测试 `118 passed`，
+  生产构建通过。另在本机
   Docker Desktop 用已有 Task 8 执行镜像运行
   `smoke_worker.py --check-files`，输出 `WORKER_SMOKE_OK`；这不是从头
   构建、容器隔离/网络/配额或目标 Linux 证据。Windows 上 POSIX 执行位等
@@ -457,15 +461,29 @@ python -m pytest \
 - `EASEL_TEST_WORKER_IMAGE` 为 `sha256:<64hex>` 固定摘要；
 - `EASEL_TEST_INVITE_A`/`EASEL_TEST_INVITE_B` 为未兑换的一次性邀请；
 - `EASEL_TEST_BACKUP_SOURCE` 为已有备份，`EASEL_TEST_RESTORE_DEST` 为新/
-  空目录；并安装 Playwright/Chromium。
+  空目录；并安装 Playwright/Chromium；
+- `EASEL_TEST_EGRESS_PROXY` 为受控出口代理；检查器会设置
+  `EASEL_EGRESS_LIVE=1` 并实际运行 `test_egress.py`（公网允许、
+  IPv6 回环/元数据/DNS 重绑定拒绝）。
 
-缺任一变量、marker 测试出现 skip/xfail/xpass、Docker/浏览器/恢复门槛
-失败，检查器均退出 1。2026-10-26 在 Windows 本机实际运行检查器输出：
+所有选中的安全/发布门槛都必须真实执行；任一 skip/xfail/xpass、空集合
+或漏选均失败，没有文件级宽松开关。检查器还区分：
+
+- **已验证证据**：真实出口测试通过；
+- **阻断证据**：XFS 挂载/工具存在不等于 10 GiB 配额建立与耗尽已实测；
+  宿主 DOCKER-USER/IPv4/IPv6 矩阵未自动验证；容器测试只构建 base/
+  execution 假 Harness，不等于传入最终 runtime 镜像及真实 DSH/profile
+  已验收。因此后三项保持 `blocked`，`release_status` 只能为 `blocked`
+  （退出 1），不能出现 `passed`。
+
+缺任一变量、门槛失败或证据未验证，检查器均退出 1。2026-10-26 在 Windows
+本机实际运行检查器输出：
 
 ```text
 release_status=failed
 [fail] platform platform_not_linux
 gates=not_run
+evidence=not_run
 ```
 
 这是本机证据，不是正式通过。正式 Linux/Docker/XFS/真实 DSH/浏览器沙箱/

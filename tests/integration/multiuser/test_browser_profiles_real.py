@@ -12,8 +12,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills" / "shared" / "scripts"))
 
-from easel.control.types import WorkspacePaths  # noqa: E402
-from easel.worker.browser import BrowserProfiles, ProfileLock  # noqa: E402
+from easel.control.types import WorkspacePaths
+from easel.worker.browser import BrowserProfiles, ProfileLock
+from tests.multiuser.cache_checks import assert_no_private_cache
 
 playwright = pytest.importorskip("playwright.sync_api")
 sync_playwright = playwright.sync_playwright
@@ -83,13 +84,13 @@ def test_persistent_profile_keeps_cookie_across_restart(tmp_path):
 
 def test_actual_skill_navigation_error_closes_browser_and_releases_lock(
         tmp_path, monkeypatch):
-    import zhihu_comments_fetch
     import zhihu_answer
+    import zhihu_comments_fetch
 
     profile = tmp_path / "home" / ".easel-browser-profiles" / "zhihu" / "default"
     for module in (zhihu_comments_fetch, zhihu_answer):
         monkeypatch.setattr(module, "PROFILE_DIR", profile, raising=False)
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 - 只验证失败路径清理
             if module is zhihu_comments_fetch:
                 module.fetch_comments("bad://invalid")
             else:
@@ -186,6 +187,7 @@ def test_run_browser_success_releases_lock_with_keep_open(
 
 def test_xhtml_output_is_sandboxed_in_real_chromium(tmp_path, monkeypatch):
     import uvicorn
+
     import web.app as web
 
     outputs = tmp_path / "outputs"
@@ -229,14 +231,46 @@ def test_exception_while_browser_open_releases_profile_lock(tmp_path):
     with sync_playwright() as p:
         browser = _launch_or_skip(p)
         browser.close()
-        with pytest.raises(RuntimeError):
-            with manager.persistent_profile("xiaohongshu", "default",
-                                            timeout=10) as profile:
-                context = p.chromium.launch_persistent_context(
-                    str(profile), headless=True)
-                try:
-                    raise RuntimeError("boom")
-                finally:
-                    context.close()
+        with (pytest.raises(RuntimeError),
+              manager.persistent_profile("xiaohongshu", "default",
+                                         timeout=10) as profile):
+            context = p.chromium.launch_persistent_context(
+                str(profile), headless=True)
+            try:
+                raise RuntimeError("boom")
+            finally:
+                context.close()
         with manager.persistent_profile("xiaohongshu", "default", timeout=2):
             pass
+
+
+def test_cache_values_with_foreign_identity_are_detected():
+    """真实 Chromium：缓存值（而非仅键名）含 A 数据时必须失败。"""
+    with sync_playwright() as p:
+        browser = _launch_or_skip(p)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            context.route(
+                "https://cache.test/",
+                lambda route: route.fulfill(
+                    status=200, content_type="text/html",
+                    body="<html><body>cache</body></html>"))
+            page.goto("https://cache.test/", wait_until="domcontentloaded")
+            page.evaluate(
+                "v => { localStorage.setItem('shared-cache', v);"
+                " sessionStorage.setItem('shared-cache', v); }",
+                "user-A ws-A A private")
+            with pytest.raises(AssertionError):
+                assert_no_private_cache(
+                    page, ["user-A", "ws-A", "A private"])
+            page.evaluate(
+                "() => { localStorage.clear(); sessionStorage.clear(); }")
+            page.evaluate(
+                "v => localStorage.setItem('mine', v)",
+                "user-B ws-B")
+            assert_no_private_cache(
+                page, ["user-A", "ws-A", "A private"])
+        finally:
+            context.close()
+            browser.close()

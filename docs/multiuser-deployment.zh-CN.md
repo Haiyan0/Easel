@@ -323,8 +323,9 @@ python -m pytest tests/multiuser -q
   假 ACP Harness；A/B 一次性邀请、同名会话、HTTP/SSE、连续追问续接、
   worker outputs 隔离、控制库/持久区备份恢复均为本机实际执行。
 - 本机结果：`test_two_users.py` 4 passed；`test_release_checker.py`
-  11 passed；`tests/multiuser` 987 passed、4 skipped；真实 Chromium
-  profile 测试 11 passed；前端 Node 测试 118 passed，生产构建通过。另在
+  18 passed；`test_live_assertions.py` 4 passed；`tests/multiuser`
+  998 passed、4 skipped；真实 Chromium profile 测试 12 passed（含缓存值
+  负向敏感性）；前端 Node 测试 118 passed，生产构建通过。另在
   本机 Docker Desktop 用已有 Task 8 执行镜像运行
   `smoke_worker.py --check-files` 得到 `WORKER_SMOKE_OK`；这不是从头
   构建、容器隔离/网络/配额或目标 Linux 证据。Windows 既有 POSIX 跳过
@@ -343,14 +344,24 @@ python -m pytest tests/integration/multiuser/test_two_users_live.py \
 ```
 
 正式检查要求 Linux、可用 Docker、XFS `prjquota`/`pquota`、受保护 master
-key、固定 worker 镜像、HTTPS control/preview、A/B 一次性邀请、真实备份源
-和空恢复目标；marker 测试出现 skip/xfail/xpass 或任一门槛失败均退出 1。
+key、固定 worker 镜像、HTTPS control/preview、A/B 一次性邀请、真实备份源、
+空恢复目标和 `EASEL_TEST_EGRESS_PROXY`；检查器设置 `EASEL_EGRESS_LIVE=1`
+并实际运行真实出口测试。所有选中的安全/发布门槛出现 skip/xfail/xpass、
+空集合或任一失败均退出 1，没有文件级宽松开关。
+
+检查器还区分已执行门槛与正式证据：真实出口通过才把 egress 标为已验证；
+XFS 只检查挂载/工具不算 10 GiB 配额建立与耗尽；宿主 DOCKER-USER/
+IPv4-IPv6 矩阵没有自动门槛；base/execution 假 Harness 容器测试不能证明
+最终 runtime 镜像及真实 DSH/profile 已验收。后三项保持 `blocked`，整体
+`release_status` 只能为 `blocked` 并退出 1，不能得到 `passed`。
+
 本机 2026-10-26 实际运行检查器：
 
 ```text
 release_status=failed
 [fail] platform platform_not_linux
 gates=not_run
+evidence=not_run
 ```
 
 因此 **正式发布门槛未通过、正式 live/restore/browser 未执行**。control 的

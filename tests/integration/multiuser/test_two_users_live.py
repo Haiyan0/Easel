@@ -58,9 +58,15 @@ def _collect(client, url: str, headers: dict[str, str]) -> list[dict]:
             frames.append(frame)
             if _state(frame) in TERMINAL:
                 break
-    if not frames or _state(frames[-1]) not in TERMINAL:
+    if not frames:
         pytest.fail(
-            "SSE 未在读取窗口内到达终态；不把超时当作通过",
+            "SSE 未返回任何帧；不把空流当作成功",
+            pytrace=False)
+    final_state = _state(frames[-1])
+    if final_state != "done":
+        pytest.fail(
+            f"Run 未成功完成（终态 {final_state!r}）；"
+            "failed/interrupted/cancelled 或部分输出不能判通过",
             pytrace=False)
     return frames
 
@@ -189,6 +195,12 @@ def test_live_two_users_are_isolated_and_history_resumes(live_users):
               for item in runs_a.json()["runs"]}
     assert states.get(run_a1) == "done"
     assert states.get(run_a2) == "done"
+    runs_b = b.client.get(
+        f"/api/sessions/{session_b}/runs", headers=b.read_headers())
+    assert runs_b.status_code == 200
+    states_b = {item["runId"]: item["state"]
+                for item in runs_b.json()["runs"]}
+    assert states_b.get(run_b) == "done"
 
     # 伪造 workspace 头不能改变身份。
     spoofed = b.client.get(
