@@ -1,0 +1,99 @@
+{
+  "task": "A1",
+  "project": "easel-a1-evidence-20261026183821",
+  "image": "sha256:d06578a3b011f6b06e9b3781414aae1757bbe41ffba7e7f3479e3302d4d3b49f",
+  "browser": {
+    "engine": "Chromium",
+    "version": "151.0.7922.34",
+    "headless": true,
+    "https_errors_ignored": false,
+    "spki_pin_used_for_local_origin": true,
+    "system_proxy_disabled": true
+  },
+  "container_boundary": {
+    "control_image": "easel-control:a1",
+    "control_uid_gid": "10001:10001",
+    "host_bind": "127.0.0.1:7861",
+    "ngrok_upstream": "http://127.0.0.1:7861",
+    "worker_started": false,
+    "chat_expected": "503 capability_unavailable"
+  },
+  "origin_initial": "https://<ngrok-fixed-host> (redacted in committed evidence)",
+  "checks": {
+    "admin_bootstrap": "ok",
+    "admin_https_login": "ok",
+    "invite_single_use": "401",
+    "member_creation": "A/B created",
+    "a_b_distinct_identity": "ok",
+    "invite_single_use_member": "401",
+    "session_directory_isolation": "ok",
+    "cross_workspace_session": "404",
+    "member_admin_api": "403",
+    "chat_without_worker": "503 capability_unavailable",
+    "logout_invalidates_login": "401",
+    "disable_invalidates_login": "401",
+    "old_admin_cookie_present_at_old_origin": 1,
+    "control_stop": "ok",
+    "reinitialize_keeps_key": "key=exists",
+    "ngrok_address_change": "not-run: free plan fixed static domain",
+    "restart_same_volumes": "healthy",
+    "old_cookie_absent_at_new_origin": "401",
+    "admin_relogin_after_origin_change": "same userId",
+    "database_persisted": "same admin userId",
+    "wrong_origin_write": "403",
+    "member_relogin_after_origin_change": "same userId",
+    "session_content_persisted": "A-only visible",
+    "https_certificate_initial": "verified by Chromium/public ngrok CA",
+    "https_certificate_origin_change": "SPKI-pinned local cert; not public CA"
+  },
+  "screenshots": [
+    "docs\\evidence\\desktop-a1\\01-admin-members.png",
+    "docs\\evidence\\desktop-a1\\02-member-a-sessions.png",
+    "docs\\evidence\\desktop-a1\\03-member-b-sessions.png",
+    "docs\\evidence\\desktop-a1\\04-admin-new-origin.png",
+    "docs\\evidence\\desktop-a1\\05-member-a-new-origin.png"
+  ],
+  "local_origin": "https://127.0.0.1:8443",
+  "local_origin_kind": "pinned local TLS (SPKI); not a public CA",
+  "members": {
+    "A": {
+      "userId": "802a868ecb30437a8fb4ad1d44c11863",
+      "workspaceId": "ff5038821a264016a4ad2525a2582929"
+    },
+    "B": {
+      "userId": "4dc73af6dcd24f099f0fc672472e0ead",
+      "workspaceId": "16b326d57c204ef6aa5417d4d89db451"
+    }
+  },
+  "origin_new": "https://127.0.0.1:8443",
+  "origin_initial_redacted": true,
+  "notes": [
+    "ngrok free plan exposes one fixed static host; a second public ngrok host could not be created without account/plan changes.",
+    "The origin-change sub-scenario used a local 127.0.0.1 TLS proxy with a Chromium SPKI pin; it is not a public CA and is not claimed as an ngrok address change.",
+    "The historical 503 shown in member A screenshot is the expected capability_unavailable for an unassembled worker/chat path."
+  ],
+  "cleanup": {
+    "project": "easel-a1-evidence-20261026183821",
+    "container_removed": true,
+    "volumes_removed": true,
+    "image_tag_removed": true,
+    "ngrok_stopped": true,
+    "global_prune_used": false
+  },
+  "final_script_verification": {
+    "image": "sha256:c4a4c7f24462addff841f9b5b360e97654bd4cebaf89c48f113bcc57f8c4e6d1",
+    "project": "easel-a1-finalcheck-20261026184907",
+    "volume_labels": {
+      "control": {
+        "easel.desktop.project": "easel-a1-finalcheck-20261026184907",
+        "easel.desktop.role": "control"
+      },
+      "keys": {
+        "easel.desktop.project": "easel-a1-finalcheck-20261026184907",
+        "easel.desktop.role": "keys"
+      }
+    },
+    "test_easel_checks": 12,
+    "cleanup": "container and volumes removed"
+  }
+}

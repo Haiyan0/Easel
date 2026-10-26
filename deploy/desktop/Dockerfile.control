@@ -1,0 +1,59 @@
+# Task A1：登录管理面 control 镜像。
+#
+# 构建上下文为仓库根目录，必须包含当前源码和当前前端构建，不复用旧测试
+# 镜像。示例：
+#   docker build -f deploy/desktop/Dockerfile.control -t easel-control:a1 .
+# 构建后请用 `docker image inspect ... --format '{{.Id}}'` 取得固定 sha256 ID，
+# 再交给 Initialize-Easel.ps1 / Start-Easel.ps1。
+#
+# 该镜像只装配 control 登录管理面：不包含 worker、Harness、Docker socket，
+# 不挂宿主 workspace。未配置签名/执行 worker 时聊天入口由 control 明确 503。
+
+FROM node:24-bookworm-slim AS frontend
+WORKDIR /build
+COPY web/frontend/package.json web/frontend/package-lock.json ./
+RUN npm ci
+COPY web/frontend/ ./
+RUN npm run build
+
+
+FROM python:3.11.12-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    EASEL_SERVICE_MODE=control \
+    HOME=/tmp
+
+WORKDIR /opt/easel
+COPY pyproject.toml README.md ./
+COPY easel ./easel
+# control.config 会从代码根加载共享模型目录；只复制这个公开模块，不复制
+# 开发者环境文件、HOME、outputs、profile 或平台凭证。
+COPY skills/shared/scripts/model_registry.py ./skills/shared/scripts/model_registry.py
+COPY deploy/desktop/keygen.py ./deploy/desktop/keygen.py
+COPY --from=frontend /build/dist /opt/easel/web/frontend/dist
+
+# control 只使用登录、成员、设置与 broker 元数据所需的最小运行依赖；
+# 不安装 worker 的 Harness/Chromium/媒体依赖。
+RUN pip install --no-cache-dir \
+      "fastapi>=0.115,<1" \
+      "uvicorn>=0.30,<1" \
+      "httpx>=0.27,<1" \
+      "pydantic>=2.7,<3" \
+      "cryptography>=42" \
+ && groupadd --gid 10001 easel \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/easel \
+            --create-home --shell /usr/sbin/nologin easel \
+ && mkdir -p /srv/easel/control \
+ && chown 10001:10001 /srv/easel/control /home/easel \
+ && chown -R root:root /opt/easel \
+ && chmod -R a-w /opt/easel \
+ && chmod 0555 /opt/easel/deploy/desktop/keygen.py
+
+USER 10001:10001
+EXPOSE 7861
+
+# Compose 显式传入完整 serve-control 命令；裸 docker run 未给出命令会失败，
+# 这是刻意的失败关闭，不提供隐式 Origin/目录默认值。

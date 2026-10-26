@@ -1,0 +1,66 @@
+# Task A1：Windows Docker Desktop 登录管理面。
+#
+# 只启动一个 control 容器，发布到宿主回环 127.0.0.1:7861，供本机 ngrok 转发。
+# 不挂 Docker socket、不挂 worker 根、不发布 worker/provisioner/broker 端口。
+# 卷名、项目名、镜像、Origin 与宿主端口由 Initialize/Start/Test 脚本显式注入。
+#
+# 手工检查（脚本内部也执行）：
+#   docker compose -p <project> -f deploy/desktop/compose.login.yaml config --quiet
+
+name: ${EASEL_DESKTOP_PROJECT:?请设置专用 Compose 项目名}
+
+services:
+  control:
+    image: ${EASEL_CONTROL_IMAGE:?请设置固定 control 镜像 ID}
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    command:
+      - python
+      - -m
+      - easel
+      - serve-control
+      - --control-dir
+      - /srv/easel/control
+      - --public-origin
+      - ${EASEL_PUBLIC_ORIGIN:?请设置 ngrok HTTPS Origin}
+      - --master-key-file
+      - /keys/master.key
+      - --frontend-dir
+      - /opt/easel/web/frontend/dist
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7861"
+    ports:
+      - "127.0.0.1:${EASEL_CONTROL_PORT:-7861}:7861"
+    volumes:
+      - control:/srv/easel/control
+      - keys:/keys:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:7861/api/health', timeout=3).read()
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+volumes:
+  control:
+    external: true
+    name: ${EASEL_CONTROL_VOLUME:?请设置 control 数据卷}
+  keys:
+    external: true
+    name: ${EASEL_KEY_VOLUME:?请设置 master key 卷}
