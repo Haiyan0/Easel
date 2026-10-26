@@ -33,12 +33,15 @@ Task 8 的真实防火墙、IPv6、XFS 配额、最终 Harness/浏览器沙箱�
 ```text
 /srv/easel/
   control/control.sqlite3        # control 库
-  workspaces/<32hex>/
-    workspace/                   # /workspace 持久区（含 state/sessions）
-    home/                        # /home/easel 持久区（平台 profile）
-    .credentials/                # provisioner 内部 token，备份显式排除
+  workspaces/
+    .migration-backups/          # migrate-local 的默认源备份（必须在 workspace 根下）
+    <32hex>/
+      workspace/                 # 容器 /workspace
+        outputs/                 # worker OUTPUTS_DIR：产物与会话 API 历史
+        state/                   # worker EASEL_STATE_ROOT：绑定、消息、Run 状态
+      home/                      # 容器 /home/easel（平台 profile）
+      .credentials/              # provisioner 内部 token，备份显式排除
   backups/                       # 与 control/data 同一受管根
-  .migration-backups/            # migrate-local 的默认源备份
   run/provisioner.sock
 /etc/easel/egress-policy.json
 /run/secrets/easel-master.key
@@ -107,11 +110,13 @@ python -m easel admin invite \
 ## 4. 备份
 
 备份包含：控制 SQLite 一致性快照、master key 文件、各 workspace 的
-`workspace/` 与 `home/` 持久区，以及带 SHA-256 的清单。备份明确排除
-`.credentials/`，并在快照中清除 `worker_leases.service_token`（使用
-`secure_delete` + `VACUUM` 避免空闲页残留），因此恢复后不会复用旧的 worker
-服务 token；新 worker 会重新签发。清单不包含邀请/登录明文、模型 Key、Cookie
-或 master key 内容，只记录必要的版本与完整性摘要。
+`workspace/` 与 `home/` 持久区，以及带 SHA-256 的清单。备份只排除
+`.credentials/` 等秘密材料；用户工作区内的 `.git`、未推送提交、分支、stash、
+脚本执行位及其他持久文件都保留，不能按镜像/构建缓存裁剪。快照同时清除
+`worker_leases.service_token`（使用 `secure_delete` + `VACUUM` 避免空闲页
+残留），因此恢复后不会复用旧的 worker 服务 token；新 worker 会重新签发。
+清单不包含邀请/登录明文、模型 Key、Cookie 或 master key 内容，只记录必要的
+版本与完整性摘要。
 
 ### 4.1 发版/维护窗口
 
@@ -136,9 +141,10 @@ python -m easel admin backup \
   不允许覆盖已有备份或运行中的 control 目录。
 - 备份目录的 `manifest.json` 记录 schema、镜像摘要、Harness 修订、受管配置
   版本、各 workspace 配置版本及每个文件的字节数与摘要。恢复时逐项复核。
-- 备份/恢复与迁移都拒绝符号链接、Windows junction 和其他非普通文件；不会
-  跟随到受管根之外。若 workspace 或 profile 中确实存在此类链接，先由管理员
-  转为普通文件或移出持久区，再重试；工具不会静默跳过它们。
+- 备份/恢复遇到符号链接、Windows junction 或其他非普通文件会失败关闭；
+  迁移会跳过这些条目并在 `rejected` 中列出。两者都不会跟随到受管根之外。
+  若 workspace 或 profile 中确实存在此类链接，先由管理员转为普通文件或移出
+  持久区，再重试；工具不会静默跳过它们。
 
 ### 4.2 验证备份
 
@@ -229,20 +235,29 @@ python -m easel admin migrate-local \
   --source /home/operator/easel/outputs \
   --workspace <32位小写workspaceID> \
   --workspace-root /srv/easel/workspaces \
-  --backup-destination /srv/easel/.migration-backups/<workspaceID>-<时间戳>
+  --backup-destination /srv/easel/workspaces/.migration-backups/<workspaceID>-<时间戳>
 ```
 
-- 目标必须是 `<workspace-root>/<workspaceID>/workspace`，不存在或为空；已有内容
-  返回 `migration_target_not_empty`。目标经 junction/symlink 逃逸时返回
-  `migration_target_escape`。
+- 目标必须是 `<workspace-root>/<workspaceID>/workspace`。dry-run 与实际执行对
+  空目标使用同一规则：不存在或只含递归空目录都允许；任何文件、链接、junction
+  或预检后新增数据都返回 `migration_target_not_empty` 并保留现有数据。目标经
+  junction/symlink 逃逸时返回 `migration_target_escape`。
 - 实际执行前先复制源到备份目录；省略 `--backup-destination` 时写入
-  `<workspace-root>/.migration-backups/`。备份包含静态内容与原始旧会话文件，
-  排除 `_harness/`、`_browser/`、`.env*`、`.credentials/`。
-- 静态内容复制到目标 workspace；`_sessions/api` 的消息导入为新会话快照。
-  原生绑定只有在记录明确给出 `cwd == /workspace` 且 `native_id` 非空时才按
-  可续接导入。缺少 cwd、路径不兼容或 native_id 为空时，只把消息作为静态历史
-  写入目标 `migrated-sessions/<session-id>/`，并在 `non_resumable_sessions`
-  报告；**不会替换、补写或重新签发 native_id**。
+  `<workspace-root>/.migration-backups/`。备份目标必须同样位于
+  `<workspace-root>` 内。备份包含静态内容、原始旧会话文件和用户 `.git`
+  历史，排除 `_harness/`、`_browser/`、`browser_profiles/`、`.env*`、
+  `.credentials/`。
+- 静态内容复制到目标 `<workspaceID>/workspace/outputs/`，与 worker 的
+  `OUTPUTS_DIR` 一致；源中同名的 `state/`、`sessions/` 等目录只会落在
+  `outputs/` 下，不会覆盖真实状态根。静态导入保留用户 `.git` 等普通内容，
+  只跳过 `_sessions`、`_harness`、`_browser`、`browser_profiles`、`.env*`、
+  `.credentials`。
+- `_sessions/api` 的消息写入目标 `<workspaceID>/workspace/state/` 下的
+  `sessions/`（真实 `EASEL_STATE_ROOT`），与静态产物隔离。原生绑定只有在记录
+  明确给出 `cwd == /workspace` 且 `native_id` 非空时才按可续接导入。缺少 cwd、
+  路径不兼容或 native_id 为空时，只把消息作为静态历史写入
+  `<workspaceID>/workspace/state/migrated-sessions/<session-id>/`，并在
+  `non_resumable_sessions` 报告；**不会替换、补写或重新签发 native_id**。
 - 源树在迁移前后做完整摘要对比；迁移中断或源被外部改动时返回
   `migration_source_changed`/`migration_write_failed`，临时目录清理，目标不出现
   半成品。

@@ -44,13 +44,17 @@ BACKUP_FORMAT = "easel.control.backup"
 BACKUP_VERSION = 1
 _ACTIVE_LEASE_STATES = ("starting", "ready", "draining", "stopping")
 
-_SKIP_BACKUP_NAMES = frozenset({".credentials", ".git", "__pycache__", "node_modules"})
+_SKIP_BACKUP_NAMES = frozenset({".credentials"})
+"""只排除秘密材料；.git、node_modules 等持久数据不得从完整备份静默丢弃。"""
 _SKIP_MIGRATION_NAMES = frozenset({
-    ".credentials", ".git", "__pycache__", "node_modules",
-    "_sessions", "_harness", "_browser", "browser_profiles",
+    ".credentials", "_sessions", "_harness", "_browser", "browser_profiles",
 })
+"""迁移只排除会话/秘密/浏览器状态；.git 与普通构建产物属于源内容。"""
 _SKIP_MIGRATION_PATTERNS = (".env", ".env.*")
-_SKIP_MIGRATION_BACKUP_NAMES = _SKIP_MIGRATION_NAMES - {"_sessions"}
+_SKIP_MIGRATION_BACKUP_NAMES = frozenset({
+    ".credentials", "_harness", "_browser", "browser_profiles",
+})
+"""迁移前源备份只排除秘密/浏览器状态；.git 等持久历史必须保留。"""
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SESSION_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 MIGRATION_BACKUP_FORMAT = "easel.local.migration.backup"
@@ -179,7 +183,10 @@ def _copy_file(source: Path, destination: Path) -> dict:
     try:
         shutil.copyfile(source, destination)
         if os.name == "posix":
-            destination.chmod(0o600)
+            # 保留普通持久文件的读/写/执行位；清除 setuid/setgid/sticky，
+            # 避免恢复后把宿主特权位带进用户工作区。
+            mode = source.stat().st_mode & 0o777
+            destination.chmod(mode)
         return {
             "path": destination,
             "bytes": destination.stat().st_size,
@@ -367,10 +374,34 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
             # 数据库值不直接拼进宿主路径；损坏/伪造 ID 不能逃出备份临时目录
             if _WORKSPACE_ID.fullmatch(workspace_id) is None:
                 raise DomainError("backup_workspace_id_invalid", 500)
+            owner = data_root / workspace_id if data_root is not None else None
+            if owner is not None:
+                if _is_reparse(owner):
+                    # 即使链接目标当前缺失，也不能当作“无数据”静默跳过
+                    raise DomainError("backup_workspace_path_escape", 409)
+                if owner.exists():
+                    if not owner.is_dir():
+                        raise DomainError(
+                            "backup_workspace_path_escape", 409)
+                    try:
+                        owner_resolved = owner.resolve()
+                    except (OSError, RuntimeError):
+                        raise DomainError(
+                            "backup_workspace_path_escape", 409) from None
+                    if (os.path.normcase(str(owner_resolved))
+                            != os.path.normcase(str(owner))):
+                        # 祖先链接/junction 指向根外或另一 workspace
+                        raise DomainError("backup_workspace_path_escape", 409)
             entry: dict[str, bool] = {}
             if data_root is not None:
                 for part in ("workspace", "home"):
                     source = data_root / workspace_id / part
+                    if _is_reparse(source):
+                        # 包括目标缺失的链接；不能按“无数据”静默略过
+                        raise DomainError("backup_symlink_rejected", 409)
+                    if source.exists() and not source.is_dir():
+                        raise DomainError(
+                            "backup_workspace_path_escape", 409)
                     if not source.is_dir():
                         entry[part] = False
                         continue
@@ -888,6 +919,35 @@ def _empty_tree(path: Path) -> bool:
     return True
 
 
+def _remove_empty_tree(path: Path) -> None:
+    """只删除空目录树；遇到任何文件、链接或新数据立即失败并保留原状。"""
+    try:
+        entries = list(os.scandir(path))
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise _migration_problem("migration_target_not_empty", 409) from None
+    for entry in entries:
+        child = Path(entry.path)
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            raise _migration_problem("migration_target_not_empty", 409) from None
+        if (child.is_symlink() or getattr(info, "st_reparse_tag", 0)
+                or not entry.is_dir(follow_symlinks=False)):
+            raise _migration_problem("migration_target_not_empty", 409)
+        _remove_empty_tree(child)
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError:
+        # 扫描后新增的文件/链接让 rmdir 失败；绝不递归删除新数据
+        if path.exists():
+            raise _migration_problem("migration_target_not_empty", 409) from None
+        return
+
+
 def _migration_target(workspace_root: Path, workspace: str) -> tuple[Path, Path]:
     if not isinstance(workspace, str) or _WORKSPACE_ID.fullmatch(workspace) is None:
         raise _migration_problem("migration_workspace_invalid")
@@ -896,11 +956,12 @@ def _migration_target(workspace_root: Path, workspace: str) -> tuple[Path, Path]
         raise _migration_problem("migration_workspace_root_invalid")
     owner = root / workspace
     target = owner / "workspace"
+    # 先拒绝重解析点，不能先遍历其目标；缺失链接也同样拒绝
+    if _is_reparse(owner) or _is_reparse(target):
+        raise _migration_problem("migration_target_escape")
     if owner.exists() and (
             not owner.is_dir() or not _empty_tree(owner)):
         raise _migration_problem("migration_target_not_empty", 409)
-    if _is_reparse(owner) or _is_reparse(target):
-        raise _migration_problem("migration_target_escape")
     try:
         resolved = target.resolve(strict=False)
     except (OSError, RuntimeError):
@@ -956,9 +1017,9 @@ def _create_migration_backup(content_root: Path, destination: Path,
         raise
 
 
-def _write_static_session(staging: Path, workspace_id: str,
+def _write_static_session(state_root: Path, workspace_id: str,
                           plan: _SessionPlan) -> None:
-    directory = staging / "migrated-sessions" / plan.session_id
+    directory = state_root / "migrated-sessions" / plan.session_id
     directory.mkdir(parents=True, exist_ok=True)
     record: dict = {
         "runtime": plan.runtime,
@@ -990,10 +1051,11 @@ def _write_static_session(staging: Path, workspace_id: str,
         raise DomainError("migration_write_failed", 500) from None
 
 
-def _import_sessions(staging: Path, workspace_id: str,
+def _import_sessions(state_root: Path, workspace_id: str,
                      plans: list[_SessionPlan],
                      report: MigrationReport) -> None:
-    store = WorkspaceSessionStore(staging, workspace_id)
+    """会话写入真实 worker state_root，而不是 workspace 根或 outputs。"""
+    store = WorkspaceSessionStore(state_root, workspace_id)
     for plan in plans:
         if plan.resumable:
             store.bind(plan.session_id, plan.runtime, plan.native_id, 1,
@@ -1002,7 +1064,7 @@ def _import_sessions(staging: Path, workspace_id: str,
                 store.append_message(plan.session_id, message)
             report.imported.append(plan.session_id)
         else:
-            _write_static_session(staging, workspace_id, plan)
+            _write_static_session(state_root, workspace_id, plan)
             report.imported.append(plan.session_id)
             report.non_resumable_sessions.append(plan.session_id)
 
@@ -1059,18 +1121,23 @@ def migrate_local(source: Path, *, workspace_root: Path, workspace: str,
         for relative in plan.static_files:
             source_file = content_root.joinpath(*relative.parts)
             copied = _copy_file(
-                source_file, staging.joinpath(*relative.parts))
+                source_file,
+                staging / "outputs" / Path(*relative.parts))
             if copied["sha256"] != _sha256_file(source_file):
                 raise _migration_problem("migration_source_changed", 409)
-        _import_sessions(staging, workspace, plan.sessions, report)
+        # 会话属于真实 worker state_root；与静态 outputs 严格隔离
+        _import_sessions(staging / "state", workspace, plan.sessions, report)
         if _source_fingerprint(content_root) != before:
             raise _migration_problem("migration_source_changed", 409)
 
+        owner = target.parent
+        if owner.exists() and (
+                not owner.is_dir() or not _empty_tree(owner)):
+            raise _migration_problem("migration_target_not_empty", 409)
         if target.exists():
-            if not target.is_dir() or any(target.iterdir()):
-                raise _migration_problem("migration_target_not_empty", 409)
-            target.rmdir()
-        target.parent.mkdir(parents=True, exist_ok=True)
+            # 接受与 dry-run 相同的“递归空目录”，但只删除空目录
+            _remove_empty_tree(target)
+        owner.mkdir(parents=True, exist_ok=True)
         os.replace(staging, target)
     except DomainError:
         shutil.rmtree(staging, ignore_errors=True)

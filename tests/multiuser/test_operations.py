@@ -27,7 +27,7 @@ from easel.control.cli import (
 from easel.control.config import ConfigService
 from easel.control.runtime import RuntimeManager
 from easel.control.store import SCHEMA_VERSION, Store
-from easel.control.types import DomainError, WorkerHandle
+from easel.control.types import DomainError, WorkerHandle, WorkspacePaths
 from easel.worker.sessions import WorkspaceSessionStore
 
 
@@ -622,33 +622,63 @@ def test_migration_imports_static_content_and_sessions_without_touching_source(
         workspace=seeded["workspace_id"], backup_destination=backup)
 
     target = seeded["workspace_root"] / seeded["workspace_id"] / "workspace"
-    assert (target / "projects" / "demo.txt").read_text(
+    outputs = target / "outputs"
+    state = target / "state"
+    assert (outputs / "projects" / "demo.txt").read_text(
         encoding="utf-8") == "project-data"
-    assert not (target / "_harness").exists()
-    assert not (target / "_browser").exists()
-    assert not (target / ".env").exists()
+    assert not (target / "projects").exists()
+    assert not (outputs / "_harness").exists()
+    assert not (outputs / "_browser").exists()
+    assert not (outputs / ".env").exists()
     assert _tree_fingerprint(seeded["outputs"]) == before
 
-    sessions = WorkspaceSessionStore(target, seeded["workspace_id"])
+    sessions = WorkspaceSessionStore(state, seeded["workspace_id"])
     assert [message["content"] for message in sessions.messages(
         seeded["api_id"])] == ["api-question", "api-answer"]
     assert sessions.binding(seeded["api_id"])["runtime"] == "api"
     assert seeded["native_id"] in report.non_resumable_sessions
     assert seeded["native_id"] in report.imported
-    native_static = target / "migrated-sessions" / seeded["native_id"]
+    native_static = state / "migrated-sessions" / seeded["native_id"]
     assert "native-abc" in (native_static / "session.json").read_text(
         encoding="utf-8")
     assert "native-question" in (native_static / "messages.jsonl").read_text(
         encoding="utf-8")
-    assert not (target / "sessions"
+    assert not (state / "sessions"
                 / hashlib.sha256(seeded["native_id"].encode()).hexdigest()
                 / "binding.json").exists()
+    assert not (target / "sessions").exists()
 
     assert (backup / "projects" / "demo.txt").is_file()
     assert (backup / "_sessions" / "api"
             / f"{seeded['api_digest']}.json").is_file()
     assert "local-env-sentinel" not in (backup / "projects" / "demo.txt").read_text(
         encoding="utf-8")
+
+
+def test_migration_isolates_source_state_and_sessions_from_worker_state(
+        tmp_path):
+    seeded = _seed_migration_source(tmp_path)
+    (seeded["outputs"] / "state").mkdir()
+    (seeded["outputs"] / "state" / "static.txt").write_text(
+        "static-state", encoding="utf-8")
+    (seeded["outputs"] / "sessions").mkdir()
+    (seeded["outputs"] / "sessions" / "static.txt").write_text(
+        "static-sessions", encoding="utf-8")
+
+    migrate_local(
+        seeded["install"], workspace_root=seeded["workspace_root"],
+        workspace=seeded["workspace_id"])
+
+    target = seeded["workspace_root"] / seeded["workspace_id"] / "workspace"
+    assert (target / "outputs" / "state" / "static.txt").read_text(
+        encoding="utf-8") == "static-state"
+    assert (target / "outputs" / "sessions" / "static.txt").read_text(
+        encoding="utf-8") == "static-sessions"
+    state = target / "state"
+    assert not (state / "static.txt").exists()
+    sessions = WorkspaceSessionStore(state, seeded["workspace_id"])
+    assert [item["content"] for item in sessions.messages(
+        seeded["api_id"])] == ["api-question", "api-answer"]
 
 
 def test_migration_imports_compatible_native_binding_without_replacing_id(
@@ -660,7 +690,7 @@ def test_migration_imports_compatible_native_binding_without_replacing_id(
 
     assert report.non_resumable_sessions == []
     target = seeded["workspace_root"] / seeded["workspace_id"] / "workspace"
-    sessions = WorkspaceSessionStore(target, seeded["workspace_id"])
+    sessions = WorkspaceSessionStore(target / "state", seeded["workspace_id"])
     binding = sessions.binding(seeded["native_id"])
     assert binding["native_id"] == "native-abc"
     assert binding["cwd"] == "/workspace"
@@ -733,9 +763,10 @@ def test_migration_reports_and_skips_source_junction_escape(tmp_path):
     assert any(item.startswith("projects/leak: symlink_or_junction")
                for item in report.rejected)
     target = seeded["workspace_root"] / seeded["workspace_id"] / "workspace"
-    assert not (target / "projects" / "leak").exists()
-    assert not (target / "projects" / "leak" / "secret.txt").exists()
-    assert (target / "projects" / "demo.txt").is_file()
+    outputs = target / "outputs"
+    assert not (outputs / "projects" / "leak").exists()
+    assert not (outputs / "projects" / "leak" / "secret.txt").exists()
+    assert (outputs / "projects" / "demo.txt").is_file()
 
 
 def test_migration_interruption_leaves_no_partial_target_and_can_retry(
@@ -768,7 +799,7 @@ def test_migration_interruption_leaves_no_partial_target_and_can_retry(
         workspace=seeded["workspace_id"],
         backup_destination=seeded["workspace_root"] / "migration-backup-2")
     assert "projects/demo.txt" in report.imported
-    assert (target / "projects" / "demo.txt").is_file()
+    assert (target / "outputs" / "projects" / "demo.txt").is_file()
 
 
 def test_migration_detects_source_changed_during_copy(
@@ -884,9 +915,248 @@ def test_admin_migrate_local_cli_dry_run_then_actual(tmp_path, capsys):
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _cli_values(captured.out)["imported"] == "3"
-    assert (target / "projects" / "demo.txt").is_file()
+    assert (target / "outputs" / "projects" / "demo.txt").is_file()
     backups = list((seeded["workspace_root"] / ".migration-backups").iterdir())
     assert len(backups) == 1
+
+
+def _git(repo: Path, *args: str, config: Path) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(config),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+    })
+    return subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "-C", str(repo), *args],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", check=True, env=env)
+
+
+def _git_setup(tmp_path: Path) -> tuple[Path, dict]:
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    owner = workspace_root / ("c" * 32)
+    repo = owner / "workspace" / "project"
+    repo.mkdir(parents=True)
+    config = tmp_path / "gitconfig"
+    config.write_text("[user]\n\tname = Test\n\temail = test@example.invalid\n",
+                      encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main", config=config)
+    (repo / "script.txt").write_text("v1\n", encoding="utf-8")
+    _git(repo, "add", "script.txt", config=config)
+    _git(repo, "commit", "-q", "-m", "v1", config=config)
+    _git(repo, "checkout", "-q", "-b", "extra", config=config)
+    (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(repo, "add", "feature.txt", config=config)
+    _git(repo, "commit", "-q", "-m", "extra", config=config)
+    _git(repo, "checkout", "-q", "main", config=config)
+    (repo / "script.txt").write_text("v2-stashed\n", encoding="utf-8")
+    _git(repo, "stash", "push", "-q", "-m", "saved-change", "script.txt",
+         config=config)
+    (repo / "script.txt").write_text("v3-uncommitted\n", encoding="utf-8")
+
+    control = tmp_path / "control"
+    key_file = _write_key(tmp_path / "master.key")
+    with Store.open(control / "control.sqlite3") as store:
+        member = store.create_user("A")
+        # 让 owner ID 与真实数据库 workspace 保持一致
+        owner.rename(workspace_root / member.workspace_id)
+        repo = workspace_root / member.workspace_id / "workspace" / "project"
+        bundle = tmp_path / "git-backup"
+        create_backup(
+            store, bundle, control_dir=control,
+            master_key_file=key_file, workspace_root=workspace_root)
+    return repo, {"bundle": bundle, "workspace_id": member.workspace_id,
+                  "config": config}
+
+
+def test_migration_uses_worker_outputs_and_state_roots(tmp_path):
+    seeded = _seed_migration_source(tmp_path)
+    migrate_local(
+        seeded["install"], workspace_root=seeded["workspace_root"],
+        workspace=seeded["workspace_id"])
+
+    workspace_root = seeded["workspace_root"] / seeded["workspace_id"] / "workspace"
+    paths = WorkspacePaths(
+        code_root=tmp_path / "code",
+        workspace_root=workspace_root,
+        state_root=workspace_root / "state",
+        home=workspace_root.parent / "home",
+    )
+    assert (paths.workspace_root / "outputs" / "projects" / "demo.txt").is_file()
+    assert not (paths.workspace_root / "projects" / "demo.txt").exists()
+    sessions = WorkspaceSessionStore(paths.state_root, seeded["workspace_id"])
+    assert [item["content"] for item in sessions.messages(
+        seeded["api_id"])] == ["api-question", "api-answer"]
+    assert not (paths.workspace_root / "sessions").exists()
+    assert (paths.state_root / "migrated-sessions" / seeded["native_id"]
+            / "messages.jsonl").is_file()
+
+
+def test_backup_rejects_workspace_owner_junction_to_outside(tmp_path):
+    control = tmp_path / "control"
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    key_file = _write_key(tmp_path / "master.key")
+    outside = tmp_path / "outside"
+    (outside / "workspace").mkdir(parents=True)
+    sentinel = outside / "workspace" / "sentinel.txt"
+    sentinel.write_text("outside-sentinel", encoding="utf-8")
+    destination = tmp_path / "backup"
+    with Store.open(control / "control.sqlite3") as store:
+        user = store.create_user("A")
+        _make_junction(workspace_root / user.workspace_id, outside)
+        with pytest.raises(DomainError) as rejected:
+            create_backup(
+                store, destination, control_dir=control,
+                master_key_file=key_file, workspace_root=workspace_root)
+        _assert_error(rejected, "backup_workspace_path_escape", 409)
+    assert not destination.exists()
+    assert sentinel.read_text(encoding="utf-8") == "outside-sentinel"
+
+
+def test_backup_rejects_workspace_owner_junction_to_other_workspace(tmp_path):
+    control = tmp_path / "control"
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    key_file = _write_key(tmp_path / "master.key")
+    destination = tmp_path / "backup"
+    with Store.open(control / "control.sqlite3") as store:
+        first = store.create_user("A")
+        second = store.create_user("B")
+        other = workspace_root / second.workspace_id / "workspace"
+        other.mkdir(parents=True)
+        (other / "other.txt").write_text("other-workspace", encoding="utf-8")
+        _make_junction(workspace_root / first.workspace_id,
+                       workspace_root / second.workspace_id)
+        with pytest.raises(DomainError) as rejected:
+            create_backup(
+                store, destination, control_dir=control,
+                master_key_file=key_file, workspace_root=workspace_root)
+        _assert_error(rejected, "backup_workspace_path_escape", 409)
+    assert not destination.exists()
+
+
+def test_backup_restore_preserves_real_git_history_and_worktree(tmp_path):
+    repo, seeded = _git_setup(tmp_path)
+    manifest = json.loads(
+        (seeded["bundle"] / "manifest.json").read_text(encoding="utf-8"))
+    assert any("/project/.git/" in entry["path"]
+               for entry in manifest["files"])
+    restored = tmp_path / "restore"
+    restore_backup(seeded["bundle"], restored)
+    restored_repo = (restored / "workspaces" / seeded["workspace_id"]
+                     / "workspace" / "project")
+    config = seeded["config"]
+
+    assert (restored_repo / "script.txt").read_text(encoding="utf-8") == (
+        "v3-uncommitted\n")
+    assert "v1" in _git(restored_repo, "show", "HEAD:script.txt",
+                        config=config).stdout
+    branches = _git(restored_repo, "branch", "--list", "extra",
+                    config=config).stdout
+    assert "extra" in branches
+    stashes = _git(restored_repo, "stash", "list", config=config).stdout
+    assert "saved-change" in stashes
+    assert "v2-stashed" in _git(restored_repo, "stash", "show", "-p",
+                                "stash@{0}", config=config).stdout
+    assert "script.txt" in _git(restored_repo, "status", "--porcelain",
+                                config=config).stdout
+    assert _git(repo, "status", "--porcelain", config=config).stdout
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX 执行位在 Windows 文件系统上不可验证")
+def test_backup_restore_preserves_executable_mode(tmp_path):
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    control = tmp_path / "control"
+    key_file = _write_key(tmp_path / "master.key")
+    with Store.open(control / "control.sqlite3") as store:
+        user = store.create_user("A")
+        script = (workspace_root / user.workspace_id / "workspace"
+                  / "run.sh")
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        bundle = tmp_path / "backup"
+        create_backup(
+            store, bundle, control_dir=control,
+            master_key_file=key_file, workspace_root=workspace_root)
+    restored = tmp_path / "restore"
+    restore_backup(bundle, restored)
+    restored_script = (restored / "workspaces" / user.workspace_id
+                       / "workspace" / "run.sh")
+    assert restored_script.stat().st_mode & 0o777 == 0o755
+
+
+def test_migration_dry_run_and_actual_accept_same_empty_subdirectory(tmp_path):
+    seeded = _seed_migration_source(tmp_path)
+    target = (seeded["workspace_root"] / seeded["workspace_id"]
+              / "workspace")
+    (target / "empty").mkdir(parents=True)
+    base = {"workspace_root": seeded["workspace_root"],
+            "workspace": seeded["workspace_id"]}
+    dry = migrate_local(seeded["install"], dry_run=True, **base)
+    assert "projects/demo.txt" in dry.imported
+
+    report = migrate_local(seeded["install"], **base)
+    assert "projects/demo.txt" in report.imported
+    assert (target / "outputs" / "projects" / "demo.txt").is_file()
+
+
+def test_migration_accepts_pure_empty_target_and_rejects_link_content(
+        tmp_path):
+    seeded = _seed_migration_source(tmp_path)
+    target = (seeded["workspace_root"] / seeded["workspace_id"]
+              / "workspace")
+    target.mkdir(parents=True)
+    migrate_local(
+        seeded["install"], workspace_root=seeded["workspace_root"],
+        workspace=seeded["workspace_id"])
+    assert (target / "outputs" / "projects" / "demo.txt").is_file()
+
+    other = _seed_migration_source(tmp_path / "second")
+    other_target = (other["workspace_root"] / other["workspace_id"]
+                    / "workspace")
+    other_target.mkdir(parents=True)
+    outside = tmp_path / "second" / "outside"
+    outside.mkdir()
+    _make_junction(other_target / "link", outside)
+    with pytest.raises(DomainError) as linked:
+        migrate_local(
+            other["install"], workspace_root=other["workspace_root"],
+            workspace=other["workspace_id"], dry_run=True)
+    _assert_error(linked, "migration_target_not_empty", 409)
+    assert (other_target / "link").exists()
+
+
+def test_migration_preserves_data_created_after_precheck(
+        tmp_path, monkeypatch):
+    from easel.control import cli as control_cli
+
+    seeded = _seed_migration_source(tmp_path)
+    target = (seeded["workspace_root"] / seeded["workspace_id"]
+              / "workspace")
+    real_import = control_cli._import_sessions
+
+    def import_with_late_file(*args, **kwargs):
+        real_import(*args, **kwargs)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "late.txt").write_text("user-data", encoding="utf-8")
+
+    monkeypatch.setattr(control_cli, "_import_sessions", import_with_late_file)
+    with pytest.raises(DomainError) as occupied:
+        migrate_local(
+            seeded["install"], workspace_root=seeded["workspace_root"],
+            workspace=seeded["workspace_id"])
+    _assert_error(occupied, "migration_target_not_empty", 409)
+    assert (target / "late.txt").read_text(encoding="utf-8") == "user-data"
+    assert not list(seeded["workspace_root"].glob(".migration-staging-*"))
 
 
 def test_admin_backup_cli_rejects_relative_destination_without_secrets(
