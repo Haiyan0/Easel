@@ -84,6 +84,11 @@ def _make_junction(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _is_link(path: Path) -> bool:
+    return bool(path.is_symlink()
+                or getattr(path.lstat(), "st_reparse_tag", 0))
+
+
 def _workspace_files(root: Path, workspace_id: str) -> None:
     data = root / workspace_id / "workspace" / "projects" / "demo.txt"
     data.parent.mkdir(parents=True, exist_ok=True)
@@ -1133,6 +1138,70 @@ def test_migration_accepts_pure_empty_target_and_rejects_link_content(
             workspace=other["workspace_id"], dry_run=True)
     _assert_error(linked, "migration_target_not_empty", 409)
     assert (other_target / "link").exists()
+
+
+def _swap_owner_after_precheck(tmp_path, monkeypatch, seeded, replacement):
+    from easel.control import cli as control_cli
+
+    owner = seeded["workspace_root"] / seeded["workspace_id"]
+    real_fingerprint = control_cli._source_fingerprint
+    calls = 0
+
+    def swapping_fingerprint(root):
+        nonlocal calls
+        result = real_fingerprint(root)
+        calls += 1
+        if calls == 2:
+            _make_junction(owner, replacement)
+        return result
+
+    monkeypatch.setattr(
+        control_cli, "_source_fingerprint", swapping_fingerprint)
+    return owner
+
+
+def test_migration_rejects_owner_swapped_to_outside_junction_before_commit(
+        tmp_path, monkeypatch):
+    seeded = _seed_migration_source(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = tmp_path / "outside-sentinel.txt"
+    sentinel.write_text("outside-sentinel", encoding="utf-8")
+    source_before = _tree_fingerprint(seeded["outputs"])
+    owner = _swap_owner_after_precheck(
+        tmp_path, monkeypatch, seeded, outside)
+
+    with pytest.raises(DomainError) as escape:
+        migrate_local(
+            seeded["install"], workspace_root=seeded["workspace_root"],
+            workspace=seeded["workspace_id"])
+    _assert_error(escape, "migration_target_escape", 400)
+    assert not (outside / "workspace").exists()
+    assert not (outside / "workspace" / "outputs").exists()
+    assert not (outside / "workspace" / "state").exists()
+    assert sentinel.read_text(encoding="utf-8") == "outside-sentinel"
+    assert owner.exists() and _is_link(owner)
+    assert _tree_fingerprint(seeded["outputs"]) == source_before
+    assert not list(seeded["workspace_root"].glob(".migration-staging-*"))
+
+
+def test_migration_rejects_owner_swapped_to_other_workspace_before_commit(
+        tmp_path, monkeypatch):
+    seeded = _seed_migration_source(tmp_path)
+    other_id = "b" * 32
+    other_owner = seeded["workspace_root"] / other_id
+    other_owner.mkdir()
+    owner = _swap_owner_after_precheck(
+        tmp_path, monkeypatch, seeded, other_owner)
+
+    with pytest.raises(DomainError) as escape:
+        migrate_local(
+            seeded["install"], workspace_root=seeded["workspace_root"],
+            workspace=seeded["workspace_id"])
+    _assert_error(escape, "migration_target_escape", 400)
+    assert not (other_owner / "workspace").exists()
+    assert owner.exists() and _is_link(owner)
+    assert not list(seeded["workspace_root"].glob(".migration-staging-*"))
 
 
 def test_migration_preserves_data_created_after_precheck(

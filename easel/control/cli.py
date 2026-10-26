@@ -900,6 +900,8 @@ def _migration_problem(code: str, status: int = 400) -> DomainError:
 
 def _empty_tree(path: Path) -> bool:
     """仅空目录/空子目录算空；任何文件、链接或特殊项都视为已有目标内容。"""
+    if _is_reparse(path) or not path.is_dir():
+        return False
     try:
         entries = list(os.scandir(path))
     except OSError:
@@ -919,8 +921,24 @@ def _empty_tree(path: Path) -> bool:
     return True
 
 
-def _remove_empty_tree(path: Path) -> None:
+def _remove_empty_tree(path: Path, *, owner: Path | None = None) -> None:
     """只删除空目录树；遇到任何文件、链接或新数据立即失败并保留原状。"""
+    if _is_reparse(path):
+        raise _migration_problem("migration_target_escape")
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise _migration_problem("migration_target_escape") from None
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(path)):
+        # 父级可能是预检后被替换的 junction
+        raise _migration_problem("migration_target_escape")
+    if owner is not None and (
+            _is_reparse(owner)
+            or os.path.normcase(str(path.parent))
+            != os.path.normcase(str(owner))):
+        raise _migration_problem("migration_target_escape")
+    if not path.is_dir():
+        raise _migration_problem("migration_target_not_empty", 409)
     try:
         entries = list(os.scandir(path))
     except FileNotFoundError:
@@ -946,6 +964,39 @@ def _remove_empty_tree(path: Path) -> None:
         if path.exists():
             raise _migration_problem("migration_target_not_empty", 409) from None
         return
+
+
+def _revalidate_migration_owner(workspace_root: Path,
+                                workspace: str) -> tuple[Path, Path]:
+    """最终提交前重新核验 owner/target，防止预检后被替换为链接。
+
+    这里先 lstat 重解析点，再做解析路径相等/根包含检查和空目录扫描；任何
+    一步失败都不得继续删除目录或 rename。
+    """
+    owner = workspace_root / workspace
+    target = owner / "workspace"
+    if _is_reparse(owner) or _is_reparse(target):
+        raise _migration_problem("migration_target_escape")
+    try:
+        owner_resolved = owner.resolve(strict=False)
+        target_resolved = target.resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise _migration_problem("migration_target_escape") from None
+    if (os.path.normcase(str(owner_resolved))
+            != os.path.normcase(str(owner))
+            or os.path.normcase(str(target_resolved))
+            != os.path.normcase(str(target))):
+        raise _migration_problem("migration_target_escape")
+    if (owner_resolved == workspace_root
+            or not owner_resolved.is_relative_to(workspace_root)
+            or not target_resolved.is_relative_to(owner_resolved)):
+        raise _migration_problem("migration_target_escape")
+    if owner.exists() and (
+            not owner.is_dir() or not _empty_tree(owner)):
+        raise _migration_problem("migration_target_not_empty", 409)
+    if target.exists() and not target.is_dir():
+        raise _migration_problem("migration_target_not_empty", 409)
+    return owner, target
 
 
 def _migration_target(workspace_root: Path, workspace: str) -> tuple[Path, Path]:
@@ -1130,14 +1181,22 @@ def migrate_local(source: Path, *, workspace_root: Path, workspace: str,
         if _source_fingerprint(content_root) != before:
             raise _migration_problem("migration_source_changed", 409)
 
-        owner = target.parent
-        if owner.exists() and (
-                not owner.is_dir() or not _empty_tree(owner)):
-            raise _migration_problem("migration_target_not_empty", 409)
+        # 预检之后 owner/target 可能被替换；提交前不再相信旧路径判断
+        owner, target = _revalidate_migration_owner(
+            workspace_root_path, workspace)
         if target.exists():
             # 接受与 dry-run 相同的“递归空目录”，但只删除空目录
-            _remove_empty_tree(target)
-        owner.mkdir(parents=True, exist_ok=True)
+            _remove_empty_tree(target, owner=owner)
+        if not owner.exists():
+            try:
+                # 非递归创建：预检后若出现同名链接/目录，明确冲突而不是跟随
+                owner.mkdir()
+            except FileExistsError:
+                raise _migration_problem(
+                    "migration_target_not_empty", 409) from None
+        # rename 之前再次核验，拒绝扫描后/建目录后的路径替换
+        owner, target = _revalidate_migration_owner(
+            workspace_root_path, workspace)
         os.replace(staging, target)
     except DomainError:
         shutil.rmtree(staging, ignore_errors=True)
