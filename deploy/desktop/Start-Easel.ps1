@@ -48,7 +48,9 @@ try {
         throw 'compose_missing'
     }
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
-    Test-EaselImagePin -Image $Image -Volumes $volumes
+    # 卷归属必须在任何 helper run / compose up 之前复核。
+    Assert-EaselVolumeContract -ProjectName $ProjectName -Volumes $volumes
+    Test-EaselImagePin -Image $Image
 
     $keyCheck = Invoke-EaselDocker -Arguments @(
         'run', '--rm', '--user', '10001:10001',

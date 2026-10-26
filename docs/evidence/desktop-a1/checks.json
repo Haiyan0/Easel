@@ -95,5 +95,34 @@
     },
     "test_easel_checks": 12,
     "cleanup": "container and volumes removed"
+  },
+  "r1": {
+    "red": {
+      "tests": 44,
+      "failed": 28,
+      "passed": 16,
+      "seconds": 37.39
+    },
+    "green": {
+      "tests": 44,
+      "passed": 44,
+      "seconds": 27.41
+    },
+    "real": {
+      "image": "sha256:3df01c1d2072a05c757e2d00bc43a31bcff93d2db5622dd5654ff9f90975e335",
+      "foreign_volume_start": "volume_not_owned; no container",
+      "first_init": "key=created",
+      "first_start": "healthy",
+      "first_diagnostics_checks": 20,
+      "stop": "no running container",
+      "reopen_init": "key=exists",
+      "reopen_start": "healthy",
+      "reopen_diagnostics_checks": 20,
+      "cleanup": "no containers/volumes; no global prune"
+    },
+    "regression": {
+      "specified": 111,
+      "multiuser": "1048 passed/4 skipped"
+    }
   }
 }

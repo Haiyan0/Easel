@@ -42,7 +42,9 @@ try {
         throw 'compose_missing'
     }
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
-    Test-EaselImagePin -Image $Image -Volumes $volumes
+    # 诊断前先复核卷的真实名称/标签/结构，不能只信预期名称。
+    Assert-EaselVolumeContract -ProjectName $ProjectName -Volumes $volumes
+    Test-EaselImagePin -Image $Image
     Set-EaselComposeEnvironment -Image $Image `
         -PublicOrigin $PublicOrigin -ProjectName $ProjectName -Port $Port
 
@@ -56,29 +58,93 @@ try {
     $running = Invoke-EaselDocker -Arguments @(
         'compose', '-p', $ProjectName, '-f', $compose,
         'ps', '-q', 'control')
-    $containerId = (($running.Output -join '').Trim())
-    if ($running.ExitCode -ne 0 -or -not $containerId) {
-        throw 'control_not_running'
+    $containerLines = @($running.Output | Where-Object {
+        $_ -and $_.Trim()
+    })
+    if ($running.ExitCode -ne 0 -or $containerLines.Count -ne 1) {
+        throw 'control_container_ambiguous'
     }
+    $containerId = $containerLines[0].Trim()
 
     $inspect = Invoke-EaselDocker -Arguments @('inspect', $containerId)
     if ($inspect.ExitCode -ne 0) {
         throw 'control_inspect_failed'
     }
-    $parsed = (($inspect.Output -join "`n") | ConvertFrom-Json)
-    $container = @($parsed)[0]
+    $inspectText = (($inspect.Output -join "`n").Trim())
+    if (-not $inspectText) {
+        throw 'container_inspect_invalid'
+    }
+    try {
+        $parsed = $inspectText | ConvertFrom-Json
+    }
+    catch {
+        throw 'container_inspect_invalid'
+    }
+    $items = @($parsed)
+    if ($items.Count -ne 1 -or $null -eq $items[0]) {
+        throw 'container_inspect_invalid'
+    }
+    $container = $items[0]
+    if ($null -eq $container.Config -or $null -eq $container.HostConfig -or
+        $null -eq $container.Mounts -or
+        $null -eq $container.NetworkSettings) {
+        throw 'container_inspect_invalid'
+    }
 
     $mounts = @($container.Mounts)
-    $destinations = @($mounts | ForEach-Object {
-        [string]$_.Destination
+    $controlMounts = @($mounts | Where-Object {
+        [string]$_.Destination -eq '/srv/easel/control'
     })
+    $keyMounts = @($mounts | Where-Object {
+        [string]$_.Destination -eq '/keys'
+    })
+    $controlVolumeName = ''
+    if ($controlMounts.Count -eq 1) {
+        $controlVolumeName = [string]$controlMounts[0].Name
+    }
+    $keyVolumeName = ''
+    if ($keyMounts.Count -eq 1) {
+        $keyVolumeName = [string]$keyMounts[0].Name
+    }
+
     $capDrop = @($container.HostConfig.CapDrop)
     $securityOpt = (@($container.HostConfig.SecurityOpt) -join ',')
-    $portProperty = $container.NetworkSettings.Ports.PSObject.Properties['7861/tcp']
-    $portBindings = @()
-    if ($null -ne $portProperty) {
-        $portBindings = @($portProperty.Value)
+    $labels = $container.Config.Labels
+    $composeProject = ''
+    $composeService = ''
+    if ($null -ne $labels) {
+        $composeProject = [string]$labels.'com.docker.compose.project'
+        $composeService = [string]$labels.'com.docker.compose.service'
     }
+
+    $actualCommand = @()
+    if ($null -ne $container.Config.Entrypoint) {
+        $actualCommand += @($container.Config.Entrypoint)
+    }
+    if ($null -ne $container.Config.Cmd) {
+        $actualCommand += @($container.Config.Cmd)
+    }
+    $expectedCommand = @(
+        'python', '-m', 'easel', 'serve-control',
+        '--control-dir', '/srv/easel/control',
+        '--public-origin', $PublicOrigin,
+        '--master-key-file', '/keys/master.key',
+        '--frontend-dir', '/opt/easel/web/frontend/dist',
+        '--host', '0.0.0.0', '--port', '7861'
+    )
+    $checksCommand = ($actualCommand -join "`n") -eq (
+        $expectedCommand -join "`n")
+
+    $portProperties = @()
+    if ($null -ne $container.NetworkSettings.Ports) {
+        $portProperties = @(
+            $container.NetworkSettings.Ports.PSObject.Properties)
+    }
+    $portBindings = @()
+    if ($portProperties.Count -eq 1) {
+        $portBindings = @($portProperties[0].Value)
+    }
+
     $healthStatus = ''
     if ($null -ne $container.State.Health) {
         $healthStatus = [string]$container.State.Health.Status
@@ -88,6 +154,8 @@ try {
 
     $checks = [ordered]@{}
     $checks['image_matches'] = ([string]$container.Image -eq $Image)
+    $checks['compose_project'] = ($composeProject -eq $ProjectName)
+    $checks['compose_service'] = ($composeService -eq 'control')
     $checks['user_10001'] = ([string]$container.Config.User -eq '10001:10001')
     $checks['read_only_rootfs'] = [bool]$container.HostConfig.ReadonlyRootfs
     $checks['cap_drop_all'] = ($capDrop -contains 'ALL')
@@ -96,26 +164,41 @@ try {
     $checks['no_host_network'] = (
         ([string]$container.HostConfig.NetworkMode -ne 'host') -and
         ([string]$container.HostConfig.NetworkMode -notlike 'container:*'))
-    $checks['only_control_and_key_volumes'] = (
-        $destinations.Count -eq 2 -and
-        $destinations -contains '/srv/easel/control' -and
-        $destinations -contains '/keys')
-    $checks['no_docker_socket'] = (-not (
-        $destinations -contains '/var/run/docker.sock'))
+    $checks['command_matches'] = $checksCommand
+    $checks['only_expected_mounts'] = ($mounts.Count -eq 2)
+    $checks['control_volume_source'] = (
+        $controlMounts.Count -eq 1 -and
+        [string]$controlMounts[0].Type -eq 'volume' -and
+        $controlVolumeName -eq $volumes.Control)
+    $checks['key_volume_source'] = (
+        $keyMounts.Count -eq 1 -and
+        [string]$keyMounts[0].Type -eq 'volume' -and
+        $keyVolumeName -eq $volumes.Keys)
+    $checks['control_volume_writable'] = (
+        $controlMounts.Count -eq 1 -and [bool]$controlMounts[0].RW)
+    $checks['key_volume_readonly'] = (
+        $keyMounts.Count -eq 1 -and -not [bool]$keyMounts[0].RW)
+    $checks['no_extra_mounts'] = ($mounts.Count -eq 2)
+    $checks['only_published_port'] = (
+        $portProperties.Count -eq 1 -and
+        $portProperties[0].Name -eq '7861/tcp')
     $checks['loopback_port'] = (
         $portBindings.Count -eq 1 -and
         [string]$portBindings[0].HostIp -eq '127.0.0.1' -and
         [string]$portBindings[0].HostPort -eq [string]$Port)
     $checks['health_ok'] = ($healthStatus -eq 'healthy')
 
-    $keyCheck = Invoke-EaselDocker -Arguments @(
-        'run', '--rm', '--user', '10001:10001',
-        '--entrypoint', 'python',
-        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys",
-        $Image,
-        '/opt/easel/deploy/desktop/keygen.py', '--check',
-        '--path', '/keys/master.key')
-    $checks['master_key_present'] = ($keyCheck.ExitCode -eq 0)
+    $checks['master_key_present'] = $false
+    if ($keyVolumeName) {
+        $keyCheck = Invoke-EaselDocker -Arguments @(
+            'run', '--rm', '--user', '10001:10001',
+            '--entrypoint', 'python',
+            '--mount', "type=volume,src=$keyVolumeName,dst=/keys",
+            $Image,
+            '/opt/easel/deploy/desktop/keygen.py', '--check',
+            '--path', '/keys/master.key')
+        $checks['master_key_present'] = ($keyCheck.ExitCode -eq 0)
+    }
 
     $failed = @()
     foreach ($name in $checks.Keys) {

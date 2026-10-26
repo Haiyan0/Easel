@@ -494,7 +494,7 @@ $PublicOrigin = 'https://替换为你的实际域名'
   -PublicOrigin $PublicOrigin -Image $ControlImage -ProjectName $ProjectName
 ```
 
-`Start-Easel.ps1` 会在调用 `docker compose up` 之前依次检查：Origin 形状、镜像是否为固定 `sha256`、专用卷是否存在、master key 是否可读、镜像内前端是否存在、Compose 配置是否可展开。任一检查失败都不会启动容器。
+`Start-Easel.ps1` 会在调用 `docker compose up` 之前依次检查：Origin 形状、镜像是否为固定 `sha256`、两个专用卷的实际 Name/项目/角色标签和单对象结构、master key 是否可读、镜像内前端是否存在、Compose 配置是否可展开。卷不存在、外来标签、缺标签、错角色、空/多对象或非法 inspect 都以 `volume_not_owned`/`volume_inspect_invalid`/`volume_inspect_failed` 明确拒绝；Start 不会自动 create 或 chown 接管。任一检查失败都不会启动容器。
 
 首次管理员邀请只在创建时输出一次；在 control 已启动后执行：
 
@@ -521,7 +521,7 @@ curl.exe -fsS -o NUL -w "http=%{http_code} ssl_verify=%{ssl_verify_result}`n" `
   "$PublicOrigin/api/health"
 ```
 
-诊断检查实际容器：UID/GID、只读根、`cap_drop ALL`、`no-new-privileges`、非 privileged、非 host 网络、仅 control/key 两个挂载、无 Docker socket、回环端口、健康状态和 master key 存在性。输出只有检查名/状态码，不解析或回显 key、邀请、Cookie、访问令牌。
+诊断从运行中容器读取实际 `docker inspect`，检查：Compose 项目/service 标签、镜像 ID、UID/GID、只读根、`cap_drop ALL`、`no-new-privileges`、非 privileged、非 host 网络、合并 Entrypoint/Cmd 后的完整 `serve-control` 命令（含实际 `--public-origin`、control/key/前端目录和 7861 端口）、恰好两个 volume 挂载（control 可写/key 只读、实际卷 Name 与项目匹配、拒绝 bind 替代）、无额外挂载、仅 `127.0.0.1:7861` 一个发布端口、健康状态，以及用实际 key 挂载卷检查 key。inspect 为空/多对象/结构缺失/非法 JSON 均失败。输出只有检查名/状态码，不解析或回显 key、邀请、Cookie、访问令牌或完整 env。
 
 ### 9.6 停止、重开与清理
 
@@ -561,6 +561,7 @@ docker volume rm "$ProjectName-control" "$ProjectName-keys"
 | Docker Desktop / Engine | 29.2.1，Linux containers |
 | 浏览器证据 control 镜像 | `sha256:d06578a3b011f6b06e9b3781414aae1757bbe41ffba7e7f3479e3302d4d3b49f` |
 | 最终脚本校验镜像（同源重建） | `sha256:c4a4c7f24462addff841f9b5b360e97654bd4cebaf89c48f113bcc57f8c4e6d1` |
+| R1 脚本校验镜像（同源重建） | `sha256:3df01c1d2072a05c757e2d00bc43a31bcff93d2db5622dd5654ff9f90975e335` |
 | ngrok | 3.39.11，公网 HTTPS 可达 |
 | Chromium | 151.0.7922.34，headless，独立 browser context |
 | 管理员 HTTPS 登录 | 通过 |
@@ -574,6 +575,11 @@ docker volume rm "$ProjectName-control" "$ProjectName-keys"
 | 旧域名 Cookie 到新 Origin | 401（host-only Cookie 未发送） |
 | 旧 Origin 写请求到新 control | 403 |
 | 新 Origin 重新登录 | 成功，userId 未变 |
+| R1 外来卷直接 Start（真实 Docker） | `volume_not_owned`，无容器、无 Compose up |
+| R1 合法初始化/启动/诊断 | `key=created`，20 项诊断全部通过 |
+| R1 停止后重开 | `key=exists`，再次启动健康，20 项诊断全部通过 |
+| R1 诊断反例（fake Docker） | 错挂载来源、bind 替代、key 可写、Origin/命令/项目/service 错误、额外端口、空/多/非法 inspect 均失败 |
+| R1 红绿 | 旧脚本 44 项中 28 failed、16 passed；当前脚本 44 passed |
 
 截图见 `docs/evidence/desktop-a1/`，均不包含邀请令牌、Cookie、CSRF 或 master key。本次 ngrok 账户使用免费固定静态域名，无法在本机同时建立第二个公开 ngrok 主机；因此“ngrok 公开地址变化”本身标记为 **not-run**。Origin 变更子场景改用 `127.0.0.1:8443` 的真实 TLS 反向代理，并以 Chromium SPKI pin 校验该本地自签证书；它是范围受限的本地证书，不是公开 CA，也不冒充 ngrok 地址变化。核心双身份登录证据仍来自真实 ngrok 公网 HTTPS。
 
@@ -594,7 +600,7 @@ if ($LASTEXITCODE -ne 0) { throw '前端构建失败' }
 Pop-Location
 ```
 
-本次实际结果：上述后端 **82 passed**；前端 lint/build 通过；`docker compose config --quiet` 通过；完整 `tests/multiuser` 为 **1019 passed、4 skipped**。真实浏览器证据脚本只存在于本次临时工作区，不读取开发者 HOME、账号、profile 或浏览器数据。
+本次实际结果：上述后端 **111 passed**（Desktop 测试 44 passed）；前端 lint/build 通过；`docker compose config --quiet` 通过；完整 `tests/multiuser` 为 **1048 passed、4 skipped**。A1 R1 未改变镜像应用内容/依赖，因此没有重跑真实 HTTPS 双身份浏览器场景；审计单允许保留已有浏览器证据，但要求用最终固定镜像复跑 init/start/Test/重开，已完成并记录在 `docs/evidence/desktop-a1/report.md`。
 
 仍有限制：没有执行 worker、Harness、真实供应商或聊天闭环；`/api/outputs` 等工作区业务继续 503；ngrok 公开地址变化未实测；本地 pinned TLS 只用于子场景；正式 Linux 发布检查器仍因固定证据 blockers 保持 blocked。本文不把本机登录管理面结果冒充正式上线。
 

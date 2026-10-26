@@ -71,6 +71,47 @@ control 容器只挂载 `control` 数据卷与 master key 卷；没有 Docker so
 
 镜像 ID 会因 Docker 重新构建而改变（同一源码、同层内容），因此表中同时保留浏览器证据镜像和最终脚本校验镜像；实际部署必须使用构建后 `docker image inspect` 得到的固定 ID，而不是可移动 tag。
 
+## A1 R1 定向返工（2026-10-27）
+
+### R1-01：Start/Test 卷归属复核
+
+`Start-Easel.ps1` 和 `Test-Easel.ps1` 现在在任何 helper `docker run` / Compose 操作前调用共用卷契约：
+
+- 原始 `docker volume inspect` 必须非零退出以外的合法 JSON；
+- 恰好一个对象，含 `Name`/`Labels`；
+- 实际 `Name` 等于本项目卷名；
+- `easel.desktop.project` 等于项目名、`easel.desktop.role` 分别为 `control`/`keys`；
+- 空/多对象、缺标签、错项目/角色、非法 JSON 明确拒绝，不自动 create/chown。
+
+反例测试覆盖 control/keys 外来标签、缺标签、错角色、实际 Name 不符、非法/空/多对象；断言失败时无 helper run、无 Compose up、key 不改变。
+
+### R1-02：诊断实际接线
+
+`Test-Easel.ps1` 现在校验运行容器的实际契约，而不是只比较目标路径：
+
+- Compose 项目/service 标签；
+- 合并 `Entrypoint`+`Cmd` 后的完整 `serve-control` 命令，包含实际 Origin、control/key/前端目录和 7861；
+- 恰好两个 volume 挂载，实际卷 Name 正确，control RW、key 只读，拒绝 bind 替代和额外挂载；
+- `NetworkSettings.Ports` 仅允许 `127.0.0.1:7861` 一个发布端口；
+- key 检查使用实际 key 挂载卷；
+- inspect 为空/多对象/缺结构/非法 JSON 失败。
+
+反例覆盖错挂载来源、bind 替代、key 可写、Origin 错、命令错、Entrypoint 错、项目/service 错、额外端口、空/多/非法 inspect。
+
+### R1 红绿与真实 Docker 复跑
+
+| 项目 | 实际结果 |
+|---|---|
+| 旧脚本（`1cee445`）跑当前 44 项 Desktop 测试 | **28 failed、16 passed**，37.39 s |
+| 当前脚本跑同 44 项 | **44 passed**，27.41 s（红后立即恢复并复跑） |
+| R1 最终固定镜像 | `sha256:3df01c1d2072a05c757e2d00bc43a31bcff93d2db5622dd5654ff9f90975e335` |
+| 真实外来卷直接 Start | exit 1 `volume_not_owned`；无容器创建 |
+| 真实合法项目首次初始化/启动 | `key=created`；start `health=healthy`；20 项诊断全部通过 |
+| 真实停止/重开 | 停止后无运行容器；再次初始化 `key=exists`；start healthy；20 项诊断再次通过 |
+| 清理 | 删除随机测试容器/卷；无残留，未使用全局 prune |
+
+A1 R1 只修改脚本、测试和文档，未改变镜像应用内容/依赖；审计单允许保留已有 A1 浏览器证据，因此没有重做 ngrok HTTPS 双身份浏览器场景。真实 Docker 复跑使用同一最终镜像完成了 init/start/Test/重开。逐项失败/通过测试 ID 见 [r1-red-green.md](r1-red-green.md)。
+
 ## 截图
 
 - `01-admin-members.png`：管理员设置页（无邀请明文）
@@ -124,7 +165,7 @@ docker compose -p $ProjectName -f .\deploy\desktop\compose.login.yaml stop
 
 ## 回归
 
-见交付说明与 `docs/windows-desktop-operations.zh-CN.md` 9.8。本次实际后端回归 82 passed；完整 `tests/multiuser` 1019 passed、4 skipped；前端 lint/build 和 Compose 静态校验通过。
+见交付说明与 `docs/windows-desktop-operations.zh-CN.md` 9.8。本次实际后端回归 111 passed（Desktop 44 passed）；完整 `tests/multiuser` 1048 passed、4 skipped；前端 lint/build 和 Compose 静态校验通过。
 
 ## 不属于 A1 的剩余项
 

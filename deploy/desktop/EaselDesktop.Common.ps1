@@ -133,10 +133,53 @@ function Set-EaselComposeEnvironment {
     $env:EASEL_CONTROL_PORT = [string]$Port
 }
 
+function Assert-EaselVolumeContract {
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)]$Volumes
+    )
+    # Start/Test 不得跳过 Initialize 的归属复核。原始 volume inspect 必须
+    # 恰好返回一个对象，且实际 Name/项目/角色标签都匹配；不接受自动接管。
+    $specs = @(
+        [pscustomobject]@{ Name = $Volumes.Control; Role = 'control' },
+        [pscustomobject]@{ Name = $Volumes.Keys; Role = 'keys' }
+    )
+    foreach ($spec in $specs) {
+        $inspect = Invoke-EaselDocker -Arguments @(
+            'volume', 'inspect', $spec.Name)
+        if ($inspect.ExitCode -ne 0) {
+            throw 'volume_inspect_failed'
+        }
+        $text = (($inspect.Output -join "`n").Trim())
+        if (-not $text) {
+            throw 'volume_inspect_invalid'
+        }
+        try {
+            $parsed = $text | ConvertFrom-Json
+        }
+        catch {
+            throw 'volume_inspect_invalid'
+        }
+        $items = @($parsed)
+        if ($items.Count -ne 1 -or $null -eq $items[0]) {
+            throw 'volume_inspect_invalid'
+        }
+        $item = $items[0]
+        if (-not ($item.PSObject.Properties.Name -contains 'Name') -or
+            -not ($item.PSObject.Properties.Name -contains 'Labels')) {
+            throw 'volume_inspect_invalid'
+        }
+        if ([string]$item.Name -ne $spec.Name) {
+            throw 'volume_not_owned'
+        }
+        Assert-EaselVolumeOwnership -Labels $item.Labels `
+            -ProjectName $ProjectName -Role $spec.Role
+    }
+}
+
 function Test-EaselImagePin {
     param(
-        [Parameter(Mandatory)][string]$Image,
-        [Parameter(Mandatory)]$Volumes
+        [Parameter(Mandatory)][string]$Image
     )
     $inspect = Invoke-EaselDocker -Arguments @(
         'image', 'inspect', '--format', '{{.Id}}', $Image)
@@ -146,11 +189,5 @@ function Test-EaselImagePin {
     $observed = (($inspect.Output -join '').Trim())
     if ($observed -ne $Image) {
         throw 'control_image_mismatch'
-    }
-    foreach ($volume in @($Volumes.Control, $Volumes.Keys)) {
-        $result = Invoke-EaselDocker -Arguments @('volume', 'inspect', $volume)
-        if ($result.ExitCode -ne 0) {
-            throw 'volume_missing'
-        }
     }
 }
