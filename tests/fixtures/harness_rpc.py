@@ -4,7 +4,6 @@ import subprocess
 import sys
 import time
 
-
 runtime = sys.argv[1]
 mode = os.environ.get("FAKE_HARNESS_MODE", "normal")
 audit = os.environ["FAKE_HARNESS_AUDIT"]
@@ -34,6 +33,32 @@ def receive():
 
 def reply(message, result):
     send({"id": message["id"], "result": result})
+
+
+def record_runtime(session_id):
+    """多人模式只记录最小运行时边界，不持久化完整环境变量。
+
+    cwd/home 是 worker 实际执行位置；workspace/run/session 用于证明
+    A/B 没有共享同一持久区。记录只进入本次测试的审计文件。
+    """
+    if mode != "multiuser":
+        return
+    record = {
+        "method": "fixture/runtime",
+        "cwd": os.getcwd(),
+        "home": os.environ.get("HOME") or "",
+        "dshHome": os.environ.get("DSH_HOME") or "",
+        "dshAgentsHome": os.environ.get("DSH_AGENTS_HOME") or "",
+        "workspaceId": os.environ.get("EASEL_WORKSPACE_ID") or "",
+        "runId": os.environ.get("EASEL_RUN_ID") or "",
+        "sessionId": session_id,
+    }
+    with open(audit, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def multiuser_reply(session_id):
+    return f"{os.environ.get('EASEL_WORKSPACE_ID', '')}:{session_id}"
 
 
 def permission():
@@ -86,6 +111,9 @@ while True:
             thread_id = message["params"]["threadId"]
         reply(message, {"thread": {"id": thread_id}})
     elif method in ("session/new", "session/load", "session/resume"):
+        if method == "session/new" and mode == "multiuser":
+            # 固定 native ID：A/B 即使得到相同 ID，也必须写入各自 state_root。
+            session_id = "multiuser-session"
         if method in ("session/load", "session/resume"):
             session_id = "replacement" if mode in ("wrong-resume", "wrong-modern-resume") else message["params"]["sessionId"]
         result = {"sessionId": session_id,
@@ -105,6 +133,9 @@ while True:
         if "id" in message:
             reply(message, {})
     elif method in ("turn/start", "session/prompt"):
+        record_runtime(session_id)
+        reply_text = (multiuser_reply(session_id)
+                      if mode == "multiuser" else "你好")
         if mode in ("permission", "permission-secret"):
             permission()
         if mode in ("hang", "slow-cancel", "ignore-cancel"):
@@ -120,9 +151,9 @@ while True:
         if runtime == "codex":
             common = {"threadId": thread_id, "turnId": turn_id, "itemId": "text"}
             send({"method": "item/reasoning/summaryTextDelta", "params": {**common, "delta": "思考"}})
-            send({"method": "item/agentMessage/delta", "params": {**common, "delta": "你好"}})
+            send({"method": "item/agentMessage/delta", "params": {**common, "delta": reply_text}})
             send({"method": "item/completed",
-                  "params": {**common, "item": {"type": "agentMessage", "id": "text", "text": "你好"}}})
+                  "params": {**common, "item": {"type": "agentMessage", "id": "text", "text": reply_text}}})
             if mode == "fatal":
                 send({"method": "error", "params": {**common, "willRetry": False}})
             else:
@@ -130,7 +161,7 @@ while True:
                       "params": {**common, "turn": {"id": turn_id, "status": "completed"}}})
             reply(message, {"turn": {"id": turn_id}})
         else:
-            for update, text in (("agent_thought_chunk", "思考"), ("agent_message_chunk", "你好")):
+            for update, text in (("agent_thought_chunk", "思考"), ("agent_message_chunk", reply_text)):
                 send({"method": "session/update", "params": {
                     "sessionId": session_id, "update": {"sessionUpdate": update,
                                                       "content": {"type": "text", "text": text}}}})

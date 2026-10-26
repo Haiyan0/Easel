@@ -405,3 +405,70 @@ token。恢复不会覆盖运行中的 control 目录，也不会在 key 缺失/
 `cwd` 不兼容或缺失的原生绑定只作为静态历史报告为不可续接，不替换
 `native_id`。上述能力不改变 Task 8 的真实防火墙/IPv6/配额/最终 Harness/
 浏览器沙箱门槛。
+
+## 11. 双用户验收与正式发布门槛
+
+本机开发证据与正式部署证据必须分开记录；本机测试不能作为发布证明。
+
+### 11.1 本机双用户证据
+
+```powershell
+python -m pytest tests/multiuser/test_two_users.py -q
+python -m pytest tests/multiuser/test_release_checker.py -q
+```
+
+- `test_two_users.py` 启动真实 control app、两个独立 worker 子进程和临时
+  假 ACP Harness；验证 A/B 一次性邀请登录、同名会话、HTTP/SSE、连续追问
+  续接、worker outputs 的 token/文件隔离，以及控制库 + 持久区在新目录的
+  备份恢复。它不连接真实 Docker、目标 Linux、真实 DSH 或供应商。
+- `test_release_checker.py` 只验证检查器在缺前提、skip/xfail、空门槛和
+  未标记测试时失败，不访问真实环境。
+- 2026-10-26 本机（Windows，父基线 `5bebd87`）结果：两文件分别
+  `4 passed` 与 `11 passed`；完整 `tests/multiuser` 为
+  `987 passed, 4 skipped`；真实 Chromium 的
+  `tests/integration/multiuser/test_browser_profiles_real.py` 为
+  `11 passed`；前端 Node 测试 `118 passed`，生产构建通过。另在本机
+  Docker Desktop 用已有 Task 8 执行镜像运行
+  `smoke_worker.py --check-files`，输出 `WORKER_SMOKE_OK`；这不是从头
+  构建、容器隔离/网络/配额或目标 Linux 证据。Windows 上 POSIX 执行位等
+  既有跳过不冒充通过，本机 Chromium 也不等于目标 Linux worker 沙箱通过。
+
+### 11.2 正式门槛（缺前提即失败）
+
+```bash
+python scripts/check_multiuser_release.py
+python -m pytest \
+  tests/integration/multiuser/test_two_users_live.py \
+  tests/integration/multiuser/test_browser_live.py \
+  tests/integration/multiuser/test_restore_live.py \
+  --multiuser-live -m multiuser_integration -q
+```
+
+正式检查要求：
+
+- Linux 宿主；Windows/Docker Desktop 结果直接 `platform_not_linux` 失败；
+- Docker Engine 可用；检测到 rootless 时当前检查器直接失败，除非后续
+  单独完成项目配额、UID 映射、`SO_PEERCRED` 与 bind mount 实测并扩展
+  自动门槛；
+- `EASEL_TEST_WORKSPACE_ROOT` 所在文件系统为 XFS 且启用
+  `prjquota`/`pquota`，并存在 `xfs_quota`；
+- `EASEL_MASTER_KEY_FILE` 为 32 字节且权限不含 group/world；
+- `EASEL_TEST_CONTROL_URL`/`EASEL_TEST_PREVIEW_URL` 为 HTTPS；
+- `EASEL_TEST_WORKER_IMAGE` 为 `sha256:<64hex>` 固定摘要；
+- `EASEL_TEST_INVITE_A`/`EASEL_TEST_INVITE_B` 为未兑换的一次性邀请；
+- `EASEL_TEST_BACKUP_SOURCE` 为已有备份，`EASEL_TEST_RESTORE_DEST` 为新/
+  空目录；并安装 Playwright/Chromium。
+
+缺任一变量、marker 测试出现 skip/xfail/xpass、Docker/浏览器/恢复门槛
+失败，检查器均退出 1。2026-10-26 在 Windows 本机实际运行检查器输出：
+
+```text
+release_status=failed
+[fail] platform platform_not_linux
+gates=not_run
+```
+
+这是本机证据，不是正式通过。正式 Linux/Docker/XFS/真实 DSH/浏览器沙箱/
+供应商门槛未执行；control 的 workspace-content 路由（如 `/api/outputs`）
+尚未装配，继续返回 503。live 测试把该 503 视为发布门槛失败，不能以本机
+worker 产物测试替代。

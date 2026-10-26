@@ -306,6 +306,57 @@ python -m pytest tests/multiuser -q
 python -m pytest tests/test_document_paths.py -q
 ```
 
+### 9.1 Task 14 本机双用户与发布门槛记录
+
+日期：2026-10-26（Asia/Shanghai）。本机证据父基线：
+`5bebd87c65f723e3be656596a71acf1af9bc5948`。
+
+本机可执行、不连接正式部署：
+
+```powershell
+python -m pytest tests/multiuser/test_two_users.py -q
+python -m pytest tests/multiuser/test_release_checker.py -q
+python -m pytest tests/multiuser -q
+```
+
+- `test_two_users.py`：真实 control app + 两个独立 worker 子进程 + 临时
+  假 ACP Harness；A/B 一次性邀请、同名会话、HTTP/SSE、连续追问续接、
+  worker outputs 隔离、控制库/持久区备份恢复均为本机实际执行。
+- 本机结果：`test_two_users.py` 4 passed；`test_release_checker.py`
+  11 passed；`tests/multiuser` 987 passed、4 skipped；真实 Chromium
+  profile 测试 11 passed；前端 Node 测试 118 passed，生产构建通过。另在
+  本机 Docker Desktop 用已有 Task 8 执行镜像运行
+  `smoke_worker.py --check-files` 得到 `WORKER_SMOKE_OK`；这不是从头
+  构建、容器隔离/网络/配额或目标 Linux 证据。Windows 既有 POSIX 跳过
+  不记为通过，本机 Chromium 也不等于目标 Linux worker 沙箱通过。
+- 这些结果只证明本机代码路径，不证明目标 Linux、Docker 资源/网络、真实
+  DSH ACP、真实供应商或 Chromium 沙箱。
+
+正式发布门槛（缺前提必须失败，不 skip）：
+
+```bash
+python scripts/check_multiuser_release.py
+python -m pytest tests/integration/multiuser/test_two_users_live.py \
+  tests/integration/multiuser/test_browser_live.py \
+  tests/integration/multiuser/test_restore_live.py \
+  --multiuser-live -m multiuser_integration -q
+```
+
+正式检查要求 Linux、可用 Docker、XFS `prjquota`/`pquota`、受保护 master
+key、固定 worker 镜像、HTTPS control/preview、A/B 一次性邀请、真实备份源
+和空恢复目标；marker 测试出现 skip/xfail/xpass 或任一门槛失败均退出 1。
+本机 2026-10-26 实际运行检查器：
+
+```text
+release_status=failed
+[fail] platform platform_not_linux
+gates=not_run
+```
+
+因此 **正式发布门槛未通过、正式 live/restore/browser 未执行**。control 的
+workspace-content 路由（如 `/api/outputs`）仍未装配并返回 503；live 测试
+把该状态视为发布失败，不能用本机 worker 产物测试替代。
+
 自动化测试只使用临时目录和临时数据，不读取真实 HOME、浏览器 profile、公众号
 配置或供应商凭证。以下仍保持未通过/未执行，不能由本手册或测试替代：
 
