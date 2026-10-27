@@ -1397,12 +1397,17 @@ def cmd_serve_control(args) -> int:
     # 受限 provisioner 必须可达才启动多人运行时；缺失时失败关闭，
     # 不回退到进程内 Docker 或“无隔离”模式。
     provisioner = None
+    gateway_required = bool(getattr(args, "gateway_required", False))
     provisioner_socket = getattr(args, "provisioner_socket", None)
+    if gateway_required and not provisioner_socket:
+        print("错误：gateway_required_needs_provisioner", file=sys.stderr)
+        return 2
     if provisioner_socket:
         if not Path(provisioner_socket).exists():
             print("错误：provisioner_unavailable", file=sys.stderr)
             return 2
-        provisioner = UnixProvisionerClient(provisioner_socket)
+        provisioner = UnixProvisionerClient(
+            provisioner_socket, gateway_required=gateway_required)
 
     # 固定前端构建目录：显式给出时必须存在，否则回退任意服务器路径是禁止的
     frontend_dir = getattr(args, "frontend_dir", None)
@@ -1424,7 +1429,9 @@ def cmd_serve_control(args) -> int:
         broker = BrokerService(store, config_service, egress=egress)
         app = create_app(store=store, auth=AuthService(store), config=config,
                          config_service=config_service, broker=broker,
-                         provisioner=provisioner, frontend_dir=frontend_dir,
+                         provisioner=provisioner,
+                         gateway_required=gateway_required,
+                         frontend_dir=frontend_dir,
                          relay_factory=relay_factory,
                          harness_summary=harness_summary)
     finally:
