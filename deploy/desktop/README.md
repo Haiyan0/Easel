@@ -143,6 +143,13 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
   management 入口。
 - `WorkerHandle.upstream` 改为 gateway 的 control 网络地址；不再把 worker
   容器 IP 暴露给 control。
+- 启动顺序：gateway 先加入 `easel-control`，解析并绑定自身 control 网络
+  地址（management 端口 8897），再加入 `easel-ws-<workspace_id>`；不在
+  worker 地址上监听。目标固定为
+  `http://easel-worker-<workspace_id>:7860`，不接受调用方给的 URL。
+- 认证闭环：provisioner 为每 workspace 签发独立的 control→gateway 凭证；
+  control 通过 `WorkerHandle` 的不透明字段持有，gateway 校验后只向固定的
+  worker 转发内部身份头；worker 不持有 gateway 凭证。
 
 相对原“宿主 provisioner”设计的权限差异：
 

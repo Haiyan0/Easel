@@ -246,6 +246,11 @@ def test_desktop_topology_contract_is_explicit_and_secret_free() -> None:
     assert network["gateway"]["docker_socket"] is False
     assert network["gateway"]["worker_ports"] == []
     assert network["gateway"]["management_bind"] == "control_network_ip_only"
+    assert network["gateway"]["management_port"] == 8897
+    assert network["gateway"]["routing"]["workspace_fixed"] is True
+    assert network["gateway"]["routing"]["client_target_allowed"] is False
+    assert network["gateway"]["worker_to_management"] == (
+        "blocked_by_bind_and_network")
     assert "/internal/lifecycle/health" in (
         network["gateway"]["path_allowlist"])
     assert network["gateway"]["sse"] == "streaming_passthrough"

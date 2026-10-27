@@ -121,13 +121,22 @@
         "easel-ws-{workspace_id}"
       ],
       "management_bind": "control_network_ip_only",
+      "management_port": 8897,
+      "management_bind_procedure": "gateway 先以 easel-control 为第一网络启动，解析自身 control 网络地址并绑定 management listener，再连接 easel-ws-{workspace_id}；不得在 worker 地址上绑定 0.0.0.0。",
+      "routing": {
+        "worker_target_template": "http://easel-worker-{workspace_id}:7860",
+        "control_upstream_template": "http://easel-gateway-{workspace_id}:8897",
+        "workspace_fixed": true,
+        "client_target_allowed": false
+      },
       "worker_ports": [],
       "docker_socket": false,
       "mounts": [],
       "read_only_rootfs": true,
       "user": "10001:10001",
-      "service_auth": "每 workspace 独立的 control→gateway 凭证；网关固定 workspace，不接受客户端指定目标。",
-      "worker_auth": "网关通过固定 workspace 路由转发内部身份头；不记录或持久化凭证。",
+      "service_auth": "provisioner 为每 workspace 签发独立 control→gateway 凭证；control 通过 WorkerHandle 的不透明字段持有，gateway 固定 workspace 并拒绝其他目标。",
+      "worker_auth": "gateway 只在 control 认证通过后，向固定 worker 转发内部身份头；凭证不写日志/磁盘，worker 不持有 gateway 凭证。",
+      "worker_to_management": "blocked_by_bind_and_network",
       "path_allowlist": [
         "/internal/lifecycle/health",
         "/internal/runs/{run_id}",
