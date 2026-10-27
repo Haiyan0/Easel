@@ -1,6 +1,6 @@
 # Task A2：Desktop 完整拓扑契约与可行性报告
 
-状态：**A2 拓扑契约保留；A3 执行 worker 已实现，gateway/A4 仍未实现。**
+状态：**A2 拓扑契约保留；A3 执行 worker 已实现；G1 独立 gateway 核心已实现并通过单元/真实 TCP 测试；G2 生命周期接线与 A4 仍未实现。**
 
 基线：`f1c4e5ef98ea756513071367919fe57fac7dbf17`（A1 验收通过）。
 本目录只增加 A2 契约、反例和证据；没有修改认证核心、A1 Compose
@@ -15,7 +15,7 @@
 | WSL/Windows 宿主到 worker 容器 IP 的 HTTP | **不可用**：TCP 可能显示已连接，但 HTTP 请求超时；不能作为健康探测 | A3 已改为固定 `docker exec` healthcheck |
 | 当前 control 网络到 worker 容器 | **不可达**：独立 bridge 到内部 worker 网络超时 | 不能直接沿用 |
 | 直接把 control 加入 worker 网络 | control→worker 可达，但 worker→control 也可达 | 拒绝，作为反例记录 |
-| 新增每 workspace 管理中继 | 推荐方案；避免 control 加入每个 worker 网络，并保持 control 无 Docker socket | **仅提交设计，不实现** |
+| 新增每 workspace 管理中继 | 推荐方案；避免 control 加入每个 worker 网络，并保持 control 无 Docker socket | G1 独立核心已实现；容器生命周期与 control 接线待 G2 |
 | WSL `/mnt/c` 作为 worker bind 源 | 可用 | 固定 |
 | WSL ext4 路径作为 bind 源 | WSL Docker CLI 可挂载；`/tmp` 不持久，只用于 socket | 耐久 workspace 仍使用 Windows 路径 |
 | 每 workspace broker URL | 继续使用 `http://easel-sidecar-<workspace_id>:8899` | 不变 |
@@ -149,7 +149,8 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
 
 ### 5.2 推荐方案：每 workspace 受信 gateway
 
-新增 `easel-gateway-<workspace_id>`（运行时代码待批准后实现）：
+新增 `easel-gateway-<workspace_id>`（G1 已实现独立 ASGI 核心
+`create_gateway_app`；容器创建、地址注入、公钥挂载与代次持久化待 G2）：
 
 - 网络：同时加入 `easel-control` 与 `easel-ws-<workspace_id>`；后者是
   `--internal`。gateway 加入共享 `easel-control` 后，**不能**声称网络上
@@ -169,17 +170,25 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
   不接受 worker 主动发起的管理请求。
 - 认证：
   - **control→gateway**：control 现有 Ed25519 私钥签名的短时断言，独立
-    domain `easel.desktop.gateway.v1`。gateway 只读持有 control 公钥；断言
-    绑定 workspace、gateway instance/generation、worker container_id、
-    config_version、method、path、canonical query、body SHA-256、issued/
-    expires、nonce、request_id；有效期 30 秒，nonce 单次使用（有界内存
-    缓存），每次请求重新签名。
+    domain `easel.desktop.gateway.v1`，放在唯一内部头
+    `X-Easel-Gateway-Assertion`。值为
+    `v1.<base64url(canonical_json)>.<base64url(signature)>`，canonical JSON
+    使用 `sort_keys=True,separators=(',',':'),ensure_ascii=True`。断言
+    绑定 workspace、gateway instance、进程启动时新生成的 boot_generation、
+    worker container_id、config_version、method、path、canonical query、
+    body SHA-256、issued/expires、nonce、request_id；有效期最多 30 秒，
+    未来 iat 容忍 5 秒，nonce 由线程锁原子单次接纳（容量 4096，满时失败
+    关闭，不提前驱逐仍有效 nonce），每次请求重新签名。实例默认未激活；
+    `activate()` 之前所有管理请求返回 503 `gateway_inactive`，同一容器
+    进程重启也必须更换 boot_generation，旧断言即使未过期也拒绝。
   - **gateway→worker**：每 worker 独立的 service 凭证，由 provisioner 的
     `.credentials` 环境提供；gateway 不接受 control 或客户端替换它，且固定
     `container_id` + `config_version`，不按 workspace 名自动落到新实例。
-  - Cookie、Authorization、Forwarded、`X-Forwarded-*`、外来 `X-Easel-*`
-    永不传给下游；gateway 先剥离同名/所有 `X-Easel-*`，再从可信配置重建
-    worker 身份头。浏览器凭证不参与 gateway 认证。
+  - Cookie、Authorization、Forwarded、`X-Forwarded-*`、外来 `X-Easel-*`、
+    Origin、Referer、Via、`X-Real-IP` 永不传给下游；gateway 先验签，再在
+    最终 `httpx.Request`（含注入 client 的默认头/cookie/auth 合并之后）
+    删除这些头，从可信配置重建 worker workspace/service token。浏览器
+    凭证不参与 gateway 认证。
 
 ### 5.3 精确路由与查询白名单
 
@@ -187,7 +196,11 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
 `run_id`/`session_id` 为 32 位小写 hex；`question_id` 解码后必须是单个
 路径段（1..256 字节，不得为 `.`/`..`，不得含 `/`、`\`、`?`、`#`、NUL、
 CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编码的 `/`/
-`\`、`%00`、尾斜杠、重复斜杠、片段和重定向。
+`\`、`%00`、尾斜杠、重复斜杠、片段和重定向。G1 的路径只允许
+`question_id` 单段做一次百分号解码/重编码，并拒绝编码 unreserved 的
+别名；其他字面量/ID 段出现 `%` 直接拒绝。查询键按字典序规范化；值只接受 unreserved 字符
+或对非 unreserved 字符的百分号编码，拒绝编码 unreserved、裸 `+`/`;`、
+空值和重复键；整数参数必须是规范十进制。
 
 | Method | Path | Query |
 |---|---|---|
@@ -207,27 +220,32 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 - 响应：拒绝 worker 的 3xx，不跟随重定向；剥离 `Set-Cookie`、`Location`
   与 hop-by-hop 头。
 - 请求上限参考现有 relay：header 64 KiB、body 64 MiB、连接 10 秒、
-  I/O/SSE idle 120 秒；每 gateway 最多 8 个并发的普通请求/SSE（与现有
-  全局活跃 Run 上限 8 对齐），超出拒绝。SSE 逐块 `write`+`drain`，
-  客户端慢时暂停上游读取，不缓存完整流；客户端断开立即取消上游读取；
-  不自动重发任何 POST；GET/SSE 可按 `after` 游标恢复。
+  I/O/SSE idle 120 秒；每 gateway 最多 8 个并发请求，其中流请求最多 7 个，
+  至少保留一个槽给 stop/权限回答等短控制请求（与现有全局活跃 Run 上限 8
+  对齐）。饱和立即返回 429 + `Retry-After`，不无限排队。SSE/流式响应逐块
+  `write`+`drain`，客户端慢时暂停上游读取，不缓存完整流；客户端断开或
+  idle 超时立即取消/关闭上游读取；不自动重发任何 POST；GET/SSE 可按
+  `after` 游标恢复。当前 worker `/events` 返回持久事件 JSON 时原样转发，
+  不强制改为 SSE。
 
 ### 5.4 实例代次与恢复
 
 - `WorkerHandle.container_id` 始终保留 worker 不可复用 Docker ID；新增
-  `gateway_instance_id` 与 `gateway_generation`，`WorkerLease`/control
+  `gateway_instance_id` 与每进程 `boot_generation`，`WorkerLease`/control
   绑定持久化二者。`WorkerHandle.upstream` 指向 gateway；不能用 gateway
   身份替代 worker ID。gateway 标签绑定 workspace、config_version、
   worker container_id，目标来自 provisioner 核验的实际 worker 地址。
 - `stop` 同时携带 worker container_id 与 gateway_instance_id；旧 stop
-  不能删除新 gateway。断言 audience 含 gateway ID/generation，旧断言不能
-  访问新 gateway；旧 worker service 凭证不能访问新 worker。
+  不能删除新 gateway。断言 audience 含 gateway ID/boot_generation，旧断言
+  不能访问新 gateway；旧 worker service 凭证不能访问新 worker。
 - control 重启：重新加载现有受保护签名私钥；gateway/worker 不变，重新
   签发新断言，不重发旧凭证。
 - provisioner 重启：重建 Unix socket；已有 gateway/worker 不删除；control
   重连后按不可复用 ID 复核并继续。
-- gateway 重启：同一容器/ID/generation 可继续；若被重建，gateway 产生新
-  ID/generation，control 必须使用新句柄，旧断言因 audience 不符被拒。
+- gateway 重启：**每次进程启动都生成新的 boot_generation**，同一容器/ID
+  重启也不得沿用旧代次；control 经可信管理路径同步新代次前，所有管理请求
+  保持未激活 503，旧断言即使未过期也因 audience 不符被拒。若容器被重建，
+  同时产生新 gateway ID/generation。
 - gateway 暂不可用：control 返回 503；不删除 active worker；Run 不标记 done；
   SSE 断开可带 `after` 恢复；POST 不自动重发。
 - gateway 更换：按旧 gateway_instance_id 停止旧 gateway，在核验过的同一
@@ -248,7 +266,9 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
   访问其他 workspace，也不能获得宿主文件系统权限。
 - control 仍不挂 Docker socket，只获得受限 HTTP 路由。
 
-这属于新增管理中继和网络边界变化，按 A2 要求**只提交设计，不实现**。
+这属于新增管理中继和网络边界变化。G1 只实现独立核心、签名工具和测试；
+不修改 provisioner/WorkerHandle/schema/WorkerRelay，也不宣称容器运行时
+或 control→worker 全链路已启用。
 
 ## 6. Broker 契约（不变）
 
@@ -260,17 +280,20 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 - 不允许把 gateway 的 management 端口复用为任意 broker/出口代理，也不
   放宽 CONNECT 私网限制。
 
-## 7. 批准门（当前为 blocked）
+## 7. 批准门（G1 核心已实现；运行时接线仍 blocked）
 
-在以下项目获主审批准前，不写 gateway/协议/Compose 运行时代码：
+1. WSL socket 0660 + control 补充组 1000 + `--allowed-uid 10001` 的权限模型：
+   已由 A1/A2 验收。
+2. 用固定 `docker exec` healthcheck 替代宿主 HTTP 探测：已由 A3 验收。
+3. gateway 精确路由/查询表、control 签名断言、worker service 凭证、
+   请求上限、SSE 背压与失败清理：G1 已实现独立核心并覆盖认证/路由/转发/
+   流式反例；跨 workspace 断言、错误公钥和真实 TCP 转发已测试。
+4. `WorkerHandle` 保留 worker container_id、新增 gateway instance/
+   generation，`WorkerLease`/stop 绑定：仍待 G2，未在本轮修改。
 
-1. WSL socket 0660 + control 补充组 1000 + `--allowed-uid 10001` 的权限模型。
-2. 用固定 `docker exec` healthcheck 替代宿主 HTTP 探测。
-3. 新增 gateway 的精确路由/查询表、control 签名断言、worker service 凭证、
-   实例代次/恢复协议、请求上限、SSE 背压和失败清理，并补 A 凭证访问 B
-   gateway 的反例及跨 workspace 拒绝测试。
-4. 修改 `WorkerHandle`（保留 worker container_id，新增 gateway instance/
-   generation）与 `WorkerLease`/stop 绑定，并补 A3/A4 的接口测试。
+G1 没有创建 Docker 容器、没有接 control 路由、没有启用完整运行时。主审
+验收 G1 后，G2 再实现容器创建/启动握手、地址绑定、公钥挂载、实例代次
+持久化与 `WorkerHandle` 接线；在 G2/A4 验收前不宣称全链路可用。
 
 主审若选择“control 加入 worker 网络 + 控制网络地址绑定”的替代方案，需要
 单独批准并补 worker→control 不可达的持续验证；本次契约不采用该方案。
@@ -297,4 +320,19 @@ $env:EASEL_RUN_CONTAINER_TESTS = '1'
 默认静态/纯逻辑为 **6 passed, 5 skipped**；显式真实测试为 **11 passed**。
 所有容器/网络（包括临时客户端）使用随机 `easel-a2-*` 名称和
 `easel.test.run-id=<run>` 标签；清理前复核标签，单项失败继续并汇总，未执行
-全局 prune，未操作开发者已有资源。本次结束后不进入 A3。
+全局 prune，未操作开发者已有资源。
+
+G1 gateway 核心：
+
+```powershell
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest `
+  tests/multiuser/test_gateway_auth.py `
+  tests/multiuser/test_gateway_forward.py `
+  tests/multiuser/test_gateway_stream.py `
+  tests/multiuser/test_gateway_tcp.py -q
+```
+
+G1 结果为 **96 passed**；其中 `test_gateway_tcp.py` 启动两个临时回环
+uvicorn（真实 worker guard + gateway），验证合法转发、跨 workspace/错误
+断言拒绝、stop/history 和 SSE，测试后两个线程均退出。详细红绿与边界见
+[`docs/evidence/desktop-g1/report.md`](../../docs/evidence/desktop-g1/report.md)。
