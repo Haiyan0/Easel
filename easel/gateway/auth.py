@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -466,7 +467,7 @@ def sign_gateway_assertion(
             f"{_b64url(signature)}")
 
 
-def verify_gateway_assertion(
+def verify_gateway_assertion_metadata(
         public_key: Ed25519PublicKey,
         token: str,
         *,
@@ -474,9 +475,13 @@ def verify_gateway_assertion(
         method: str,
         path: str,
         canonical_query: str,
-        body_sha256: str,
         now: int) -> GatewayAssertion:
-    """验签并绑定完整请求；任何 audience/请求字段不一致都拒绝。"""
+    """验签并绑定固定请求元数据；不读取 body，也不接纳 nonce。
+
+    gateway 用本函数在读取 body/取得受保护槽位前快速拒绝无效断言；
+    ``body_sha256`` 只校验为签名声明，真实 body 摘要由调用方在读取有界
+    body 后比较。
+    """
     if not isinstance(public_key, Ed25519PublicKey) \
             or not isinstance(audience, GatewayAudience):
         raise _unauthorized()
@@ -484,9 +489,6 @@ def verify_gateway_assertion(
         raise _unauthorized()
     method, path, query_text = _validate_signed_request(
         method, path, canonical_query)
-    if (not isinstance(body_sha256, str)
-            or not _SHA256.fullmatch(body_sha256)):
-        raise _invalid_argument()
     payload, signature = _parse_assertion(token)
     try:
         public_key.verify(signature, _DOMAIN_BYTES + _canonical_json(payload))
@@ -501,7 +503,6 @@ def verify_gateway_assertion(
         or payload["method"] != method
         or payload["path"] != path
         or payload["canonical_query"] != query_text
-        or payload["body_sha256"] != body_sha256
     ):
         raise _forbidden()
     issued_at = payload["issued_at"]
@@ -523,6 +524,28 @@ def verify_gateway_assertion(
         nonce=payload["nonce"],
         request_id=payload["request_id"],
     )
+
+
+def verify_gateway_assertion(
+        public_key: Ed25519PublicKey,
+        token: str,
+        *,
+        audience: GatewayAudience,
+        method: str,
+        path: str,
+        canonical_query: str,
+        body_sha256: str,
+        now: int) -> GatewayAssertion:
+    """验签并绑定完整请求；任何 audience/请求 body 摘要不一致都拒绝。"""
+    if (not isinstance(body_sha256, str)
+            or not _SHA256.fullmatch(body_sha256)):
+        raise _invalid_argument()
+    assertion = verify_gateway_assertion_metadata(
+        public_key, token, audience=audience, method=method, path=path,
+        canonical_query=canonical_query, now=now)
+    if not hmac.compare_digest(assertion.body_sha256, body_sha256):
+        raise _forbidden()
+    return assertion
 
 
 class GatewayNonceCache:

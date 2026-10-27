@@ -181,6 +181,11 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
     关闭，不提前驱逐仍有效 nonce），每次请求重新签名。实例默认未激活；
     `activate()` 之前所有管理请求返回 503 `gateway_inactive`，同一容器
     进程重启也必须更换 boot_generation，旧断言即使未过期也拒绝。
+  - **验签顺序**：gateway 先验签并校验固定 method/path/query/audience 与
+    签名声明的 body SHA-256，再读取 body、取得受保护槽位；读取有界 body
+    后比较真实摘要，匹配后才接纳 nonce 并转发。缺失/畸形/错误签名/
+    错误 audience/过期断言在读取 body 和占槽前快速拒绝；慢 body 不能延长
+    断言有效期。
   - **gateway→worker**：每 worker 独立的 service 凭证，由 provisioner 的
     `.credentials` 环境提供；gateway 不接受 control 或客户端替换它，且固定
     `container_id` + `config_version`，不按 workspace 名自动落到新实例。
@@ -227,6 +232,15 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
   idle 超时立即取消/关闭上游读取；不自动重发任何 POST；GET/SSE 可按
   `after` 游标恢复。当前 worker `/events` 返回持久事件 JSON 时原样转发，
   不强制改为 SSE。
+- 出站 URL：在注入 `AsyncClient` 的默认 params 合并后，最终 Request URL
+  必须精确恢复为固定 origin + 已验签 path + canonical query；默认 params
+  不得添加、覆盖或重排查询，也不修改共享 client 的 params/headers/cookies/auth。
+- 上游清理：每个上游响应只有一个 cleanup task，直接消费原始
+  `AsyncByteStream`，不让 `aiter_raw` 在自然 EOF 取得首次关闭所有权；EOF、
+  异常、超时、主动关闭、断连和 background 共享该任务。取消等待者不取消
+  cleanup，底层关闭完成后才释放槽位。
+- Content-Length 在 `int` 转换前按十进制位数与 body 上限做有界比较；超长值
+  明确 413，不产生 500。重复/冲突 framing 规则不变。
 
 ### 5.4 实例代次与恢复
 
@@ -287,7 +301,8 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 2. 用固定 `docker exec` healthcheck 替代宿主 HTTP 探测：已由 A3 验收。
 3. gateway 精确路由/查询表、control 签名断言、worker service 凭证、
    请求上限、SSE 背压与失败清理：G1 已实现独立核心并覆盖认证/路由/转发/
-   流式反例；跨 workspace 断言、错误公钥和真实 TCP 转发已测试。
+   流式反例；跨 workspace 断言、错误公钥和真实 TCP 转发已测试。R1 进一步
+   固定唯一关闭任务、最终出站 URL、验签前快速拒绝和超长 Content-Length。
 4. `WorkerHandle` 保留 worker container_id、新增 gateway instance/
    generation，`WorkerLease`/stop 绑定：仍待 G2，未在本轮修改。
 
@@ -332,7 +347,11 @@ G1 gateway 核心：
   tests/multiuser/test_gateway_tcp.py -q
 ```
 
-G1 结果为 **96 passed**；其中 `test_gateway_tcp.py` 启动两个临时回环
-uvicorn（真实 worker guard + gateway），验证合法转发、跨 workspace/错误
-断言拒绝、stop/history 和 SSE，测试后两个线程均退出。详细红绿与边界见
+G1 R1 结果为 **112 passed**；覆盖唯一上游关闭任务/慢关闭取消、最终出站
+URL、验签前快速拒绝慢 body/槽位、超长 Content-Length、真实 ASGI send
+背压/断连，以及真实 TCP（临时 worker guard + gateway）的合法转发、
+跨 workspace/错误断言拒绝、stop/history 和 SSE/断连清理；测试后两个
+uvicorn 线程均退出。详细红绿与边界见
+[`docs/evidence/desktop-g1-r1/report.md`](../../docs/evidence/desktop-g1-r1/report.md)，
+上一轮证据保留在
 [`docs/evidence/desktop-g1/report.md`](../../docs/evidence/desktop-g1/report.md)。

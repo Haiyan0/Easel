@@ -43,6 +43,9 @@ class WorkerState:
     def __init__(self) -> None:
         self.requests: list[dict] = []
         self.stream_closed = threading.Event()
+        self.slow_gate = threading.Event()
+        self.slow_closed = threading.Event()
+        self.slow_second = threading.Event()
         self._lock = threading.Lock()
 
     def record(self, request: Request, body: bytes) -> None:
@@ -114,6 +117,17 @@ def create_worker_app(state: WorkerState) -> FastAPI:
             return StreamingResponse(
                 body(), media_type="text/event-stream",
                 headers={"Set-Cookie": "worker=1"})
+        if nonce == "tcp-slow":
+            async def slow_body():
+                try:
+                    yield b"data: first\n\n"
+                    await asyncio.to_thread(state.slow_gate.wait)
+                    state.slow_second.set()
+                    yield b"data: second\n\n"
+                finally:
+                    state.slow_closed.set()
+            return StreamingResponse(
+                slow_body(), media_type="text/event-stream")
         return {
             "runId": run_id,
             "state": "running",
@@ -313,6 +327,25 @@ def test_real_tcp_gateway_forwards_to_guarded_worker_and_rejects_outer_scope():
                 lines = [line for line in response.iter_lines() if line]
                 assert lines == ["data: one", "data: two"]
             assert state.stream_closed.wait(2), "真实 TCP SSE 未正常关闭"
+
+            # 真实 TCP 客户端断开：gateway 必须关闭上游，worker generator
+            # 不得继续产出第二块。
+            try:
+                with client.stream(
+                        "GET",
+                        base + events_path + "?after=0&nonce=tcp-slow",
+                        headers=headers_for(
+                            "GET", events_path,
+                            query={"after": "0", "nonce": "tcp-slow"})
+                ) as response:
+                    assert response.status_code == 200
+                    assert next(response.iter_lines()) == "data: first"
+                assert state.slow_closed.wait(2), \
+                    "真实 TCP 断连未关闭 worker 上游"
+                assert not state.slow_second.is_set(), \
+                    "断连后 worker 仍继续产出第二块"
+            finally:
+                state.slow_gate.set()
     finally:
         stop_server(gateway_server, gateway_thread)
         stop_server(worker_server, worker_thread)

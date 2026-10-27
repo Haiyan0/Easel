@@ -9,6 +9,7 @@
     "gateway_core": {
       "status": "implemented_not_wired",
       "task": "G1",
+      "review_round": "G1-R1",
       "factory": "create_gateway_app",
       "modules": [
         "easel/gateway/auth.py",
@@ -232,6 +233,7 @@
       "url_rules": {
         "path": "只接受 origin-form；解码一次；拒绝绝对 URI、反斜杠、编码的 / 和 \\、%00、尾斜杠、重复斜杠、片段和越界路径。G1 只有 question_id 单段允许百分号解码/重编码；其他字面量/ID 段出现 % 直接拒绝。",
         "query": "只允许 routes 列出的查询项；未知/重复/空值拒绝；查询顺序无关；不做二次解码；不使用 ; 分隔。G1 键按字典序规范化；值只接受 unreserved 或对非 unreserved 的百分号编码，拒绝编码 unreserved、裸 +/;、空值和重复键；整数参数必须是规范十进制。",
+        "final_url": "在注入 AsyncClient 的默认 params 合并后，最终 Request URL 必须精确恢复为固定 origin + 已验签 path + canonical query；默认 params 不得添加、覆盖或重排查询。",
         "redirect": "不跟随 worker 的 3xx；3xx、Location 或非法响应直接失败，不把重定向结果当成功。"
       },
       "id_rules": {
@@ -298,6 +300,7 @@
           "clock_skew_seconds": 5,
           "max_assertion_bytes": 4096,
           "nonce_cache_capacity": 4096,
+          "preauth": "先验签并校验固定 method/path/query/audience 与签名声明的 body_sha256，再读取 body 和取得受保护槽位；读取后比较真实 digest，匹配后才接纳 nonce 并转发。超长 Content-Length 在 int 转换前按位数失败关闭。",
           "replay": "gateway 单实例内存 nonce 缓存，线程锁原子 check+add；过期才淘汰，容量满时失败关闭，不提前驱逐仍有效 nonce；每次请求新 nonce；不持久化，不记录断言/凭证。",
           "activation": "进程启动生成新 boot_generation；activate 之前所有管理请求返回 503 gateway_inactive，不接受旧代次断言。",
           "placement": "内部头，仅 control→gateway；gateway 验签后才重建下游身份，所有外来同名头/X-Easel-* 不转发。"
@@ -340,6 +343,8 @@
         "max_concurrent_streams": 7,
         "max_concurrent_reason": "与现有 max_active_runs_total=8 对齐；每个 SSE 连接占用一个槽；流请求最多 7 个，保留至少一个槽给 stop/权限回答等短控制请求。",
         "stream_slot_reservation": "流槽满时立即 429 + Retry-After，不无限排队；短请求仍可占用保留槽，避免长流永久饥饿。",
+        "cleanup_ownership": "每上游响应创建唯一 cleanup task，直接消费原始 AsyncByteStream，不让 aiter_raw 取得自然 EOF 关闭所有权；EOF/异常/超时/断连/background 共享同一任务。取消等待者不取消 cleanup；底层响应关闭完成后才释放槽位。",
+        "content_length_parse": "Content-Length 先做十进制位数有界比较；超长或超过 body 上限返回 413，不触发 int 转换异常。",
         "sse_backpressure": "逐块 write + drain；客户端慢时暂停上游读取，不缓存完整流；客户端断开立即取消上游读取。",
         "post_retry": "不自动重发任何 POST；Run admission/idempotency 由 worker 与 control 继续校验。"
       },

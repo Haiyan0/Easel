@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import logging
 import re
 import time
@@ -31,7 +32,7 @@ from easel.gateway.auth import (
     GatewayConfig,
     GatewayError,
     GatewayNonceCache,
-    verify_gateway_assertion,
+    verify_gateway_assertion_metadata,
 )
 from easel.worker.guard import SERVICE_TOKEN_HEADER, WORKSPACE_HEADER
 
@@ -137,6 +138,44 @@ class _Slot:
             return
         self._released = True
         self._limiter.release(self.stream)
+
+
+class _ResponseCleanup:
+    """每请求唯一的上游关闭任务；所有等待者共享同一完成状态。
+
+    httpx 的 ``response.is_closed`` 会在底层 ``stream.aclose`` 完成前置真；
+    因此这里不把它当关闭完成证据，也不让读取协程取得 EOF 关闭所有权。
+    只有本任务的 ``response.aclose`` 完成后才释放槽位；等待者取消不会
+    取消这个任务。
+    """
+
+    def __init__(self, response: httpx.Response, slot: _Slot) -> None:
+        self.response = response
+        self._slot = slot
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> asyncio.Task:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        return self._task
+
+    async def close(self) -> None:
+        task = self.start()
+        await asyncio.shield(task)
+
+    async def _run(self) -> None:
+        cancelled = False
+        try:
+            try:
+                await self.response.aclose()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except Exception:  # noqa: BLE001 - 关闭失败不能吞掉终态
+                LOGGER.error("gateway 上游响应关闭失败")
+        finally:
+            if not cancelled:
+                await self._slot.release()
 
 
 class _ConcurrencyLimiter:
@@ -477,6 +516,9 @@ def _parse_inbound_headers(raw_headers: list[tuple[bytes, bytes]],
         raw_length = content_lengths[0]
         if not re.fullmatch(r"0|[1-9][0-9]*", raw_length):
             raise GatewayError("gateway_framing_ambiguous", 400)
+        # 先按十进制位数有界比较，避免超长数字触发 int 转换限制/异常。
+        if len(raw_length) > len(str(limits.max_body_bytes)):
+            raise GatewayError("gateway_body_too_large", 413)
         content_length = int(raw_length)
         if content_length > limits.max_body_bytes:
             raise GatewayError("gateway_body_too_large", 413)
@@ -670,39 +712,61 @@ class GatewayController:
         if parsed_headers.assertion is not None \
                 and len(parsed_headers.assertion) > self._limits.max_assertion_bytes:
             raise GatewayError("gateway_unauthorized", 401)
+        # 先验签并绑定固定请求元数据，再读取 body、占用受保护槽位。
+        # 未认证慢 body / 错误 audience / 过期断言在这里快速失败。
+        assertion = verify_gateway_assertion_metadata(
+            self._public_key, parsed_headers.assertion or "",
+            audience=self._config.audience, method=method,
+            path=route.path, canonical_query=canonical_query,
+            now=self._now())
         slot = self._slots.acquire(route.stream)
+        guard: _ResponseCleanup | None = None
         streaming = False
+        cancelled = False
         try:
             body = await _read_body(
                 request, parsed_headers.content_length, self._limits)
             now = self._now()
-            assertion = verify_gateway_assertion(
-                self._public_key, parsed_headers.assertion or "",
-                audience=self._config.audience, method=method,
-                path=route.path, canonical_query=canonical_query,
-                body_sha256=hashlib.sha256(body).hexdigest(), now=now)
+            if assertion.expires_at <= now:
+                # 慢 body 不能延长已验签断言的有效期。
+                raise GatewayError("gateway_unauthorized", 401)
+            actual_digest = hashlib.sha256(body).hexdigest()
+            if not hmac.compare_digest(
+                    assertion.body_sha256, actual_digest):
+                raise GatewayError("gateway_forbidden", 403)
             self._nonces.accept(
                 assertion.nonce, expires_at=assertion.expires_at, now=now)
             response = await self._send_upstream(
                 route, canonical_query, parsed_headers, body)
+            guard = _ResponseCleanup(response, slot)
             if 300 <= response.status_code < 400:
-                await response.aclose()
+                await guard.close()
                 raise GatewayError("gateway_upstream_redirect", 502)
             if response.is_stream_consumed:
-                await response.aclose()
+                await guard.close()
                 raise GatewayError("gateway_upstream_unavailable", 502)
             if route.stream or _is_streaming_response(response):
                 try:
-                    streamed = self._streaming_response(response, slot)
+                    streamed = self._streaming_response(guard)
                 except BaseException:
-                    await response.aclose()
+                    await guard.close()
                     raise
                 streaming = True
                 return streamed
-            return await self._buffered_response(response)
+            return await self._buffered_response(guard)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            if not streaming:
+            if guard is None:
                 await slot.release()
+            elif not streaming:
+                # 取消路径只启动唯一 cleanup，不在已取消任务里等待慢关闭；
+                # 不取消 cleanup 任务，槽位由它完成后释放。
+                if cancelled:
+                    guard.start()
+                else:
+                    await guard.close()
 
     async def _send_upstream(self, route: _Route, canonical_query: str,
                              headers: _InboundHeaders,
@@ -712,8 +776,12 @@ class GatewayController:
             url += "?" + canonical_query
         host = urlsplit(self._config.worker_origin).netloc
         try:
+            expected_url = httpx.URL(url)
             request = self._client.build_request(
                 route.method, url, headers=headers.forwarded, content=body)
+            # build_request 会合并注入 client 的默认 params；必须在最终
+            # Request 上恢复已验签的精确 URL，不能只清洗 headers。
+            request.url = expected_url
             _clean_request_headers(request.headers, headers.connection_tokens)
             request.headers["Host"] = host
             if body or route.method == "POST":
@@ -734,32 +802,46 @@ class GatewayController:
         except httpx.HTTPError:
             raise GatewayError("gateway_upstream_unavailable", 502) from None
 
-    async def _buffered_response(self, response: httpx.Response) -> Response:
+    async def _buffered_response(self, guard: _ResponseCleanup) -> Response:
+        response = guard.response
         headers = _clean_response_headers(response.headers)
         chunks: list[bytes] = []
 
         async def collect() -> None:
-            async for chunk in response.aiter_raw():
+            # 直接消费原始 AsyncByteStream；aiter_raw 会在自然 EOF 自行
+            # 取得首次 aclose 所有权，关闭可能被取消截断。
+            iterator = response.stream.__aiter__()
+            while True:
+                try:
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
                 chunks.append(chunk)
 
+        cancelled = False
         try:
             await asyncio.wait_for(collect(), timeout=self._limits.io_timeout)
+        except asyncio.CancelledError:
+            cancelled = True
+            guard.start()
+            raise
         except asyncio.TimeoutError:
             raise GatewayError("gateway_upstream_timeout", 504) from None
         except httpx.HTTPError:
             raise GatewayError("gateway_upstream_unavailable", 502) from None
         finally:
-            await response.aclose()
+            if not cancelled:
+                await guard.close()
         return Response(content=b"".join(chunks),
                         status_code=response.status_code, headers=headers)
 
-    def _streaming_response(self, response: httpx.Response,
-                            slot: _Slot) -> Response:
+    def _streaming_response(self, guard: _ResponseCleanup) -> Response:
+        response = guard.response
         headers = _stream_response_headers(response.headers)
 
         async def body_stream() -> AsyncIterator[bytes]:
             try:
-                iterator = response.aiter_raw()
+                iterator = response.stream.__aiter__()
                 while True:
                     try:
                         chunk = await asyncio.wait_for(
@@ -774,22 +856,13 @@ class GatewayController:
                         break
                     yield chunk
             finally:
-                try:
-                    await response.aclose()
-                finally:
-                    await slot.release()
-
-        async def cleanup() -> None:
-            # generator 可能尚未开始迭代就被客户端断开；后台任务兜底关闭
-            # 上游响应并释放槽位（与 generator finally 幂等）。
-            try:
-                await response.aclose()
-            finally:
-                await slot.release()
+                # 唯一 cleanup 任务负责关闭与释放槽位；等待者取消只
+                # 取消本生成器，不取消 cleanup。
+                await guard.close()
 
         return StreamingResponse(
             body_stream(), status_code=response.status_code, headers=headers,
-            background=BackgroundTask(cleanup))
+            background=BackgroundTask(guard.close))
 
 
 def _is_streaming_response(response: httpx.Response) -> bool:

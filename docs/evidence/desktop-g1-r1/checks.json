@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-27",
+  "g1_baseline": "8a5c16be2b80328f234ad4693b00b6795a23a12f",
+  "reviewed_commit": "64c64305bde1d4d5333a7e667eb8b044add806fe",
+  "scope": ["G1-R1-01", "G1-R1-02", "G1-R1-03"],
+  "fixes": {
+    "G1-R1-01": "per-response unique cleanup task; raw AsyncByteStream; shielded cleanup; slot released after close",
+    "G1-R1-02": "final Request URL restored after client-default params merge",
+    "G1-R1-03": "metadata preauth before body/slot; bounded Content-Length; body digest then nonce"
+  },
+  "tests": {
+    "gateway_core": "112 passed",
+    "affected_regression": "226 passed",
+    "multiuser_and_desktop_static": "1203 passed, 9 skipped",
+    "real_tcp": "1 passed"
+  },
+  "real_evidence": {
+    "asgi": [
+      "send backpressure and disconnect",
+      "disconnect before body iteration",
+      "EOF slow-close cancel",
+      "buffered slow-close cancel",
+      "read exception and idle timeout"
+    ],
+    "tcp": [
+      "real worker guard",
+      "legal forwarding",
+      "cross-workspace/wrong-key rejection",
+      "stop/history",
+      "SSE close and client disconnect without second chunk"
+    ],
+    "docker_resources": "none",
+    "ngrok_or_provider": "not used"
+  },
+  "not_run": [
+    "G2 container lifecycle/address binding/public-key mount",
+    "A4 control/WorkerHandle/schema wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}
