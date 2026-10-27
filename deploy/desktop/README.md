@@ -1,6 +1,6 @@
 # Task A2：Desktop 完整拓扑契约与可行性报告
 
-状态：**实测完成，拓扑提案待主审批准；未实现运行时代码，不进入 A3/A4。**
+状态：**A2 拓扑契约保留；A3 执行 worker 已实现，gateway/A4 仍未实现。**
 
 基线：`f1c4e5ef98ea756513071367919fe57fac7dbf17`（A1 验收通过）。
 本目录只增加 A2 契约、反例和证据；没有修改认证核心、A1 Compose
@@ -89,11 +89,10 @@
 ## 4. 健康探测契约（A3 已实现）
 
 WSL 宿主和 Windows 宿主到 worker 容器 IP 的 HTTP 健康请求均实测超时；TCP
-连接成功不能证明 HTTP、身份或就绪。当前 provisioner 的 `_probe` 使用
-宿主 HTTP，因此真实 `ensure` 在临时资源上返回 `worker_not_ready`（容器创建后
-按失败清理）。
+连接成功不能证明 HTTP、身份或就绪。A3 已把 provisioner 的 `_probe` 改为
+容器内固定 exec，不再使用宿主 HTTP。
 
-提案（**未实现**）：
+已实现：
 
 - 使用固定命令从 provisioner 侧执行：
   `docker exec <worker> python -m easel.worker.server healthcheck --port 7860`
@@ -107,7 +106,7 @@ WSL 宿主和 Windows 宿主到 worker 容器 IP 的 HTTP 健康请求均实测�
 
 ## 4.1 A3 执行 worker 状态（2026-10-27）
 
-- 最终 execution 测试镜像：`sha256:45022743e7d378c516e2b03ddf5a6c64c42e8029bb7d17c42416279ad3d25da8`。
+- A3-R1 最终 execution 测试镜像：`sha256:970e730af21c1f08647567854dceec61ca542c8d5b0ff30f8417a2690210d62b`。
 - 固定入口：`python -m easel.worker.server serve --host 0.0.0.0 --port 7860`；
   UID/GID 10001；单一进程同时提供 lifecycle 和既有 `/internal/runs` 路由。
 - 公钥：管理员固定文件只读挂载到 `/keys/worker-public.key`，环境
@@ -117,6 +116,13 @@ WSL 宿主和 Windows 宿主到 worker 容器 IP 的 HTTP 健康请求均实测�
   easel.worker.server healthcheck --port 7860`，10 秒超时；输出最小 JSON，
   校验 workspace/config_version/container_id/ready/execution_capable，不含
   token。
+- 既有实例接管只读宿主 token，并与容器实际 Env 比较；缺/错 token、重复
+  Env 键或大小写不符失败关闭，不自动轮换、删除或重建活跃实例。探针
+  失败、ready=false、paused/restarting/缺状态均保留实例与 sidecar；只有
+  明确 exited/dead 才按不可复用 ID 重建。
+- SIGTERM/SIGINT 接入 Uvicorn `Server.handle_exit`：首个信号先 drain，监听
+  socket 保持到宽限期结束；默认 15 秒内短 Run 完成，超时取消为
+  cancelled/interrupted，第二个信号强制取消。
 - 持久路径预检（UID 10001）在 `/mnt/c` 与 WSL ext4 临时根均实测通过
   创建、SQLite/WAL、跨进程 flock、fsync、原子替换、重开数据；`/mnt/c`
   被选为 Desktop 持久根。

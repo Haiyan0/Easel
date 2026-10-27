@@ -143,6 +143,10 @@ while True:
             if runtime == "codex":
                 reply(message, {"turn": {"id": turn_id}})
             continue
+        if mode == "delayed":
+            # 真实 SIGTERM 验收用：让 Run 在宽限期内仍处于执行中。
+            time.sleep(float(os.environ.get(
+                "FAKE_HARNESS_DELAY_SECONDS", "1.0")))
         if mode == "exit":
             sys.exit(0)
         if mode == "error":

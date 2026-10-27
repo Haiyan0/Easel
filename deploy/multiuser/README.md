@@ -160,6 +160,7 @@ python -m easel serve-control \
 
 ```text
 docker run -d --name easel-worker-<uuid> \
+  --cidfile <root>/.credentials/.<uuid>.cid.<random> \
   --label easel.managed=true \
   --label easel.workspace-id=<uuid> \
   --label easel.config-version=<N> \
@@ -170,16 +171,26 @@ docker run -d --name easel-worker-<uuid> \
   --network easel-ws-<uuid> \
   --mount type=bind,src=<root>/<uuid>/workspace,dst=/workspace \
   --mount type=bind,src=<root>/<uuid>/home,dst=/home/easel \
+  --mount type=bind,src=<admin-key>,dst=/keys/worker-public.key,readonly \
+  --env EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key \
   --env-file <root>/.credentials/<uuid>.env \
   --restart=no --stop-timeout=30 \
   --log-driver=local --log-opt max-size=10m --log-opt max-file=3 \
-  <pinned-image> python -m easel.worker.lifecycle serve --host 0.0.0.0 --port 7860
+  <pinned-image> python -m easel.worker.server serve --host 0.0.0.0 --port 7860
 ```
 
 - 无 `--privileged`、无 `--publish`、无 Docker/provisioner socket 挂载。
-- 服务 token 只在 0600 env 文件与数据库中，不进入 argv。
+- 服务 token 只在 0600 env 文件、容器实际 Env 与数据库中，不进入 argv、
+  inspect 白名单输出或日志。provisioner 只为本轮新建实例生成 token；接管
+  既有实例时只读宿主 token，并与容器实际 `Config.Env` 做常量时间比较。
+  缺凭据、错误旧 token、大小写不符或重复 Env 键均失败关闭，不自动轮换、
+  删除或重建活跃实例。
+- `--cidfile` 只用于取得本轮 `docker run` 的不可复用容器 ID；健康循环、
+  失败清理和 exited 重建都只使用该 ID，不按同名容器反推归属。
 - `docker inspect` 经 provisioner 输出前只保留白名单字段；Env、宿主路径和
-  未知标签被丢弃。
+  未知标签被丢弃。`Running + Status=running + 健康` 才可作为 ready；paused、
+  restarting、缺状态、ready=false 或 exec 探针失败都只返回未就绪，不删除
+  仍有停止授权争议的实例。
 
 ### 每空间 sidecar
 
@@ -247,6 +258,12 @@ docker network connect easel-control easel-sidecar-<uuid>
 - 空闲阈值 900 秒，且必须无活跃 Run、无活跃请求；权限等待、发布中均不回收。
 - `drain`：拒绝新任务，等待现有工作结束后停止容器；超时返回
   `worker_drain_timeout` 并保持 draining，不 delete 持久目录。
+- worker 进程的 SIGTERM/SIGINT 由 Uvicorn `Server.handle_exit` 子类接入：
+  首个信号立即进入 draining（health ready=false、新 Run 返回 503
+  `worker_draining`），并在监听 socket 仍可服务时给在途 Run 有限宽限
+  （`EASEL_WORKER_DRAIN_TIMEOUT`，默认 15 秒）；宽限内完成的历史保留，
+  超时取消并写 cancelled/interrupted，绝不伪标 done。第二个信号跳过剩余
+  宽限强制取消；进程和 ACP 子进程清理均有界。
 - 停止只按 Docker 实例 ID 执行 `docker stop` + `rm`；同名新容器不会成为
   旧 stop 目标，`<root>/<uuid>/{workspace,home,state}` 保留。
 - 静态安全配置仍合法但已退出的实例（运行时 IP 为空）可被回收重建；未知或

@@ -64,6 +64,12 @@ def _not_found(target: str) -> subprocess.CompletedProcess:
         [], 1, "", f"Error: No such object: {target}\n")
 
 
+def _write_cidfile(args: list[str], instance_id: str) -> None:
+    if "--cidfile" in args:
+        pathlib.Path(args[args.index("--cidfile") + 1]).write_text(
+            instance_id + "\n", encoding="ascii")
+
+
 def _worker_container(root: pathlib.Path, env: list[str] | None = None,
                       workspace: str = WORKSPACE) -> dict:
     paths = provisioner.prepare_workspace(root, workspace)
@@ -81,7 +87,8 @@ def _worker_container(root: pathlib.Path, env: list[str] | None = None,
             "Labels": provisioner.workload_labels(workspace, 1),
             "Env": env_list,
         },
-        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "State": {"Running": True, "Status": "running",
+                  "Health": {"Status": "healthy"}},
         "HostConfig": {
             "ReadonlyRootfs": True, "Privileged": False,
             "CapDrop": ["ALL"], "CapAdd": [],
@@ -130,7 +137,8 @@ def _sidecar_container(policy: pathlib.Path,
                  "urllib.request.urlopen('http://127.0.0.1:8899/healthz',"
                  "timeout=2)\"")]},
         },
-        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "State": {"Running": True, "Status": "running",
+                  "Health": {"Status": "healthy"}},
         "HostConfig": {
             "ReadonlyRootfs": True, "Privileged": False,
             "CapDrop": ["ALL"], "CapAdd": [],
@@ -229,15 +237,20 @@ class FakeDocker:
                 if self.invalid_sidecar and self.sidecar_runs == 1:
                     raw["HostConfig"]["Privileged"] = True
                 self.containers[name] = raw
+                _write_cidfile(args, raw["Id"])
                 return _ok(raw["Id"] + "\n")
             # Docker 只在创建时读取 env-file；fake 也必须保存当时内容，
             # 否则“更新宿主文件”会被误当作容器实际配置已变化。
             env_path = pathlib.Path(
                 args[args.index("--env-file") + 1])
             env = env_path.read_text(encoding="utf-8").splitlines()
+            for index, value in enumerate(args):
+                if value == "--env":
+                    env.append(args[index + 1])
             raw = _worker_container(
                 self.root, env=env, workspace=self.workspace)
             self.containers[name] = raw
+            _write_cidfile(args, raw["Id"])
             return _ok(raw["Id"] + "\n")
         if args[:1] == ["exec"]:
             if self.probe_failure == "timeout":
@@ -332,6 +345,37 @@ def test_sidecar_is_created_hardened_and_worker_gets_broker_proxy_env(
     assert ("HTTP_PROXY=http://"
             f"{provisioner.sidecar_container_name(WORKSPACE)}:8898") in env_text
     assert f"{provisioner.sidecar_container_name(WORKSPACE)}" in env_text
+
+
+def test_probe_failure_does_not_create_or_touch_sidecar(tmp_path,
+                                                        monkeypatch):
+    """既有 worker 健康失败时，不得先补 sidecar 再强删 worker。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path)
+    fake = FakeDocker(root, settings.sidecar_policy)
+    fake.workspace_network = True
+    wiring = provisioner.worker_wiring_env(
+        WORKSPACE, provisioner.sidecar_container_name(WORKSPACE))
+    env = ["EASEL_SERVICE_TOKEN=old-token",
+           "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"]
+    env.extend(f"{key}={value}" for key, value in wiring.items())
+    worker = _worker_container(root, env=env)
+    fake.containers[provisioner.container_name(WORKSPACE)] = worker
+    token_path = root / ".credentials" / f"{WORKSPACE}.token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text("old-token", encoding="ascii")
+    fake.probe_failure = "not_ready"
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.sidecar_runs == 0
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is worker
+    assert provisioner.sidecar_container_name(WORKSPACE) not in fake.containers
+    assert fake.stopped == [] and fake.removed == []
 
 
 def test_valid_sidecar_is_reused(tmp_path, monkeypatch):
@@ -549,6 +593,9 @@ def test_zero_egress_worker_with_matching_env_is_still_reused(
     seeded = _worker_container(
         root, ["EASEL_SERVICE_TOKEN=old-token"])
     fake.containers[provisioner.container_name(WORKSPACE)] = seeded
+    token_path = root / ".credentials" / f"{WORKSPACE}.token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text("old-token", encoding="ascii")
     service = provisioner.Provisioner(settings, run=fake)
 
     handle = asyncio.run(service.ensure(WORKSPACE, 1))

@@ -49,6 +49,25 @@ _EVENT_KINDS = frozenset({
     "token", "thinking", "activity", "question", "error", "done"})
 _MAX_TIMEOUT = 86400
 _DEFAULT_TIMEOUT = 1800
+SHUTDOWN_GRACE_ENV = "EASEL_WORKER_DRAIN_TIMEOUT"
+DEFAULT_SHUTDOWN_GRACE = 15.0
+MAX_SHUTDOWN_GRACE = 120.0
+_SHUTDOWN_CANCEL_TIMEOUT = 5.0
+
+
+def shutdown_grace_from_env(environ: Mapping[str, str] | None = None) -> float:
+    """SIGTERM 后允许在途 Run 完成的宽限期；非法值启动失败。"""
+    env = os.environ if environ is None else environ
+    raw = (env.get(SHUTDOWN_GRACE_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_SHUTDOWN_GRACE
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError("shutdown_grace_invalid") from None
+    if not 0.0 <= value <= MAX_SHUTDOWN_GRACE:
+        raise ValueError("shutdown_grace_invalid")
+    return value
 
 
 def _placeholders(values: tuple | list) -> str:
@@ -985,13 +1004,19 @@ class RunManager:
                  clock: Callable[[], float] = time.time,
                  native_binding_version: int = 1,
                  question_timeout: int = _DEFAULT_TIMEOUT,
-                 recover: bool = True) -> None:
+                 recover: bool = True,
+                 shutdown_grace: float = 0.0) -> None:
         if not isinstance(paths, WorkspacePaths):
             raise TypeError("paths must be WorkspacePaths")
         if type(native_binding_version) is not int or native_binding_version < 1:
             raise ValueError("native_binding_version must be positive")
         if type(question_timeout) is not int or not 1 <= question_timeout <= _MAX_TIMEOUT:
             raise ValueError("question_timeout out of range")
+        if (isinstance(shutdown_grace, bool)
+                or not isinstance(shutdown_grace, (int, float))
+                or not 0.0 <= float(shutdown_grace) <= MAX_SHUTDOWN_GRACE):
+            raise ValueError("shutdown_grace out of range")
+        self._shutdown_grace = float(shutdown_grace)
         self.workspace_id = workspace_id
         self._paths = paths
         self._public_key = public_key
@@ -1009,7 +1034,9 @@ class RunManager:
         self._questions: dict[tuple[str, str], asyncio.Future] = {}
         self._active_conversations: dict[str, str] = {}
         self._closing = False
+        self._closed = False
         self._draining = False
+        self._force_stop = False
         if recover:
             self.registry.recover_inflight()
             # 已保存输出但尚未提交 done 的 Run：补提交，消息按 runId 去重。
@@ -1029,6 +1056,10 @@ class RunManager:
 
     def is_draining(self) -> bool:
         return self._draining
+
+    def request_force_stop(self) -> None:
+        """重复 SIGTERM：跳过剩余宽限期，立即取消在途 Run。"""
+        self._force_stop = True
 
     def state(self, run_id: str) -> str | None:
         return self.registry.state(run_id)
@@ -1531,21 +1562,51 @@ class RunManager:
         return {**result, "state": self.registry.state(run_id)}
 
     async def aclose(self) -> None:
-        """worker 关闭：取消在途 supervisor，并把残留 Run 标 interrupted。"""
+        """先进入 draining，宽限期内等在途 Run，超时后有限取消并清理。
+
+        SIGTERM 后不能立刻取消所有 supervisor：已接纳的短 Run 应在期限内
+        完成并保留历史；挂起 Run 超过宽限期才取消。取消后的任务由
+        supervisor 写 cancelled/interrupted，绝不能被伪标 done。
+        """
+        self.begin_drain()
+        if self._closed:
+            return
         self._closing = True
-        tasks = [task for task in self._tasks.values() if not task.done()]
-        for task in tasks:
+        pending = {task for task in self._tasks.values() if not task.done()}
+        if pending and self._shutdown_grace > 0 and not self._force_stop:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._shutdown_grace
+            while pending and not self._force_stop:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                _done, pending = await asyncio.wait(
+                    pending, timeout=min(0.1, remaining))
+        for task in pending:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=_SHUTDOWN_CANCEL_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                # 进程仍要退出；残留任务由 registry 对账为 interrupted。
+                pass
         # 同时关闭本 workspace 的空闲 ACP/CLI 子进程，避免测试或重载时
-        # 留下跨事件循环的僵死句柄。
+        # 留下跨事件循环的僵死句柄。关闭动作本身也要有界，不能拖死
+        # docker stop。
         from ..harnesses.rpc import close_sessions
-        await close_sessions(workspace_id=self.workspace_id)
+        try:
+            await asyncio.wait_for(
+                close_sessions(workspace_id=self.workspace_id),
+                timeout=_SHUTDOWN_CANCEL_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
         self.registry.recover_inflight("worker_shutdown")
         self._tasks.clear()
         self._questions.clear()
         self._active_conversations.clear()
+        self._closed = True
 
 
 # ---------------------------------------------------------------------------

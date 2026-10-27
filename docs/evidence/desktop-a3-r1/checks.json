@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-27",
+  "a3_baseline": "81589c0f24f3507b954e46b37ce85d181c619520",
+  "reviewed_commit": "b88d236",
+  "scope": ["A3-R1-01", "A3-R1-02", "A3-R1-03"],
+  "image": "sha256:970e730af21c1f08647567854dceec61ca542c8d5b0ff30f8417a2690210d62b",
+  "entry": [
+    "python",
+    "-m",
+    "easel.worker.server",
+    "serve",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "7860"
+  ],
+  "tests": {
+    "affected_focused": "184 passed, 1 skipped",
+    "multiuser_and_desktop_static": "1084 passed, 9 skipped",
+    "real_sigterm_and_protocol": "2 passed",
+    "container_isolation_non_chromium": "7 passed, 2 deselected",
+    "ruff_worker_files": "All checks passed"
+  },
+  "signal": {
+    "short_run": {
+      "active_runs_at_drain": 1,
+      "drain_ms": 296,
+      "exit_ms": 8125
+    },
+    "hung_run": {
+      "drain_ms": 328,
+      "exit_ms": 15563
+    }
+  },
+  "not_run": [
+    "gateway",
+    "A4",
+    "real DeepSeek Harness/provider",
+    "Chromium sandbox",
+    "full multiuser chat"
+  ]
+}

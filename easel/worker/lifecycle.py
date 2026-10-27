@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import re
-import signal
 import sys
 import threading
 from collections.abc import Iterator, Mapping
@@ -23,6 +22,7 @@ from dataclasses import dataclass, field
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -150,19 +150,17 @@ def create_lifecycle_app(config: LifecycleConfig,
     return app
 
 
-def _install_drain_signals(counter: RequestCounter) -> None:
-    """容器收到 SIGTERM 时先进入 draining，让 health 立刻报告不可接新任务。"""
-    def handler(signum, frame):
-        counter.start_drain()
+class LifecycleServer(uvicorn.Server):
+    """lifecycle-only 入口同样使用 Uvicorn 自己的信号处理器。"""
 
-    for name in ("SIGTERM", "SIGINT"):
-        signal_value = getattr(signal, name, None)
-        if signal_value is not None:
-            try:
-                signal.signal(signal_value, handler)
-            except (OSError, ValueError):
-                # 非主线程或平台不支持时忽略；健康端点仍可工作
-                pass
+    def __init__(self, config: uvicorn.Config,
+                 counter: RequestCounter) -> None:
+        super().__init__(config)
+        self._lifecycle_counter = counter
+
+    def handle_exit(self, sig, frame) -> None:
+        self._lifecycle_counter.start_drain()
+        super().handle_exit(sig, frame)
 
 
 def _healthcheck(config: LifecycleConfig, port: int) -> int:
@@ -202,12 +200,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "healthcheck":
         return _healthcheck(config, args.port)
 
-    import uvicorn
-
     counter = RequestCounter()
-    _install_drain_signals(counter)
     app = create_lifecycle_app(config, counter)
-    uvicorn.run(app, host=args.host, port=args.port, proxy_headers=False)
+    server = LifecycleServer(
+        uvicorn.Config(app, host=args.host, port=args.port,
+                       proxy_headers=False), counter)
+    server.run()
     return 0
 
 

@@ -685,7 +685,8 @@ async def main():
                     "Env": [*(env or ["EASEL_SERVICE_TOKEN=old-token"]),
                             "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"],
                 },
-                "State": {"Running": True, "Health": {"Status": "healthy"}},
+                "State": {"Running": True, "Status": "running",
+                          "Health": {"Status": "healthy"}},
                 "HostConfig": {
                     "ReadonlyRootfs": True,
                     "Privileged": False,
@@ -778,6 +779,10 @@ async def main():
                     args[args.index("--env-file") + 1])
                 env = env_path.read_text(encoding="utf-8").splitlines()
                 self.container = self.make_container(env)
+                if "--cidfile" in args:
+                    pathlib.Path(
+                        args[args.index("--cidfile") + 1]).write_text(
+                            self.container["Id"] + "\n", encoding="ascii")
                 return self.completed(argv, 0, "fake-container\n")
             if args[:1] == ["stop"]:
                 target = args[-1]

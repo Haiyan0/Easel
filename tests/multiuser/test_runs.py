@@ -20,7 +20,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from easel.control.types import DomainError, WorkspacePaths
 from easel.worker.config import run_input_digest, sign_run_snapshot
-from easel.worker.runs import RunManager
+from easel.worker.runs import (DEFAULT_SHUTDOWN_GRACE, RunManager,
+                               shutdown_grace_from_env)
 from easel.worker.sessions import WorkspaceSessionStore
 
 WORKSPACE = "workspace-a"
@@ -1331,6 +1332,101 @@ def test_acp_permission_text_is_scrubbed_but_choice_maps(tmp_path):
         assert secret not in audit_text
         assert [item["role"] for item in messages] == ["user", "assistant"]
         await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_grace_env_is_bounded_and_fails_closed():
+    assert shutdown_grace_from_env({}) == DEFAULT_SHUTDOWN_GRACE
+    assert shutdown_grace_from_env({"EASEL_WORKER_DRAIN_TIMEOUT": "2.5"}) == 2.5
+    for raw in ("-1", "121", "nan", "bad"):
+        with pytest.raises(ValueError):
+            shutdown_grace_from_env({"EASEL_WORKER_DRAIN_TIMEOUT": raw})
+
+
+def test_run_manager_aclose_waits_for_runs_within_grace(tmp_path):
+    """SIGTERM 宽限期内，已接纳的 Run 应继续完成而不是被 aclose 立即取消。"""
+    paths = make_paths(tmp_path)
+    private = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"session-a": "native-a"}, answers={}, chunks={})
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths,
+        public_key=private.public_key(), executor=executor,
+        clock=lambda: CLOCK, recover=False, shutdown_grace=0.5)
+    envelope = sign(
+        private, run_id="run-grace", session_id="session-a",
+        message="grace", routes={}, agent={"runtime": "acp",
+                                           "command": ["fixture-acp"]})
+    request = request_for("session-a", "grace", envelope)
+
+    async def scenario():
+        await manager.submit("run-grace", envelope, request)
+        await asyncio.wait_for(executor.event("run-grace").wait(), 2)
+        closing = asyncio.create_task(manager.aclose())
+        await asyncio.sleep(0.1)
+        assert not closing.done()
+        assert manager.active_runs() == 1
+        executor.gate("run-grace").set()
+        await asyncio.wait_for(closing, 2)
+        assert manager.state("run-grace") == "done"
+        assert manager.active_runs() == 0
+
+    asyncio.run(scenario())
+
+
+def test_run_manager_aclose_force_cancels_after_grace(tmp_path):
+    """宽限期耗尽后必须有限时间取消，终态不能伪标 done。"""
+    paths = make_paths(tmp_path)
+    private = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"session-a": "native-a"}, answers={}, chunks={})
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths,
+        public_key=private.public_key(), executor=executor,
+        clock=lambda: CLOCK, recover=False, shutdown_grace=0.1)
+    envelope = sign(
+        private, run_id="run-hang", session_id="session-a",
+        message="hang", routes={}, agent={"runtime": "acp",
+                                          "command": ["fixture-acp"]})
+    request = request_for("session-a", "hang", envelope)
+
+    async def scenario():
+        await manager.submit("run-hang", envelope, request)
+        await asyncio.wait_for(executor.event("run-hang").wait(), 2)
+        started = time.monotonic()
+        await asyncio.wait_for(manager.aclose(), 2)
+        assert time.monotonic() - started < 1.5
+        assert manager.state("run-hang") in ("cancelled", "interrupted")
+        assert manager.state("run-hang") != "done"
+        assert manager.active_runs() == 0
+
+    asyncio.run(scenario())
+
+
+def test_run_manager_force_stop_skips_remaining_grace(tmp_path):
+    paths = make_paths(tmp_path)
+    private = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"session-a": "native-a"}, answers={}, chunks={})
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths,
+        public_key=private.public_key(), executor=executor,
+        clock=lambda: CLOCK, recover=False, shutdown_grace=30.0)
+    envelope = sign(
+        private, run_id="run-force", session_id="session-a",
+        message="force", routes={}, agent={"runtime": "acp",
+                                           "command": ["fixture-acp"]})
+    request = request_for("session-a", "force", envelope)
+
+    async def scenario():
+        await manager.submit("run-force", envelope, request)
+        await asyncio.wait_for(executor.event("run-force").wait(), 2)
+        manager.request_force_stop()
+        started = time.monotonic()
+        await asyncio.wait_for(manager.aclose(), 2)
+        assert time.monotonic() - started < 1.5
+        assert manager.state("run-force") in ("cancelled", "interrupted")
 
     asyncio.run(scenario())
 

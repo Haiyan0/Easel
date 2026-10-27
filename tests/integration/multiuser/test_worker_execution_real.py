@@ -6,6 +6,7 @@ worker、客户端容器和网络；不发布 worker 端口，不访问开发者
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -76,15 +77,23 @@ def _write_key(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
-def _wrapper(workspace: pathlib.Path, mode: str) -> str:
+def _wrapper(workspace: pathlib.Path, mode: str, *,
+             delay_seconds: float | None = None) -> str:
     shutil.copy2(FIXTURE, workspace / "harness_rpc.py")
-    target = workspace / f"fixture_{mode}.py"
-    target.write_text(
-        "import os, runpy\n"
-        "os.environ['FAKE_HARNESS_AUDIT'] = '/workspace/fixture-audit.jsonl'\n"
-        f"os.environ['FAKE_HARNESS_MODE'] = {mode!r}\n"
-        "runpy.run_path('/workspace/harness_rpc.py', run_name='__main__')\n",
-        encoding="utf-8")
+    suffix = "" if delay_seconds is None else f"-{delay_seconds:g}"
+    target = workspace / f"fixture_{mode}{suffix}.py"
+    lines = [
+        "import os, runpy\n",
+        "os.environ['FAKE_HARNESS_AUDIT'] = '/workspace/fixture-audit.jsonl'\n",
+        f"os.environ['FAKE_HARNESS_MODE'] = {mode!r}\n",
+    ]
+    if delay_seconds is not None:
+        lines.append(
+            "os.environ['FAKE_HARNESS_DELAY_SECONDS'] = "
+            f"{str(delay_seconds)!r}\n")
+    lines.append(
+        "runpy.run_path('/workspace/harness_rpc.py', run_name='__main__')\n")
+    target.write_text("".join(lines), encoding="utf-8")
     return f"/workspace/{target.name}"
 
 
@@ -108,6 +117,88 @@ def _snapshot(private, workspace_id: str, run_id: str, session_id: str,
         "taskType": "chat", "inputDigest": digest,
     }
     return envelope, request
+
+
+@pytest.fixture(scope="module")
+def execution_image() -> str:
+    image = _image_id(EXECUTION_TAG)
+    print("EXECUTION_IMAGE", image)
+    return image
+
+
+def _inspect_state(worker: str) -> dict:
+    result = _docker("container", "inspect", "--format",
+                     "{{json .State}}", worker)
+    return json.loads(result.stdout)
+
+
+def _wait_not_running(worker: str, timeout: float) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = _inspect_state(worker)
+        if last.get("Running") is False:
+            return last
+        time.sleep(0.2)
+    pytest.fail(f"worker 未在 {timeout:g}s 内退出：{last}")
+
+
+_HEALTH_PROBE = r'''
+import json, os, urllib.error, urllib.request
+request = urllib.request.Request(
+    "http://127.0.0.1:7860/internal/lifecycle/health",
+    headers={"X-Easel-Workspace-Id": os.environ["EASEL_WORKSPACE_ID"],
+             "X-Easel-Service-Token": os.environ["EASEL_SERVICE_TOKEN"]})
+try:
+    with urllib.request.urlopen(request, timeout=2) as response:
+        print(json.dumps([response.status, json.loads(response.read())]))
+except urllib.error.HTTPError as error:
+    print(json.dumps([error.code, json.loads(error.read())]))
+'''
+
+
+def _health(network: str, name: str, run_label: str, image: str,
+            worker: str, token: str, workspace_id: str,
+            tmp_path: pathlib.Path) -> tuple[int, dict]:
+    """在 worker 内做固定回环探测，避免每次启动临时客户端拖慢时序。"""
+    result = _docker("exec", worker, "python", "-c", _HEALTH_PROBE,
+                     check=False, timeout=10)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 or not lines:
+        raise RuntimeError("worker health 不可用")
+    status, payload = json.loads(lines[-1])
+    return int(status), payload
+
+
+def _wait_health_state(network: str, name: str, run_label: str, image: str,
+                       worker: str, token: str, workspace_id: str,
+                       tmp_path: pathlib.Path, *, ready: bool,
+                       active_runs: int | None = None,
+                       timeout: float = 20.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict = {}
+    while time.monotonic() < deadline:
+        try:
+            status, payload = _health(
+                network, name, run_label, image, worker, token,
+                workspace_id, tmp_path)
+        except Exception as error:  # noqa: BLE001 - 停机边界继续轮询
+            logs = _docker("logs", "--tail", "40", worker,
+                           check=False).stdout
+            state = _docker("container", "inspect", "--format",
+                            "{{json .State}}", worker,
+                            check=False).stdout.strip()
+            last = {"error": type(error).__name__, "state": state,
+                    "logs": logs[-3000:]}
+            time.sleep(0.2)
+            continue
+        last = payload
+        if (status == 200 and payload.get("ready") is ready
+                and (active_runs is None
+                     or payload.get("active_runs") == active_runs)):
+            return payload
+        time.sleep(0.2)
+    pytest.fail(f"未等到 health ready={ready} active_runs={active_runs}：{last}")
 
 
 def _wait_health(worker: str) -> None:
@@ -187,6 +278,8 @@ elif op == "answer":
 elif op == "messages":
     write(request(
         "GET", f"/internal/sessions/{session}/messages?limit=100&offset=0"))
+elif op == "health":
+    write(request("GET", "/internal/lifecycle/health"))
 elif op == "stop":
     write(request("POST", f"/internal/runs/{run_id}/stop",
                   {"runId": run_id, "sessionId": session}))
@@ -207,7 +300,7 @@ def _client(network: str, name: str, run_label: str, image: str,
     client.write_text(_CLIENT, encoding="utf-8")
     result_dir.joinpath("result.json").unlink(missing_ok=True)
     _docker(
-        "run", "--name", name, "--network", network,
+        "run", "--rm", "--name", name, "--network", network,
         "--label", f"{RUN_LABEL}={run_label}", "--user", "10001:10001",
         "-v", f"{client}:/client.py:ro",
         "-v", f"{input_dir}:/input:ro",
@@ -230,8 +323,8 @@ def _start_worker(image: str, workspace_id: str, paths, env_file,
 
 
 def test_real_worker_protocol_run_question_stop_and_restart(
-        tmp_path: pathlib.Path) -> None:
-    image = _image_id(EXECUTION_TAG)
+        tmp_path: pathlib.Path, execution_image: str) -> None:
+    image = execution_image
     run_label = "a3-" + uuid.uuid4().hex[:12]
     workspace_id = uuid.uuid4().hex
     root = tmp_path / "root"
@@ -360,6 +453,176 @@ def test_real_worker_protocol_run_question_stop_and_restart(
                           worker, token, workspace_id, "stop", stop_run,
                           "session-stop", sin, tmp_path / "stop-result")
         assert stopped[1]["state"] in ("cancelled", "interrupted")
+    finally:
+        for name in clients:
+            _docker("rm", "-f", name, check=False)
+        _docker("rm", "-f", worker, check=False)
+        _docker("network", "rm", network, check=False)
+
+
+def test_real_sigterm_grace_drain_and_persistent_recovery(
+        tmp_path: pathlib.Path, execution_image: str) -> None:
+    """真实 Linux worker + 真实 SIGTERM：先 drain，短 Run 完成，挂起 Run 有限退出。"""
+    run_label = "a3-sigterm-" + uuid.uuid4().hex[:12]
+    workspace_id = uuid.uuid4().hex
+    root = tmp_path / "root"
+    root.mkdir()
+    paths = provisioner.prepare_workspace(root, workspace_id)
+    for directory in (paths.workspace, paths.home, paths.state):
+        directory.chmod(0o777)
+    private = Ed25519PrivateKey.generate()
+    key = root.parent / "worker.pub"
+    key.write_bytes(private.public_key().public_bytes_raw())
+    settings = provisioner.ProvisionerSettings(
+        image=execution_image, workspace_root=root,
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=key)
+    service = provisioner.Provisioner(settings)
+    network = provisioner.network_name(workspace_id)
+    worker = provisioner.container_name(workspace_id)
+    clients: list[str] = []
+    try:
+        short_wrapper = _wrapper(paths.workspace, "delayed",
+                                 delay_seconds=8.0)
+        hang_wrapper = _wrapper(paths.workspace, "hang")
+        handle = asyncio.run(service.ensure(workspace_id, 1))
+        token = handle.service_token
+        token_path = root / ".credentials" / f"{workspace_id}.token"
+        original_token = token_path.read_text(encoding="ascii")
+        assert original_token == token
+
+        # 真实 inspect/ensure 必须使用同一 token；错误/缺失 token 不得改写
+        # 运行实例，也不得自动创建新凭据。
+        assert handle.container_id == json.loads(_docker(
+            "container", "inspect", "--format", "{{json .Id}}",
+            worker).stdout)
+        token_path.write_text("wrong-token", encoding="ascii")
+        wrong = asyncio.run(service.inspect(workspace_id))
+        assert wrong["ready"] is False
+        assert _inspect_state(worker)["Running"] is True
+        token_path.unlink()
+        missing = asyncio.run(service.inspect(workspace_id))
+        assert missing["ready"] is False
+        assert not token_path.exists()
+        with pytest.raises(provisioner.ProvisionerError) as missing_ensure:
+            asyncio.run(service.ensure(workspace_id, 1))
+        assert missing_ensure.value.code == "worker_credentials_missing"
+        assert _inspect_state(worker)["Running"] is True
+        token_path.write_text(original_token, encoding="ascii")
+        assert asyncio.run(service.inspect(workspace_id))["ready"] is True
+        assert _inspect_state(worker)["Running"] is True
+
+        # 短 Run：收到 SIGTERM 后仍在宽限期内完成。
+        short_run = "run-sig-short-" + uuid.uuid4().hex[:12]
+        short_envelope, short_request = _snapshot(
+            private, workspace_id, short_run, "session-sig-short",
+            "short", short_wrapper)
+        short_in = tmp_path / "short-input"
+        short_in.mkdir()
+        short_in.joinpath("envelope.json").write_text(
+            json.dumps(short_envelope))
+        short_in.joinpath("request.json").write_text(
+            json.dumps(short_request))
+        short_client = f"easel-a3-sig-short-{short_run}"
+        clients.append(short_client)
+        submitted = _client(
+            network, short_client, run_label, execution_image, worker, token,
+            workspace_id, "submit-once", short_run, "session-sig-short",
+            short_in, tmp_path / "short-result")
+        assert submitted["status"] == 202
+        _wait_health_state(
+            network, "short-health", run_label, execution_image, worker,
+            token, workspace_id, tmp_path, ready=True, active_runs=1)
+        signal_started = time.monotonic()
+        _docker("kill", "--signal=TERM", worker)
+        draining = _wait_health_state(
+            network, "short-drain", run_label, execution_image, worker,
+            token, workspace_id, tmp_path, ready=False, active_runs=1,
+            timeout=8.0)
+        drain_elapsed = time.monotonic() - signal_started
+        assert draining["execution_capable"] is True
+        rejected_run = "run-sig-rejected-" + uuid.uuid4().hex[:12]
+        rejected_envelope, rejected_request = _snapshot(
+            private, workspace_id, rejected_run, "session-sig-rejected",
+            "rejected", short_wrapper)
+        rejected_in = tmp_path / "rejected-input"
+        rejected_in.mkdir()
+        rejected_in.joinpath("envelope.json").write_text(
+            json.dumps(rejected_envelope))
+        rejected_in.joinpath("request.json").write_text(
+            json.dumps(rejected_request))
+        rejected_client = f"easel-a3-sig-rejected-{rejected_run}"
+        clients.append(rejected_client)
+        rejected = _client(
+            network, rejected_client, run_label, execution_image, worker,
+            token, workspace_id, "submit-once", rejected_run,
+            "session-sig-rejected", rejected_in,
+            tmp_path / "rejected-result")
+        assert rejected["status"] == 503
+        assert "worker_draining" in json.dumps(rejected["payload"],
+                                               ensure_ascii=False)
+        state = _wait_not_running(worker, 20.0)
+        print("SIGTERM_SHORT", json.dumps({
+            "drain_ms": round(drain_elapsed * 1000),
+            "exit_ms": round((time.monotonic() - signal_started) * 1000),
+            "active_runs_at_drain": draining["active_runs"],
+        }, sort_keys=True))
+        assert state.get("Status") == "exited"
+        assert time.monotonic() - signal_started < 18.0
+        handle = asyncio.run(service.ensure(workspace_id, 1))
+        _wait_health(worker)
+        short_events = _client(
+            network, f"{short_client}-after", run_label, execution_image,
+            worker, handle.service_token, workspace_id, "events", short_run,
+            "session-sig-short", short_in, tmp_path / "short-after")
+        assert short_events["events"][1]["state"] == "done"
+
+        # 挂起 Run：宽限期耗尽后必须有限退出，重开后可读取非 done 终态。
+        hang_run = "run-sig-hang-" + uuid.uuid4().hex[:12]
+        hang_envelope, hang_request = _snapshot(
+            private, workspace_id, hang_run, "session-sig-hang", "hang",
+            hang_wrapper)
+        hang_in = tmp_path / "hang-input"
+        hang_in.mkdir()
+        hang_in.joinpath("envelope.json").write_text(
+            json.dumps(hang_envelope))
+        hang_in.joinpath("request.json").write_text(
+            json.dumps(hang_request))
+        hang_client = f"easel-a3-sig-hang-{hang_run}"
+        clients.append(hang_client)
+        submitted = _client(
+            network, hang_client, run_label, execution_image, worker,
+            handle.service_token, workspace_id, "submit-once", hang_run,
+            "session-sig-hang", hang_in, tmp_path / "hang-result")
+        assert submitted["status"] == 202
+        _wait_health_state(
+            network, "hang-health", run_label, execution_image, worker,
+            handle.service_token, workspace_id, tmp_path, ready=True,
+            active_runs=1)
+        signal_started = time.monotonic()
+        _docker("kill", "--signal=TERM", worker)
+        _wait_health_state(
+            network, "hang-drain", run_label, execution_image, worker,
+            handle.service_token, workspace_id, tmp_path, ready=False,
+            active_runs=1, timeout=8.0)
+        hang_drain_elapsed = time.monotonic() - signal_started
+        state = _wait_not_running(worker, 25.0)
+        print("SIGTERM_HANG", json.dumps({
+            "drain_ms": round(hang_drain_elapsed * 1000),
+            "exit_ms": round((time.monotonic() - signal_started) * 1000),
+        }, sort_keys=True))
+        assert state.get("Status") == "exited"
+        assert time.monotonic() - signal_started < 25.0
+        handle = asyncio.run(service.ensure(workspace_id, 1))
+        _wait_health(worker)
+        hang_events = _client(
+            network, f"{hang_client}-after", run_label, execution_image,
+            worker, handle.service_token, workspace_id, "events", hang_run,
+            "session-sig-hang", hang_in, tmp_path / "hang-after")
+        assert hang_events["events"][1]["state"] in (
+            "cancelled", "interrupted", "failed")
+        assert hang_events["events"][1]["state"] != "done"
     finally:
         for name in clients:
             _docker("rm", "-f", name, check=False)

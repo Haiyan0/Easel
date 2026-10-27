@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
 from typing import Any
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -64,21 +64,47 @@ def _attach_lifecycle(app: FastAPI, config: LifecycleConfig,
     return
 
 
-def _install_drain_signals(counter: RequestCounter,
-                           run_manager: Any) -> None:
-    """SIGTERM/SIGINT 先进入 draining；RunManager 拒绝新 Run，在途继续。"""
-    def handler(signum, frame):
-        counter.start_drain()
-        run_manager.begin_drain()
+class WorkerServer(uvicorn.Server):
+    """把 drain 接到 Uvicorn 自己的信号处理器，避免被外层注册覆盖。
 
-    for name in ("SIGTERM", "SIGINT"):
-        value = getattr(signal, name, None)
-        if value is None:
-            continue
-        try:
-            signal.signal(value, handler)
-        except (OSError, ValueError):
-            pass
+    Uvicorn 在 ``capture_signals`` 中把 SIGTERM/SIGINT 指向
+    ``Server.handle_exit``；这里先标记 counter/RunManager draining，再交给
+    父类设置 ``should_exit``。因此首个 SIGTERM 在任何 lifespan shutdown
+    或 RunManager.aclose 之前生效。重复信号进入强制停止，跳过剩余宽限期。
+    """
+
+    def __init__(self, config: uvicorn.Config, *,
+                 counter: RequestCounter, run_manager: Any,
+                 shutdown_grace: float | None = None) -> None:
+        super().__init__(config)
+        self._lifecycle_counter = counter
+        self._run_manager = run_manager
+        self.shutdown_grace = (
+            float(shutdown_grace) if shutdown_grace is not None else
+            float(getattr(run_manager, "_shutdown_grace", 0.0)))
+        self._signal_count = 0
+        self._force_requested = False
+
+    def handle_exit(self, sig, frame) -> None:
+        self._signal_count += 1
+        self._lifecycle_counter.start_drain()
+        self._run_manager.begin_drain()
+        if self._signal_count > 1:
+            self._force_requested = True
+            self._run_manager.request_force_stop()
+        super().handle_exit(sig, frame)
+
+    async def shutdown(self, sockets=None) -> None:
+        """在关闭监听 socket 前完成 drain 宽限。
+
+        Uvicorn 默认先关闭监听再执行 lifespan；那样宽限期内 health/新请求
+        只会看到 connection refused，无法返回明确 503。先让 RunManager 在
+        仍可服务的窗口内等待/取消，再交给父类关闭连接和 lifespan。
+        """
+        self._lifecycle_counter.start_drain()
+        self._run_manager.begin_drain()
+        await self._run_manager.aclose()
+        await super().shutdown(sockets)
 
 
 def _load_combined_app():
@@ -145,12 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     counter = RequestCounter()
     run_manager = web_app._RUNS
     _attach_lifecycle(web_app.app, config, counter, run_manager)
-    _install_drain_signals(counter, run_manager)
-
-    import uvicorn
-
-    uvicorn.run(web_app.app, host=args.host, port=args.port,
-                proxy_headers=False)
+    uvicorn_config = uvicorn.Config(
+        web_app.app, host=args.host, port=args.port,
+        proxy_headers=False, timeout_graceful_shutdown=5.0)
+    WorkerServer(
+        uvicorn_config, counter=counter, run_manager=run_manager,
+        shutdown_grace=getattr(run_manager, "_shutdown_grace", 0.0)).run()
     return 0
 
 

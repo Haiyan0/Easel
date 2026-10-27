@@ -61,7 +61,7 @@ from easel.worker.config import (SnapshotAdmissionStore, WorkerConfigSnapshot,
                                  load_worker_snapshot)
 from easel.worker.context import resolve_paths, service_mode
 from easel.worker.guard import load_worker_identity, verify_worker_request
-from easel.worker.runs import RunManager
+from easel.worker.runs import RunManager, shutdown_grace_from_env
 from easel.worker.sessions import MAX_ATTACHMENTS, WorkspaceSessionStore
 
 # worker 模式必须在导入/启动阶段就拿到固定身份；缺少配置直接失败，不回退 local。
@@ -245,6 +245,7 @@ def _load_run_manager() -> RunManager:
             _RUNTIME_PATHS.state_root, _WORKER_IDENTITY.workspace_id),
         base_env=os.environ,
         native_binding_version=NATIVE_BINDING_VERSION,
+        shutdown_grace=shutdown_grace_from_env(os.environ),
     )
 
 
@@ -771,10 +772,12 @@ async def _lifespan(_app: FastAPI):
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    from easel.harnesses.rpc import close_sessions
-    await close_sessions()
+    # 常驻 worker 必须先让 RunManager 在宽限期内收尾自己的 Run，再关闭
+    # 全局 RPC 池；反过来会把仍在完成的 ACP 子进程提前杀掉。
     if _RUNS is not None:
         await _RUNS.aclose()
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
     _HARNESS_LOOP = None
     _stop_mp_login_on_shutdown()
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import pathlib
@@ -14,6 +15,9 @@ import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from easel.worker.guard import (SERVICE_TOKEN_HEADER, WORKSPACE_HEADER,
+                                verify_worker_request)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy" / "multiuser" / "provisioner.py"
@@ -274,7 +278,8 @@ def test_sanitize_inspect_drops_env_paths_and_unknown_labels():
                 "com.example.leak": "host-detail",
             },
         },
-        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "State": {"Running": True, "Status": "running",
+                  "Health": {"Status": "healthy"}},
         "HostConfig": {
             "ReadonlyRootfs": True,
             "Privileged": False,
@@ -378,7 +383,8 @@ def _write_public_key(path: pathlib.Path) -> pathlib.Path:
 
 
 def _valid_container(root: pathlib.Path, config_version: int = 3,
-                     image: str = IMAGE) -> dict:
+                     image: str = IMAGE,
+                     env: list[str] | None = None) -> dict:
     paths = provisioner.prepare_workspace(root, WORKSPACE)
     public_key = _write_public_key(root.parent / "worker.pub")
     return {
@@ -389,11 +395,13 @@ def _valid_container(root: pathlib.Path, config_version: int = 3,
             "Image": image,
             "Entrypoint": None,
             "Cmd": list(provisioner.WORKER_COMMAND),
-            "Env": ["EASEL_SERVICE_TOKEN=super-secret",
-                    "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"],
+            "Env": list(env or ["EASEL_SERVICE_TOKEN=super-secret",
+                                "EASEL_WORKER_PUBLIC_KEY_FILE="
+                                "/keys/worker-public.key"]),
             "Labels": provisioner.workload_labels(WORKSPACE, config_version),
         },
-        "State": {"Running": True, "Health": {"Status": "healthy"}},
+        "State": {"Running": True, "Status": "running",
+                  "Health": {"Status": "healthy"}},
         "HostConfig": {
             "ReadonlyRootfs": True,
             "Privileged": False,
@@ -445,6 +453,12 @@ def _valid_network() -> dict:
     }
 
 
+def _cidfile_arg(args: list[str]) -> str | None:
+    if "--cidfile" not in args:
+        return None
+    return args[args.index("--cidfile") + 1]
+
+
 class FakeDocker:
     """模拟 Docker 外部边界；记录实际 argv 并返回可配置的 inspect。"""
 
@@ -458,7 +472,9 @@ class FakeDocker:
                  instance_inspect_error: str | None = None,
                  inspect_stdout: str | None = None,
                  instance_inspect_stdout: str | None = None,
-                 network_inspect_stdout: str | None = None):
+                 network_inspect_stdout: str | None = None,
+                 exec_returncode: int = 0,
+                 exec_timeout: bool = False):
         self.root = root
         self.container = existing
         self.network = network
@@ -471,6 +487,8 @@ class FakeDocker:
         self.inspect_stdout = inspect_stdout
         self.instance_inspect_stdout = instance_inspect_stdout
         self.network_inspect_stdout = network_inspect_stdout
+        self.exec_returncode = exec_returncode
+        self.exec_timeout = exec_timeout
         self.exec_payload: dict | None = None
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
@@ -516,9 +534,27 @@ class FakeDocker:
             if self.run_returncode != 0:
                 return subprocess.CompletedProcess(argv, self.run_returncode,
                                                    "", "")
-            self.container = self.after_run or _valid_container(self.root)
-            return _ok("fake-container-id\n")
+            env_path = pathlib.Path(args[args.index("--env-file") + 1])
+            env = env_path.read_text(encoding="utf-8").splitlines()
+            for index, value in enumerate(args):
+                if value == "--env":
+                    env.append(args[index + 1])
+            if self.after_run is None:
+                self.container = _valid_container(self.root, env=env)
+            else:
+                self.container = self.after_run
+                self.container["Config"]["Env"] = env
+            cidfile = _cidfile_arg(args)
+            if cidfile is not None:
+                pathlib.Path(cidfile).write_text(
+                    self.container["Id"] + "\n", encoding="ascii")
+            return _ok(self.container["Id"] + "\n")
         if args[:1] == ["exec"]:
+            if self.exec_timeout:
+                raise TimeoutError("probe timed out")
+            if self.exec_returncode != 0:
+                return subprocess.CompletedProcess(
+                    argv, self.exec_returncode, "", "probe failed\n")
             payload = self.exec_payload or {
                 "workspace_id": WORKSPACE,
                 "config_version": int(
@@ -564,6 +600,18 @@ def _settings(tmp_path: pathlib.Path) -> object:
         socket_path=tmp_path / "provisioner.sock",
         quota_mode="none", allow_unquotaed=True,
         worker_public_key=_write_public_key(tmp_path / "worker.pub"))
+
+
+def _token_path(root: pathlib.Path) -> pathlib.Path:
+    return provisioner.credentials_dir(root) / f"{WORKSPACE}.token"
+
+
+def _write_token(root: pathlib.Path, token: str) -> pathlib.Path:
+    directory = provisioner.credentials_dir(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = _token_path(root)
+    path.write_text(token, encoding="ascii")
+    return path
 
 
 def _fake_health(monkeypatch):
@@ -701,12 +749,229 @@ def test_ensure_reuses_fully_valid_existing_container(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     _fake_health(monkeypatch)
+    _write_token(root, "super-secret")
     fake = FakeDocker(root, existing=_valid_container(root))
     service = provisioner.Provisioner(_settings(tmp_path), run=fake)
 
     handle = asyncio.run(service.ensure(WORKSPACE, 3))
     assert handle.container_id == "f" * 64
     assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_ensure_reuses_credentials_only_when_actual_token_matches(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    handle = asyncio.run(service.ensure(WORKSPACE, 3))
+    assert handle.service_token == "super-secret"
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+    verify_worker_request(
+        {WORKSPACE_HEADER: WORKSPACE,
+         SERVICE_TOKEN_HEADER: handle.service_token},
+        WORKSPACE, "super-secret")
+
+
+@pytest.mark.parametrize("host_token", [None, "wrong-token", "SUPER-SECRET"])
+def test_ensure_existing_credentials_mismatch_fails_closed(
+        tmp_path, monkeypatch, host_token):
+    """缺凭据/错误旧凭据/大小写不符时不得轮换、删除或重建活跃实例。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    if host_token is not None:
+        _write_token(root, host_token)
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+    expected = ("worker_credentials_missing" if host_token is None
+                else "worker_credentials_mismatch")
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == expected
+    assert "super-secret" not in str(rejected.value)
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+    if host_token is None:
+        assert not _token_path(root).exists()
+        assert not (provisioner.credentials_dir(root)
+                    / f"{WORKSPACE}.env").exists()
+
+
+def test_ensure_existing_duplicate_token_env_is_rejected_without_mutation(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    existing["Config"]["Env"] = [
+        "EASEL_SERVICE_TOKEN=super-secret",
+        "easel_service_token=super-secret",
+        "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key",
+    ]
+    _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code in ("container_conflict",
+                                   "worker_wiring_mismatch")
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+
+
+def test_ensure_probe_failure_keeps_running_instance_and_credentials(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    token = _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing, exec_returncode=1)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+    assert token.read_text(encoding="ascii") == "super-secret"
+    assert not (provisioner.credentials_dir(root)
+                / f"{WORKSPACE}.env").exists()
+
+
+def test_ensure_probe_timeout_keeps_running_instance(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing, exec_timeout=True)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_ensure_ready_false_with_active_run_keeps_instance(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    existing["State"] = {
+        "Running": True, "Status": "running",
+        "Health": {"Status": "unhealthy"},
+    }
+    _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing)
+    fake.exec_payload = {
+        "workspace_id": WORKSPACE,
+        "config_version": 3,
+        "container_id": provisioner.container_name(WORKSPACE),
+        "ready": False,
+        "active_runs": 1,
+        "execution_capable": True,
+    }
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+@pytest.mark.parametrize("state", [
+    {"Running": False, "Status": "paused"},
+    {"Running": True, "Status": "restarting"},
+    {},
+])
+def test_ensure_paused_restarting_or_missing_state_is_not_replaced(
+        tmp_path, monkeypatch, state):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    existing["State"] = dict(state)
+    _write_token(root, "super-secret")
+    fake = FakeDocker(root, existing=existing)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+    assert all(call[1:2] != ["run"] for call in fake.calls)
+
+
+def test_inspect_does_not_create_missing_host_credentials(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    fake = FakeDocker(root, existing=existing, network=_valid_network())
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    report = asyncio.run(service.inspect(WORKSPACE))
+    assert report["ready"] is False
+    assert not _token_path(root).exists()
+    assert fake.container is existing
+    assert fake.removed == [] and fake.stopped == []
+
+
+def test_inspect_wrong_credentials_is_not_cached_as_ready(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    existing = _valid_container(root)
+    _write_token(root, "wrong-token")
+    fake = FakeDocker(root, existing=existing, network=_valid_network())
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    first = asyncio.run(service.inspect(WORKSPACE))
+    assert first["ready"] is False
+    _write_token(root, "super-secret")
+    second = asyncio.run(service.inspect(WORKSPACE))
+    assert second["ready"] is True
+    assert fake.container is existing
+
+
+def test_new_start_cleanup_uses_only_the_created_instance_id(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    created = _valid_container(root)
+    created["Id"] = "c" * 64
+    fake = FakeDocker(root, after_run=created, exec_returncode=1)
+    settings = dataclasses.replace(_settings(tmp_path), health_timeout=0.2)
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_not_ready"
+    assert fake.removed == [created["Id"]]
+    assert provisioner.container_name(WORKSPACE) not in fake.removed
 
 
 def test_ensure_accepts_docker_bare_no_new_privileges_form(tmp_path,
@@ -716,6 +981,7 @@ def test_ensure_accepts_docker_bare_no_new_privileges_form(tmp_path,
     _fake_health(monkeypatch)
     existing = _valid_container(root)
     existing["HostConfig"]["SecurityOpt"] = ["no-new-privileges"]
+    _write_token(root, "super-secret")
     fake = FakeDocker(root, existing=existing)
     service = provisioner.Provisioner(_settings(tmp_path), run=fake)
 
@@ -739,6 +1005,8 @@ def test_ensure_replaces_safely_exited_container_without_runtime_ip(
     handle = asyncio.run(service.ensure(WORKSPACE, 3))
     assert handle.container_id == "f" * 64
     assert any(call[1:2] == ["run"] for call in fake.calls)
+    assert fake.removed == [exited["Id"]]
+    assert provisioner.container_name(WORKSPACE) not in fake.removed
 
 
 def test_inspect_accepts_safely_exited_container_as_not_ready(

@@ -103,7 +103,8 @@ class FakeDocker:
                 "Labels": provisioner.workload_labels(workspace_id, 1),
                 "Env": env_list,
             },
-            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "State": {"Running": True, "Status": "running",
+                      "Health": {"Status": "healthy"}},
             "HostConfig": {
                 "ReadonlyRootfs": True,
                 "Privileged": False,
@@ -175,6 +176,9 @@ class FakeDocker:
                 args[args.index("--env-file") + 1])
             env = env_path.read_text(encoding="utf-8").splitlines()
             self.container = self._container(self.workspace_id, env)
+            if "--cidfile" in args:
+                pathlib.Path(args[args.index("--cidfile") + 1]).write_text(
+                    self.container["Id"] + "\n", encoding="ascii")
             return self._ok(self.container["Id"] + "\n")
         if args[:1] == ["exec"]:
             config_version = int(

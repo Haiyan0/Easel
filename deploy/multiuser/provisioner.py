@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -548,7 +549,8 @@ def validate_worker_public_key(path: object) -> Path:
 
 def build_run_argv(*, image: str, workspace_id: str, config_version: int,
                    paths: RuntimePaths, env_file: Path,
-                   public_key_file: Path) -> list[str]:
+                   public_key_file: Path,
+                   cidfile: Path | None = None) -> list[str]:
     """从批准配置构造唯一允许的 docker run argv。
 
     容器代码位于只读镜像 ``/opt/easel``；持久 bind 只有 ``/workspace`` 与
@@ -566,6 +568,9 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
         "run", "-d",
         "--name", name,
     ]
+    if cidfile is not None:
+        # 只信任 Docker 写出的本轮实例 ID；不能靠同名容器反推归属。
+        argv.extend(["--cidfile", _safe_path_text(cidfile)])
     for key, value in labels.items():
         argv.extend(["--label", f"{key}={value}"])
     argv.extend([
@@ -719,7 +724,8 @@ def sanitize_inspect(raw: dict | None) -> dict:
         if isinstance(entry, dict):
             address = entry.get("IPAddress") or ""
     state = raw.get("State") or {}
-    running = state.get("Running") is True
+    running = (state.get("Running") is True
+               and state.get("Status") == "running")
     health = (state.get("Health") or {}).get("Status")
     ready = running and health in (None, "healthy")
 
@@ -825,9 +831,7 @@ def verify_worker_wiring(raw: dict | None, *, workspace_id: str,
     env = _worker_env_map(raw)
     if env is None:
         return False
-    token = env.get("easel_service_token", "")
-    if (not token or not token.isascii() or len(token) > 512
-            or any(char in token for char in ("\n", "\r", "\0"))):
+    if not _valid_service_token(env.get("easel_service_token")):
         return False
     try:
         expected = {name.lower(): value
@@ -1252,28 +1256,96 @@ def ensure_quota(path: Path, workspace_id: str, *, mode: str,
 # 凭证与环境文件
 # ----------------------------------------------------------------------
 
+def _valid_service_token(value: object) -> bool:
+    """token 必须是无首尾空白的 ASCII 单行值；大小写敏感。"""
+    return (isinstance(value, str)
+            and bool(value)
+            and value.isascii()
+            and value == value.strip()
+            and len(value) <= 512
+            and not any(character in value
+                        for character in ("\n", "\r", "\0")))
+
+
+def _token_path(workspace_root: Path,
+                workspace_id: str) -> tuple[Path, Path]:
+    directory = credentials_dir(workspace_root)
+    if directory.is_symlink():
+        raise _reject("credentials_escape")
+    path = directory / f"{workspace_id}.token"
+    if path.is_symlink():
+        raise _reject("credentials_escape")
+    return directory, path
+
+
+def _read_token(workspace_root: Path, workspace_id: str) -> str:
+    """只读既有宿主凭据；不存在时明确缺失，绝不在这里生成新 token。"""
+    _directory, path = _token_path(workspace_root, workspace_id)
+    try:
+        raw = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        raise _reject("worker_credentials_missing") from None
+    except (OSError, UnicodeError):
+        raise _reject("credentials_invalid") from None
+    token = raw.strip()
+    if not _valid_service_token(token):
+        raise _reject("credentials_invalid")
+    return token
+
+
 def _load_or_create_token(workspace_root: Path, workspace_id: str) -> str:
+    """仅给本轮新建实例生成凭据；既有实例走 :func:`_read_token`。"""
+    try:
+        return _read_token(workspace_root, workspace_id)
+    except ProvisionerError as error:
+        if error.code != "worker_credentials_missing":
+            raise
+    directory, path = _token_path(workspace_root, workspace_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    token = secrets.token_urlsafe(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.write(descriptor, token.encode("ascii"))
+    finally:
+        os.close(descriptor)
+    return token
+
+
+def _new_cidfile(workspace_root: Path, workspace_id: str) -> Path:
+    """在私有凭证目录生成本轮 cidfile 路径；Docker 负责写入实例 ID。"""
     directory = credentials_dir(workspace_root)
     if directory.is_symlink():
         raise _reject("credentials_escape")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = directory / f"{workspace_id}.token"
-    if path.is_symlink():
-        raise _reject("credentials_escape")
+    return directory / f".{workspace_id}.cid.{secrets.token_hex(8)}"
+
+
+def _read_cidfile(path: Path) -> str | None:
     try:
-        token = path.read_text(encoding="ascii").strip()
-    except FileNotFoundError:
-        token = secrets.token_urlsafe(32)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(path, flags, 0o600)
-        try:
-            os.write(descriptor, token.encode("ascii"))
-        finally:
-            os.close(descriptor)
-        return token
-    if not token or not token.isascii() or len(token) > 512:
-        raise _reject("credentials_invalid")
-    return token
+        if path.is_symlink() or not path.is_file():
+            return None
+        content = path.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return content if _CONTAINER_INSTANCE.fullmatch(content) else None
+
+
+def _worker_env_token(raw: dict | None) -> str | None:
+    """从已核验 inspect 的实际 Env 取 token；重复键/非法值返回 None。"""
+    env = _worker_env_map(raw)
+    if env is None:
+        return None
+    token = env.get("easel_service_token")
+    return token if _valid_service_token(token) else None
+
+
+def _actual_token_matches(raw: dict | None, expected: str) -> bool:
+    """比较待返回 token 与容器实际 Env；只做常量时间比较，不回显值。"""
+    if not _valid_service_token(expected):
+        return False
+    actual = _worker_env_token(raw)
+    return actual is not None and hmac.compare_digest(actual, expected)
 
 
 def write_env_file(workspace_root: Path, workspace_id: str,
@@ -1281,8 +1353,7 @@ def write_env_file(workspace_root: Path, workspace_id: str,
                    paths: RuntimePaths, *,
                    sidecar_host: str | None = None) -> Path:
     """原子写入 0600 env 文件；argv 与日志不含 token。"""
-    if not token or not token.isascii() or any(
-            character in token for character in ("\n", "\r", "\0")):
+    if not _valid_service_token(token):
         raise _reject("credentials_invalid")
     directory = credentials_dir(workspace_root)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1469,8 +1540,26 @@ class Provisioner:
                                                          workspace_id):
             raise ProvisionerError("network_conflict")
 
-    async def _remove_container(self, workspace_id: str) -> None:
-        await self._docker("rm", "-f", container_name(workspace_id))
+    async def _remove_instance(self, instance_id: str,
+                               workspace_id: str) -> None:
+        """只删除已核验的不可复用实例 ID；同名新代次绝不受影响。"""
+        if (not isinstance(instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
+            raise ProvisionerError("container_conflict")
+        raw = await self._inspect_instance(instance_id)
+        if raw is None:
+            return
+        report = sanitize_inspect(raw)
+        if (not report["managed"]
+                or report["workspace_id"] != workspace_id):
+            raise ProvisionerError("container_conflict")
+        removed = await self._docker("rm", "-f", instance_id, timeout=60.0)
+        if removed.returncode != 0:
+            if await self._inspect_instance(instance_id) is None:
+                return
+            raise ProvisionerError("container_remove_failed")
+        if await self._inspect_instance(instance_id) is not None:
+            raise ProvisionerError("container_remove_failed")
 
     # -- 受控 sidecar ----------------------------------------------------
 
@@ -1587,13 +1676,17 @@ class Provisioner:
                 pass
             raise
 
-    async def _cleanup_failed_start(self, workspace_id: str) -> None:
-        """worker 启动失败时移除半成品 worker 与已无使用者的 sidecar。"""
-        await self._remove_container(workspace_id)
+    async def _cleanup_failed_start(self, workspace_id: str,
+                                    instance_id: str | None = None) -> None:
+        """只清理本轮已取得 ID 的半成品；既有运行实例永不按名称删除。"""
         try:
-            await self._stop_sidecar(workspace_id)
-        except ProvisionerError:
-            pass
+            if instance_id is not None:
+                await self._remove_instance(instance_id, workspace_id)
+        finally:
+            try:
+                await self._stop_sidecar(workspace_id)
+            except ProvisionerError:
+                pass
 
     async def _stop_sidecar(self, workspace_id: str) -> None:
         """停止并确认删除本空间 sidecar；已不存在按幂等成功处理。"""
@@ -1651,16 +1744,10 @@ class Provisioner:
             mode=self.settings.quota_mode,
             limit_bytes=self.settings.quota_bytes,
             allow_unquotaed=self.settings.allow_unquotaed)
-        token = await asyncio.to_thread(
-            _load_or_create_token, self.settings.workspace_root, workspace_id)
         sidecar_host = self._sidecar_host(workspace_id)
-        env_file = await asyncio.to_thread(
-            write_env_file, self.settings.workspace_root, workspace_id,
-            config_version, token, paths, sidecar_host=sidecar_host)
         await self._ensure_network(workspace_id)
 
         existing = await self._inspect_raw(workspace_id)
-        sidecar_ensured = False
         if existing is not None:
             report = sanitize_inspect(existing)
             if not report["managed"]:
@@ -1684,39 +1771,58 @@ class Provisioner:
                 # 的实例才可安全重建，持久目录不删除。
                 if not worker_confirmed_exited(existing):
                     raise ProvisionerError("worker_wiring_mismatch")
-                await self._remove_container(workspace_id)
+                await self._remove_instance(report["instance_id"],
+                                            workspace_id)
+                existing = None
+            elif worker_confirmed_exited(existing):
+                # 退出实例按已核验实例 ID 清理；绝不按同名容器删除。
+                await self._remove_instance(report["instance_id"],
+                                            workspace_id)
                 existing = None
             else:
+                # Running/restarting/paused 等非明确退出状态都没有停止
+                # 授权。探针失败、ready=false（包括 drain 中的 active Run）
+                # 只返回未就绪，保留 worker、凭据、sidecar 与持久目录。
+                if not report["ready"]:
+                    raise ProvisionerError("worker_not_ready")
+                token = await asyncio.to_thread(
+                    _read_token, self.settings.workspace_root, workspace_id)
+                if not _actual_token_matches(existing, token):
+                    raise ProvisionerError("worker_credentials_mismatch")
+                if not await self._probe(
+                        workspace_id, config_version, report["instance_id"]):
+                    raise ProvisionerError("worker_not_ready")
                 await self._ensure_sidecar(workspace_id)
-                sidecar_ensured = True
-                if report["ready"] and await self._probe(
-                        workspace_id, config_version,
-                        report["instance_id"]):
-                    return WorkerHandle(
-                        workspace_id, report["instance_id"],
-                        report["upstream"], token, config_version)
-                await self._remove_container(workspace_id)
-                existing = None
+                return WorkerHandle(
+                    workspace_id, report["instance_id"],
+                    report["upstream"], token, config_version)
 
-        if existing is None and not sidecar_ensured:
-            await self._ensure_sidecar(workspace_id)
-
+        # 只有本轮新建实例才允许生成 token；既有实例已在上面严格比较。
+        token = await asyncio.to_thread(
+            _load_or_create_token, self.settings.workspace_root, workspace_id)
+        env_file = await asyncio.to_thread(
+            write_env_file, self.settings.workspace_root, workspace_id,
+            config_version, token, paths, sidecar_host=sidecar_host)
+        await self._ensure_sidecar(workspace_id)
         await asyncio.to_thread(verify_prepared_paths, paths)
+        cidfile = _new_cidfile(self.settings.workspace_root, workspace_id)
         argv = build_run_argv(
             image=self.settings.image, workspace_id=workspace_id,
             config_version=config_version, paths=paths, env_file=env_file,
-            public_key_file=self._worker_public_key)
+            public_key_file=self._worker_public_key, cidfile=cidfile)
         # build_run_argv 以 run 开头；_docker 自行添加 docker 可执行程序，
         # 必须传完整 argv，不能丢弃 run。
-        result = await self._docker(*argv, timeout=60.0)
-        if result.returncode != 0:
-            await self._cleanup_failed_start(workspace_id)
-            raise ProvisionerError("worker_start_failed")
-
-        deadline = time.monotonic() + self.settings.health_timeout
+        instance_id: str | None = None
         try:
+            result = await self._docker(*argv, timeout=60.0)
+            instance_id = _read_cidfile(cidfile)
+            cidfile.unlink(missing_ok=True)
+            if result.returncode != 0 or instance_id is None:
+                raise ProvisionerError("worker_start_failed")
+
+            deadline = time.monotonic() + self.settings.health_timeout
             while time.monotonic() < deadline:
-                raw = await self._inspect_raw(workspace_id)
+                raw = await self._inspect_instance(instance_id)
                 if raw is None:
                     break
                 if not verify_worker_inspect(
@@ -1727,18 +1833,21 @@ class Provisioner:
                         public_key_file=self._worker_public_key):
                     raise ProvisionerError("container_conflict")
                 report = sanitize_inspect(raw)
+                if not _actual_token_matches(raw, token):
+                    raise ProvisionerError("worker_credentials_mismatch")
                 if (report["ready"]
                         and await self._probe(workspace_id, config_version,
-                                              report["instance_id"])):
-                    return WorkerHandle(workspace_id, report["instance_id"],
+                                              instance_id)):
+                    return WorkerHandle(workspace_id, instance_id,
                                         report["upstream"], token,
                                         config_version)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
+            raise ProvisionerError("worker_not_ready")
         except BaseException:
-            await self._cleanup_failed_start(workspace_id)
+            await self._cleanup_failed_start(workspace_id, instance_id)
             raise
-        await self._cleanup_failed_start(workspace_id)
-        raise ProvisionerError("worker_not_ready")
+        finally:
+            cidfile.unlink(missing_ok=True)
 
     async def stop(self, workspace_id: str, instance_id: str) -> None:
         """只停止调用方取得的那个物理实例；同名新容器绝不受影响。
@@ -1826,9 +1935,14 @@ class Provisioner:
             report["ready"] and wiring_ready and sidecar_ready)
         if report["ready"]:
             try:
-                token = _load_or_create_token(
+                token = _read_token(
                     self.settings.workspace_root, workspace_id)
             except ProvisionerError:
+                report["ready"] = False
+                return report
+            # 返回/控制面使用的 token 必须与已核验实例的实际 Env 一致；
+            # 缺宿主凭据或旧 token 不得静默接管。
+            if not _actual_token_matches(raw, token):
                 report["ready"] = False
                 return report
             report["ready"] = await self._probe(
