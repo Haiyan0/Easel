@@ -131,16 +131,16 @@ provisioner 拒绝启动。gateway 启用后，v1 ensure/stop/inspect 失败关�
   只允许 provisioner 自身 UID。
 - 单行 JSON 协议，最大 8 KiB，10 秒请求超时：
   - v1 旧部署：`{"version":1,"action":"ensure","workspace_id":"<32hex>","config_version":N}`、`stop`、`inspect`。
-  - v2 gateway：`ensure` 返回候选 gateway 字段但不激活；
+  - v2 gateway：`ensure` 携带 attempt_id 并返回候选 gateway 字段但不激活；
     `activate` 精确携带 workspace/gateway_instance_id/worker_container_id/
     boot_generation/config_version；`stop` 同时携带 worker `instance_id` 与
-    `gateway_instance_id`；`abort` 仅按本轮 `worker_created`/
-    `gateway_created` 清理候选。gateway 启用时 v1 被拒绝。
-  - `{"version":2,"action":"ensure","workspace_id":"<32hex>","config_version":N}`
+    `gateway_instance_id`；`abort` 必须携带当前 attempt_id 以及本轮
+    `worker_created`/`gateway_created`。gateway 启用时 v1 被拒绝。
+  - `{"version":2,"action":"ensure","workspace_id":"<32hex>","config_version":N,"attempt_id":"<32hex>"}`
   - `{"version":2,"action":"activate","workspace_id":"<32hex>","config_version":N,"worker_container_id":"<64hex>","gateway_instance_id":"<64hex>","boot_generation":"<32hex>"}`
   - `{"version":2,"action":"stop","workspace_id":"<32hex>","instance_id":"<64hex>","gateway_instance_id":"<64hex>"}`
   - `{"version":2,"action":"inspect","workspace_id":"<32hex>"}`
-  - `{"version":2,"action":"abort","workspace_id":"<32hex>","worker_container_id":"<64hex>","gateway_instance_id":"<64hex>","worker_created":true,"gateway_created":true}`
+  - `{"version":2,"action":"abort","workspace_id":"<32hex>","worker_container_id":"<64hex>","gateway_instance_id":"<64hex>","attempt_id":"<32hex>","worker_created":true,"gateway_created":true}`
 - `stop` 的 `instance_id` 是 Docker 容器不可复用 ID；gateway 启用时先按
   `gateway_instance_id` 精确停止 gateway，失败不继续删除 worker。旧 stop
   不会作用于同名新代次。Docker stop/rm 非零或
@@ -245,8 +245,19 @@ docker create --name easel-gateway-<uuid> \
 - gateway 进程每次启动生成新 boot generation；configure 不激活，activate
   必须匹配 workspace/实例/boot/worker/config_version。RuntimeManager 在
   owner/generation CAS 中先保存候选，再 activate，成功后才写 ready。
-- status 从实际 inspect + 容器内 configured/active/available 计算；关闭失败
-  隔离时 available=false，不通过 active 布尔伪装可用。
+- status 从实际 inspect + 容器内 worker_ready/worker_running、
+  configured/active/available 计算；关闭失败隔离时 available=false，不通过
+  active 布尔伪装可用。
+- 创建使用专属 cidfile：`docker create` 超时/取消先等 CLI 终结，再按
+  cidfile 中不可复用 ID 清理；start/connect/configure/activate 取消也等待
+  底层 CLI。清理失败保留 cidfile 并返回 gateway_create_cleanup_incomplete。
+- refresh 的 starting 过期保留 worker/候选/attempt，按实际实例重新握手；
+  临时故障恢复 ready/unavailable，不按冷启动中断在途 Run。abort 先取得
+  Store 的 starting owner/generation/attempt 停止承诺，旧 owner 的迟到
+  abort 不得删除新 owner 已采用的实例。
+- Store v12 只追加 `attempt_id`；refresh 以已有 worker `container_id`
+  区分，不把进程崩溃当执行终止。worker_ready/worker_running 与 gateway
+  available 分开报告。
 
 ### 每空间 sidecar
 

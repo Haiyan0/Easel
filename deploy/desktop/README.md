@@ -166,11 +166,14 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
   `docker exec -i ... configure` + 有界 stdin JSON 绑定实际
   workspace/worker ID/version/IP/service token，进程生成新的 boot
   generation；配置只保存在内存，不写用户卷。状态经固定 `status` 命令读取
-  容器内 0600 Unix socket，不输出 service token。
+  容器内 0600 Unix socket，分别报告 worker_ready/worker_running 与 gateway
+  configured/active/available，不输出 service token。
 - 配置与激活分离：configure 只绑定目标且保持未激活；RuntimeManager 在
-  owner/generation CAS 中保存候选后，才用固定 `activate` 命令提交精确
-  workspace/gateway_instance_id/boot_generation/worker_container_id/
-  config_version。任何字段不匹配都拒绝；只有验证 available 后才写 ready。
+  owner/generation/attempt CAS 中保存候选后，才用固定 `activate` 命令提交
+  精确 workspace/gateway_instance_id/boot_generation/worker_container_id/
+  config_version。任何字段不匹配都拒绝；只有 worker 物理就绪且 gateway
+  available 后才写 ready。attempt 使迟到的 abort 在实例被新 owner 采用后
+  CAS 失败，不能删除新代次资源。
 - 不发布宿主端口、不挂 Docker socket、不挂 worker workspace/home、不读
   控制数据库；仅只读挂载 control 公钥；只读 rootfs、UID 10001、
   cap-drop ALL、no-new-privileges、固定资源上限。worker service 凭证由
@@ -265,8 +268,9 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
   `gateway_upstream` 作为管理转发地址，不能用 gateway 身份替代 worker ID。
   gateway 标签绑定 workspace、config_version、worker container_id，目标来自
   provisioner 核验的实际 worker 地址；boot generation 不写入 Docker 标签。
-- 受限协议 v2：v2 ensure 只返回未激活候选；RuntimeManager 在受保护
-  owner/generation CAS 中保存候选后调用 v2 activate；v2 stop 同时携带
+- 受限协议 v2：v2 ensure 携带 attempt_id 并只返回未激活候选；RuntimeManager
+  在受保护 owner/generation/attempt CAS 中保存候选后调用 v2 activate；v2
+  stop 同时携带
   worker container_id 与 gateway_instance_id，先按精确 gateway ID 停止
   gateway，失败时不继续删除 worker；v2 abort 仅按本轮 worker_created/
   gateway_created 清理。未启用 gateway 的旧部署保留 v1；gateway 启用时
@@ -277,16 +281,20 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
   签发新断言，不重发旧凭证。
 - provisioner 重启：重建 Unix socket；已有 gateway/worker 不删除；control
   重连后按不可复用 ID 复核并继续。
-- gateway 重启：**每次进程启动都生成新的 boot_generation**，同一容器/ID
-  重启也不得沿用旧代次；provisioner 从容器内 status 读取新 boot，
-  RuntimeManager 在 CAS 中保存新候选后 activate。同步前所有管理请求保持
-  未激活 503，旧断言即使未过期也因 audience 不符被拒。若容器被重建，同时
-  产生新 gateway ID/generation；已开始的 Run 不重发、不伪结算。
+- gateway 重启/refresh 崩溃：**每次进程启动都生成新的 boot_generation**，
+  同一容器/ID 重启也不得沿用旧代次；provisioner 从容器内 status 读取新
+  boot，RuntimeManager 在 CAS 中保存新候选后 activate。refresh 的 starting
+  过期保留 worker ID/gateway 候选/attempt，按 refresh 对账，不按冷启动
+  清空身份或中断活跃 Run；临时 ensure/activate 失败恢复 ready/unavailable。
+  同步前所有管理请求保持未激活 503，旧断言即使未过期也因 audience 不符
+  被拒。若容器被重建，同时产生新 gateway ID/generation；已开始的 Run 不重发、
+  不伪结算。
 - gateway 暂不可用：provisioner status 从实际 inspect 与容器内
-  configured/active/available 计算，关闭失败隔离也报告 unavailable，不能
-  只看 active 或 worker health；control 返回 503；不删除 active worker；
-  Run 不标记 done/failed/interrupted；SSE 断开可带 `after` 恢复；POST 不
-  自动重发。
+  worker_ready/worker_running、configured/active/available 计算，关闭失败
+  隔离也报告 unavailable，不能只看 active 或 worker health；control 返回
+  503；不删除 active worker；Run 不标记 done/failed/interrupted；SSE 断开
+  可带 `after` 恢复；POST 不自动重发。物理 worker 未就绪只拒绝派发；物理
+  gateway 同 boot 恢复时通过 CAS 恢复 DB available，不永久 identity mismatch。
 - gateway 更换：按旧 gateway_instance_id 停止旧 gateway，在核验过的同一
   worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/
   SSE 按游标恢复，POST 不自动重试。
@@ -329,8 +337,10 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
    断言、错误公钥和真实 TCP 转发已测试。
 4. G2 已实现：固定 control IPv4 的 create/start、可信 configure/activate
    握手、只读公钥与固定资源/网络、v2 受限协议、WorkerHandle/Lease
-   gateway 字段与 Store v11、三态关闭失败隔离上报、两阶段 CAS 激活、
+   gateway 字段与 Store v12、三态关闭失败隔离上报、两阶段 CAS 激活、
    gateway 重启新 boot 对账与精确 ID 停止；真实双 workspace 拓扑已运行。
+   G2 R1 进一步收口 attempt 清理认领 fencing、refresh 崩溃恢复、
+   worker_ready/available 分离同步，以及 cidfile 创建超时/取消清理。
 5. 公开 WorkerRelay/聊天入口与 A4 broker URL/受管 Agent 接线仍未实现；
    在 A4 验收前不宣称多用户聊天可用。
 
@@ -396,14 +406,17 @@ $env:EASEL_RUN_CONTAINER_TESTS = '1'
   tests/integration/multiuser/test_gateway_runtime_real.py -q
 ```
 
-G2 静态结果：新增单元 **28 passed**；provisioner/runtime/store/stop
-**238 passed, 1 skipped**；multiuser+拓扑全量 **1245 passed, 9 skipped**
-（2 条既有 websockets/uvicorn deprecation warning）。真实测试 **1 passed**
-（约 377 秒），固定镜像为 gateway
-`sha256:a25c259e9c09a36d902ddb9e68f28de803f30fea1636d8b794b4919ffceb5707`、
+G2 R1 静态结果：新增单元 **38 passed**；指定 provisioner/runtime/store/
+stop/gateway/拓扑回归 **284 passed, 6 skipped**；multiuser+拓扑全量
+**1257 passed, 9 skipped**（2 条既有 websockets/uvicorn deprecation warning）。
+真实测试 **2 passed**（341.40 秒），固定镜像为 gateway
+`sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a`、
 worker execution
-`sha256:f599b224abdbf7ad71052febad55ebba0c87513dce4053d085f84fb3e17dc3cb`；
+`sha256:0d8ea2c3e6f21d3ba9cb12125f80dd851eef73c013d0fb24d7a69676dfab7ef4`；
 覆盖两个 workspace、签名 health/submit/events/question status/answer/stop/
 messages、跨 workspace 拒绝、worker 反向不可达、同容器 gateway 重启新 boot、
-旧断言 503→403、worker ID/在途 Run 保持、精确 ID drain。详细证据见
+旧断言 503→403、worker ID/在途 Run 保持、精确 ID drain，以及真实
+docker create 已创建后 CLI 超时的 cidfile 定向清理。详细证据见
+[`docs/evidence/desktop-g2-r1/report.md`](../../docs/evidence/desktop-g2-r1/report.md)，
+上一轮证据保留在
 [`docs/evidence/desktop-g2/report.md`](../../docs/evidence/desktop-g2/report.md)。

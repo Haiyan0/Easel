@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -62,7 +62,7 @@ _WORKER_LEASE_COLUMNS = (
     " started_at, owner_id, generation, lease_expires_at, updated_at,"
     " last_activity_at, active_requests, upstream, service_token,"
     " gateway_instance_id, gateway_generation, gateway_upstream,"
-    " gateway_state")
+    " gateway_state, attempt_id")
 
 
 def _now() -> int:
@@ -375,6 +375,11 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "ALTER TABLE worker_leases ADD COLUMN gateway_generation TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE worker_leases ADD COLUMN gateway_upstream TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE worker_leases ADD COLUMN gateway_state TEXT NOT NULL DEFAULT 'disabled'",
+    ),
+    # 版本 12：两阶段启动/refresh 的清理尝试标识。abort 必须匹配当前
+    # starting 的 owner/generation/attempt，旧候选不能删除新 owner 资源。
+    (
+        "ALTER TABLE worker_leases ADD COLUMN attempt_id TEXT NOT NULL DEFAULT ''",
     ),
 )
 
@@ -827,6 +832,10 @@ class Store:
             if lease.state == "starting":
                 if lease.lease_expires_at > now:
                     return "wait", lease
+                if lease.container_id and lease.gateway_instance_id:
+                    # refresh 崩溃：物理 worker 可能仍有活跃 Run，不能清空
+                    # 身份走冷启动；由新 owner 按实际实例重新握手。
+                    return "refresh", lease
                 self._claim_new_generation(workspace_id, config_version,
                                            owner_id, now, lease_seconds)
                 return "started", self._worker_lease_row(workspace_id)
@@ -876,27 +885,33 @@ class Store:
 
     def stage_worker_gateway_start(
             self, workspace_id: str, owner_id: str, generation: int,
-            handle: WorkerHandle, now: int) -> bool:
-        """在启动 CAS 内保存候选 gateway；activation 前仍保持 starting。"""
+            handle: WorkerHandle, attempt_id: str, now: int) -> bool:
+        """在启动 CAS 内保存候选 gateway/attempt；activation 前仍 starting。"""
+        attempt_id = _text(attempt_id)
         with self._transaction():
             cursor = self._connection.execute(
-                "UPDATE worker_leases SET gateway_instance_id = ?,"
-                " gateway_generation = ?, gateway_upstream = ?,"
-                " gateway_state = 'staged', updated_at = ?"
+                "UPDATE worker_leases SET container_id = ?, upstream = ?,"
+                " service_token = ?, config_version = ?,"
+                " gateway_instance_id = ?, gateway_generation = ?,"
+                " gateway_upstream = ?, gateway_state = 'staged',"
+                " attempt_id = ?, updated_at = ?"
                 " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
                 " AND state = 'starting'",
-                (handle.gateway_instance_id, handle.gateway_generation,
-                 handle.gateway_upstream, int(now), _text(workspace_id),
-                 _text(owner_id), int(generation)))
+                (handle.container_id, handle.upstream, handle.service_token,
+                 int(handle.config_version), handle.gateway_instance_id,
+                 handle.gateway_generation, handle.gateway_upstream,
+                 attempt_id, int(now), _text(workspace_id), _text(owner_id),
+                 int(generation)))
         return cursor.rowcount == 1
 
     def begin_worker_gateway_refresh(
             self, workspace_id: str, generation: int, owner_id: str,
-            handle: WorkerHandle, now: int,
+            handle: WorkerHandle, attempt_id: str, now: int,
             lease_seconds: int) -> WorkerLease | None:
-        """ready→starting CAS 保存新候选；递增 generation 使旧持有者失效。"""
+        """ready/expired-refresh→starting CAS；递增 generation 使旧持有者失效。"""
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise DomainError("invalid_argument", 400)
+        attempt_id = _text(attempt_id)
         now = int(now)
         with self._transaction():
             cursor = self._connection.execute(
@@ -904,11 +919,14 @@ class Store:
                 " generation = generation + 1, heartbeat_at = ?,"
                 " lease_expires_at = ?, updated_at = ?,"
                 " gateway_instance_id = ?, gateway_generation = ?,"
-                " gateway_upstream = ?, gateway_state = 'staged'"
-                " WHERE workspace_id = ? AND generation = ? AND state = 'ready'",
+                " gateway_upstream = ?, gateway_state = 'staged',"
+                " attempt_id = ?"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND (state = 'ready'"
+                "      OR (state = 'starting' AND container_id <> ''))",
                 (_text(owner_id), now, now + lease_seconds, now,
                  handle.gateway_instance_id, handle.gateway_generation,
-                 handle.gateway_upstream, _text(workspace_id),
+                 handle.gateway_upstream, attempt_id, _text(workspace_id),
                  int(generation)))
             if cursor.rowcount != 1:
                 return None
@@ -949,6 +967,46 @@ class Store:
                  int(generation)))
         return cursor.rowcount == 1
 
+    def begin_worker_abort(self, workspace_id: str, owner_id: str,
+                           generation: int, attempt_id: str,
+                           now: int) -> bool:
+        """把当前 starting 尝试原子转为 stopping 清理承诺。
+
+        旧 owner/attempt 必须先取得该承诺才能远程删除；新 owner 在承诺
+        消解前不能采用该实例。CAS 失败时调用方不得发送 abort。
+        """
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'stopping', updated_at = ?"
+                " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
+                " AND attempt_id = ? AND state = 'starting'",
+                (int(now), _text(workspace_id), _text(owner_id),
+                 int(generation), _text(attempt_id)))
+        return cursor.rowcount == 1
+
+    def fail_expired_worker_gateway_refresh(
+            self, workspace_id: str, generation: int, now: int) -> bool:
+        """refresh 的临时故障恢复为 ready/unavailable，不当作冷启动失败。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready',"
+                " gateway_state = 'unavailable', updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND state = 'starting' AND container_id <> ''",
+                (int(now), _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
+    def mark_worker_gateway_available(
+            self, workspace_id: str, generation: int, now: int) -> bool:
+        """物理 gateway 恢复且 boot/target 未变时，CAS 恢复 DB available。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET gateway_state = 'available',"
+                " updated_at = ? WHERE workspace_id = ? AND generation = ?"
+                " AND state = 'ready'",
+                (int(now), _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
     def mark_worker_gateway_unavailable(
             self, workspace_id: str, generation: int, now: int) -> bool:
         """标记 gateway 暂不可用；保留 worker/在途 Run/事件游标。"""
@@ -976,7 +1034,7 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " lease_expires_at = 0, updated_at = ?"
+                " attempt_id = '', lease_expires_at = 0, updated_at = ?"
                 " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
                 " AND state = 'starting'",
                 (now, workspace_id, owner_id, int(generation)))
@@ -1009,7 +1067,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " lease_expires_at = 0, updated_at = ? WHERE " + where,
+                " attempt_id = '', lease_expires_at = 0, updated_at = ? WHERE "
+                + where,
                 (now, *values))
             if cursor.rowcount != 1:
                 return []
@@ -1088,7 +1147,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " lease_expires_at = 0, updated_at = ? WHERE " + where,
+                " attempt_id = '', lease_expires_at = 0, updated_at = ? WHERE "
+                + where,
                 (state, int(now), *values))
         return cursor.rowcount == 1
 
@@ -1249,9 +1309,9 @@ class Store:
             "  started_at, owner_id, generation, lease_expires_at, updated_at,"
             "  last_activity_at, active_requests, upstream, service_token,"
             "  gateway_instance_id, gateway_generation, gateway_upstream,"
-            "  gateway_state)"
+            "  gateway_state, attempt_id)"
             " VALUES (?, '', ?, 'starting', ?, ?, ?, 1, ?, ?, ?, 0, '', '',"
-            "         '', '', '', 'disabled')"
+            "         '', '', '', 'disabled', '')"
             " ON CONFLICT(workspace_id) DO UPDATE SET"
             "  container_id = '', config_version = excluded.config_version,"
             "  state = 'starting', heartbeat_at = excluded.heartbeat_at,"
@@ -1262,7 +1322,8 @@ class Store:
             "  last_activity_at = excluded.last_activity_at,"
             "  active_requests = 0, upstream = '', service_token = '',"
             "  gateway_instance_id = '', gateway_generation = '',"
-            "  gateway_upstream = '', gateway_state = 'disabled'",
+            "  gateway_upstream = '', gateway_state = 'disabled',"
+            "  attempt_id = ''",
             (workspace_id, int(config_version), now, now, owner_id,
              now + lease_seconds, now, now))
 
@@ -2646,6 +2707,7 @@ def _worker_lease(row: sqlite3.Row | None) -> WorkerLease | None:
         gateway_generation=row["gateway_generation"],
         gateway_upstream=row["gateway_upstream"],
         gateway_state=row["gateway_state"],
+        attempt_id=row["attempt_id"],
     )
 
 

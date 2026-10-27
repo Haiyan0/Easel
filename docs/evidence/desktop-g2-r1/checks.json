@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-28",
+  "baseline": "d1fc8b16d6cb98092fa1ff9d0772c15bd40e35bd",
+  "reviewed_commit": "3ce9fcf4a65823c12c19db64f7dddfdbfa612eb5",
+  "scope": ["G2-R1-01", "G2-R1-02", "G2-R1-03", "G2-R1-04"],
+  "schema_version": 12,
+  "fixes": {
+    "G2-R1-01": "attempt_id + Store starting owner/generation/attempt abort claim + provisioner attempt registry; stale abort CAS rejected",
+    "G2-R1-02": "expired starting refresh keeps worker/gateway/attempt; refresh recovery restores ready/unavailable, no cold-start Run interruption",
+    "G2-R1-03": "worker_ready/worker_running separate from gateway available; same-boot physical recovery CAS restores available; unready worker only 503",
+    "G2-R1-04": "cidfile-backed unique create cleanup; wait CLI before cleanup; exact ID only; cleanup failure explicit and cidfile retained"
+  },
+  "tests": {
+    "new_units": "38 passed",
+    "targeted_regression": "284 passed, 6 skipped",
+    "multiuser_and_desktop_static": "1257 passed, 9 skipped, 2 warnings",
+    "real_two_workspace_and_create_timeout": "2 passed in 341.40s"
+  },
+  "fixed_images": {
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:0d8ea2c3e6f21d3ba9cb12125f80dd851eef73c013d0fb24d7a69676dfab7ef4"
+  },
+  "cleanup": "no easel-gateway/worker/sidecar containers or easel-g2/easel-ws networks remain",
+  "not_run": [
+    "public WorkerRelay/chat/frontend",
+    "A4 broker URL/managed Agent wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}

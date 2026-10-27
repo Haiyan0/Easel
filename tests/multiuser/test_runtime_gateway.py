@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -41,6 +42,8 @@ class GatewayFake:
         self.abort_calls: list[dict] = []
         self.worker_created = False
         self.gateway_created = False
+        self.worker_ready = True
+        self.attempt_id = ""
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
         return WorkerHandle(
@@ -49,11 +52,14 @@ class GatewayFake:
             gateway_generation=self.boot,
             gateway_upstream=GATEWAY_UPSTREAM,
             gateway_state="available" if self.active else "staged",
+            attempt_id=self.attempt_id,
             worker_created=self.worker_created,
             gateway_created=self.gateway_created)
 
-    async def ensure(self, workspace_id: str, version: int) -> WorkerHandle:
+    async def ensure(self, workspace_id: str, version: int, *,
+                     attempt_id: str = "") -> WorkerHandle:
         self.ensure_calls += 1
+        self.attempt_id = attempt_id
         if self.fail_ensure is not None:
             raise self.fail_ensure
         return self.handle(workspace_id, version)
@@ -86,16 +92,15 @@ class GatewayFake:
         self.inspect_calls += 1
         lease = self.store.get_worker_lease(workspace_id)
         assert lease is not None
-        available = bool(
-            self.available and self.active
-            and lease.gateway_generation == self.boot
-            and lease.gateway_state == "available")
+        # 物理事实独立于 Store；不得用 DB gateway_state 构造 available。
+        available = bool(self.available and self.active)
         return {
             "workspace_id": workspace_id,
             "container_id": lease.container_id,
             "instance_id": lease.container_id,
             "config_version": lease.config_version,
-            "ready": available,
+            "ready": available and self.worker_ready,
+            "worker_ready": self.worker_ready,
             "managed": True,
             "upstream": lease.upstream,
             "labels": {
@@ -124,12 +129,13 @@ class GatewayFake:
             (workspace_id, instance_id, gateway_instance_id))
 
     async def abort(self, workspace_id: str, worker_container_id: str,
-                    gateway_instance_id: str, *, worker_created: bool,
-                    gateway_created: bool) -> None:
+                    gateway_instance_id: str, *, attempt_id: str,
+                    worker_created: bool, gateway_created: bool) -> None:
         self.abort_calls.append({
             "workspace": workspace_id,
             "worker": worker_container_id,
             "gateway": gateway_instance_id,
+            "attempt_id": attempt_id,
             "worker_created": worker_created,
             "gateway_created": gateway_created,
         })
@@ -264,24 +270,23 @@ def test_activation_failure_cleans_only_created_candidate(tmp_path):
             user = store.create_user("A")
             run = _running(store, user)
             fake = GatewayFake(store)
-            manager = RuntimeManager(
-                store, fake, gateway_required=True, clock=Clock())
-            await manager.ensure_ready(user.workspace_id, 1)
-
-            fake.boot = NEW_BOOT
-            fake.active = False
             fake.worker_created = True
             fake.gateway_created = True
             fake.fail_activate = RuntimeUnavailable("gateway_activation_failed")
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
             with pytest.raises(RuntimeUnavailable):
                 await manager.ensure_ready(user.workspace_id, 1)
-            assert fake.abort_calls == [{
-                "workspace": user.workspace_id,
-                "worker": WORKER,
-                "gateway": GATEWAY,
-                "worker_created": True,
-                "gateway_created": True,
-            }]
+            assert len(fake.abort_calls) == 1
+            abort = fake.abort_calls[0]
+            assert abort["workspace"] == user.workspace_id
+            assert abort["worker"] == WORKER
+            assert abort["gateway"] == GATEWAY
+            assert abort["attempt_id"] == fake.attempt_id
+            assert abort["worker_created"] is True
+            assert abort["gateway_created"] is True
+            assert store.get_worker_lease(
+                user.workspace_id).state == "stopped"
             assert store.get_run(user, run.id).status == "running"
     _run(scenario())
 
@@ -340,6 +345,215 @@ def test_bound_handle_requires_available_gateway_fields(tmp_path):
                 user.workspace_id, 1, 1001)
             assert await manager.bound_handle(
                 user.workspace_id, WORKER, 1) is None
+    _run(scenario())
+
+
+def test_worker_unready_is_rejected_without_failing_or_deleting(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            run = _running(store, user)
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            fake.worker_ready = False
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await manager.ensure_ready(user.workspace_id, 1)
+            assert rejected.value.code == "worker_not_ready"
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == WORKER
+            assert fake.stop_calls == []
+            assert store.get_run(user, run.id).status == "running"
+    _run(scenario())
+
+
+def test_db_unavailable_physical_recovery_same_boot_marks_available(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            store.mark_worker_gateway_unavailable(
+                user.workspace_id, 1, 1001)
+            assert store.get_worker_lease(
+                user.workspace_id).gateway_state == "unavailable"
+            recovered = await manager.ensure_ready(user.workspace_id, 1)
+            assert recovered.gateway_instance_id == handle.gateway_instance_id
+            assert recovered.gateway_generation == handle.gateway_generation
+            assert store.get_worker_lease(
+                user.workspace_id).gateway_state == "available"
+            assert fake.ensure_calls == 1
+    _run(scenario())
+
+
+def test_expired_refresh_recovery_does_not_interrupt_running_work(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            run = _running(first, user)
+            clock = Clock()
+            fake = GatewayFake(first)
+            manager_a = RuntimeManager(
+                first, fake, gateway_required=True, clock=clock)
+            await manager_a.ensure_ready(user.workspace_id, 1)
+            lease = first.get_worker_lease(user.workspace_id)
+            assert lease is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1), gateway_generation=NEW_BOOT,
+                gateway_state="staged")
+            assert first.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, "dead-owner",
+                candidate, "a" * 32, 1001, 2) is not None
+            clock.value = 1200
+            fake.boot = NEW_BOOT
+            fake.active = False
+            class Broker:
+                def __init__(self):
+                    self.revoked = []
+
+                async def revoke_run(self, run_id, workspace_id):
+                    self.revoked.append((run_id, workspace_id))
+
+            broker = Broker()
+            fake.fail_ensure = RuntimeUnavailable("gateway_unavailable")
+            manager_b = RuntimeManager(
+                second, fake, gateway_required=True, clock=clock,
+                broker=broker, poll_interval=0.01)
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await manager_b.ensure_ready(user.workspace_id, 1)
+            assert rejected.value.code == "gateway_unavailable"
+            after = second.get_worker_lease(user.workspace_id)
+            assert after.container_id == WORKER
+            assert after.state == "ready"
+            assert after.gateway_state == "unavailable"
+            assert fake.stop_calls == []
+            assert broker.revoked == []
+            assert first.get_run(user, run.id).status == "running"
+            release_count = first._connection.execute(
+                "SELECT release_count FROM runs WHERE id = ?",
+                (run.id,)).fetchone()[0]
+            assert release_count == 0
+
+            fake.fail_ensure = None
+            recovered = await manager_b.ensure_ready(user.workspace_id, 1)
+            assert recovered.container_id == WORKER
+            assert recovered.gateway_generation == NEW_BOOT
+            assert first.get_run(user, run.id).status == "running"
+    _run(scenario())
+
+
+def test_expired_staged_refresh_recovers_same_worker_new_boot(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            run = _running(first, user)
+            clock = Clock()
+            fake = GatewayFake(first)
+            manager_a = RuntimeManager(
+                first, fake, gateway_required=True, clock=clock)
+            await manager_a.ensure_ready(user.workspace_id, 1)
+            lease = first.get_worker_lease(user.workspace_id)
+            assert lease is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1), gateway_generation=NEW_BOOT,
+                gateway_state="staged")
+            assert first.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, "dead-owner",
+                candidate, "a" * 32, 1001, 2) is not None
+            clock.value = 1200
+            fake.boot = NEW_BOOT
+            fake.active = False
+            manager_b = RuntimeManager(
+                second, fake, gateway_required=True, clock=clock,
+                poll_interval=0.01)
+            recovered = await manager_b.ensure_ready(user.workspace_id, 1)
+            assert recovered.container_id == WORKER
+            assert recovered.gateway_generation == NEW_BOOT
+            assert fake.stop_calls == []
+            assert first.get_run(user, run.id).status == "running"
+            assert second.get_worker_lease(
+                user.workspace_id).state == "ready"
+    _run(scenario())
+
+
+def test_late_abort_loses_cas_after_new_owner_adopts(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            fake = GatewayFake(first)
+            manager = RuntimeManager(
+                first, fake, gateway_required=True, clock=Clock())
+            old = first.claim_worker_start(
+                user.workspace_id, 1, "owner-a", 1000, 60)[1]
+            assert old is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1),
+                worker_created=True, gateway_created=True,
+                attempt_id="a" * 32)
+            # A 的旧启动尝试在 B 接管前仍留在 DB；B 在过期后采用同一
+            # 物理身份并写 ready，A 的迟到 abort 必须 CAS 失败。
+            assert first.stage_worker_gateway_start(
+                user.workspace_id, old.owner_id, old.generation,
+                candidate, "a" * 32, 1001) is True
+            claimed = second.claim_worker_start(
+                user.workspace_id, 1, "owner-b", 2000, 60)
+            assert claimed[0] == "refresh"
+            b_lease = claimed[1]
+            assert b_lease is not None
+            b_staged = second.begin_worker_gateway_refresh(
+                user.workspace_id, b_lease.generation, "owner-b",
+                candidate, "b" * 32, 2001, 60)
+            assert b_staged is not None
+            assert second.complete_worker_gateway_refresh(
+                user.workspace_id, "owner-b", b_staged.generation,
+                dataclasses.replace(
+                    candidate, workspace_id=user.workspace_id,
+                    gateway_state="available"), 2002, 60) is True
+            cleaned = await manager._cleanup_candidate(
+                user.workspace_id, candidate, old, "a" * 32)
+            assert cleaned is False
+            assert fake.abort_calls == []
+            current = second.get_worker_lease(user.workspace_id)
+            assert current.state == "ready"
+            assert current.owner_id == "owner-b"
+    _run(scenario())
+
+
+def test_abort_claim_fences_new_owner_until_stop_terminal(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            lease = first.claim_worker_start(
+                user.workspace_id, 1, "owner-a", 1000, 60)[1]
+            assert lease is not None
+            handle = dataclasses.replace(
+                GatewayFake(first).handle(user.workspace_id, 1),
+                worker_created=True, gateway_created=True)
+            assert first.stage_worker_gateway_start(
+                user.workspace_id, "owner-a", lease.generation,
+                handle, "a" * 32, 1001) is True
+            assert first.begin_worker_abort(
+                user.workspace_id, "owner-a", lease.generation,
+                "a" * 32, 1002) is True
+            outcome, current = second.claim_worker_start(
+                user.workspace_id, 1, "owner-b", 1003, 60)
+            assert outcome == "draining"
+            assert current is not None and current.state == "stopping"
+            assert second.stop_worker(
+                user.workspace_id, 1004, generation=lease.generation,
+                expected_state="stopping") is True
+            outcome, current = second.claim_worker_start(
+                user.workspace_id, 1, "owner-b", 1005, 60)
+            assert outcome == "started"
+            assert current is not None
     _run(scenario())
 
 

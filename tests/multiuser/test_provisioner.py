@@ -111,7 +111,8 @@ def test_protocol_v2_accepts_exact_activate_and_gateway_stop():
         "version": 2, "action": "abort", "workspace_id": WORKSPACE,
         "worker_container_id": "c" * 64,
         "gateway_instance_id": "b" * 64,
-        "worker_created": True, "gateway_created": False})
+        "worker_created": True, "gateway_created": False,
+        "attempt_id": "d" * 32})
     assert abort.worker_created is True
     assert abort.gateway_created is False
 
@@ -159,6 +160,66 @@ def test_gateway_enabled_requires_v2_and_disabled_rejects_v2(tmp_path):
     with pytest.raises(provisioner.ProvisionerError) as required:
         asyncio.run(enabled._with_gateway(handle, 1, worker_created=False))
     assert required.value.code == "gateway_required"
+
+
+def test_abort_is_fenced_by_current_attempt_registry(tmp_path):
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    service = provisioner.Provisioner(settings)
+    stops = []
+
+    class FakeGateway:
+        async def stop(self, workspace_id, worker_id, gateway_id):
+            stops.append((workspace_id, worker_id, gateway_id))
+
+        async def current_instance_id(self, workspace_id):
+            return "e" * 64
+
+    service._gateway = FakeGateway()
+    service._attempts[WORKSPACE] = "a" * 32
+    with pytest.raises(provisioner.ProvisionerError) as stale:
+        asyncio.run(service.abort(
+            WORKSPACE, "c" * 64, "b" * 64, attempt_id="d" * 32,
+            worker_created=False, gateway_created=True))
+    assert stale.value.code == "gateway_abort_superseded"
+    assert stops == []
+    asyncio.run(service.abort(
+        WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+        worker_created=False, gateway_created=True))
+    assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
+
+
+def test_old_stop_tuple_refuses_worker_when_new_gateway_exists(tmp_path):
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    service = provisioner.Provisioner(settings)
+    stops = []
+
+    class FakeGateway:
+        async def stop(self, workspace_id, worker_id, gateway_id):
+            stops.append((workspace_id, worker_id, gateway_id))
+
+        async def current_instance_id(self, workspace_id):
+            return "e" * 64
+
+    service._gateway = FakeGateway()
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.stop(
+            WORKSPACE, "c" * 64, "b" * 64, protocol_version=2))
+    assert rejected.value.code == "gateway_target_mismatch"
+    assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
 
 
 def test_parse_request_rejects_oversized_and_malformed_payloads():

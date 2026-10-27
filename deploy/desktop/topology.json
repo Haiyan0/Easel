@@ -9,7 +9,7 @@
     "gateway_core": {
       "status": "assembled_not_public_relay",
       "task": "G2",
-      "review_round": "G2",
+      "review_round": "G2-R1",
       "factory": "create_gateway_app",
       "runtime": "deploy/multiuser/gateway_runtime.py",
       "server": "easel/gateway/server.py",
@@ -80,7 +80,9 @@
       "protocol_version": 2,
       "legacy_policy": "v1 仅保留给未启用 gateway 的既有部署；gateway 启用时 v1 ensure/stop/inspect 失败关闭，v2 才携带 gateway 元数据。",
       "config_channel": "docker exec -i 固定命令 + 有界 stdin JSON；配置含 worker 目标/服务 token，但不进入 argv、状态输出或日志。",
-      "status_channel": "docker exec 固定 status 命令读取容器内 0600 Unix socket；返回 boot/实例/目标/available，不返回 worker service token。",
+      "status_channel": "docker exec 固定 status 命令读取容器内 0600 Unix socket；分别返回 worker_ready/worker_running、gateway configured/active/available 与 boot/实例/目标，不返回 worker service token。",
+      "attempt_fencing": "v2 ensure 携带 attempt_id；provisioner 记录每 workspace 当前 attempt。abort 必须匹配当前 attempt；Store 还要求 starting owner/generation/attempt 的原子 abort 认领，旧 owner 在接管后 CAS 失败，不发送删除。",
+      "create_tracking": "docker create 使用专属 cidfile；超时/取消等待 CLI 终结后按 cidfile 中不可复用 ID 清理；start/connect/configure/activate 取消也等待底层 CLI。清理失败保留 cidfile 并返回 gateway_create_cleanup_incomplete。",
       "activation": "configure 绑定实例与 worker 目标但不激活；activate 精确匹配 workspace/gateway_instance_id/boot_generation/worker_container_id/config_version。",
       "network_join": "create 前固定 control IPv4；仅控制网络 start 并 inspect 绑定；configure 后再 connect 唯一 worker 网络；最终 inspect 要求恰好 control+worker 两张网。"
     },
@@ -333,7 +335,7 @@
       },
       "instance_binding": {
         "worker": "WorkerHandle.container_id 保持 worker 不可复用 Docker ID；gateway 元数据不能替代或覆盖它。",
-        "gateway": "WorkerHandle/WorkerLease 新增 gateway_instance_id（完整 gateway 容器 ID）、每进程 boot_generation（gateway_generation）、gateway_upstream 与 gateway_state；WorkerLease/control 持久化这些字段，gateway 标签含 workspace、config_version、worker_container_id，不把 boot generation 写入 Docker 标签。",
+        "gateway": "WorkerHandle/WorkerLease 新增 gateway_instance_id（完整 gateway 容器 ID）、每进程 boot_generation（gateway_generation）、gateway_upstream、gateway_state 与 attempt_id；WorkerLease/control 持久化这些字段，gateway 标签含 workspace、config_version、worker_container_id，不把 boot generation 写入 Docker 标签。",
         "target": "gateway 启动时从 provisioner 核验结果获得固定 worker container_id/config_version/IP；不按容器名自动解析到新代次。",
         "stop": "v2 stop 同时携带 worker container_id 与 gateway_instance_id；先按精确 gateway ID 停止 gateway，失败时不继续删除 worker；旧 stop 不能删除新 gateway。",
         "old_auth": "断言 audience 含 gateway ID/boot_generation；旧断言不能访问新 gateway；旧 worker service 凭证不能访问新 worker。",
@@ -343,7 +345,8 @@
         "control_restart": "从现有受保护 signing key 重新加载；gateway/worker 不变，重新签发新断言即可，不重发旧凭证。",
         "provisioner_restart": "重建 Unix socket；已有 gateway/worker 不删除；control 重连后按不可复用 ID 复核并继续，不重新签发不可用 token。",
         "gateway_restart": "每次 gateway 进程启动都必须生成新 boot_generation，即使同一容器/ID 重启也不能沿用旧代次；provisioner 经 status 读取新 boot，RuntimeManager 在 CAS 中保存新候选后再 activate；旧断言即使未过期也因 audience 不符被拒。容器被重建时同时产生新 gateway ID/generation。",
-        "gateway_unavailable": "provisioner status 从实际 inspect + 容器内 status/available 计算，不只看 active 或 worker health；隔离/不可达时 control 返回 503，不删除 active worker，不把 Run 改 done/failed/interrupted；SSE 断开可带 after 恢复，POST 不自动重发。",
+        "gateway_unavailable": "provisioner status 从实际 inspect + 容器内 status/available 计算，不只看 active 或 worker health；隔离/不可达时 control 返回 503，不删除 active worker，不把 Run 改 done/failed/interrupted；SSE 断开可带 after 恢复，POST 不自动重发。物理恢复同 boot 时 RuntimeManager 通过 CAS 恢复 DB available；worker/sidecar 未就绪只拒绝派发。",
+        "gateway_refresh_crash": "refresh 的 starting 租约保留 worker ID/gateway 候选/attempt；租约过期返回 refresh 而非 cold start。临时 ensure/activate 失败恢复 ready/unavailable，保留在途 Run；新 owner 用 begin refresh CAS 接管并重新握手，不把进程崩溃当作执行终止。",
         "gateway_replacement": "按旧 gateway_instance_id 停止旧 gateway，在核验过的同一 worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/SSE 可按游标恢复，POST 不自动重试。",
         "control_key_unavailable": "gateway 无法验证 control 断言时返回 503；不得删除 worker，直到显式 drain/stop。",
         "worker_replacement": "新 worker 使用新 container_id/service 凭证；旧 gateway 目标/凭证不匹配，必须 drain/stop 旧代次后重建。",
@@ -359,7 +362,7 @@
         "max_concurrent_streams": 7,
         "max_concurrent_reason": "与现有 max_active_runs_total=8 对齐；每个 SSE 连接占用一个槽；流请求最多 7 个，保留至少一个槽给 stop/权限回答等短控制请求。",
         "stream_slot_reservation": "流槽满时立即 429 + Retry-After，不无限排队；短请求仍可占用保留槽，避免长流永久饥饿。",
-        "cleanup_ownership": "每上游响应创建唯一 cleanup task，直接消费原始 AsyncByteStream，不让 aiter_raw 取得自然 EOF 关闭所有权；EOF/异常/超时/断连/background 共享同一任务。取消等待者不取消 cleanup；底层响应关闭成功后才释放槽位。关闭抛错或取消时保留槽位并将实例隔离，后续请求 503 gateway_unavailable；重复关闭共享同一脱敏失败终态，不关闭注入的共享 client，不重试业务请求。",
+        "cleanup_ownership": "每上游响应创建唯一 cleanup task，直接消费原始 AsyncByteStream，不让 aiter_raw 取得自然 EOF 关闭所有权；EOF/异常/超时/断连/background 共享同一任务。取消等待者不取消 cleanup；底层响应关闭成功后才释放槽位。关闭抛错或取消时保留槽位并将实例隔离，后续请求 503 gateway_unavailable；重复关闭共享同一脱敏失败终态，不关闭注入的共享 client，不重试业务请求。gateway create 另有 cidfile/attempt 唯一清理，超时/取消等待 CLI 终结后按不可复用 ID 删除。",
         "content_length_parse": "Content-Length 先做十进制位数有界比较；超长或超过 body 上限返回 413，不触发 int 转换异常。",
         "sse_backpressure": "逐块 write + drain；客户端慢时暂停上游读取，不缓存完整流；客户端断开立即取消上游读取。",
         "post_retry": "不自动重发任何 POST；Run admission/idempotency 由 worker 与 control 继续校验。"
@@ -386,8 +389,8 @@
     "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。"
   },
   "evidence": {
-    "report": "docs/evidence/desktop-g2/report.md",
-    "red_green": "docs/evidence/desktop-g2/red-green.md",
+    "report": "docs/evidence/desktop-g2-r1/report.md",
+    "red_green": "docs/evidence/desktop-g2-r1/red-green.md",
     "test_file": "tests/integration/multiuser/test_gateway_runtime_real.py",
     "previous": "docs/evidence/desktop-a2/report.md"
   },

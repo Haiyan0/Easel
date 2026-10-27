@@ -33,6 +33,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -117,6 +118,7 @@ class WorkerRequest:
     boot_generation: str = ""
     worker_created: bool = False
     gateway_created: bool = False
+    attempt_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,8 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     allowed = {"version", "action", "workspace_id"}
     if action in ("ensure", "activate"):
         allowed.add("config_version")
+    if action == "ensure" and version == PROTOCOL_VERSION:
+        allowed.add("attempt_id")
     if action == "stop":
         allowed.add("instance_id")
         if version == PROTOCOL_VERSION:
@@ -186,7 +190,7 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
                         "boot_generation"})
     if action == "abort":
         allowed.update({"gateway_instance_id", "worker_container_id",
-                        "worker_created", "gateway_created"})
+                        "worker_created", "gateway_created", "attempt_id"})
     unknown = {key for key in data if key not in allowed}
     if unknown:
         # 明确拒绝所有镜像/命令/挂载/网络/环境注入尝试
@@ -209,6 +213,7 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     boot_generation = ""
     worker_created = False
     gateway_created = False
+    attempt_id = ""
     if action == "stop":
         instance_id = data.get("instance_id")
         if (not isinstance(instance_id, str)
@@ -248,10 +253,20 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
             raise _reject("invalid_instance")
         if type(worker_created) is not bool or type(gateway_created) is not bool:
             raise _reject("invalid_cleanup_flag")
+        attempt_id = data.get("attempt_id")
+        if (not isinstance(attempt_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None):
+            raise _reject("invalid_attempt_id")
+    elif action == "ensure" and version == PROTOCOL_VERSION:
+        attempt_id = data.get("attempt_id", "")
+        if attempt_id and (not isinstance(attempt_id, str)
+                           or re.fullmatch(r"[0-9a-f]{32}", attempt_id)
+                           is None):
+            raise _reject("invalid_attempt_id")
     return WorkerRequest(
         action, workspace_id, config_version, instance_id, version,
         gateway_instance_id, worker_container_id, boot_generation,
-        worker_created, gateway_created)
+        worker_created, gateway_created, attempt_id)
 
 
 def _valid_config_version(value: object) -> bool:
@@ -755,6 +770,7 @@ def sanitize_inspect(raw: dict | None) -> dict:
         "instance_id": "",
         "config_version": 0,
         "ready": False,
+        "worker_running": False,
         "managed": False,
         "labels": {},
         "upstream": "",
@@ -817,6 +833,7 @@ def sanitize_inspect(raw: dict | None) -> dict:
         "instance_id": str(raw.get("Id") or ""),
         "config_version": config_version,
         "ready": ready,
+        "worker_running": running,
         "managed": True,
         "labels": workload_labels(workspace_id, config_version),
         "upstream": (f"http://{address}:{WORKER_PORT}" if address else ""),
@@ -1512,6 +1529,7 @@ class Provisioner:
         if any(configured) and not all(configured):
             raise _reject("gateway_config_incomplete")
         self._gateway = None
+        self._attempts: dict[str, str] = {}
         if all(configured):
             try:
                 gateway_settings = GatewaySettings(
@@ -1520,7 +1538,8 @@ class Provisioner:
                     public_key=settings.gateway_public_key,
                     port=settings.gateway_port,
                     start_timeout=settings.gateway_start_timeout,
-                    docker=settings.docker)
+                    docker=settings.docker,
+                    attempt_dir=settings.workspace_root / ".gateway")
             except GatewayRuntimeError as error:
                 raise _reject(error.code) from None
             self._gateway = GatewayRuntime(
@@ -1867,18 +1886,24 @@ class Provisioner:
     # -- 对外动作 ------------------------------------------------------
 
     async def ensure(self, workspace_id: str, config_version: int, *,
-                     protocol_version: int = LEGACY_PROTOCOL_VERSION
-                     ) -> WorkerHandle:
-        parse_request({"version": protocol_version, "action": "ensure",
-                       "workspace_id": workspace_id,
-                       "config_version": config_version})
+                     protocol_version: int = LEGACY_PROTOCOL_VERSION,
+                     attempt_id: str = "") -> WorkerHandle:
+        if protocol_version >= PROTOCOL_VERSION and not attempt_id:
+            attempt_id = uuid.uuid4().hex
+        payload = {"version": protocol_version, "action": "ensure",
+                   "workspace_id": workspace_id,
+                   "config_version": config_version}
+        if protocol_version >= PROTOCOL_VERSION:
+            payload["attempt_id"] = attempt_id
+        parse_request(payload)
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
             return await self._ensure_locked(
-                workspace_id, config_version, protocol_version)
+                workspace_id, config_version, protocol_version, attempt_id)
 
     async def _ensure_locked(self, workspace_id: str, config_version: int,
-                             protocol_version: int) -> WorkerHandle:
+                             protocol_version: int,
+                             attempt_id: str = "") -> WorkerHandle:
         if self._worker_public_key is None:
             raise ProvisionerError("worker_public_key_unavailable")
         paths = await asyncio.to_thread(
@@ -1942,7 +1967,8 @@ class Provisioner:
                     workspace_id, report["instance_id"],
                     report["upstream"], token, config_version)
                 return await self._with_gateway(
-                    handle, protocol_version, worker_created=False)
+                    handle, protocol_version, worker_created=False,
+                    attempt_id=attempt_id)
 
         # 只有本轮新建实例才允许生成 token；既有实例已在上面严格比较。
         token = await asyncio.to_thread(
@@ -1993,7 +2019,8 @@ class Provisioner:
                         workspace_id, instance_id, report["upstream"], token,
                         config_version)
                     return await self._with_gateway(
-                        handle, protocol_version, worker_created=True)
+                        handle, protocol_version, worker_created=True,
+                        attempt_id=attempt_id)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
             raise ProvisionerError("worker_not_ready")
         except asyncio.CancelledError:
@@ -2023,7 +2050,8 @@ class Provisioner:
             raise ProvisionerError("worker_start_failed") from failure
 
     async def _with_gateway(self, handle: WorkerHandle, protocol_version: int,
-                            *, worker_created: bool) -> WorkerHandle:
+                            *, worker_created: bool,
+                            attempt_id: str = "") -> WorkerHandle:
         """gateway 启用时只返回候选；v1 缺失元数据必须失败关闭。"""
         if not self.gateway_enabled:
             if protocol_version >= PROTOCOL_VERSION:
@@ -2041,12 +2069,15 @@ class Provisioner:
                 worker_service_token=handle.service_token)
         except GatewayRuntimeError as error:
             raise ProvisionerError(error.code) from None
+        if attempt_id:
+            self._attempts[handle.workspace_id] = attempt_id
         return replace(
             handle,
             gateway_instance_id=candidate.gateway_instance_id,
             gateway_generation=candidate.boot_generation,
             gateway_upstream=candidate.gateway_upstream,
             gateway_state="available" if candidate.active else "staged",
+            attempt_id=attempt_id,
             worker_created=worker_created,
             gateway_created=candidate.gateway_created)
 
@@ -2081,6 +2112,13 @@ class Provisioner:
                         workspace_id, instance_id, gateway_instance_id)
                 except GatewayRuntimeError as error:
                     raise ProvisionerError(error.code) from None
+                # 旧 gateway 已消失但同名新 gateway 仍存在时，旧 tuple
+                # 不能据此停止当前 worker。
+                current_gateway = await self._gateway.current_instance_id(
+                    workspace_id)
+                if (current_gateway
+                        and current_gateway != gateway_instance_id):
+                    raise ProvisionerError("gateway_target_mismatch")
             await self._stop_worker_locked(workspace_id, instance_id)
 
     async def _stop_worker_locked(self, workspace_id: str,
@@ -2118,8 +2156,8 @@ class Provisioner:
         await self._stop_sidecar(workspace_id)
 
     async def abort(self, workspace_id: str, worker_container_id: str,
-                    gateway_instance_id: str, *, worker_created: bool,
-                    gateway_created: bool) -> None:
+                    gateway_instance_id: str, *, attempt_id: str,
+                    worker_created: bool, gateway_created: bool) -> None:
         """激活失败时只清理本轮新建资源；既有 worker/gateway 保留。"""
         if not self.gateway_enabled:
             raise ProvisionerError("gateway_disabled")
@@ -2129,9 +2167,12 @@ class Provisioner:
             "worker_container_id": worker_container_id,
             "gateway_instance_id": gateway_instance_id,
             "worker_created": worker_created,
-            "gateway_created": gateway_created})
+            "gateway_created": gateway_created,
+            "attempt_id": attempt_id})
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
+            if self._attempts.get(workspace_id) != attempt_id:
+                raise ProvisionerError("gateway_abort_superseded")
             if gateway_created:
                 assert self._gateway is not None
                 try:
@@ -2225,6 +2266,7 @@ class Provisioner:
                 "container_id": "",
                 "config_version": 0,
                 "ready": False,
+                "worker_running": False,
                 "managed": False,
                 "labels": {},
                 "upstream": "",
@@ -2253,23 +2295,25 @@ class Provisioner:
         # 对账必须验收完整批准依赖：缺 sidecar、sidecar 被篡改或其受控
         # 出站网络失效时，worker 自身健康不能证明接线可用。
         sidecar_ready = await self._sidecar_ready(workspace_id)
-        report["ready"] = bool(
+        report["sidecar_ready"] = sidecar_ready
+        worker_ready = bool(
             report["ready"] and wiring_ready and sidecar_ready)
-        if report["ready"]:
+        if worker_ready:
             try:
                 token = _read_token(
                     self.settings.workspace_root, workspace_id)
             except ProvisionerError:
-                report["ready"] = False
-                return self._attach_gateway(report, gateway_report)
+                worker_ready = False
             # 返回/控制面使用的 token 必须与已核验实例的实际 Env 一致；
             # 缺宿主凭据或旧 token 不得静默接管。
-            if not _actual_token_matches(raw, token):
-                report["ready"] = False
-                return self._attach_gateway(report, gateway_report)
-            report["ready"] = await self._probe(
-                workspace_id, report["config_version"],
-                report["instance_id"])
+            if worker_ready and not _actual_token_matches(raw, token):
+                worker_ready = False
+            if worker_ready:
+                worker_ready = await self._probe(
+                    workspace_id, report["config_version"],
+                    report["instance_id"])
+        report["worker_ready"] = worker_ready
+        report["ready"] = worker_ready
         return self._attach_gateway(report, gateway_report)
 
     @staticmethod
@@ -2283,8 +2327,9 @@ class Provisioner:
         report["gateway_generation"] = gateway.get("boot_generation", "")
         report["gateway_upstream"] = gateway.get("gateway_upstream", "")
         report["gateway_available"] = gateway.get("available") is True
-        if not report["gateway_available"]:
-            report["ready"] = False
+        report["ready"] = bool(
+            report.get("worker_ready", report.get("ready"))
+            and report["gateway_available"])
         return report
 
     async def _probe(self, workspace_id: str, config_version: int,
@@ -2378,7 +2423,8 @@ class Provisioner:
         if request.action == "ensure":
             handle = await self.ensure(
                 request.workspace_id, request.config_version,
-                protocol_version=request.version)
+                protocol_version=request.version,
+                attempt_id=request.attempt_id)
             payload = {
                 "workspace_id": handle.workspace_id,
                 "container_id": handle.container_id,
@@ -2405,7 +2451,7 @@ class Provisioner:
         if request.action == "abort":
             await self.abort(
                 request.workspace_id, request.worker_container_id,
-                request.gateway_instance_id,
+                request.gateway_instance_id, attempt_id=request.attempt_id,
                 worker_created=request.worker_created,
                 gateway_created=request.gateway_created)
             return {"ok": True}

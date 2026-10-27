@@ -150,9 +150,11 @@ def _snapshot(private: Ed25519PrivateKey, workspace_id: str, run_id: str,
 class DirectProvisioner:
     service: object
 
-    async def ensure(self, workspace_id: str, config_version: int):
+    async def ensure(self, workspace_id: str, config_version: int, *,
+                     attempt_id: str = ""):
         return await self.service.ensure(
-            workspace_id, config_version, protocol_version=2)
+            workspace_id, config_version, protocol_version=2,
+            attempt_id=attempt_id)
 
     async def stop(self, workspace_id: str, container_id: str,
                    gateway_instance_id: str = "") -> None:
@@ -161,10 +163,11 @@ class DirectProvisioner:
             protocol_version=2)
 
     async def abort(self, workspace_id: str, container_id: str,
-                    gateway_instance_id: str, *, worker_created: bool,
-                    gateway_created: bool) -> None:
+                    gateway_instance_id: str, *, attempt_id: str,
+                    worker_created: bool, gateway_created: bool) -> None:
         await self.service.abort(
             workspace_id, container_id, gateway_instance_id,
+            attempt_id=attempt_id,
             worker_created=worker_created,
             gateway_created=gateway_created)
 
@@ -536,3 +539,52 @@ def test_real_two_workspace_gateway_protocol_restart_and_isolation(
         _docker("network", "rm", control_network, check=False)
         store.close()
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_real_gateway_create_cli_timeout_cleans_created_container(
+        tmp_path: pathlib.Path, images: tuple[str, str]) -> None:
+    """真实 docker create 已创建容器但 CLI 超时：按 cidfile ID 清理。"""
+    from easel.gateway.runtime import (
+        GatewayRuntime,
+        GatewayRuntimeError,
+        GatewaySettings,
+    )
+    gateway_image, _ = images
+    run_label = "g2-timeout-" + uuid.uuid4().hex[:12]
+    control_network = _control_network(run_label)
+    workspace = uuid.uuid4().hex
+    key = tmp_path / "control.pub"
+    key.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    wrapper = tmp_path / "docker.cmd"
+    wrapper.write_text(
+        chr(10).join([
+            "@echo off",
+            'if /I "%~1"=="create" (',
+            "  docker %*",
+            "  ping -n 10 127.0.0.1 >nul",
+            "  exit /b 0",
+            ")",
+            "docker %*",
+            "",
+        ]),
+        encoding="ascii")
+    settings = GatewaySettings(
+        image=gateway_image, control_network=control_network,
+        public_key=key, attempt_dir=tmp_path / "attempts",
+        create_timeout=3.0, start_timeout=2.0, docker=str(wrapper))
+    runtime = GatewayRuntime(settings)
+    name = f"easel-gateway-{workspace}"
+    try:
+        with pytest.raises(GatewayRuntimeError) as rejected:
+            asyncio.run(runtime._create(
+                workspace, 3, "b" * 64, "http://127.0.0.1:7860", "token"))
+        assert rejected.value.code in (
+            "gateway_create_failed", "gateway_create_cleanup_incomplete")
+        assert _docker("container", "inspect", name,
+                       check=False).returncode != 0
+        attempts = list((tmp_path / "attempts").glob("*.cid"))
+        if rejected.value.code == "gateway_create_failed":
+            assert attempts == []
+    finally:
+        _docker("container", "rm", "-f", name, check=False)
+        _docker("network", "rm", control_network, check=False)

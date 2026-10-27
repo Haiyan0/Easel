@@ -86,7 +86,8 @@ def test_initial_gateway_candidate_is_staged_then_activated(tmp_path):
         handle = dataclasses.replace(
             _handle(state="staged"), workspace_id=workspace)
         assert store.stage_worker_gateway_start(
-            workspace, "owner", lease.generation, handle, 1001) is True
+            workspace, "owner", lease.generation, handle,
+            "a" * 32, 1001) is True
         staged = store.get_worker_lease(workspace)
         assert staged.state == "starting"
         assert staged.gateway_instance_id == GATEWAY
@@ -120,7 +121,8 @@ def test_gateway_refresh_cas_keeps_runs_and_stale_activation_cannot_win(
         candidate = dataclasses.replace(
             _handle(boot=NEW_BOOT, state="staged"), workspace_id=workspace)
         refreshed = store.begin_worker_gateway_refresh(
-            workspace, lease.generation, "new-owner", candidate, 1002, 60)
+            workspace, lease.generation, "new-owner", candidate,
+            "b" * 32, 1002, 60)
         assert refreshed is not None
         assert refreshed.state == "starting"
         assert refreshed.generation == lease.generation + 1
@@ -147,7 +149,7 @@ def test_gateway_refresh_cas_keeps_runs_and_stale_activation_cannot_win(
 
         second = store.begin_worker_gateway_refresh(
             workspace, unavailable.generation, "third-owner", candidate,
-            1005, 60)
+            "c" * 32, 1005, 60)
         assert second is not None
         assert store.complete_worker_gateway_refresh(
             workspace, "third-owner", second.generation,

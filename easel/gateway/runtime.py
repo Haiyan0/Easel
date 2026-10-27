@@ -12,6 +12,7 @@ import ipaddress
 import json
 import re
 import subprocess
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +61,9 @@ class GatewaySettings:
     public_key: Path
     port: int = GATEWAY_PORT
     start_timeout: float = 30.0
+    create_timeout: float = 60.0
     docker: str = "docker"
+    attempt_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.image, str) or _PINNED_IMAGE.fullmatch(
@@ -71,10 +74,10 @@ class GatewaySettings:
             raise GatewayRuntimeError("gateway_network_invalid")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise GatewayRuntimeError("gateway_port_invalid")
-        if (not isinstance(self.start_timeout, (int, float))
-                or isinstance(self.start_timeout, bool)
-                or self.start_timeout <= 0):
-            raise GatewayRuntimeError("gateway_timeout_invalid")
+        for timeout in (self.start_timeout, self.create_timeout):
+            if (not isinstance(timeout, (int, float))
+                    or isinstance(timeout, bool) or timeout <= 0):
+                raise GatewayRuntimeError("gateway_timeout_invalid")
         path = Path(self.public_key)
         if path.is_symlink():
             raise GatewayRuntimeError("gateway_public_key_invalid")
@@ -89,7 +92,9 @@ class GatewaySettings:
             _load_key_bytes(data)
         except (ValueError, TypeError):
             raise GatewayRuntimeError("gateway_public_key_invalid") from None
-        object.__setattr__(self, "public_key", resolved)
+        attempt_dir = (Path(self.attempt_dir) if self.attempt_dir is not None
+                       else resolved.parent / ".gateway-attempts")
+        object.__setattr__(self, "attempt_dir", attempt_dir)
 
 
 @dataclass(frozen=True)
@@ -169,12 +174,14 @@ def gateway_command(settings: GatewaySettings, bind: str) -> tuple[str, ...]:
 def build_gateway_create_argv(
         settings: GatewaySettings, *, workspace_id: str,
         config_version: int, worker_container_id: str,
-        control_ip: str) -> list[str]:
+        control_ip: str, cidfile: Path | None = None) -> list[str]:
     """唯一允许的 gateway create argv；不发布端口，不挂用户/控制数据。"""
     address = _ipv4(control_ip)
     name = gateway_container_name(workspace_id)
     labels = gateway_labels(workspace_id, config_version, worker_container_id)
     argv = ["create", "--name", name]
+    if cidfile is not None:
+        argv.extend(["--cidfile", _safe_path(cidfile)])
     for key, value in labels.items():
         argv.extend(["--label", f"{key}={value}"])
     argv.extend([
@@ -580,6 +587,8 @@ class GatewayRuntime:
         self.settings = settings
         self._run = run or self._default_run
         self._lock = asyncio.Lock()
+        attempt_dir = Path(settings.attempt_dir or "")
+        attempt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     async def _default_run(self, argv, *, timeout=120.0, input_text=None):
         return await asyncio.to_thread(
@@ -649,7 +658,7 @@ class GatewayRuntime:
                        payload: dict) -> dict:
         # CLI 自己构造 action 信封；这里只传受信 payload，避免双重包裹。
         data = json.dumps(payload, separators=(",", ":"))
-        result = await self._docker(
+        result = await self._run_cli(
             "exec", "-i", "--user", GATEWAY_USER, instance_id,
             "python", "-m", "easel.gateway.server", action,
             "--control-socket", GATEWAY_CONTROL_SOCKET,
@@ -780,22 +789,117 @@ class GatewayRuntime:
                 workspace, version, worker, worker_origin,
                 worker_service_token)
 
+    def _new_cidfile(self, workspace: str) -> Path:
+        directory = Path(self.settings.attempt_dir or "")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return directory / f"{workspace}-{uuid.uuid4().hex}.cid"
+
+    @staticmethod
+    def _read_cidfile(path: Path) -> str:
+        try:
+            value = path.read_text(encoding="ascii").strip()
+        except OSError:
+            return ""
+        return value if _CONTAINER_ID.fullmatch(value) else ""
+
+    @staticmethod
+    def _discard_cidfile(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def _await_cli(self, task: asyncio.Task) -> None:
+        """外层取消不取消底层 create CLI；等其终结后再读 cidfile。"""
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                continue
+        try:
+            task.result()
+        except BaseException:  # noqa: BLE001,S110 - CLI 失败仍可能已创建
+            pass
+
+    async def _run_cli(self, *args: str, timeout: float = 60.0,
+                       input_text: str | None = None
+                       ) -> subprocess.CompletedProcess:
+        """取消等待者也要等底层 Docker CLI 终结，避免与清理竞态。"""
+        task = asyncio.create_task(
+            self._docker(*args, timeout=timeout, input_text=input_text))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._await_cli(task)
+            raise
+        except BaseException:
+            await self._await_cli(task)
+            raise
+
+    async def _cleanup_create(self, instance_id: str, workspace: str,
+                              worker: str, cidfile: Path) -> bool:
+        if not instance_id:
+            return False
+        try:
+            await self._remove_gateway(instance_id, workspace, worker)
+        except GatewayRuntimeError:
+            return False
+        self._discard_cidfile(cidfile)
+        return True
+
+    async def _cleanup_created(self, instance_id: str, workspace: str,
+                               worker: str, cidfile: Path) -> None:
+        """唯一清理任务：等待者反复取消也等清理终结。"""
+        task = asyncio.create_task(self._cleanup_create(
+            instance_id, workspace, worker, cidfile))
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                continue
+        try:
+            cleaned = task.result()
+        except BaseException:  # noqa: BLE001
+            raise GatewayRuntimeError(
+                "gateway_create_cleanup_incomplete") from None
+        if not cleaned:
+            raise GatewayRuntimeError("gateway_create_cleanup_incomplete")
+
     async def _create(self, workspace: str, version: int, worker: str,
                       worker_origin: str, worker_service_token: str
                       ) -> GatewayCandidate:
         payload = await self._network_payload()
         control_ip = allocate_gateway_ip(
             payload, self.settings.control_network)
+        cidfile = self._new_cidfile(workspace)
         argv = build_gateway_create_argv(
             self.settings, workspace_id=workspace, config_version=version,
-            worker_container_id=worker, control_ip=control_ip)
-        result = await self._docker(*argv, timeout=60.0)
-        if result.returncode != 0:
+            worker_container_id=worker, control_ip=control_ip,
+            cidfile=cidfile)
+        create_task = asyncio.create_task(
+            self._docker(*argv, timeout=self.settings.create_timeout))
+        try:
+            result = await asyncio.shield(create_task)
+        except asyncio.CancelledError:
+            await self._await_cli(create_task)
+            instance_id = self._read_cidfile(cidfile)
+            if instance_id:
+                await self._cleanup_created(
+                    instance_id, workspace, worker, cidfile)
+            raise
+        except BaseException:  # noqa: BLE001 - 超时/取消/CLI 异常统一清理
+            await self._await_cli(create_task)
+            instance_id = self._read_cidfile(cidfile)
+            if instance_id:
+                await self._cleanup_created(
+                    instance_id, workspace, worker, cidfile)
+            raise GatewayRuntimeError("gateway_create_failed") from None
+        instance_id = self._read_cidfile(cidfile)
+        if result.returncode != 0 or not instance_id:
+            if instance_id:
+                await self._cleanup_created(
+                    instance_id, workspace, worker, cidfile)
             raise GatewayRuntimeError("gateway_create_failed")
-        instance_id = str(result.stdout or "").strip()
-        if _CONTAINER_ID.fullmatch(instance_id) is None:
-            raise GatewayRuntimeError("gateway_create_failed")
-        created = True
         try:
             raw = await self._inspect_id(instance_id)
             if raw is None or not verify_gateway_inspect(
@@ -804,7 +908,7 @@ class GatewayRuntime:
                     control_ip=control_ip,
                     worker_network_connected=False):
                 raise GatewayRuntimeError("gateway_container_conflict")
-            result = await self._docker("start", instance_id, timeout=30.0)
+            result = await self._run_cli("start", instance_id, timeout=30.0)
             if result.returncode != 0:
                 raise GatewayRuntimeError("gateway_start_failed")
             status = await self._wait_started(instance_id)
@@ -817,7 +921,7 @@ class GatewayRuntime:
             await self._configure(
                 report, workspace, version, worker, worker_origin,
                 worker_service_token)
-            connected = await self._docker(
+            connected = await self._run_cli(
                 "network", "connect", gateway_worker_network(workspace),
                 instance_id, timeout=30.0)
             if connected.returncode != 0:
@@ -832,15 +936,15 @@ class GatewayRuntime:
             status = await self._status(instance_id)
             report = sanitize_gateway_inspect(
                 after, workspace_id=workspace)
-            return self._candidate(
+            candidate = self._candidate(
                 workspace, version, worker, report, status,
-                active=False, created=created)
+                active=False, created=True)
         except BaseException:
-            try:
-                await self._remove_gateway(instance_id, workspace, worker)
-            except GatewayRuntimeError:
-                pass
+            await self._cleanup_created(
+                instance_id, workspace, worker, cidfile)
             raise
+        self._discard_cidfile(cidfile)
+        return candidate
 
     async def _configure(self, report: dict, workspace: str, version: int,
                          worker: str, worker_origin: str,
@@ -931,6 +1035,15 @@ class GatewayRuntime:
                 control_ip=report["control_ip"]):
             raise GatewayRuntimeError("gateway_activation_invalid")
         return active
+
+    async def current_instance_id(self, workspace_id: str) -> str:
+        """返回同名 gateway 的实际 Docker ID；不存在返回空。"""
+        raw = await self._inspect_name(
+            gateway_container_name(_workspace(workspace_id)))
+        if raw is None:
+            return ""
+        value = raw.get("Id")
+        return value if isinstance(value, str) else ""
 
     async def inspect(self, *, workspace_id: str,
                       gateway_instance_id: str = "") -> dict:

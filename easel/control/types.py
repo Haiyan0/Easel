@@ -102,6 +102,7 @@ class WorkerHandle:
     gateway_generation: str = ""
     gateway_upstream: str = ""
     gateway_state: str = "disabled"
+    attempt_id: str = ""
     worker_created: bool = False
     gateway_created: bool = False
 
@@ -133,6 +134,7 @@ class WorkerLease:
     gateway_generation: str = ""
     gateway_upstream: str = ""
     gateway_state: str = "disabled"
+    attempt_id: str = ""
 
 
 @dataclass(frozen=True)
