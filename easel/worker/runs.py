@@ -25,7 +25,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 from ..control.types import DomainError, WorkspacePaths
 from ..harnesses.base import RunRequest
@@ -123,7 +122,7 @@ def _attachment_context(paths: WorkspacePaths, conversation_id: str,
         return ""
     outputs = (paths.workspace_root / "outputs").resolve()
     scope = hashlib.sha256(
-        conversation_id.encode("utf-8")).hexdigest()[:20]
+        conversation_id.encode()).hexdigest()[:20]
     rows: list[str] = []
     seen: set[str] = set()
     for attachment in attachments:
@@ -134,7 +133,7 @@ def _attachment_context(paths: WorkspacePaths, conversation_id: str,
             raise _forbidden("attachment_forbidden")
         normalized = relative.as_posix()
         expected = hashlib.sha256(
-            f"{scope}\0{normalized}".encode("utf-8")).hexdigest()[:24]
+            f"{scope}\0{normalized}".encode()).hexdigest()[:24]
         if attachment["id"] != expected:
             raise _forbidden("attachment_forbidden")
         full = (outputs / normalized).resolve()
@@ -210,11 +209,10 @@ def _sensitive_values(snapshot: RunSnapshot) -> tuple[str, ...]:
                 values.add(value)
         elif isinstance(value, Mapping):
             for key, item in value.items():
-                if isinstance(key, str) and any(
+                if (isinstance(key, str) and any(
                         marker in key.upper()
-                        for marker in ("TOKEN", "SECRET", "KEY", "PASSWORD")):
-                    collect(item)
-                elif isinstance(item, Mapping):
+                        for marker in ("TOKEN", "SECRET", "KEY", "PASSWORD"))
+                        or isinstance(item, Mapping)):
                     collect(item)
 
     collect(snapshot.routes)
@@ -1011,6 +1009,7 @@ class RunManager:
         self._questions: dict[tuple[str, str], asyncio.Future] = {}
         self._active_conversations: dict[str, str] = {}
         self._closing = False
+        self._draining = False
         if recover:
             self.registry.recover_inflight()
             # 已保存输出但尚未提交 done 的 Run：补提交，消息按 runId 去重。
@@ -1019,6 +1018,17 @@ class RunManager:
             self._recover_orphan_outputs()
 
     # -- 公开只读接口 ------------------------------------------------------
+
+    def active_runs(self) -> int:
+        """真实在途 Run 数；SSE/请求断开不影响该计数。"""
+        return sum(1 for task in self._tasks.values() if not task.done())
+
+    def begin_drain(self) -> None:
+        """停止接纳新 Run；已接纳的 supervisor 继续执行。"""
+        self._draining = True
+
+    def is_draining(self) -> bool:
+        return self._draining
 
     def state(self, run_id: str) -> str | None:
         return self.registry.state(run_id)
@@ -1099,6 +1109,8 @@ class RunManager:
 
     async def submit(self, run_id: str, envelope: object,
                      request: object) -> dict:
+        if self._draining:
+            raise DomainError("worker_draining", 503)
         envelope, snapshot, normalized = self._verify(
             run_id, envelope, request)
         admission = self.registry.admit(
@@ -1112,10 +1124,10 @@ class RunManager:
                     "duplicate": True}
         try:
             context, run_request = self._prepare(snapshot, normalized)
-        except DomainError as error:
+        except DomainError:
             self.registry.finish_if_active(
                 run_id, "failed", "admission_rejected")
-            raise error
+            raise
         task = asyncio.create_task(
             self._supervise(context, run_request),
             name=f"easel-run:{run_id}")
@@ -1310,7 +1322,7 @@ class RunManager:
                 run_id, "failed", error.code)
             self._release(context)
             return
-        except Exception:
+        except Exception:  # noqa: BLE001 - 适配器边界统一收敛失败
             emit("error", "Agent 执行失败，请检查本机 CLI、登录和模型配置")
             self.registry.finish_if_active(run_id, "failed", "agent_failed")
             self._release(context)
@@ -1344,7 +1356,7 @@ class RunManager:
             self._sessions.append_message_once(
                 context.conversation_id, run_id,
                 {"role": "assistant", "content": text, "runId": run_id})
-        except Exception:
+        except Exception:  # noqa: BLE001 - 输出保存失败必须收敛
             self.registry.append_event(run_id, "error", "输出保存失败")
             self.registry.finish_finalizing(
                 run_id, "failed", "output_storage_failed")
@@ -1438,7 +1450,7 @@ class RunManager:
                     conversation_id, run_id,
                     {"role": "assistant", "content": content,
                      "runId": run_id})
-            except Exception:
+            except Exception:  # noqa: BLE001 - 恢复输出保存失败必须收敛
                 self.registry.finish_finalizing(
                     run_id, "failed", "output_storage_failed")
                 # 提交未成功：保留暂存输出供审查/人工恢复，不能当垃圾删除

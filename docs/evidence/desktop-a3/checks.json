@@ -1,0 +1,33 @@
+{
+  "task": "A3",
+  "baseline": "81589c0f24f3507b954e46b37ce85d181c619520",
+  "image": "sha256:45022743e7d378c516e2b03ddf5a6c64c42e8029bb7d17c42416279ad3d25da8",
+  "entry": ["python", "-m", "easel.worker.server", "serve", "--host", "0.0.0.0", "--port", "7860"],
+  "uid": 10001,
+  "gid": 10001,
+  "public_key_mount": "/keys/worker-public.key",
+  "public_key_env": "EASEL_WORKER_PUBLIC_KEY_FILE",
+  "health_probe": "fixed docker exec healthcheck with execution_capable=true",
+  "persistence": {
+    "mnt_c": {"create": true, "sqlite_read": true, "lock_cross_process": true, "fsync": true, "atomic_replace": true, "restart_verify": true, "symlink_escape_detected": true},
+    "wsl_ext4_tmp": {"create": true, "sqlite_read": true, "lock_cross_process": true, "fsync": true, "atomic_replace": true, "restart_verify": true, "symlink_escape_detected": true},
+    "selected_root": "/mnt/c"
+  },
+  "tests": {
+    "real_worker": {"result": "1 passed", "seconds": 441.60},
+    "affected_units": {"result": "299 passed, 1 skipped"},
+    "desktop_docs_topology": {"result": "61 passed, 5 skipped"},
+    "container_isolation_non_chromium": {"result": "7 passed, 2 deselected"},
+    "ruff": "passed",
+    "json": "passed"
+  },
+  "cleanup": {
+    "a3_containers_remaining": 0,
+    "a3_networks_remaining": 0,
+    "named_clients_remaining": 0,
+    "wsl_temp_remaining": 0,
+    "global_prune": false,
+    "developer_resources_touched": false
+  },
+  "not_run": ["real DeepSeek Harness/provider", "gateway", "A4", "Chromium sandbox", "full multiuser chat"]
+}

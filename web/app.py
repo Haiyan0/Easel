@@ -773,6 +773,8 @@ async def _lifespan(_app: FastAPI):
         await asyncio.gather(*tasks, return_exceptions=True)
     from easel.harnesses.rpc import close_sessions
     await close_sessions()
+    if _RUNS is not None:
+        await _RUNS.aclose()
     _HARNESS_LOOP = None
     _stop_mp_login_on_shutdown()
 

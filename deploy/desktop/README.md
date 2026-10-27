@@ -12,7 +12,7 @@
 |---|---|---|
 | WSL2 宿主 provisioner 调用 Docker | 可用；Ubuntu-26.04 内 Docker CLI 使用 `/var/run/docker.sock` 指向同一 Docker Desktop Engine | 保留 |
 | control 容器使用现有 Unix socket 协议 | **可用**：WSL `/tmp` socket 挂载进容器，UID 10001 + 补充组 1000，`SO_PEERCRED` 正确报告 10001 | 固定契约 |
-| WSL/Windows 宿主到 worker 容器 IP 的 HTTP | **不可用**：TCP 可能显示已连接，但 HTTP 请求超时；不能作为健康探测 | 改为固定 `docker exec` healthcheck，待批准 |
+| WSL/Windows 宿主到 worker 容器 IP 的 HTTP | **不可用**：TCP 可能显示已连接，但 HTTP 请求超时；不能作为健康探测 | A3 已改为固定 `docker exec` healthcheck |
 | 当前 control 网络到 worker 容器 | **不可达**：独立 bridge 到内部 worker 网络超时 | 不能直接沿用 |
 | 直接把 control 加入 worker 网络 | control→worker 可达，但 worker→control 也可达 | 拒绝，作为反例记录 |
 | 新增每 workspace 管理中继 | 推荐方案；避免 control 加入每个 worker 网络，并保持 control 无 Docker socket | **仅提交设计，不实现** |
@@ -86,7 +86,7 @@
   根并记录 Windows 备份方式；`/tmp` 永远不作为持久 workspace 根。本轮只
   证明 bind 可见性，不把 marker 可读当成持久性验收。
 
-## 4. 健康探测契约（待批准）
+## 4. 健康探测契约（A3 已实现）
 
 WSL 宿主和 Windows 宿主到 worker 容器 IP 的 HTTP 健康请求均实测超时；TCP
 连接成功不能证明 HTTP、身份或就绪。当前 provisioner 的 `_probe` 使用
@@ -96,14 +96,32 @@ WSL 宿主和 Windows 宿主到 worker 容器 IP 的 HTTP 健康请求均实测�
 提案（**未实现**）：
 
 - 使用固定命令从 provisioner 侧执行：
-  `docker exec <worker> python -m easel.worker.lifecycle healthcheck --port 7860`
+  `docker exec <worker> python -m easel.worker.server healthcheck --port 7860`
 - 目标必须是已核验 worker inspect 的不可复用 container_id，不能只用容器名；
   固定 argv、10 秒超时；退出 0 还必须由 healthcheck 返回的 workspace/
   config_version/container_id/ready 全部匹配，任意退出 0 不算通过。
-- A3 执行能力接入后，healthcheck 还要验证真实 Run 路由/身份，而非只验证
-  lifecycle-only 入口；只通过 lifecycle check 不得标记执行能力 ready。
+- A3 合入的 healthcheck 已验证 execution_capable；真实 Run 路由/身份由
+  真实协议测试覆盖。只通过 lifecycle-only check 不得标记执行能力 ready。
 - 若主审不接受 `docker exec`，替代方案必须是宿主本地受控代理；不能把
   WSL/Windows 宿主直连容器 IP 写成已通过。
+
+## 4.1 A3 执行 worker 状态（2026-10-27）
+
+- 最终 execution 测试镜像：`sha256:45022743e7d378c516e2b03ddf5a6c64c42e8029bb7d17c42416279ad3d25da8`。
+- 固定入口：`python -m easel.worker.server serve --host 0.0.0.0 --port 7860`；
+  UID/GID 10001；单一进程同时提供 lifecycle 和既有 `/internal/runs` 路由。
+- 公钥：管理员固定文件只读挂载到 `/keys/worker-public.key`，环境
+  `EASEL_WORKER_PUBLIC_KEY_FILE` 指向该固定路径；私钥只在测试签发端/未来
+  control，不进入 worker。
+- provisioner 固定 exec：`docker exec <不可复用 container_id> python -m
+  easel.worker.server healthcheck --port 7860`，10 秒超时；输出最小 JSON，
+  校验 workspace/config_version/container_id/ready/execution_capable，不含
+  token。
+- 持久路径预检（UID 10001）在 `/mnt/c` 与 WSL ext4 临时根均实测通过
+  创建、SQLite/WAL、跨进程 flock、fsync、原子替换、重开数据；`/mnt/c`
+  被选为 Desktop 持久根。
+- 真实容器协议（签名测试快照 + ACP 夹具）通过提交/重复/事件/问题回答/
+  停止/重建历史；夹具不是真实 DSH。gateway 仍未实现，A4 未开始。
 
 ## 5. control→worker 网络契约（设计，待批准）
 

@@ -208,6 +208,7 @@ _RULES: tuple[_Route, ...] = (
 
     # worker 内部接口：只允许已验证服务凭证 + 逐 Run 签名的 relay 调用；
     # control 自身的 authorize 对其它身份一律拒绝。
+    _route("GET", r"^/internal/lifecycle/health$", INTERNAL),
     _route("POST", r"^/internal/runs/([^/]+)$", INTERNAL, "run", 1),
     _route("GET", r"^/internal/runs/([^/]+)/events$", INTERNAL, "run", 1),
     _route("POST", r"^/internal/runs/([^/]+)/stop$", INTERNAL, "run", 1),

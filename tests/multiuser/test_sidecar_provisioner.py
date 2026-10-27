@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from easel.control.runtime import RuntimeManager, RuntimeUnavailable
 from easel.control.store import Store
@@ -34,6 +35,12 @@ SIDECAR_NETWORK = "easel-control"
 UPSTREAM = "control:7861"
 
 
+def _write_public_key(path):
+    path.write_bytes(Ed25519PrivateKey.generate().public_key()
+                     .public_bytes_raw())
+    return path
+
+
 def _settings(tmp_path, *, sidecar=True):
     policy = tmp_path / "policies" / "egress.json"
     policy.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +51,8 @@ def _settings(tmp_path, *, sidecar=True):
         quota_mode="none", allow_unquotaed=True,
         sidecar_network=SIDECAR_NETWORK if sidecar else "",
         sidecar_policy=policy if sidecar else None,
-        broker_upstream=UPSTREAM if sidecar else "")
+        broker_upstream=UPSTREAM if sidecar else "",
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"))
 
 
 def _ok(stdout: str = "") -> subprocess.CompletedProcess:
@@ -59,15 +67,19 @@ def _not_found(target: str) -> subprocess.CompletedProcess:
 def _worker_container(root: pathlib.Path, env: list[str] | None = None,
                       workspace: str = WORKSPACE) -> dict:
     paths = provisioner.prepare_workspace(root, workspace)
+    public_key = _write_public_key(root.parent / "worker.pub")
+    env_list = list(env or ["EASEL_SERVICE_TOKEN=old-token"])
+    if not any(line.startswith("EASEL_WORKER_PUBLIC_KEY_FILE=")
+               for line in env_list):
+        env_list.append("EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key")
     return {
         "Id": "1" * 64,
         "Name": "/" + provisioner.container_name(workspace),
         "Config": {
             "User": "10001:10001", "Image": IMAGE, "Entrypoint": None,
-            "Cmd": ["python", "-m", "easel.worker.lifecycle", "serve",
-                    "--host", "0.0.0.0", "--port", "7860"],
+            "Cmd": list(provisioner.WORKER_COMMAND),
             "Labels": provisioner.workload_labels(workspace, 1),
-            "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
+            "Env": env_list,
         },
         "State": {"Running": True, "Health": {"Status": "healthy"}},
         "HostConfig": {
@@ -87,6 +99,8 @@ def _worker_container(root: pathlib.Path, env: list[str] | None = None,
              "Destination": "/workspace", "RW": True},
             {"Type": "bind", "Source": str(paths.home),
              "Destination": "/home/easel", "RW": True},
+            {"Type": "bind", "Source": str(public_key),
+             "Destination": "/keys/worker-public.key", "RW": False},
         ],
         "NetworkSettings": {
             "Ports": {},
@@ -95,6 +109,10 @@ def _worker_container(root: pathlib.Path, env: list[str] | None = None,
                     "IPAddress": "172.30.0.2"}},
         },
     }
+
+
+def _with_public_key(env: list[str]) -> list[str]:
+    return [*env, "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"]
 
 
 def _sidecar_container(policy: pathlib.Path,
@@ -146,7 +164,8 @@ class FakeDocker:
                  sidecar_failure: bool = False,
                  sidecar_stop_failure: bool = False,
                  invalid_sidecar: bool = False,
-                 sidecar_network_internal: bool = False):
+                 sidecar_network_internal: bool = False,
+                 probe_failure: str | None = None):
         self.root = root
         self.policy = policy
         self.workspace = workspace
@@ -154,6 +173,7 @@ class FakeDocker:
         self.sidecar_failure = sidecar_failure
         self.sidecar_stop_failure = sidecar_stop_failure
         self.invalid_sidecar = invalid_sidecar
+        self.probe_failure = probe_failure
         self.sidecar_runs = 0
         self.containers: dict[str, dict] = {}
         self.workspace_network = False
@@ -219,6 +239,23 @@ class FakeDocker:
                 self.root, env=env, workspace=self.workspace)
             self.containers[name] = raw
             return _ok(raw["Id"] + "\n")
+        if args[:1] == ["exec"]:
+            if self.probe_failure == "timeout":
+                raise TimeoutError("probe timed out")
+            if self.probe_failure == "network":
+                raise OSError("probe network unreachable")
+            raw = self.containers.get(
+                provisioner.container_name(self.workspace))
+            config_version = int(
+                raw["Config"]["Labels"]["easel.config-version"])
+            ready = self.probe_failure != "not_ready"
+            return _ok(json.dumps({
+                "workspace_id": self.workspace,
+                "config_version": config_version,
+                "container_id": provisioner.container_name(self.workspace),
+                "ready": ready,
+                "execution_capable": True,
+            }) + "\n")
         if args[:1] == ["stop"]:
             target = args[-1]
             self.stopped.append(target)
@@ -441,7 +478,8 @@ def test_live_wiring_mismatch_preserves_running_worker_on_probe_failure(
     assert rejected.value.code == "worker_wiring_mismatch"
     assert fake.containers[provisioner.container_name(WORKSPACE)] is seeded
     assert seeded["State"]["Running"] is True
-    assert seeded["Config"]["Env"] == ["EASEL_SERVICE_TOKEN=old-token"]
+    assert seeded["Config"]["Env"] == _with_public_key([
+        "EASEL_SERVICE_TOKEN=old-token"])
     assert (paths.workspace / "keep.txt").read_text(
         encoding="utf-8") == "persisted"
     assert fake.removed == []
@@ -485,13 +523,13 @@ def test_running_worker_with_stale_proxy_env_is_not_reused(
     _root, _settings_value, fake, service, _handle = _setup_started(
         tmp_path, monkeypatch)
     worker = fake.containers[provisioner.container_name(WORKSPACE)]
-    worker["Config"]["Env"] = [
+    worker["Config"]["Env"] = _with_public_key([
         "EASEL_SERVICE_TOKEN=old-token",
         "EASEL_BROKER_URL=http://127.0.0.1:8899",
         "HTTP_PROXY=http://127.0.0.1:8898",
         "HTTPS_PROXY=http://127.0.0.1:8898",
         "NO_PROXY=127.0.0.1,localhost",
-    ]
+    ])
 
     with pytest.raises(provisioner.ProvisionerError) as rejected:
         asyncio.run(service.ensure(WORKSPACE, 1))
@@ -557,7 +595,8 @@ def test_inspect_does_not_report_ready_when_worker_wiring_is_stale(
     _root, _settings_value, fake, service, _handle = _setup_started(
         tmp_path, monkeypatch)
     worker = fake.containers[provisioner.container_name(WORKSPACE)]
-    worker["Config"]["Env"] = ["EASEL_SERVICE_TOKEN=old-token"]
+    worker["Config"]["Env"] = _with_public_key([
+        "EASEL_SERVICE_TOKEN=old-token"])
 
     report = asyncio.run(service.inspect(WORKSPACE))
     assert report["ready"] is False

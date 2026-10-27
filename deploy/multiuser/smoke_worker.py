@@ -23,6 +23,7 @@ from typing import NoReturn
 
 REQUIRED_FILES = (
     "web/app.py",
+    "easel/worker/server.py",
     "web/static/index.html",
     "agents/workspace/AGENTS.md",
     "agents/workspace/SOUL.md",

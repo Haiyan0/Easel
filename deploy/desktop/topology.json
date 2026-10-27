@@ -67,14 +67,22 @@
       },
       "windows_native_peer_cred": false
     },
+    "worker_runtime": {
+      "entry": "python -m easel.worker.server serve --host 0.0.0.0 --port 7860",
+      "uid": 10001,
+      "gid": 10001,
+      "public_key_mount": "/keys/worker-public.key:ro",
+      "public_key_env": "EASEL_WORKER_PUBLIC_KEY_FILE",
+      "implemented": true
+    },
     "health_probe": {
       "mode": "docker_exec_required",
-      "implemented": false,
+      "implemented": true,
       "target": "从已核验 worker inspect 取得的不可复用 container_id；不得只用容器名。",
       "command": [
         "python",
         "-m",
-        "easel.worker.lifecycle",
+        "easel.worker.server",
         "healthcheck",
         "--port",
         "7860"

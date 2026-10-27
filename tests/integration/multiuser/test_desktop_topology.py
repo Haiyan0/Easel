@@ -529,8 +529,13 @@ def test_desktop_topology_contract_is_explicit_and_secret_free() -> None:
     assert management["socket"]["peer_cred"]["allowed_uids"] == [10001]
     assert management["socket"]["mode"] == "0660"
     assert management["socket"]["windows_native_peer_cred"] is False
+    runtime = management["worker_runtime"]
+    assert runtime["implemented"] is True
+    assert runtime["uid"] == 10001
+    assert "easel.worker.server" in runtime["entry"]
+    assert runtime["public_key_mount"] == "/keys/worker-public.key:ro"
     assert management["health_probe"]["mode"] == "docker_exec_required"
-    assert management["health_probe"]["implemented"] is False
+    assert management["health_probe"]["implemented"] is True
     assert "container_id" in management["health_probe"]["target"]
     assert management["health_probe"]["timeout_seconds"] == 10
     assert "任意退出 0" in management["health_probe"]["success"]

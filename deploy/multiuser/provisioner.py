@@ -35,7 +35,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
 
 from easel.control.types import WorkerHandle
 
@@ -49,6 +48,11 @@ HEALTH_POLL_SECONDS = 0.5
 HEALTH_REQUEST_TIMEOUT = 3.0
 
 WORKER_PORT = 7860
+WORKER_PUBLIC_KEY_PATH = "/keys/worker-public.key"
+WORKER_HEALTHCHECK_COMMAND = (
+    "python", "-m", "easel.worker.server", "healthcheck",
+    "--port", str(WORKER_PORT),
+)
 WORKER_USER = "10001:10001"
 WORKER_UID = 10001
 WORKER_GID = 10001
@@ -64,7 +68,7 @@ SIDECAR_NANO_CPUS = 1_000_000_000
 SIDECAR_TMPFS = "/tmp:rw,noexec,nosuid,nodev,size=64m"
 SIDECAR_POLICY_CONTAINER_PATH = "/etc/easel/egress-policy.json"
 WORKER_COMMAND = (
-    "python", "-m", "easel.worker.lifecycle",
+    "python", "-m", "easel.worker.server",
     "serve", "--host", "0.0.0.0", "--port", str(WORKER_PORT),
 )
 DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
@@ -505,18 +509,57 @@ def _safe_path_text(path: Path) -> str:
     return text
 
 
+def validate_worker_public_key(path: object) -> Path:
+    """校验管理员固定的只读公钥文件；只接受合法 Ed25519 公钥。"""
+    if path is None:
+        raise _reject("worker_public_key_unavailable")
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise _reject("worker_public_key_invalid")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        raise _reject("worker_public_key_unavailable") from None
+    if not resolved.is_file():
+        raise _reject("worker_public_key_unavailable")
+    _safe_path_text(resolved)
+    try:
+        data = resolved.read_bytes()
+    except OSError:
+        raise _reject("worker_public_key_unavailable") from None
+    if not data or len(data) > 32 * 1024:
+        raise _reject("worker_public_key_invalid")
+    try:
+        if len(data) == 32:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PublicKey)
+            Ed25519PublicKey.from_public_bytes(data)
+        else:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PublicKey)
+            key = serialization.load_pem_public_key(data)
+            if not isinstance(key, Ed25519PublicKey):
+                raise ValueError
+    except (ImportError, ValueError, TypeError):
+        raise _reject("worker_public_key_invalid") from None
+    return resolved
+
+
 def build_run_argv(*, image: str, workspace_id: str, config_version: int,
-                   paths: RuntimePaths, env_file: Path) -> list[str]:
+                   paths: RuntimePaths, env_file: Path,
+                   public_key_file: Path) -> list[str]:
     """从批准配置构造唯一允许的 docker run argv。
 
-    容器代码位于只读镜像 ``/opt/easel``；仅两个持久 bind：``/workspace`` 与
-    ``/home/easel``，来源都经过 prepare_workspace 校验。网络是每空间内部
-    网络（``--internal``），没有宿主端口和默认外网路由。
+    容器代码位于只读镜像 ``/opt/easel``；持久 bind 只有 ``/workspace`` 与
+    ``/home/easel``，公钥只读 bind 到固定路径；网络是每空间内部网络
+    （``--internal``），没有宿主端口和默认外网路由。
     """
     if not isinstance(image, str) or _PINNED_IMAGE.fullmatch(image) is None:
         raise _reject("invalid_image")
     if not _valid_config_version(config_version):
         raise _reject("invalid_config_version")
+    public_key = validate_worker_public_key(public_key_file)
     name = container_name(workspace_id)
     labels = workload_labels(workspace_id, config_version)
     argv = [
@@ -540,6 +583,10 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
         f"type=bind,src={_safe_path_text(paths.workspace)},dst=/workspace",
         "--mount",
         f"type=bind,src={_safe_path_text(paths.home)},dst=/home/easel",
+        "--mount",
+        (f"type=bind,src={_safe_path_text(public_key)},"
+         f"dst={WORKER_PUBLIC_KEY_PATH},readonly"),
+        "--env", f"EASEL_WORKER_PUBLIC_KEY_FILE={WORKER_PUBLIC_KEY_PATH}",
         "--env-file", _safe_path_text(env_file),
         "--restart=no",
         "--stop-timeout=30",
@@ -547,8 +594,7 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
         "--log-opt=max-size=10m",
         "--log-opt=max-file=3",
         image,
-        "python", "-m", "easel.worker.lifecycle",
-        "serve", "--host", "0.0.0.0", "--port", str(WORKER_PORT),
+        *WORKER_COMMAND,
     ])
     return argv
 
@@ -806,7 +852,8 @@ def verify_worker_wiring(raw: dict | None, *, workspace_id: str,
 
 def _verify_worker_static(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
-                          paths: RuntimePaths) -> bool:
+                          paths: RuntimePaths,
+                          public_key_file: Path | None = None) -> bool:
     """核对除运行接线外的静态安全配置。"""
     if not isinstance(raw, dict):
         return False
@@ -829,6 +876,11 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
     if config.get("Entrypoint") not in (None, []):
         return False
     if config.get("Cmd") != list(WORKER_COMMAND):
+        return False
+    env = _worker_env_map(raw)
+    if (env is None
+            or env.get("easel_worker_public_key_file")
+            != WORKER_PUBLIC_KEY_PATH):
         return False
 
     if host.get("ReadonlyRootfs") is not True:
@@ -874,25 +926,37 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
         return False
 
     mounts = raw.get("Mounts")
-    if not isinstance(mounts, list) or len(mounts) != 2:
+    if not isinstance(mounts, list) or len(mounts) != 3:
         return False
     expected_mounts = {
         "/workspace": str(paths.workspace),
         "/home/easel": str(paths.home),
     }
+    expected_key_source = (
+        str(public_key_file) if public_key_file is not None else None)
     seen: dict[str, str] = {}
+    key_seen = False
     for mount in mounts:
         if not isinstance(mount, dict):
             return False
         destination = mount.get("Destination")
         source = mount.get("Source")
+        if destination == WORKER_PUBLIC_KEY_PATH:
+            if (mount.get("Type") != "bind" or mount.get("RW") is not False
+                    or not isinstance(source, str) or not source
+                    or "docker.sock" in source
+                    or (expected_key_source is not None
+                        and source != expected_key_source)):
+                return False
+            key_seen = True
+            continue
         if (mount.get("Type") != "bind" or mount.get("RW") is not True
                 or destination not in expected_mounts
                 or source != expected_mounts[destination]
                 or "docker.sock" in str(source)):
             return False
         seen[destination] = str(source)
-    if set(seen) != set(expected_mounts):
+    if set(seen) != set(expected_mounts) or not key_seen:
         return False
 
     network_settings = raw.get("NetworkSettings")
@@ -930,7 +994,8 @@ def worker_confirmed_exited(raw: dict | None) -> bool:
 def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
                           paths: RuntimePaths,
-                          sidecar_host: str | None = None) -> bool:
+                          sidecar_host: str | None = None,
+                          public_key_file: Path | None = None) -> bool:
     """严格核对实际容器配置；复用、接管、inspect 与健康循环共用同一门槛。
 
     标签只表示归属，不能证明镜像、权限、资源、挂载、网络或运行接线仍是
@@ -938,7 +1003,8 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     """
     if not _verify_worker_static(
             raw, workspace_id=workspace_id,
-            config_version=config_version, image=image, paths=paths):
+            config_version=config_version, image=image, paths=paths,
+            public_key_file=public_key_file):
         return False
     return verify_worker_wiring(
         raw, workspace_id=workspace_id, sidecar_host=sidecar_host)
@@ -1279,6 +1345,7 @@ class ProvisionerSettings:
     sidecar_network: str = ""
     sidecar_policy: Path | None = None
     broker_upstream: str = ""
+    worker_public_key: Path | None = None
 
 
 class Provisioner:
@@ -1290,6 +1357,9 @@ class Provisioner:
         self._runner = run or self._subprocess_run
         self._locks: dict[str, asyncio.Lock] = {}
         self._sidecar = validate_sidecar_settings(settings)
+        self._worker_public_key = (
+            validate_worker_public_key(settings.worker_public_key)
+            if settings.worker_public_key is not None else None)
 
     # -- Docker 调用 ---------------------------------------------------
 
@@ -1571,6 +1641,8 @@ class Provisioner:
 
     async def _ensure_locked(self, workspace_id: str,
                              config_version: int) -> WorkerHandle:
+        if self._worker_public_key is None:
+            raise ProvisionerError("worker_public_key_unavailable")
         paths = await asyncio.to_thread(
             prepare_workspace, self.settings.workspace_root, workspace_id)
         await asyncio.to_thread(ensure_worker_ownership, paths)
@@ -1600,7 +1672,8 @@ class Provisioner:
             if not _verify_worker_static(
                     existing, workspace_id=workspace_id,
                     config_version=config_version,
-                    image=self.settings.image, paths=paths):
+                    image=self.settings.image, paths=paths,
+                    public_key_file=self._worker_public_key):
                 raise ProvisionerError("container_conflict")
             if not verify_worker_wiring(
                     existing, workspace_id=workspace_id,
@@ -1617,8 +1690,8 @@ class Provisioner:
                 await self._ensure_sidecar(workspace_id)
                 sidecar_ensured = True
                 if report["ready"] and await self._probe(
-                        workspace_id, config_version, report["upstream"],
-                        token):
+                        workspace_id, config_version,
+                        report["instance_id"]):
                     return WorkerHandle(
                         workspace_id, report["instance_id"],
                         report["upstream"], token, config_version)
@@ -1631,7 +1704,8 @@ class Provisioner:
         await asyncio.to_thread(verify_prepared_paths, paths)
         argv = build_run_argv(
             image=self.settings.image, workspace_id=workspace_id,
-            config_version=config_version, paths=paths, env_file=env_file)
+            config_version=config_version, paths=paths, env_file=env_file,
+            public_key_file=self._worker_public_key)
         # build_run_argv 以 run 开头；_docker 自行添加 docker 可执行程序，
         # 必须传完整 argv，不能丢弃 run。
         result = await self._docker(*argv, timeout=60.0)
@@ -1649,12 +1723,13 @@ class Provisioner:
                         raw, workspace_id=workspace_id,
                         config_version=config_version,
                         image=self.settings.image, paths=paths,
-                        sidecar_host=sidecar_host):
+                        sidecar_host=sidecar_host,
+                        public_key_file=self._worker_public_key):
                     raise ProvisionerError("container_conflict")
                 report = sanitize_inspect(raw)
                 if (report["ready"]
                         and await self._probe(workspace_id, config_version,
-                                              report["upstream"], token)):
+                                              report["instance_id"])):
                     return WorkerHandle(workspace_id, report["instance_id"],
                                         report["upstream"], token,
                                         config_version)
@@ -1736,7 +1811,8 @@ class Provisioner:
         if not _verify_worker_static(
                 raw, workspace_id=workspace_id,
                 config_version=report["config_version"],
-                image=self.settings.image, paths=paths):
+                image=self.settings.image, paths=paths,
+                public_key_file=self._worker_public_key):
             raise ProvisionerError("container_conflict")
         sidecar_host = self._sidecar_host(workspace_id)
         wiring_ready = verify_worker_wiring(
@@ -1756,35 +1832,39 @@ class Provisioner:
                 report["ready"] = False
                 return report
             report["ready"] = await self._probe(
-                workspace_id, report["config_version"], report["upstream"],
-                token)
+                workspace_id, report["config_version"],
+                report["instance_id"])
         return report
 
     async def _probe(self, workspace_id: str, config_version: int,
-                     upstream: str, token: str) -> bool:
-        """核对 lifecycle 身份响应；不执行 prompt，不接纳快照。"""
-        if not upstream:
+                     instance_id: str) -> bool:
+        """对不可复用容器 ID 执行固定 healthcheck，不探测宿主到容器 IP。"""
+        if (not isinstance(instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(instance_id) is None):
             return False
-        parsed = urlsplit(upstream)
-        host, port = parsed.hostname, parsed.port
-        if not host or not port:
-            return False
-        headers = {
-            "X-Easel-Workspace-Id": workspace_id,
-            "X-Easel-Service-Token": token,
-        }
         try:
-            payload = await asyncio.to_thread(
-                _http_get_json, host, port, "/internal/lifecycle/health",
-                headers, HEALTH_REQUEST_TIMEOUT)
+            result = await self._docker(
+                "exec", instance_id, *WORKER_HEALTHCHECK_COMMAND,
+                timeout=10.0)
         except Exception:
+            return False
+        if result.returncode != 0:
+            return False
+        lines = [line.strip() for line in str(result.stdout or "").splitlines()
+                 if line.strip()]
+        if not lines:
+            return False
+        try:
+            payload = json.loads(lines[-1])
+        except (TypeError, ValueError):
             return False
         return (
             isinstance(payload, dict)
             and payload.get("workspace_id") == workspace_id
             and payload.get("config_version") == config_version
             and payload.get("container_id") == container_name(workspace_id)
-            and payload.get("ready") is True)
+            and payload.get("ready") is True
+            and payload.get("execution_capable") is True)
 
     # -- Unix socket 服务 ----------------------------------------------
 
@@ -1937,6 +2017,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="宿主侧管理员 egress policy JSON 路径")
     parser.add_argument("--broker-upstream", default="",
                         help="sidecar 转发的 control broker host:port")
+    parser.add_argument("--worker-public-key", required=True,
+                        help="管理员固定的 worker Ed25519 只读公钥文件")
     args = parser.parse_args(argv)
 
     if _PINNED_IMAGE.fullmatch(args.image) is None:
@@ -1962,6 +2044,7 @@ def main(argv: list[str] | None = None) -> int:
         sidecar_policy=(Path(args.sidecar_policy)
                         if args.sidecar_policy else None),
         broker_upstream=args.broker_upstream,
+        worker_public_key=Path(args.worker_public_key),
     )
     try:
         provisioner = Provisioner(settings)

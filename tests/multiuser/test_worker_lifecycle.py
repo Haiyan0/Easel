@@ -13,8 +13,8 @@ from easel.worker.guard import (
     WORKSPACE_ID_ENV,
 )
 from easel.worker.lifecycle import (
-    CONTAINER_ID_ENV,
     CONFIG_VERSION_ENV,
+    CONTAINER_ID_ENV,
     LIFECYCLE_PATH,
     LifecycleDraining,
     RequestCounter,
@@ -69,6 +69,8 @@ def test_payload_contains_identity_and_never_the_service_token():
         "ready": True,
         "draining": False,
         "active_requests": 0,
+        "active_runs": 0,
+        "execution_capable": False,
     }
     assert TOKEN not in repr(payload)
 
@@ -80,9 +82,8 @@ def test_request_counter_blocks_new_requests_while_draining():
     assert counter.snapshot() == (0, False)
     counter.start_drain()
     assert counter.snapshot() == (0, True)
-    with pytest.raises(LifecycleDraining):
-        with counter.track():
-            pass
+    with pytest.raises(LifecycleDraining), counter.track():
+        pass
 
 
 def test_health_endpoint_requires_internal_credentials():
@@ -105,6 +106,8 @@ def test_health_endpoint_requires_internal_credentials():
         "ready": True,
         "draining": False,
         "active_requests": 0,
+        "active_runs": 0,
+        "execution_capable": False,
     }
 
 
@@ -121,3 +124,33 @@ def test_health_endpoint_reports_draining_and_active_requests():
         draining = client.get(LIFECYCLE_PATH, headers=HEADERS).json()
     assert draining["draining"] is True
     assert draining["ready"] is False
+
+
+def test_payload_reports_real_active_runs_and_execution_capability():
+    config = load_lifecycle_config(_env())
+    counter = RequestCounter()
+    payload = build_payload(
+        config, counter, active_runs=2, execution_capable=True)
+    assert payload["active_runs"] == 2
+    assert payload["active_requests"] == 0
+    assert payload["execution_capable"] is True
+    assert payload["ready"] is True
+
+
+def test_lifecycle_only_healthcheck_is_not_a_ready_execution_worker(monkeypatch):
+    from easel.worker import lifecycle
+    config = load_lifecycle_config(_env())
+    payload = build_payload(config, RequestCounter())
+    assert payload["execution_capable"] is False
+
+    class _Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            import json
+            return json.dumps(payload).encode()
+
+    monkeypatch.setattr(lifecycle, "urlopen", lambda *args, **kwargs: _Response())
+    assert lifecycle._healthcheck(config, 7860) == 1

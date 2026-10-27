@@ -101,6 +101,7 @@ RUN chown -R root:root /opt/easel \
 # 不以 base 的 lifecycle health 代替最终执行代码冒烟。
 USER 10001:10001
 RUN python deploy/multiuser/smoke_worker.py --check-files
+CMD ["python", "-m", "easel.worker.server", "serve",      "--host", "0.0.0.0", "--port", "7860"]
 
 # 最终阶段：锁定管理员受管的 DeepSeek Harness commit 与已验收 ACP profile。
 # managed/acp-profile.json 必须由管理员按实际验收结果提供；仓库不伪造。

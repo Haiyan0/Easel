@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 MODULE_PATH = ROOT / "deploy" / "multiuser" / "provisioner.py"
@@ -148,17 +149,9 @@ def _remove_owned_network(workspace_id: str) -> None:
 
 
 @pytest.fixture(scope="session")
-def worker_image() -> str:
-    """构建并固定本次测试镜像到实际 sha256 摘要。"""
-    assert DOCKERFILE.is_file(), "缺少 deploy/multiuser/Dockerfile.worker"
-    result = _docker(
-        "build", "-f", str(DOCKERFILE), "--target", "base",
-        "-t", IMAGE_TAG, str(ROOT), timeout=1800)
-    image_id = _docker(
-        "image", "inspect", "--format", "{{.Id}}", IMAGE_TAG).stdout.strip()
-    if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
-        pytest.fail(f"测试镜像未获得固定摘要：{image_id!r}（构建输出 {result.stdout[-500:]}）")
-    return image_id
+def worker_image(execution_image) -> str:
+    """真实执行入口使用 execution 镜像，而不是 lifecycle-only base。"""
+    return execution_image
 
 
 EXECUTION_TAG = "easel-worker-execution-test:task8-r2"
@@ -170,7 +163,11 @@ def execution_image() -> str:
     _docker(
         "build", "-f", str(DOCKERFILE), "--target", "execution",
         "-t", EXECUTION_TAG, str(ROOT), timeout=1800)
-    return EXECUTION_TAG
+    image_id = _docker(
+        "image", "inspect", "--format", "{{.Id}}", EXECUTION_TAG).stdout.strip()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+        pytest.fail(f"执行测试镜像未获得固定摘要：{image_id!r}")
+    return image_id
 
 
 def test_execution_image_contains_web_skills_and_fake_harness(execution_image):
@@ -283,6 +280,7 @@ class Worker:
     name: str
     network: str
     image: str = ""
+    public_key: pathlib.Path | None = None
 
     def token(self) -> str:
         for line in self.env_file.read_text(encoding="utf-8").splitlines():
@@ -294,6 +292,13 @@ class Worker:
 @dataclass
 class Pair:
     workers: dict[str, Worker]
+
+
+def _public_key(root: pathlib.Path) -> pathlib.Path:
+    path = root.parent / "worker.pub"
+    path.write_bytes(Ed25519PrivateKey.generate().public_key()
+                     .public_bytes_raw())
+    return path
 
 
 def _prepare_worker(root: pathlib.Path, config_version: int,
@@ -313,6 +318,7 @@ def _prepare_worker(root: pathlib.Path, config_version: int,
             "--label", f"easel.workspace-id={workspace_id}", network)
     worker = Worker(workspace_id, config_version, paths, env_file,
                     provisioner.container_name(workspace_id), network, image)
+    worker.public_key = _public_key(root)
     _run_worker(worker)
     return worker
 
@@ -321,7 +327,7 @@ def _run_worker(worker: Worker) -> None:
     argv = provisioner.build_run_argv(
         image=worker.image, workspace_id=worker.workspace_id,
         config_version=worker.config_version, paths=worker.paths,
-        env_file=worker.env_file)
+        env_file=worker.env_file, public_key_file=worker.public_key)
     _docker(*argv, timeout=120)
     _wait_ready(worker.name, worker.workspace_id, worker.config_version)
 
@@ -372,7 +378,8 @@ def test_container_security_and_resource_boundaries(workers, worker_image):
 
     mount_map = {item["Destination"]: item["Source"]
                  for item in raw["Mounts"]}
-    assert set(mount_map) == {"/workspace", "/home/easel"}
+    assert set(mount_map) == {
+        "/workspace", "/home/easel", "/keys/worker-public.key"}
     assert not any("docker.sock" in source for source in mount_map.values())
 
     assert _exec(worker.name, "id", "-u").stdout.strip() == "10001"
@@ -437,7 +444,9 @@ def test_lifecycle_requires_workspace_credentials(workers):
                           worker.config_version)
     assert set(payload) == {
         "workspace_id", "config_version", "container_id", "ready",
-        "draining", "active_requests"}
+        "draining", "active_requests", "active_runs",
+        "execution_capable"}
+    assert payload["execution_capable"] is True
     assert payload["container_id"] == worker.name
     assert payload["active_requests"] == 0
 
@@ -553,6 +562,8 @@ spec.loader.exec_module(module)
 WORKSPACE = "a" * 32
 SOCKET = "/run/easel/provisioner.sock"
 IMAGE = "sha256:" + "b" * 64
+PUBLIC_KEY = pathlib.Path("/check/worker.pub")
+PUBLIC_KEY.write_bytes(b"\x00" * 32)
 CONTEXT_NOT_FOUND = (
     "Failed to initialize: unable to resolve docker endpoint: "
     'context "codex-review-absent-context-20261021": context not found:\n'
@@ -586,7 +597,8 @@ async def main():
     settings = module.ProvisionerSettings(
         image=IMAGE, workspace_root=pathlib.Path("/work"),
         socket_path=pathlib.Path(SOCKET), quota_mode="none",
-        allow_unquotaed=True, allowed_uids=frozenset({0}))
+        allow_unquotaed=True, allowed_uids=frozenset({0}),
+        worker_public_key=PUBLIC_KEY)
     service = module.Provisioner(settings, run=fake)
     task = asyncio.create_task(service.serve())
     for _ in range(100):
@@ -668,10 +680,10 @@ async def main():
                     "User": "10001:10001",
                     "Image": IMAGE,
                     "Entrypoint": None,
-                    "Cmd": ["python", "-m", "easel.worker.lifecycle",
-                            "serve", "--host", "0.0.0.0", "--port", "7860"],
+                    "Cmd": list(module.WORKER_COMMAND),
                     "Labels": module.workload_labels(workspace_id, 1),
-                    "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
+                    "Env": [*(env or ["EASEL_SERVICE_TOKEN=old-token"]),
+                            "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"],
                 },
                 "State": {"Running": True, "Health": {"Status": "healthy"}},
                 "HostConfig": {
@@ -699,6 +711,8 @@ async def main():
                      "Destination": "/workspace", "RW": True},
                     {"Type": "bind", "Source": str(paths.home),
                      "Destination": "/home/easel", "RW": True},
+                    {"Type": "bind", "Source": str(PUBLIC_KEY),
+                     "Destination": "/keys/worker-public.key", "RW": False},
                 ],
                 "NetworkSettings": {
                     "Ports": {},

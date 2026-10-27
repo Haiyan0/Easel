@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from easel.control.runtime import RuntimeManager
 from easel.control.store import Store
@@ -28,6 +29,12 @@ def _load_provisioner():
 
 provisioner = _load_provisioner()
 IMAGE = "sha256:" + "b" * 64
+
+
+def _write_public_key(path: pathlib.Path) -> pathlib.Path:
+    path.write_bytes(Ed25519PrivateKey.generate().public_key()
+                     .public_bytes_raw())
+    return path
 
 
 class Clock:
@@ -79,6 +86,12 @@ class FakeDocker:
     def _container(self, workspace_id: str,
                    env: list[str] | None = None) -> dict:
         paths = provisioner.prepare_workspace(self.root, workspace_id)
+        public_key = _write_public_key(self.root.parent / "worker.pub")
+        env_list = list(env or ["EASEL_SERVICE_TOKEN=old-token"])
+        if not any(line.startswith("EASEL_WORKER_PUBLIC_KEY_FILE=")
+                   for line in env_list):
+            env_list.append(
+                "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key")
         return {
             "Id": f"{self.serial:064x}",
             "Name": "/" + provisioner.container_name(workspace_id),
@@ -86,10 +99,9 @@ class FakeDocker:
                 "User": "10001:10001",
                 "Image": IMAGE,
                 "Entrypoint": None,
-                "Cmd": ["python", "-m", "easel.worker.lifecycle",
-                        "serve", "--host", "0.0.0.0", "--port", "7860"],
+                "Cmd": list(provisioner.WORKER_COMMAND),
                 "Labels": provisioner.workload_labels(workspace_id, 1),
-                "Env": list(env or ["EASEL_SERVICE_TOKEN=old-token"]),
+                "Env": env_list,
             },
             "State": {"Running": True, "Health": {"Status": "healthy"}},
             "HostConfig": {
@@ -117,6 +129,8 @@ class FakeDocker:
                  "Destination": "/workspace", "RW": True},
                 {"Type": "bind", "Source": str(paths.home),
                  "Destination": "/home/easel", "RW": True},
+                {"Type": "bind", "Source": str(public_key),
+                 "Destination": "/keys/worker-public.key", "RW": False},
             ],
             "NetworkSettings": {
                 "Ports": {},
@@ -162,6 +176,17 @@ class FakeDocker:
             env = env_path.read_text(encoding="utf-8").splitlines()
             self.container = self._container(self.workspace_id, env)
             return self._ok(self.container["Id"] + "\n")
+        if args[:1] == ["exec"]:
+            config_version = int(
+                self.container["Config"]["Labels"]["easel.config-version"])
+            return self._ok(json.dumps({
+                "workspace_id": self.workspace_id,
+                "config_version": config_version,
+                "container_id": provisioner.container_name(
+                    self.workspace_id),
+                "ready": True,
+                "execution_capable": True,
+            }) + "\n")
         if args[:1] == ["stop"]:
             target = args[-1]
             self.stop_ids.append(target)
@@ -195,7 +220,8 @@ def _service(root: pathlib.Path, fake: FakeDocker) -> object:
     settings = provisioner.ProvisionerSettings(
         image=IMAGE, workspace_root=root,
         socket_path=root.parent / "provisioner.sock",
-        quota_mode="none", allow_unquotaed=True)
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(root.parent / "worker.pub"))
     return provisioner.Provisioner(settings, run=fake)
 
 

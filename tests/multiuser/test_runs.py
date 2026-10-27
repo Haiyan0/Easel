@@ -1333,3 +1333,41 @@ def test_acp_permission_text_is_scrubbed_but_choice_maps(tmp_path):
         await manager.aclose()
 
     asyncio.run(scenario())
+
+
+def test_run_manager_active_runs_and_drain_gate(tmp_path):
+    paths = make_paths(tmp_path)
+    private = Ed25519PrivateKey.generate()
+    executor = PausingExecutor(
+        natives={"session-a": "native-a"}, answers={}, chunks={})
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths,
+        public_key=private.public_key(), executor=executor,
+        clock=lambda: CLOCK, recover=False)
+    envelope = sign(
+        private, run_id="run-drain", session_id="session-a",
+        message="drain", routes={}, agent={"runtime": "acp",
+                                           "command": ["fixture-acp"]})
+    request = request_for("session-a", "drain", envelope)
+
+    async def scenario():
+        assert manager.active_runs() == 0
+        first = await manager.submit("run-drain", envelope, request)
+        assert first["duplicate"] is False
+        await asyncio.wait_for(executor.event("run-drain").wait(), 2)
+        assert manager.active_runs() == 1
+        manager.begin_drain()
+        second = sign(
+            private, run_id="run-drain-2", session_id="session-b",
+            message="blocked", routes={},
+            agent={"runtime": "acp", "command": ["fixture-acp"]})
+        with pytest.raises(DomainError) as rejected:
+            await manager.submit(
+                "run-drain-2", second,
+                request_for("session-b", "blocked", second))
+        assert rejected.value.code == "worker_draining"
+        executor.gate("run-drain").set()
+        await asyncio.wait_for(executor.done("run-drain").wait(), 2)
+        await wait_until(lambda: manager.active_runs() == 0)
+
+    asyncio.run(scenario())

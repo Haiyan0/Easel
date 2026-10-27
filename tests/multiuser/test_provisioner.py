@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy" / "multiuser" / "provisioner.py"
@@ -198,9 +199,10 @@ def test_build_run_argv_hardens_the_container_without_secrets_in_argv(
     root.mkdir()
     paths = provisioner.prepare_workspace(root, WORKSPACE)
     env_file = provisioner.credentials_dir(root) / f"{WORKSPACE}.env"
+    public_key = _write_public_key(tmp_path / "worker.pub")
     argv = provisioner.build_run_argv(
         image=IMAGE, workspace_id=WORKSPACE, config_version=3, paths=paths,
-        env_file=env_file)
+        env_file=env_file, public_key_file=public_key)
 
     joined = "\n".join(argv)
     assert argv[:2] == ["run", "-d"]
@@ -224,8 +226,9 @@ def test_build_run_argv_hardens_the_container_without_secrets_in_argv(
     assert "--publish" not in joined and "\n-p\n" not in joined
     assert "docker.sock" not in joined
     assert "EASEL_SERVICE_TOKEN" not in joined
-    assert argv[-8:] == ["python", "-m", "easel.worker.lifecycle",
-                         "serve", "--host", "0.0.0.0", "--port", "7860"]
+    assert argv[-8:] == list(provisioner.WORKER_COMMAND)
+    assert "type=bind,src=" + str(public_key) +         ",dst=/keys/worker-public.key,readonly" in argv
+    assert "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key" in argv
     assert argv[argv.index(IMAGE) + 1:][:1] == ["python"]
     labels = provisioner.workload_labels(WORKSPACE, 3)
     assert labels == {
@@ -245,7 +248,8 @@ def test_build_run_argv_rejects_unpinned_images(tmp_path):
         with pytest.raises(provisioner.ProvisionerError):
             provisioner.build_run_argv(
                 image=image, workspace_id=WORKSPACE, config_version=3,
-                paths=paths, env_file=tmp_path / "env")
+                paths=paths, env_file=tmp_path / "env",
+                public_key_file=_write_public_key(tmp_path / "worker.pub"))
 
 
 def test_peer_authorization_rejects_unknown_or_unavailable_credentials():
@@ -367,9 +371,16 @@ def _not_found(target: str) -> subprocess.CompletedProcess:
     return _fail(f"Error: No such object: {target}\n")
 
 
+def _write_public_key(path: pathlib.Path) -> pathlib.Path:
+    path.write_bytes(Ed25519PrivateKey.generate().public_key()
+                     .public_bytes_raw())
+    return path
+
+
 def _valid_container(root: pathlib.Path, config_version: int = 3,
                      image: str = IMAGE) -> dict:
     paths = provisioner.prepare_workspace(root, WORKSPACE)
+    public_key = _write_public_key(root.parent / "worker.pub")
     return {
         "Id": "f" * 64,
         "Name": "/" + provisioner.container_name(WORKSPACE),
@@ -377,9 +388,9 @@ def _valid_container(root: pathlib.Path, config_version: int = 3,
             "User": "10001:10001",
             "Image": image,
             "Entrypoint": None,
-            "Cmd": ["python", "-m", "easel.worker.lifecycle",
-                    "serve", "--host", "0.0.0.0", "--port", "7860"],
-            "Env": ["EASEL_SERVICE_TOKEN=super-secret"],
+            "Cmd": list(provisioner.WORKER_COMMAND),
+            "Env": ["EASEL_SERVICE_TOKEN=super-secret",
+                    "EASEL_WORKER_PUBLIC_KEY_FILE=/keys/worker-public.key"],
             "Labels": provisioner.workload_labels(WORKSPACE, config_version),
         },
         "State": {"Running": True, "Health": {"Status": "healthy"}},
@@ -408,6 +419,8 @@ def _valid_container(root: pathlib.Path, config_version: int = 3,
              "Destination": "/workspace", "RW": True},
             {"Type": "bind", "Source": str(paths.home),
              "Destination": "/home/easel", "RW": True},
+            {"Type": "bind", "Source": str(public_key),
+             "Destination": "/keys/worker-public.key", "RW": False},
         ],
         "NetworkSettings": {
             "Ports": {},
@@ -458,6 +471,7 @@ class FakeDocker:
         self.inspect_stdout = inspect_stdout
         self.instance_inspect_stdout = instance_inspect_stdout
         self.network_inspect_stdout = network_inspect_stdout
+        self.exec_payload: dict | None = None
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
         self.removed: list[str] = []
@@ -504,6 +518,18 @@ class FakeDocker:
                                                    "", "")
             self.container = self.after_run or _valid_container(self.root)
             return _ok("fake-container-id\n")
+        if args[:1] == ["exec"]:
+            payload = self.exec_payload or {
+                "workspace_id": WORKSPACE,
+                "config_version": int(
+                    self.container["Config"]["Labels"].get(
+                        "easel.config-version", "3"))
+                if self.container is not None else 3,
+                "container_id": provisioner.container_name(WORKSPACE),
+                "ready": True,
+                "execution_capable": True,
+            }
+            return _ok(json.dumps(payload) + "\n")
         if args[:1] == ["stop"]:
             target = args[-1]
             self.stopped.append(target)
@@ -536,7 +562,8 @@ def _settings(tmp_path: pathlib.Path) -> object:
     return provisioner.ProvisionerSettings(
         image=IMAGE, workspace_root=tmp_path / "root",
         socket_path=tmp_path / "provisioner.sock",
-        quota_mode="none", allow_unquotaed=True)
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"))
 
 
 def _fake_health(monkeypatch):
@@ -1049,3 +1076,68 @@ def test_ownership_rejects_state_replaced_after_prepare(tmp_path, monkeypatch):
     assert recorded == [], "不得对已替换路径执行特权 chown"
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
     assert outside.is_dir() and not (outside / "state").exists()
+
+
+def test_health_probe_uses_immutable_exec_target_and_execution_capability(
+        tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root)
+    fake.container = _valid_container(root)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+    assert asyncio.run(service._probe(WORKSPACE, 3, "f" * 64)) is True
+    exec_calls = [call for call in fake.calls if call[1:2] == ["exec"]]
+    assert exec_calls
+    call = exec_calls[-1]
+    assert call[2] == "f" * 64
+    assert call[3:6] == ["python", "-m", "easel.worker.server"]
+    assert call[-1] == "healthcheck" or "healthcheck" in call
+    fake.exec_payload = {
+        "workspace_id": WORKSPACE,
+        "config_version": 3,
+        "container_id": provisioner.container_name(WORKSPACE),
+        "ready": True,
+    }
+    assert asyncio.run(service._probe(WORKSPACE, 3, "f" * 64)) is False
+
+
+def test_lifecycle_only_mount_or_missing_public_key_is_not_adopted(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    key = _write_public_key(tmp_path / "worker.pub")
+    raw = _valid_container(root)
+    raw["Mounts"] = [mount for mount in raw["Mounts"]
+                     if mount["Destination"] != "/keys/worker-public.key"]
+    raw["Config"]["Env"] = [
+        item for item in raw["Config"]["Env"]
+        if not item.startswith("EASEL_WORKER_PUBLIC_KEY_FILE=")]
+    assert provisioner.verify_worker_inspect(
+        raw, workspace_id=WORKSPACE, config_version=3, image=IMAGE,
+        paths=provisioner.prepare_workspace(root, WORKSPACE),
+        public_key_file=key) is False
+
+
+def test_worker_public_key_validation_rejects_missing_and_invalid(tmp_path):
+    with pytest.raises(provisioner.ProvisionerError) as missing:
+        provisioner.validate_worker_public_key(tmp_path / "missing.pub")
+    assert missing.value.code == "worker_public_key_unavailable"
+    invalid = tmp_path / "invalid.pub"
+    invalid.write_bytes(b"not-a-public-key")
+    with pytest.raises(provisioner.ProvisionerError) as bad:
+        provisioner.validate_worker_public_key(invalid)
+    assert bad.value.code == "worker_public_key_invalid"
+
+
+def test_ensure_without_public_key_fails_before_docker(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root)
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=root,
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True)
+    service = provisioner.Provisioner(settings, run=fake)
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_public_key_unavailable"
+    assert fake.calls == []

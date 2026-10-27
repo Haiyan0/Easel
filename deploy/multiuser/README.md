@@ -313,8 +313,9 @@ worker 不挂载控制卷。一次性初始化助手只处理这三个卷，目�
   `socket.AF_UNIX`。本轮的 Linux 容器测试已覆盖 socket 权限、注入拒绝、
   `SO_PEERCRED` 未授权拒绝与 `UnixProvisionerClient` 解码；尚未在 Windows
   宿主启动完整 control 服务进程走同一链路。
-- **宿主 provisioner → 容器 IP 健康探测**：集成测试经 `docker exec` 从容器
-  内探测；Docker Desktop 的 VM 网络不提供宿主直达容器 IP 的等价路径。
+- **宿主 provisioner → 容器 IP 健康探测**：A3 已改为对不可复用 container_id
+  执行固定 `docker exec ... easel.worker.server healthcheck`，不再使用宿主
+  HTTP；真实 Docker 验收通过。宿主到容器 IP 的 HTTP 路径仍不可用。
 - **最终 runtime 镜像**：缺少管理员已验收的 `DSH_COMMIT` 与
   `managed/acp-profile.json`，未构建 Harness/Chromium 最终镜像。`execution`
   阶段构建冒烟只证明文件/依赖/worker 参数/子进程启动，不证明真实 DSH

@@ -137,6 +137,7 @@ def test_workspace_routes_allowed_for_both_roles():
     ("POST", "/api/upload"),
     ("POST", "/api/chat/stream"),
     ("GET", "/api/outputs"),
+    ("GET", "/internal/lifecycle/health"),
 ])
 def test_worker_allows_public_and_workspace_routes(method, path):
     assert worker_allowed(method, path) is True

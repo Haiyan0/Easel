@@ -17,9 +17,9 @@ import re
 import signal
 import sys
 import threading
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Mapping
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
@@ -27,9 +27,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from easel.control.types import DomainError
-from easel.worker.guard import (SERVICE_TOKEN_ENV, SERVICE_TOKEN_HEADER,
-                                WORKSPACE_HEADER, WORKSPACE_ID_ENV,
-                                load_worker_identity, verify_worker_request)
+from easel.worker.guard import (
+    SERVICE_TOKEN_HEADER,
+    WORKSPACE_HEADER,
+    load_worker_identity,
+    verify_worker_request,
+)
 
 CONFIG_VERSION_ENV = "EASEL_CONFIG_VERSION"
 CONTAINER_ID_ENV = "EASEL_CONTAINER_ID"
@@ -111,8 +114,10 @@ def load_lifecycle_config(
 
 
 def build_payload(config: LifecycleConfig,
-                  counter: RequestCounter) -> dict[str, object]:
-    """身份 + 版本 + 活动请求数；永远不含服务 token。"""
+                  counter: RequestCounter, *,
+                  active_runs: int = 0,
+                  execution_capable: bool = False) -> dict[str, object]:
+    """身份 + 版本 + 活动 HTTP/Run 数 + 执行能力；不含服务 token。"""
     active, draining = counter.snapshot()
     return {
         "workspace_id": config.workspace_id,
@@ -121,6 +126,8 @@ def build_payload(config: LifecycleConfig,
         "ready": not draining,
         "draining": draining,
         "active_requests": active,
+        "active_runs": int(active_runs),
+        "execution_capable": bool(execution_capable),
     }
 
 
@@ -145,7 +152,7 @@ def create_lifecycle_app(config: LifecycleConfig,
 
 def _install_drain_signals(counter: RequestCounter) -> None:
     """容器收到 SIGTERM 时先进入 draining，让 health 立刻报告不可接新任务。"""
-    def handler(signum, frame):  # noqa: ARG001 - signal 回调签名固定
+    def handler(signum, frame):
         counter.start_drain()
 
     for name in ("SIGTERM", "SIGINT"):
@@ -166,15 +173,16 @@ def _healthcheck(config: LifecycleConfig, port: int) -> int:
     request.add_header(WORKSPACE_HEADER, config.workspace_id)
     request.add_header(SERVICE_TOKEN_HEADER, config.service_token)
     try:
-        with urlopen(request, timeout=3) as response:  # noqa: S310 - 固定回环地址
+        with urlopen(request, timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except Exception:
+    except Exception:  # noqa: BLE001 - 固定回环探针失败即未就绪
         return 1
     expected = {
         "workspace_id": config.workspace_id,
         "config_version": config.config_version,
         "container_id": config.container_id,
         "ready": True,
+        "execution_capable": True,
     }
     return 0 if all(payload.get(key) == value
                     for key, value in expected.items()) else 1
