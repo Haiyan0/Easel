@@ -242,6 +242,10 @@ class _ConcurrencyLimiter:
         self._isolated = True
 
     @property
+    def isolated(self) -> bool:
+        return self._isolated
+
+    @property
     def active(self) -> int:
         return self._active
 
@@ -705,6 +709,11 @@ class GatewayController:
     @property
     def active_streams(self) -> int:
         return self._slots.active_streams
+
+    @property
+    def isolated(self) -> bool:
+        """关闭失败后实例已隔离；状态接口不能只读 active 标志。"""
+        return self._slots.isolated
 
     def activate(self) -> None:
         self._active = True

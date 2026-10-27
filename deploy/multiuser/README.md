@@ -110,8 +110,16 @@ python deploy/multiuser/provisioner.py \
   --quota-mode project --quota-bytes 10737418240 \
   --sidecar-network easel-control \
   --sidecar-policy /etc/easel/egress-policy.json \
-  --broker-upstream control:7861
+  --broker-upstream control:7861 \
+  --gateway-image sha256:<gateway-image-digest> \
+  --gateway-control-network easel-control \
+  --gateway-public-key /etc/easel/control-public.key
 ```
+
+`--gateway-image`、`--gateway-control-network`、`--gateway-public-key`
+必须同时提供；全部省略时保留旧版 v1 直连 worker 部署。任一缺失/非法时
+provisioner 拒绝启动。gateway 启用后，v1 ensure/stop/inspect 失败关闭，
+不会静默回退到直接 worker URL；v2 才返回 gateway 元数据。
 
 `--sidecar-network` 必须是已存在、非 internal 的受控出站网络；三项 sidecar
 参数必须同时提供，否则 provisioner 拒绝启动，避免把“未接线”误当允许路径。
@@ -122,11 +130,20 @@ python deploy/multiuser/provisioner.py \
 - 只接受建立连接时 `SO_PEERCRED` UID 在 `--allowed-uid` 中的调用；未配置时
   只允许 provisioner 自身 UID。
 - 单行 JSON 协议，最大 8 KiB，10 秒请求超时：
-  - `{"version":1,"action":"ensure","workspace_id":"<32hex>","config_version":N}`
-  - `{"version":1,"action":"stop","workspace_id":"<32hex>","instance_id":"<64hex>"}`
-  - `{"version":1,"action":"inspect","workspace_id":"<32hex>"}`
-- `stop` 的 `instance_id` 是 Docker 容器不可复用 ID；provisioner 在 stop/rm
-  前核对实际 ID，旧 stop 不会作用于同名新代次。Docker stop/rm 非零或
+  - v1 旧部署：`{"version":1,"action":"ensure","workspace_id":"<32hex>","config_version":N}`、`stop`、`inspect`。
+  - v2 gateway：`ensure` 返回候选 gateway 字段但不激活；
+    `activate` 精确携带 workspace/gateway_instance_id/worker_container_id/
+    boot_generation/config_version；`stop` 同时携带 worker `instance_id` 与
+    `gateway_instance_id`；`abort` 仅按本轮 `worker_created`/
+    `gateway_created` 清理候选。gateway 启用时 v1 被拒绝。
+  - `{"version":2,"action":"ensure","workspace_id":"<32hex>","config_version":N}`
+  - `{"version":2,"action":"activate","workspace_id":"<32hex>","config_version":N,"worker_container_id":"<64hex>","gateway_instance_id":"<64hex>","boot_generation":"<32hex>"}`
+  - `{"version":2,"action":"stop","workspace_id":"<32hex>","instance_id":"<64hex>","gateway_instance_id":"<64hex>"}`
+  - `{"version":2,"action":"inspect","workspace_id":"<32hex>"}`
+  - `{"version":2,"action":"abort","workspace_id":"<32hex>","worker_container_id":"<64hex>","gateway_instance_id":"<64hex>","worker_created":true,"gateway_created":true}`
+- `stop` 的 `instance_id` 是 Docker 容器不可复用 ID；gateway 启用时先按
+  `gateway_instance_id` 精确停止 gateway，失败不继续删除 worker。旧 stop
+  不会作用于同名新代次。Docker stop/rm 非零或
   inspect 失败返回 `container_stop_failed`、`container_remove_failed`、
   `docker_inspect_failed`，只有在确认原实例已消失后才回复 `ok=true`。
   只有明确指向本次容器/网络对象的 absent 响应按不存在处理；Docker context、
@@ -148,11 +165,13 @@ python -m easel serve-control \
   --master-key-file /run/secrets/easel-master.key \
   --egress-proxy http://127.0.0.1:8899 \
   --egress-policy /etc/easel/egress-policy.json \
-  --provisioner-socket /run/easel/provisioner.sock
+  --provisioner-socket /run/easel/provisioner.sock   --gateway-required
 ```
 
 `--provisioner-socket` 指向的 socket 不存在时 control 直接失败退出，不进入
-无隔离的降级模式。compose 参考拓扑见 `compose.yaml`；实际部署前按
+无隔离的降级模式。启用 gateway 的部署必须加 `--gateway-required`，否则
+control 使用 v1 旧协议并在 provisioner 侧失败；该 flag 只接通生命周期
+CAS/激活，不启用公开聊天入口。compose 参考拓扑见 `compose.yaml`；实际部署前按
 `egress-policy.md` 配置宿主防火墙，并验证控制面发布端口仅对本机/反向代理
 可见。
 
@@ -196,6 +215,38 @@ docker run -d --name easel-worker-<uuid> \
   未知标签被丢弃。`Running + Status=running + 健康` 才可作为 ready；paused、
   restarting、缺状态、ready=false 或 exec 探针失败都只返回未就绪，不删除
   仍有停止授权争议的实例。
+
+### 每 workspace gateway（G2）
+
+启用后，provisioner 先为控制网络分配固定 IPv4，再构造：
+
+```text
+docker create --name easel-gateway-<uuid> \
+  --label easel.role=gateway --label easel.workspace-id=<uuid> \
+  --label easel.config-version=<N> \
+  --label easel.worker-container-id=<worker-64hex> \
+  --user 10001:10001 --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges:true --cpus=1 --memory=256m \
+  --memory-swap=256m --pids-limit=128 \
+  --tmpfs /run/easel:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=10001,gid=10001 \
+  --network easel-control --ip <fixed-control-ip> \
+  --mount type=bind,src=<control-public-key>,dst=/keys/control-public.key,readonly \
+  --restart=no --stop-timeout=15 \
+  <pinned-gateway-image> \
+  python -m easel.gateway.server serve --bind <fixed-control-ip> \
+    --port 8897 --public-key /keys/control-public.key \
+    --control-socket /run/easel/gateway-control.sock
+```
+
+- 无宿主端口、无 Docker socket、无 worker workspace/控制数据库挂载。
+- start 后 inspect 必须恰好一个 control IPv4 等于预分配地址；随后经固定
+  `docker exec -i ... configure`（有界 stdin JSON）写入实际 worker 目标，
+  再 connect 唯一 `easel-ws-<uuid>`；最终 inspect 必须恰好两张网。
+- gateway 进程每次启动生成新 boot generation；configure 不激活，activate
+  必须匹配 workspace/实例/boot/worker/config_version。RuntimeManager 在
+  owner/generation CAS 中先保存候选，再 activate，成功后才写 ready。
+- status 从实际 inspect + 容器内 configured/active/available 计算；关闭失败
+  隔离时 available=false，不通过 active 布尔伪装可用。
 
 ### 每空间 sidecar
 

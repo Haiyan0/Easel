@@ -98,6 +98,12 @@ class WorkerHandle:
     upstream: str
     service_token: str = field(repr=False)
     config_version: int
+    gateway_instance_id: str = ""
+    gateway_generation: str = ""
+    gateway_upstream: str = ""
+    gateway_state: str = "disabled"
+    worker_created: bool = False
+    gateway_created: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,10 @@ class WorkerLease:
     active_requests: int
     upstream: str = field(repr=False, default="")
     service_token: str = field(repr=False, default="")
+    gateway_instance_id: str = ""
+    gateway_generation: str = ""
+    gateway_upstream: str = ""
+    gateway_state: str = "disabled"
 
 
 @dataclass(frozen=True)

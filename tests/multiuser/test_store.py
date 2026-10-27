@@ -111,9 +111,9 @@ def open_concurrently(path, count: int) -> tuple[list[Identity], list[str]]:
 
 
 RELEASED_SCHEMA_FINGERPRINT = (
-    "6c68324476bfc8d7c81672a31f45d76a58e5aa0a6ae8e41a883b84785d5cc164"
+    "015c7ccbbd8a67551af6ecd06d95fca95d6d1086db6200e3f53ebc928e734a39"
 )
-"""当前发布版（schema v10，Task 10 唯一准备所有权）的 schema 指纹；
+"""当前发布版（schema v11，G2 gateway 租约绑定）的 schema 指纹；
 变更 schema 时必须同步更新。"""
 
 

@@ -281,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="管理员出口策略 JSON（approved_hosts/approved_cidrs）")
     p_serve.add_argument("--provisioner-socket", default=None,
                          help="受限 provisioner 的本地 Unix socket；缺失时失败关闭")
+    p_serve.add_argument(
+        "--gateway-required", action="store_true",
+        help="要求 v2 gateway 元数据并在 CAS 后激活；未提供 provisioner 时失败")
     p_serve.add_argument("--snapshot-key-file", default=None,
                          help="受保护的 Ed25519 私钥文件；与受管 Agent 配置成对使用")
     p_serve.add_argument("--managed-agent-config", default=None,

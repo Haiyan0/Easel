@@ -1,0 +1,43 @@
+# Task G2：每 workspace 受信 gateway 的最小镜像。
+#
+# 构建上下文为仓库根目录：
+#   docker build -f deploy/desktop/Dockerfile.gateway -t easel-gateway:g2 .
+#
+# 容器只运行 G1 gateway 核心与本任务的可信配置入口；不包含 worker/Harness、
+# Docker socket、用户 workspace、控制数据库或 provider 凭证。管理监听地址、
+# 实例身份、控制公钥与网络由 provisioner 在 create 时固定。
+FROM python:3.11.12-slim-bookworm
+
+ARG FASTAPI_VERSION=0.115.6
+ARG UVICORN_VERSION=0.32.1
+ARG HTTPX_VERSION=0.28.1
+ARG PYDANTIC_VERSION=2.10.4
+ARG CRYPTOGRAPHY_VERSION=44.0.0
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN groupadd --gid 10001 easel \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/easel \
+            --create-home --shell /usr/sbin/nologin easel \
+ && mkdir -p /opt/easel /keys /run/easel \
+ && chown 10001:10001 /run/easel
+
+WORKDIR /opt/easel
+COPY pyproject.toml README.md ./
+COPY easel ./easel
+RUN pip install --no-cache-dir \
+      "fastapi==${FASTAPI_VERSION}" \
+      "uvicorn==${UVICORN_VERSION}" \
+      "httpx==${HTTPX_VERSION}" \
+      "pydantic==${PYDANTIC_VERSION}" \
+      "cryptography==${CRYPTOGRAPHY_VERSION}" \
+ && chown -R root:root /opt/easel \
+ && chmod -R a-w /opt/easel
+
+USER 10001:10001
+# provisioner 不发布宿主端口；这里只声明容器内管理端口。
+EXPOSE 8897
+CMD ["python", "-m", "easel.gateway.server", "serve"]

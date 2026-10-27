@@ -468,6 +468,7 @@ def create_app(*, store: Store, auth: AuthService,
                config: ControlConfig | None = None,
                config_service: ConfigService | None = None,
                runtime=None, broker=None, provisioner=None,
+               gateway_required: bool = False,
                frontend_dir: str | Path | None = None,
                relay_factory: Callable[..., object] | None = None,
                harness_summary: dict | None = None) -> FastAPI:
@@ -526,7 +527,8 @@ def create_app(*, store: Store, auth: AuthService,
             if provisioner is not None:
                 app.state.runtime = RuntimeManager(
                     app.state.control_store, provisioner,
-                    db_runner=control_db_runner)
+                    db_runner=control_db_runner,
+                    gateway_required=gateway_required)
             else:
                 app.state.runtime = runtime
             app.state.auth = AuthService(app.state.control_store, clock=auth.clock)

@@ -5,24 +5,27 @@
   "approval_required": true,
   "implementation": {
     "enabled": false,
-    "reason": "G1 独立 gateway 核心已实现并测试；尚未接 provisioner/WorkerHandle/control，完整多用户运行时仍未启用。",
+    "reason": "G2 已接通 provisioner 的 gateway 容器、固定控制网 IPv4、可信配置/激活握手与 WorkerHandle/租约 CAS；公开 WorkerRelay/聊天入口与 A4 broker 接线仍未启用。",
     "gateway_core": {
-      "status": "implemented_not_wired",
-      "task": "G1",
-      "review_round": "G1-R2",
+      "status": "assembled_not_public_relay",
+      "task": "G2",
+      "review_round": "G2",
       "factory": "create_gateway_app",
+      "runtime": "deploy/multiuser/gateway_runtime.py",
+      "server": "easel/gateway/server.py",
+      "image": "deploy/desktop/Dockerfile.gateway",
       "modules": [
         "easel/gateway/auth.py",
         "easel/gateway/app.py",
+        "easel/gateway/server.py",
+        "easel/gateway/runtime.py",
         "easel/control/gateway_auth.py"
       ],
-      "activation": "默认未激活；activate 之前所有管理请求返回 503 gateway_inactive",
+      "activation": "进程启动生成新 boot_generation；可信 configure 只绑定目标，activate 精确匹配实例/boot 后才启用；之前所有管理请求 503 gateway_inactive。",
       "not_modified": [
-        "provisioner",
-        "WorkerHandle/WorkerLease",
-        "schema",
-        "WorkerRelay",
-        "control 路由装配"
+        "公开 WorkerRelay/聊天入口",
+        "A4 broker URL/受管 Agent 接线",
+        "真实 Harness/供应商"
       ]
     }
   },
@@ -70,6 +73,16 @@
       "docker_socket": false,
       "host_network": false,
       "published_ports": ["127.0.0.1:7861"]
+    },
+    "gateway_runtime": {
+      "location": "docker",
+      "created_by": "wsl2 provisioner",
+      "protocol_version": 2,
+      "legacy_policy": "v1 仅保留给未启用 gateway 的既有部署；gateway 启用时 v1 ensure/stop/inspect 失败关闭，v2 才携带 gateway 元数据。",
+      "config_channel": "docker exec -i 固定命令 + 有界 stdin JSON；配置含 worker 目标/服务 token，但不进入 argv、状态输出或日志。",
+      "status_channel": "docker exec 固定 status 命令读取容器内 0600 Unix socket；返回 boot/实例/目标/available，不返回 worker service token。",
+      "activation": "configure 绑定实例与 worker 目标但不激活；activate 精确匹配 workspace/gateway_instance_id/boot_generation/worker_container_id/config_version。",
+      "network_join": "create 前固定 control IPv4；仅控制网络 start 并 inspect 绑定；configure 后再 connect 唯一 worker 网络；最终 inspect 要求恰好 control+worker 两张网。"
     },
     "socket": {
       "path": "/tmp/easel-runtime/provisioner.sock",
@@ -147,6 +160,8 @@
     },
     "gateway": {
       "enabled": false,
+      "runtime_implemented": true,
+      "public_relay_enabled": false,
       "name_template": "easel-gateway-{workspace_id}",
       "networks": [
         "easel-control",
@@ -154,7 +169,7 @@
       ],
       "management_bind": "control_network_ip_only",
       "management_port": 8897,
-      "management_bind_procedure": "provisioner 以 easel-control 创建 gateway 后 docker inspect 实际控制网络 endpoint，要求恰好一个 IPv4；将精确地址作为 EASEL_GATEWAY_BIND 在 start 前注入，绑定成功后才连接 easel-ws-{workspace_id}。地址缺失、歧义或启动前后变化均失败关闭；禁止 0.0.0.0、首张网卡或名称解析推断。",
+      "management_bind_procedure": "provisioner 先 docker network inspect easel-control 的 IPAM/Containers，按空闲主机分配固定 IPv4；docker create 时使用 --network easel-control --ip <fixed>，禁止 create 后修改 Env。start 后用 docker inspect 要求恰好一个控制网 IPv4 且等于预分配地址；随后 configure，再 connect 唯一 easel-ws-{workspace_id}，最终 inspect 要求恰好两张网、控制地址未变。地址缺失、冲突、歧义或启动前后变化均失败关闭；禁止 0.0.0.0、首张网卡或名称解析推断。",
       "routes": [
         {
           "method": "GET",
@@ -307,7 +322,7 @@
         },
         "gateway_to_worker": {
           "scheme": "worker_service_token",
-          "source": "provisioner 的 .credentials/<workspace_id>.env，由 provisioner 提供给 gateway；不接受 control 或客户端替换。",
+          "source": "provisioner 从 .credentials/<workspace_id>.env 读出 worker service token，经固定 configure stdin 提供给 gateway；不接受 control 或客户端替换，不进入 argv/状态/日志。",
           "headers": [
             "X-Easel-Workspace-Id",
             "X-Easel-Service-Token"
@@ -317,17 +332,18 @@
         "independence": "control 签名私钥与每个 worker 的 service 凭证是两套独立凭证；gateway 不持有 control 私钥，worker 不持有 control 断言；浏览器凭证不参与。"
       },
       "instance_binding": {
-        "worker": "WorkerHandle.container_id 保持 worker 不可复用 Docker ID；gateway upstream 不能替代或覆盖它。",
-        "gateway": "WorkerHandle 新增 gateway_instance_id 与每进程 boot_generation（gateway_generation）；WorkerLease/control 绑定持久化二者，gateway 标签含 workspace、config_version、worker_container_id。",
+        "worker": "WorkerHandle.container_id 保持 worker 不可复用 Docker ID；gateway 元数据不能替代或覆盖它。",
+        "gateway": "WorkerHandle/WorkerLease 新增 gateway_instance_id（完整 gateway 容器 ID）、每进程 boot_generation（gateway_generation）、gateway_upstream 与 gateway_state；WorkerLease/control 持久化这些字段，gateway 标签含 workspace、config_version、worker_container_id，不把 boot generation 写入 Docker 标签。",
         "target": "gateway 启动时从 provisioner 核验结果获得固定 worker container_id/config_version/IP；不按容器名自动解析到新代次。",
-        "stop": "stop 请求同时携带 worker container_id 与 gateway_instance_id；旧 stop 不能删除新 gateway。",
-        "old_auth": "断言 audience 含 gateway ID/boot_generation；旧断言不能访问新 gateway；旧 worker service 凭证不能访问新 worker。"
+        "stop": "v2 stop 同时携带 worker container_id 与 gateway_instance_id；先按精确 gateway ID 停止 gateway，失败时不继续删除 worker；旧 stop 不能删除新 gateway。",
+        "old_auth": "断言 audience 含 gateway ID/boot_generation；旧断言不能访问新 gateway；旧 worker service 凭证不能访问新 worker。",
+        "protocol": "v2 ensure 返回候选 gateway 字段但不激活；RuntimeManager 在 owner/generation CAS 中保存候选后才调用 v2 activate；v2 abort 只按本轮 worker_created/gateway_created 清理。"
       },
       "recovery": {
         "control_restart": "从现有受保护 signing key 重新加载；gateway/worker 不变，重新签发新断言即可，不重发旧凭证。",
         "provisioner_restart": "重建 Unix socket；已有 gateway/worker 不删除；control 重连后按不可复用 ID 复核并继续，不重新签发不可用 token。",
-        "gateway_restart": "每次 gateway 进程启动都必须生成新 boot_generation，即使同一容器/ID 重启也不能沿用旧代次；control 经可信激活握手同步新代次后，旧断言即使未过期也因 audience 不符被拒。容器被重建时同时产生新 gateway ID/generation。",
-        "gateway_unavailable": "control 返回 503；不删除 active worker；Run 不标记 done；SSE 断开可带 after 恢复；POST 不自动重发。",
+        "gateway_restart": "每次 gateway 进程启动都必须生成新 boot_generation，即使同一容器/ID 重启也不能沿用旧代次；provisioner 经 status 读取新 boot，RuntimeManager 在 CAS 中保存新候选后再 activate；旧断言即使未过期也因 audience 不符被拒。容器被重建时同时产生新 gateway ID/generation。",
+        "gateway_unavailable": "provisioner status 从实际 inspect + 容器内 status/available 计算，不只看 active 或 worker health；隔离/不可达时 control 返回 503，不删除 active worker，不把 Run 改 done/failed/interrupted；SSE 断开可带 after 恢复，POST 不自动重发。",
         "gateway_replacement": "按旧 gateway_instance_id 停止旧 gateway，在核验过的同一 worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/SSE 可按游标恢复，POST 不自动重试。",
         "control_key_unavailable": "gateway 无法验证 control 断言时返回 503；不得删除 worker，直到显式 drain/stop。",
         "worker_replacement": "新 worker 使用新 container_id/service 凭证；旧 gateway 目标/凭证不匹配，必须 drain/stop 旧代次后重建。",
@@ -359,7 +375,7 @@
       "user": "10001:10001",
       "worker_to_management": "blocked_by_bind_and_network",
       "sse": "streaming_passthrough",
-      "failure_cleanup": "gateway 与 worker 同代次创建/停止；启动失败和 worker 停止都清理 gateway；gateway 停止失败不得吞掉，不留下可达入口。"
+      "failure_cleanup": "gateway 与 worker 同代次创建/停止；启动/连接/配置/激活失败按本轮 worker_created/gateway_created 与不可复用 ID 清理；已有活跃 worker/gateway 不因一次 probe 失败删除；gateway 停止失败不得吞掉，不留下可达入口。"
     }
   },
   "broker": {
@@ -370,9 +386,10 @@
     "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。"
   },
   "evidence": {
-    "report": "docs/evidence/desktop-a2/report.md",
-    "red_green": "docs/evidence/desktop-a2/red-green.md",
-    "test_file": "tests/integration/multiuser/test_desktop_topology.py"
+    "report": "docs/evidence/desktop-g2/report.md",
+    "red_green": "docs/evidence/desktop-g2/red-green.md",
+    "test_file": "tests/integration/multiuser/test_gateway_runtime_real.py",
+    "previous": "docs/evidence/desktop-a2/report.md"
   },
   "approval": {
     "items": [

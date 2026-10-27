@@ -17,6 +17,7 @@ import threading
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from easel.control.types import WorkerHandle
 from easel.worker.guard import (
     SERVICE_TOKEN_HEADER,
     WORKSPACE_HEADER,
@@ -94,6 +95,72 @@ def test_parse_request_rejects_invalid_config_version(value):
         provisioner.parse_request(_ensure_payload(config_version=value))
 
 
+def test_protocol_v2_accepts_exact_activate_and_gateway_stop():
+    activate = provisioner.parse_request({
+        "version": 2, "action": "activate", "workspace_id": WORKSPACE,
+        "config_version": 3, "gateway_instance_id": "b" * 64,
+        "worker_container_id": "c" * 64, "boot_generation": "d" * 32})
+    assert activate.version == 2
+    assert activate.gateway_instance_id == "b" * 64
+    assert activate.worker_container_id == "c" * 64
+    stop = provisioner.parse_request({
+        "version": 2, "action": "stop", "workspace_id": WORKSPACE,
+        "instance_id": "c" * 64, "gateway_instance_id": "b" * 64})
+    assert stop.gateway_instance_id == "b" * 64
+    abort = provisioner.parse_request({
+        "version": 2, "action": "abort", "workspace_id": WORKSPACE,
+        "worker_container_id": "c" * 64,
+        "gateway_instance_id": "b" * 64,
+        "worker_created": True, "gateway_created": False})
+    assert abort.worker_created is True
+    assert abort.gateway_created is False
+
+
+@pytest.mark.parametrize("payload", [
+    {"version": 1, "action": "activate", "workspace_id": WORKSPACE,
+     "config_version": 3, "gateway_instance_id": "b" * 64,
+     "worker_container_id": "c" * 64, "boot_generation": "d" * 32},
+    {"version": 2, "action": "stop", "workspace_id": WORKSPACE,
+     "instance_id": "c" * 64},
+    {"version": 2, "action": "activate", "workspace_id": WORKSPACE,
+     "config_version": 3, "gateway_instance_id": "b" * 64,
+     "worker_container_id": "c" * 64, "boot_generation": "not-hex"},
+    {"version": 2, "action": "abort", "workspace_id": WORKSPACE,
+     "worker_container_id": "c" * 64,
+     "gateway_instance_id": "b" * 64},
+])
+def test_protocol_rejects_partial_or_legacy_activation_fields(payload):
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        provisioner.parse_request(payload)
+    assert rejected.value.code in {
+        "unsupported_protocol", "invalid_gateway_instance",
+        "invalid_boot_generation", "invalid_cleanup_flag"}
+
+
+def test_gateway_enabled_requires_v2_and_disabled_rejects_v2(tmp_path):
+    handle = WorkerHandle(
+        WORKSPACE, "c" * 64, "http://172.32.0.2:7860", "token", 3)
+    legacy = provisioner.Provisioner(_settings(tmp_path))
+    with pytest.raises(provisioner.ProvisionerError) as disabled:
+        asyncio.run(legacy._with_gateway(handle, 2, worker_created=False))
+    assert disabled.value.code == "gateway_disabled"
+    assert asyncio.run(
+        legacy._with_gateway(handle, 1, worker_created=False)) is handle
+
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    enabled = provisioner.Provisioner(settings)
+    with pytest.raises(provisioner.ProvisionerError) as required:
+        asyncio.run(enabled._with_gateway(handle, 1, worker_created=False))
+    assert required.value.code == "gateway_required"
+
+
 def test_parse_request_rejects_oversized_and_malformed_payloads():
     with pytest.raises(provisioner.ProvisionerError):
         provisioner.parse_request(b"{" + b" " * provisioner.MAX_REQUEST_BYTES)
@@ -102,7 +169,7 @@ def test_parse_request_rejects_oversized_and_malformed_payloads():
     with pytest.raises(provisioner.ProvisionerError):
         provisioner.parse_request([])
     with pytest.raises(provisioner.ProvisionerError):
-        provisioner.parse_request({"version": 2, "action": "inspect",
+        provisioner.parse_request({"version": 3, "action": "inspect",
                                    "workspace_id": WORKSPACE})
 
 

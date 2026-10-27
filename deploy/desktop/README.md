@@ -152,20 +152,30 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
 新增 `easel-gateway-<workspace_id>`（G1 已实现独立 ASGI 核心
 `create_gateway_app`；容器创建、地址注入、公钥挂载与代次持久化待 G2）：
 
-- 网络：同时加入 `easel-control` 与 `easel-ws-<workspace_id>`；后者是
-  `--internal`。gateway 加入共享 `easel-control` 后，**不能**声称网络上
-  其他 gateway/sidecar 无法访问它；跨 workspace 保护依靠独立 control
-  断言、固定 workspace/worker 目标和协议白名单，并在实施验收补 A 凭证访问
-  B 的反例。
-- 监听：management listener **只绑定 control 网络地址**。provisioner 先
-  `docker create` gateway，inspect 实际控制网络 endpoint，要求恰好一个
-  IPv4，把精确地址作为 `EASEL_GATEWAY_BIND` 在 start 前注入；地址缺失、
-  歧义或启动前后变化均失败关闭。禁止 `0.0.0.0`、首张网卡或名称解析推断。
+- 网络加入时点：provisioner 先 inspect `easel-control` 的 IPAM/已用地址，
+  在 **create 前**分配固定 IPv4，并执行
+  `docker create --network easel-control --ip <fixed>`；禁止 create 后修改
+  Env。gateway 仅在控制网络 start 并 inspect 绑定，可信 configure 后再
+  `docker network connect easel-ws-<workspace_id>`，最终 inspect 要求恰好
+  control+worker 两张网且控制 IP 未变。地址缺失、冲突、歧义或前后变化均
+  失败关闭；禁止 `0.0.0.0`、首张网卡或名称解析推断。worker 网络是
+  `--internal`；共享控制网络上的其他 gateway/sidecar 本身可达，不承诺
+  物理隔绝，跨 workspace 由独立断言、固定目标和白名单拒绝。
+- 监听：management listener **只绑定上述固定 control IPv4**。gateway
+  容器启动时不接收 worker 目标；provisioner 经固定
+  `docker exec -i ... configure` + 有界 stdin JSON 绑定实际
+  workspace/worker ID/version/IP/service token，进程生成新的 boot
+  generation；配置只保存在内存，不写用户卷。状态经固定 `status` 命令读取
+  容器内 0600 Unix socket，不输出 service token。
+- 配置与激活分离：configure 只绑定目标且保持未激活；RuntimeManager 在
+  owner/generation CAS 中保存候选后，才用固定 `activate` 命令提交精确
+  workspace/gateway_instance_id/boot_generation/worker_container_id/
+  config_version。任何字段不匹配都拒绝；只有验证 available 后才写 ready。
 - 不发布宿主端口、不挂 Docker socket、不挂 worker workspace/home、不读
   控制数据库；仅只读挂载 control 公钥；只读 rootfs、UID 10001、
   cap-drop ALL、no-new-privileges、固定资源上限。worker service 凭证由
-  provisioner 的 `.credentials/<workspace_id>.env` 提供给 gateway，不来自
-  control/浏览器，且不写入日志。
+  provisioner 从 `.credentials/<workspace_id>.env` 读出后经 configure
+  stdin 提供，不来自 control/浏览器，且不进入 argv/日志/状态。
 - 请求方向：control → gateway（control 网络）→ 固定 worker（worker 网络）。
   不接受 worker 主动发起的管理请求。
 - 认证：
@@ -186,9 +196,10 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
     后比较真实摘要，匹配后才接纳 nonce 并转发。缺失/畸形/错误签名/
     错误 audience/过期断言在读取 body 和占槽前快速拒绝；慢 body 不能延长
     断言有效期。
-  - **gateway→worker**：每 worker 独立的 service 凭证，由 provisioner 的
-    `.credentials` 环境提供；gateway 不接受 control 或客户端替换它，且固定
-    `container_id` + `config_version`，不按 workspace 名自动落到新实例。
+  - **gateway→worker**：每 worker 独立的 service 凭证，由 provisioner 从
+    `.credentials/<workspace_id>.env` 读出后经固定 configure stdin 提供；
+    gateway 不接受 control 或客户端替换它，且固定 `container_id` +
+    `config_version`，不按 workspace 名自动落到新实例。
   - Cookie、Authorization、Forwarded、`X-Forwarded-*`、外来 `X-Easel-*`、
     Origin、Referer、Via、`X-Real-IP` 永不传给下游；gateway 先验签，再在
     最终 `httpx.Request`（含注入 client 的默认头/cookie/auth 合并之后）
@@ -247,24 +258,35 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 
 ### 5.4 实例代次与恢复
 
-- `WorkerHandle.container_id` 始终保留 worker 不可复用 Docker ID；新增
-  `gateway_instance_id` 与每进程 `boot_generation`，`WorkerLease`/control
-  绑定持久化二者。`WorkerHandle.upstream` 指向 gateway；不能用 gateway
-  身份替代 worker ID。gateway 标签绑定 workspace、config_version、
-  worker container_id，目标来自 provisioner 核验的实际 worker 地址。
-- `stop` 同时携带 worker container_id 与 gateway_instance_id；旧 stop
-  不能删除新 gateway。断言 audience 含 gateway ID/boot_generation，旧断言
-  不能访问新 gateway；旧 worker service 凭证不能访问新 worker。
+- `WorkerHandle.container_id` 始终保留 worker 不可复用 Docker ID，`upstream`
+  保留 worker 内部地址；新增 `gateway_instance_id`（完整 gateway 容器 ID）、
+  `gateway_generation`（每进程 boot generation）、`gateway_upstream` 与
+  `gateway_state`，`WorkerLease`/control 持久化这些字段。控制面使用
+  `gateway_upstream` 作为管理转发地址，不能用 gateway 身份替代 worker ID。
+  gateway 标签绑定 workspace、config_version、worker container_id，目标来自
+  provisioner 核验的实际 worker 地址；boot generation 不写入 Docker 标签。
+- 受限协议 v2：v2 ensure 只返回未激活候选；RuntimeManager 在受保护
+  owner/generation CAS 中保存候选后调用 v2 activate；v2 stop 同时携带
+  worker container_id 与 gateway_instance_id，先按精确 gateway ID 停止
+  gateway，失败时不继续删除 worker；v2 abort 仅按本轮 worker_created/
+  gateway_created 清理。未启用 gateway 的旧部署保留 v1；gateway 启用时
+  v1 ensure/stop/inspect 失败关闭，不能静默回退直接 worker URL。
+- 断言 audience 含 gateway ID/boot_generation，旧断言不能访问新 gateway；
+  旧 worker service 凭证不能访问新 worker。
 - control 重启：重新加载现有受保护签名私钥；gateway/worker 不变，重新
   签发新断言，不重发旧凭证。
 - provisioner 重启：重建 Unix socket；已有 gateway/worker 不删除；control
   重连后按不可复用 ID 复核并继续。
 - gateway 重启：**每次进程启动都生成新的 boot_generation**，同一容器/ID
-  重启也不得沿用旧代次；control 经可信管理路径同步新代次前，所有管理请求
-  保持未激活 503，旧断言即使未过期也因 audience 不符被拒。若容器被重建，
-  同时产生新 gateway ID/generation。
-- gateway 暂不可用：control 返回 503；不删除 active worker；Run 不标记 done；
-  SSE 断开可带 `after` 恢复；POST 不自动重发。
+  重启也不得沿用旧代次；provisioner 从容器内 status 读取新 boot，
+  RuntimeManager 在 CAS 中保存新候选后 activate。同步前所有管理请求保持
+  未激活 503，旧断言即使未过期也因 audience 不符被拒。若容器被重建，同时
+  产生新 gateway ID/generation；已开始的 Run 不重发、不伪结算。
+- gateway 暂不可用：provisioner status 从实际 inspect 与容器内
+  configured/active/available 计算，关闭失败隔离也报告 unavailable，不能
+  只看 active 或 worker health；control 返回 503；不删除 active worker；
+  Run 不标记 done/failed/interrupted；SSE 断开可带 `after` 恢复；POST 不
+  自动重发。
 - gateway 更换：按旧 gateway_instance_id 停止旧 gateway，在核验过的同一
   worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/
   SSE 按游标恢复，POST 不自动重试。
@@ -297,22 +319,20 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 - 不允许把 gateway 的 management 端口复用为任意 broker/出口代理，也不
   放宽 CONNECT 私网限制。
 
-## 7. 批准门（G1 核心已实现；运行时接线仍 blocked）
+## 7. 批准门（G2 已实现 provisioner 运行时；公开 relay 仍 blocked）
 
 1. WSL socket 0660 + control 补充组 1000 + `--allowed-uid 10001` 的权限模型：
    已由 A1/A2 验收。
 2. 用固定 `docker exec` healthcheck 替代宿主 HTTP 探测：已由 A3 验收。
 3. gateway 精确路由/查询表、control 签名断言、worker service 凭证、
-   请求上限、SSE 背压与失败清理：G1 已实现独立核心并覆盖认证/路由/转发/
-   流式反例；跨 workspace 断言、错误公钥和真实 TCP 转发已测试。R1 进一步
-   固定唯一关闭任务、最终出站 URL、验签前快速拒绝和超长 Content-Length；
-   R2 收口底层关闭失败：保留槽位与失败终态，隔离实例，不伪成功。
-4. `WorkerHandle` 保留 worker container_id、新增 gateway instance/
-   generation，`WorkerLease`/stop 绑定：仍待 G2，未在本轮修改。
-
-G1 没有创建 Docker 容器、没有接 control 路由、没有启用完整运行时。主审
-验收 G1 后，G2 再实现容器创建/启动握手、地址绑定、公钥挂载、实例代次
-持久化与 `WorkerHandle` 接线；在 G2/A4 验收前不宣称全链路可用。
+   请求上限、SSE 背压与失败清理：G1 已实现并通过 R1/R2 收口；跨 workspace
+   断言、错误公钥和真实 TCP 转发已测试。
+4. G2 已实现：固定 control IPv4 的 create/start、可信 configure/activate
+   握手、只读公钥与固定资源/网络、v2 受限协议、WorkerHandle/Lease
+   gateway 字段与 Store v11、三态关闭失败隔离上报、两阶段 CAS 激活、
+   gateway 重启新 boot 对账与精确 ID 停止；真实双 workspace 拓扑已运行。
+5. 公开 WorkerRelay/聊天入口与 A4 broker URL/受管 Agent 接线仍未实现；
+   在 A4 验收前不宣称多用户聊天可用。
 
 主审若选择“control 加入 worker 网络 + 控制网络地址绑定”的替代方案，需要
 单独批准并补 worker→control 不可达的持续验证；本次契约不采用该方案。
@@ -362,3 +382,28 @@ R1 证据保留在
 [`docs/evidence/desktop-g1-r1/report.md`](../../docs/evidence/desktop-g1-r1/report.md)，
 最早一轮证据保留在
 [`docs/evidence/desktop-g1/report.md`](../../docs/evidence/desktop-g1/report.md)。
+
+G2 gateway 运行时：
+
+```powershell
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest `
+  tests/multiuser/test_gateway_server.py `
+  tests/multiuser/test_gateway_runtime.py `
+  tests/multiuser/test_runtime_gateway.py `
+  tests/multiuser/test_store_gateway.py -q
+$env:EASEL_RUN_CONTAINER_TESTS = '1'
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest `
+  tests/integration/multiuser/test_gateway_runtime_real.py -q
+```
+
+G2 静态结果：新增单元 **28 passed**；provisioner/runtime/store/stop
+**238 passed, 1 skipped**；multiuser+拓扑全量 **1245 passed, 9 skipped**
+（2 条既有 websockets/uvicorn deprecation warning）。真实测试 **1 passed**
+（约 377 秒），固定镜像为 gateway
+`sha256:a25c259e9c09a36d902ddb9e68f28de803f30fea1636d8b794b4919ffceb5707`、
+worker execution
+`sha256:f599b224abdbf7ad71052febad55ebba0c87513dce4053d085f84fb3e17dc3cb`；
+覆盖两个 workspace、签名 health/submit/events/question status/answer/stop/
+messages、跨 workspace 拒绝、worker 反向不可达、同容器 gateway 重启新 boot、
+旧断言 503→403、worker ID/在途 Run 保持、精确 ID drain。详细证据见
+[`docs/evidence/desktop-g2/report.md`](../../docs/evidence/desktop-g2/report.md)。

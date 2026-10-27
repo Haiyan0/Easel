@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-28",
+  "baseline": "d1fc8b16d6cb98092fa1ff9d0772c15bd40e35bd",
+  "scope": [
+    "G2 gateway container runtime",
+    "fixed control-network IPv4",
+    "trusted configure/activate handshake",
+    "WorkerHandle/WorkerLease/Store v11",
+    "RuntimeManager two-phase CAS",
+    "gateway restart/recovery/isolation",
+    "real two-workspace topology"
+  ],
+  "protocol": {
+    "current": 2,
+    "legacy": "v1 only when gateway disabled; v1 rejected when gateway enabled"
+  },
+  "tests": {
+    "g2_units": "28 passed",
+    "provisioner_runtime_store_stop": "238 passed, 1 skipped",
+    "multiuser_and_desktop_static": "1245 passed, 9 skipped, 2 warnings",
+    "g1_core": "120 passed, 2 warnings",
+    "real_two_workspace": "1 passed in 377.37s"
+  },
+  "fixed_images": {
+    "gateway": "sha256:a25c259e9c09a36d902ddb9e68f28de803f30fea1636d8b794b4919ffceb5707",
+    "worker_execution": "sha256:f599b224abdbf7ad71052febad55ebba0c87513dce4053d085f84fb3e17dc3cb"
+  },
+  "real_evidence": {
+    "two_workspaces": true,
+    "signed_health_submit_events_questions_stop_messages": true,
+    "cross_workspace_rejected": true,
+    "control_network_shared_reachability_recorded": true,
+    "worker_to_management_and_other_workspace_blocked": true,
+    "same_container_restart_new_boot": true,
+    "old_assertion_503_before_activation_403_after": true,
+    "worker_id_and_inflight_run_preserved": true,
+    "exact_worker_gateway_drain": true,
+    "cleanup": "no containers or networks remain"
+  },
+  "docker_resources": {
+    "runtime_containers": "none after test",
+    "test_networks": "none after test",
+    "test_images_retained": true
+  },
+  "not_run": [
+    "public WorkerRelay/chat/frontend",
+    "A4 broker URL/managed Agent wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}

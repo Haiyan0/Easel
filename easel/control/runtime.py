@@ -17,8 +17,10 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from .store import Store
@@ -34,6 +36,8 @@ IDLE_SECONDS = 900
 LEASE_SECONDS = 120
 DRAIN_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
+_GATEWAY_ID = re.compile(r"^[0-9a-f]{64}$")
+_BOOT_GENERATION = re.compile(r"^[0-9a-f]{32}$")
 
 
 class RuntimeUnavailable(Exception):
@@ -57,8 +61,19 @@ class Provisioner(Protocol):
                      config_version: int) -> WorkerHandle:
         """幂等确保该 workspace 的容器已启动；失败必须自行清理半成品。"""
 
-    async def stop(self, workspace_id: str, instance_id: str) -> None:
+    async def stop(self, workspace_id: str, instance_id: str,
+                   gateway_instance_id: str = "") -> None:
         """只停止该实例 ID；不得按同名容器停止新代次或删除持久挂载。"""
+
+    async def activate(self, workspace_id: str, worker_container_id: str,
+                       gateway_instance_id: str, boot_generation: str,
+                       config_version: int) -> dict:
+        """按候选的精确实例/boot 激活；只能在受保护 CAS 之后调用。"""
+
+    async def abort(self, workspace_id: str, worker_container_id: str,
+                    gateway_instance_id: str, *, worker_created: bool,
+                    gateway_created: bool) -> None:
+        """激活失败时仅清理本轮新建资源。"""
 
     async def inspect(self, workspace_id: str) -> dict:
         """返回实际容器身份；不含秘密，``container_id`` 为空表示不存在。"""
@@ -76,7 +91,8 @@ class RuntimeManager:
                  idle_seconds: int = IDLE_SECONDS,
                  drain_timeout: float = DRAIN_TIMEOUT_SECONDS,
                  broker=None,
-                 db_runner: Callable[..., Awaitable[object]] | None = None):
+                 db_runner: Callable[..., Awaitable[object]] | None = None,
+                 gateway_required: bool = False):
         self._store = store
         self._provisioner = provisioner
         self._clock = clock or time.time
@@ -92,6 +108,7 @@ class RuntimeManager:
         # Store，因此所有短数据库步骤都必须调度回该线程；容器/网络等待
         # 保持在异步层，不能占用数据库线程或事务。
         self._db_runner = db_runner
+        self._gateway_required = bool(gateway_required)
 
     async def _db(self, function, *args, **kwargs):
         """在 Store 所属线程执行一个短同步数据库步骤。"""
@@ -111,7 +128,10 @@ class RuntimeManager:
         while True:
             outcome, lease = await self._claim(workspace_id, config_version)
             if outcome == "ready":
-                return self._handle_from_lease(lease, config_version)
+                if not self._gateway_required:
+                    return self._handle_from_lease(lease, config_version)
+                return await self._ready_gateway(
+                    workspace_id, config_version, lease, deadline)
             if outcome == "started":
                 return await self._start(workspace_id, config_version, lease,
                                          deadline)
@@ -150,9 +170,20 @@ class RuntimeManager:
                 or lease.config_version != config_version
                 or not lease.upstream or not lease.service_token):
             return None
-        return WorkerHandle(lease.workspace_id, lease.container_id,
-                            lease.upstream, lease.service_token,
-                            lease.config_version)
+        if lease.gateway_instance_id:
+            if lease.gateway_state != "available":
+                return None
+            if not self._gateway_fields_valid(lease):
+                return None
+        elif self._gateway_required:
+            return None
+        return WorkerHandle(
+            lease.workspace_id, lease.container_id,
+            lease.upstream, lease.service_token, lease.config_version,
+            gateway_instance_id=lease.gateway_instance_id,
+            gateway_generation=lease.gateway_generation,
+            gateway_upstream=lease.gateway_upstream,
+            gateway_state=lease.gateway_state)
 
     async def confirm_instance_stopped(self, workspace_id: str,
                                        container_id: str) -> bool:
@@ -164,9 +195,18 @@ class RuntimeManager:
         """
         if not isinstance(container_id, str) or not container_id:
             return False
+        gateway_instance_id = ""
+        if self._gateway_required:
+            lease = await self._db(
+                self._store.get_worker_lease, workspace_id)
+            if (lease is None or lease.container_id != container_id
+                    or not lease.gateway_instance_id):
+                return False
+            gateway_instance_id = lease.gateway_instance_id
         try:
             await asyncio.wait_for(
-                self._provisioner.stop(workspace_id, container_id),
+                self._stop_provisioner(
+                    workspace_id, container_id, gateway_instance_id),
                 timeout=CONFIRM_STOP_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
             raise
@@ -212,7 +252,7 @@ class RuntimeManager:
                 self._store.begin_worker_stop, workspace_id, self._now(),
                 generation=lease.generation):
             return
-        await self._provisioner.stop(workspace_id, lease.container_id)
+        await self._stop_lease(lease)
         await self._db(self._store.stop_worker, workspace_id, self._now(),
                        generation=lease.generation,
                        expected_state="stopping")
@@ -258,8 +298,7 @@ class RuntimeManager:
                     stamp, generation=lease.generation):
                 continue
             try:
-                await self._provisioner.stop(lease.workspace_id,
-                                             lease.container_id)
+                await self._stop_lease(lease)
             except Exception:
                 # 失败关闭：无法确认容器已停止时不写 stopped
                 continue
@@ -290,6 +329,144 @@ class RuntimeManager:
     # ------------------------------------------------------------------
     # 启动 / 对账 / 升级
     # ------------------------------------------------------------------
+
+    async def _ready_gateway(self, workspace_id: str, config_version: int,
+                             lease: WorkerLease | None,
+                             deadline: float) -> WorkerHandle:
+        """ready 租约在 gateway 模式下每次核对实际 boot/可用性。"""
+        if lease is None:
+            raise RuntimeUnavailable("worker_unavailable", 503)
+        if self._gateway_fields_valid(lease):
+            try:
+                report = await self._provisioner.inspect(workspace_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise RuntimeUnavailable(
+                    "gateway_inspect_failed", 503, retry_after=5) from error
+            if self._report_worker_matches(
+                    report, workspace_id, config_version, lease):
+                if self._report_gateway_matches(
+                        report, workspace_id, config_version, lease):
+                    return self._handle_from_lease(lease, config_version)
+                return await self._refresh_gateway(
+                    workspace_id, config_version, lease, deadline)
+        return await self._refresh_gateway(
+            workspace_id, config_version, lease, deadline)
+
+    async def _refresh_gateway(self, workspace_id: str, config_version: int,
+                               lease: WorkerLease,
+                               deadline: float) -> WorkerHandle:
+        """重新配置/激活 gateway；CAS 后失败只标 unavailable，不中断 Run。"""
+        try:
+            candidate = await self._ensure_candidate(
+                workspace_id, config_version, deadline, lease)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._db(
+                self._store.mark_worker_gateway_unavailable,
+                workspace_id, lease.generation, self._now())
+            raise
+        if candidate.container_id != lease.container_id:
+            await self._fail_ready(workspace_id, lease)
+            raise RuntimeUnavailable("worker_identity_mismatch", 503,
+                                     retry_after=5)
+        staged = await self._db(
+            self._store.begin_worker_gateway_refresh,
+            workspace_id, lease.generation, self.owner_id, candidate,
+            self._now(), self._lease_seconds)
+        if staged is None:
+            raise RuntimeUnavailable("worker_start_superseded", 503,
+                                     retry_after=1)
+        try:
+            final = await self._activate_candidate(
+                workspace_id, config_version, candidate, deadline)
+        except asyncio.CancelledError:
+            await self._db(
+                self._store.fail_worker_gateway_refresh,
+                workspace_id, self.owner_id, staged.generation, self._now())
+            raise
+        except Exception as error:
+            await self._cleanup_candidate(workspace_id, candidate)
+            await self._db(
+                self._store.fail_worker_gateway_refresh,
+                workspace_id, self.owner_id, staged.generation, self._now())
+            raise RuntimeUnavailable(
+                getattr(error, "code", "gateway_unavailable"), 503,
+                retry_after=5) from error
+        if not await self._db(
+                self._store.complete_worker_gateway_refresh,
+                workspace_id, self.owner_id, staged.generation, final,
+                self._now(), self._lease_seconds):
+            raise RuntimeUnavailable("worker_start_superseded", 503,
+                                     retry_after=1)
+        return final
+
+    async def _ensure_candidate(self, workspace_id: str, config_version: int,
+                                deadline: float, lease: WorkerLease | None
+                                ) -> WorkerHandle:
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise RuntimeUnavailable("worker_start_timeout", 503,
+                                     retry_after=5)
+        try:
+            handle = await asyncio.wait_for(
+                self._provisioner.ensure(workspace_id, config_version),
+                timeout=remaining)
+        except asyncio.TimeoutError:
+            raise RuntimeUnavailable("worker_start_timeout", 503,
+                                     retry_after=5) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeUnavailable("worker_start_failed", 503,
+                                     retry_after=5) from error
+        problem = self._handle_problem(
+            handle, workspace_id, config_version,
+            gateway_required=self._gateway_required)
+        if problem is not None:
+            raise RuntimeUnavailable(problem, 503, retry_after=5)
+        return handle
+
+    async def _activate_candidate(self, workspace_id: str,
+                                  config_version: int, candidate: WorkerHandle,
+                                  deadline: float) -> WorkerHandle:
+        if candidate.gateway_state == "available":
+            return replace(candidate, gateway_state="available")
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise RuntimeUnavailable("gateway_activation_timeout", 503,
+                                     retry_after=5)
+        try:
+            status = await asyncio.wait_for(
+                self._provisioner.activate(
+                    workspace_id, candidate.container_id,
+                    candidate.gateway_instance_id,
+                    candidate.gateway_generation, config_version),
+                timeout=remaining)
+        except asyncio.TimeoutError:
+            raise RuntimeUnavailable("gateway_activation_timeout", 503,
+                                     retry_after=5) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeUnavailable(
+                getattr(error, "code", "gateway_activation_failed"), 503,
+                retry_after=5) from error
+        gateway = status.get("gateway") if isinstance(status, dict) else None
+        if (not isinstance(gateway, dict)
+                or gateway.get("gateway_instance_id")
+                != candidate.gateway_instance_id
+                or gateway.get("boot_generation")
+                != candidate.gateway_generation
+                or gateway.get("worker_container_id")
+                != candidate.container_id
+                or gateway.get("config_version") != config_version
+                or gateway.get("available") is not True):
+            raise RuntimeUnavailable("gateway_activation_invalid", 503,
+                                     retry_after=5)
+        return replace(candidate, gateway_state="available")
 
     async def _claim(self, workspace_id: str,
                      config_version: int) -> tuple[str, WorkerLease | None]:
@@ -324,10 +501,32 @@ class RuntimeManager:
             raise RuntimeUnavailable("worker_start_failed", 503,
                                      retry_after=5) from error
 
-        problem = self._handle_problem(handle, workspace_id, config_version)
+        problem = self._handle_problem(
+            handle, workspace_id, config_version,
+            gateway_required=self._gateway_required)
         if problem is not None:
             await self._fail_start(workspace_id, lease)
             raise RuntimeUnavailable(problem, 503, retry_after=5)
+        if self._gateway_required:
+            if not await self._db(
+                    self._store.stage_worker_gateway_start,
+                    workspace_id, self.owner_id, lease.generation, handle,
+                    self._now()):
+                raise RuntimeUnavailable("worker_start_superseded", 503,
+                                         retry_after=1)
+            try:
+                handle = await self._activate_candidate(
+                    workspace_id, config_version, handle, deadline)
+            except asyncio.CancelledError:
+                await self._cleanup_candidate(workspace_id, handle)
+                await self._fail_start(workspace_id, lease)
+                raise
+            except Exception as error:
+                await self._cleanup_candidate(workspace_id, handle)
+                await self._fail_start(workspace_id, lease)
+                raise RuntimeUnavailable(
+                    getattr(error, "code", "gateway_activation_failed"), 503,
+                    retry_after=5) from error
         if not await self._db(
                 self._store.complete_worker_start,
                 workspace_id, self.owner_id, lease.generation, handle,
@@ -342,6 +541,25 @@ class RuntimeManager:
         """租约过期后核对真实容器；身份不符则失败关闭，不接管。"""
         if lease is None:
             raise RuntimeUnavailable("worker_unavailable", 503)
+        if self._gateway_required:
+            if not self._worker_lease_valid(lease):
+                await self._fail_ready(workspace_id, lease)
+                raise RuntimeUnavailable("worker_identity_mismatch", 503,
+                                         retry_after=5)
+            try:
+                report = await self._provisioner.inspect(workspace_id)
+            except Exception as error:
+                raise RuntimeUnavailable(
+                    "gateway_inspect_failed", 503,
+                    retry_after=5) from error
+            if not self._report_worker_matches(
+                    report, workspace_id, config_version, lease):
+                await self._fail_ready(workspace_id, lease)
+                raise RuntimeUnavailable("worker_identity_mismatch", 503,
+                                         retry_after=5)
+            return await self._refresh_gateway(
+                workspace_id, config_version, lease,
+                self._clock() + self._ready_timeout)
         if not self._valid_lease_handle(lease):
             await self._fail_ready(workspace_id, lease)
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
@@ -393,7 +611,7 @@ class RuntimeManager:
                 self._store.begin_worker_stop, workspace_id, self._now(),
                 generation=lease.generation):
             return
-        await self._provisioner.stop(workspace_id, lease.container_id)
+        await self._stop_lease(lease)
         await self._db(self._store.stop_worker, workspace_id, self._now(),
                        generation=lease.generation,
                        expected_state="stopping")
@@ -414,8 +632,7 @@ class RuntimeManager:
                                      retry_after=5)
         try:
             await asyncio.wait_for(
-                self._provisioner.stop(workspace_id, lease.container_id),
-                timeout=remaining)
+                self._stop_lease(lease), timeout=remaining)
         except asyncio.TimeoutError:
             raise RuntimeUnavailable("worker_stop_timeout", 503,
                                      retry_after=5) from None
@@ -442,7 +659,8 @@ class RuntimeManager:
 
     @staticmethod
     def _handle_problem(handle: object, workspace_id: str,
-                        config_version: int) -> str | None:
+                        config_version: int, *,
+                        gateway_required: bool = False) -> str | None:
         if not isinstance(handle, WorkerHandle):
             return "worker_identity_mismatch"
         if handle.workspace_id != workspace_id:
@@ -455,30 +673,57 @@ class RuntimeManager:
             return "worker_identity_mismatch"
         if not _valid_upstream(handle.upstream):
             return "worker_identity_mismatch"
+        if gateway_required or handle.gateway_instance_id:
+            if not RuntimeManager._gateway_fields_valid(handle):
+                return "worker_identity_mismatch"
+            if handle.gateway_state not in ("staged", "available"):
+                return "worker_identity_mismatch"
         return None
 
     @staticmethod
-    def _valid_lease_handle(lease: WorkerLease) -> bool:
+    def _gateway_fields_valid(value: object) -> bool:
+        gateway_id = getattr(value, "gateway_instance_id", "")
+        generation = getattr(value, "gateway_generation", "")
+        upstream = getattr(value, "gateway_upstream", "")
+        return (
+            isinstance(gateway_id, str) and _GATEWAY_ID.fullmatch(gateway_id)
+            is not None
+            and isinstance(generation, str)
+            and _BOOT_GENERATION.fullmatch(generation) is not None
+            and _valid_upstream(upstream))
+
+    @staticmethod
+    def _worker_lease_valid(lease: WorkerLease) -> bool:
         return (lease.state == "ready"
                 and _valid_identifier(lease.container_id)
                 and _valid_token(lease.service_token)
                 and _valid_upstream(lease.upstream))
 
     @staticmethod
-    def _report_matches(report: object, workspace_id: str, config_version: int,
-                        lease: WorkerLease) -> bool:
-        """只认受管标签和身份响应同时匹配的实际容器。"""
+    def _valid_lease_handle(lease: WorkerLease) -> bool:
+        if not (lease.state == "ready"
+                and _valid_identifier(lease.container_id)
+                and _valid_token(lease.service_token)
+                and _valid_upstream(lease.upstream)):
+            return False
+        if lease.gateway_instance_id:
+            return (lease.gateway_state == "available"
+                    and RuntimeManager._gateway_fields_valid(lease))
+        return True
+
+    @staticmethod
+    def _report_worker_matches(report: object, workspace_id: str,
+                               config_version: int,
+                               lease: WorkerLease) -> bool:
         if not isinstance(report, dict):
             return False
-        if report.get("managed") is not True or report.get("ready") is not True:
+        if report.get("managed") is not True:
             return False
         if report.get("workspace_id") != workspace_id:
             return False
         if report.get("config_version") != config_version:
             return False
         if report.get("instance_id") != lease.container_id:
-            return False
-        if report.get("upstream") != lease.upstream:
             return False
         labels = report.get("labels")
         if not isinstance(labels, dict):
@@ -487,18 +732,61 @@ class RuntimeManager:
                 and labels.get(WORKSPACE_LABEL) == workspace_id
                 and labels.get(CONFIG_VERSION_LABEL) == str(config_version))
 
+    @staticmethod
+    def _report_gateway_matches(report: object, workspace_id: str,
+                                config_version: int,
+                                lease: WorkerLease) -> bool:
+        if not isinstance(report, dict):
+            return False
+        gateway = report.get("gateway")
+        if not isinstance(gateway, dict):
+            return False
+        return (
+            report.get("gateway_available") is True
+            and gateway.get("managed") is True
+            and gateway.get("available") is True
+            and gateway.get("workspace_id") == workspace_id
+            and gateway.get("config_version") == config_version
+            and gateway.get("worker_container_id") == lease.container_id
+            and gateway.get("gateway_instance_id")
+            == lease.gateway_instance_id
+            and report.get("gateway_generation") == lease.gateway_generation
+            and report.get("gateway_upstream") == lease.gateway_upstream)
+
+    @staticmethod
+    def _report_matches(report: object, workspace_id: str, config_version: int,
+                        lease: WorkerLease) -> bool:
+        """只认受管标签和身份响应同时匹配的实际容器。"""
+        if not isinstance(report, dict) or report.get("ready") is not True:
+            return False
+        if report.get("upstream") != lease.upstream:
+            return False
+        if not RuntimeManager._report_worker_matches(
+                report, workspace_id, config_version, lease):
+            return False
+        if lease.gateway_instance_id or lease.gateway_state != "disabled":
+            return RuntimeManager._report_gateway_matches(
+                report, workspace_id, config_version, lease)
+        return True
+
     def _handle_from_lease(self, lease: WorkerLease | None,
                            config_version: int) -> WorkerHandle:
-        if not self._valid_lease_handle(lease):
+        if lease is None or not self._valid_lease_handle(lease):
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
-        assert lease is not None
         if lease.config_version != config_version:
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
-        return WorkerHandle(lease.workspace_id, lease.container_id,
-                            lease.upstream, lease.service_token,
-                            lease.config_version)
+        if self._gateway_required and not lease.gateway_instance_id:
+            raise RuntimeUnavailable("gateway_unavailable", 503,
+                                     retry_after=5)
+        return WorkerHandle(
+            lease.workspace_id, lease.container_id,
+            lease.upstream, lease.service_token, lease.config_version,
+            gateway_instance_id=lease.gateway_instance_id,
+            gateway_generation=lease.gateway_generation,
+            gateway_upstream=lease.gateway_upstream,
+            gateway_state=lease.gateway_state)
 
     async def _has_active_workload(self, workspace_id: str) -> bool:
         lease = await self._db(self._store.get_worker_lease, workspace_id)
@@ -540,6 +828,43 @@ class RuntimeManager:
             raise RuntimeUnavailable(code, 503, retry_after=5)
         await asyncio.sleep(min(self._poll_interval,
                                 max(0.0, deadline - self._clock())))
+
+    async def _stop_provisioner(self, workspace_id: str, container_id: str,
+                                gateway_instance_id: str) -> None:
+        if gateway_instance_id:
+            await self._provisioner.stop(
+                workspace_id, container_id, gateway_instance_id)
+        else:
+            await self._provisioner.stop(workspace_id, container_id)
+
+    async def _cleanup_candidate(self, workspace_id: str,
+                                 handle: WorkerHandle) -> None:
+        """只按本轮新建标记清理；既有 worker/gateway 绝不因激活失败删除。"""
+        if not self._gateway_required:
+            return
+        if not (handle.worker_created or handle.gateway_created):
+            return
+        abort = getattr(self._provisioner, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            await asyncio.wait_for(
+                abort(
+                    workspace_id, handle.container_id,
+                    handle.gateway_instance_id,
+                    worker_created=handle.worker_created,
+                    gateway_created=handle.gateway_created),
+                timeout=CONFIRM_STOP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001,S110 - 原激活错误仍向上抛出
+            # 清理失败不把整体终态伪装成成功。
+            pass
+
+    async def _stop_lease(self, lease: WorkerLease) -> None:
+        gateway = lease.gateway_instance_id if self._gateway_required else ""
+        await self._stop_provisioner(
+            lease.workspace_id, lease.container_id, gateway)
 
     def _now(self) -> int:
         return int(self._clock())
@@ -594,9 +919,16 @@ class UnixProvisionerClient:
     ENSURE_TIMEOUT = 90.0
     STOP_TIMEOUT = 90.0
     INSPECT_TIMEOUT = 15.0
+    ACTIVATE_TIMEOUT = 30.0
 
-    def __init__(self, socket_path: str | Path):
+    def __init__(self, socket_path: str | Path, *,
+                 gateway_required: bool = False):
         self.socket_path = str(socket_path)
+        self.gateway_required = bool(gateway_required)
+
+    @property
+    def _protocol_version(self) -> int:
+        return 2 if self.gateway_required else 1
 
     async def _call(self, payload: dict, timeout: float) -> dict:
         try:
@@ -635,22 +967,62 @@ class UnixProvisionerClient:
     async def ensure(self, workspace_id: str,
                      config_version: int) -> WorkerHandle:
         response = await self._call({
-            "version": 1, "action": "ensure", "workspace_id": workspace_id,
+            "version": self._protocol_version, "action": "ensure",
+            "workspace_id": workspace_id,
             "config_version": config_version}, self.ENSURE_TIMEOUT)
-        return self._decode_ensure(response)
+        return self._decode_ensure(response, gateway_required=self.gateway_required)
 
-    async def stop(self, workspace_id: str, instance_id: str) -> None:
+    async def stop(self, workspace_id: str, instance_id: str,
+                   gateway_instance_id: str = "") -> None:
+        payload = {
+            "version": self._protocol_version, "action": "stop",
+            "workspace_id": workspace_id, "instance_id": instance_id}
+        if self.gateway_required:
+            payload["gateway_instance_id"] = gateway_instance_id
+        response = await self._call(payload, self.STOP_TIMEOUT)
+        if response.get("ok") is not True:
+            raise RuntimeUnavailable(
+                _safe_error_code(response.get("error")), 503, retry_after=5)
+
+    async def activate(self, workspace_id: str, worker_container_id: str,
+                       gateway_instance_id: str, boot_generation: str,
+                       config_version: int) -> dict:
+        if not self.gateway_required:
+            raise RuntimeUnavailable("gateway_disabled", 503)
         response = await self._call({
-            "version": 1, "action": "stop", "workspace_id": workspace_id,
-            "instance_id": instance_id}, self.STOP_TIMEOUT)
+            "version": 2, "action": "activate", "workspace_id": workspace_id,
+            "config_version": config_version,
+            "worker_container_id": worker_container_id,
+            "gateway_instance_id": gateway_instance_id,
+            "boot_generation": boot_generation}, self.ACTIVATE_TIMEOUT)
+        if response.get("ok") is not True:
+            raise RuntimeUnavailable(
+                _safe_error_code(response.get("error")), 503, retry_after=5)
+        gateway = response.get("gateway")
+        if not isinstance(gateway, dict):
+            raise RuntimeUnavailable("provisioner_invalid_response", 503,
+                                     retry_after=5)
+        return {"gateway": gateway}
+
+    async def abort(self, workspace_id: str, worker_container_id: str,
+                    gateway_instance_id: str, *, worker_created: bool,
+                    gateway_created: bool) -> None:
+        if not self.gateway_required:
+            return
+        response = await self._call({
+            "version": 2, "action": "abort", "workspace_id": workspace_id,
+            "worker_container_id": worker_container_id,
+            "gateway_instance_id": gateway_instance_id,
+            "worker_created": worker_created,
+            "gateway_created": gateway_created}, self.STOP_TIMEOUT)
         if response.get("ok") is not True:
             raise RuntimeUnavailable(
                 _safe_error_code(response.get("error")), 503, retry_after=5)
 
     async def inspect(self, workspace_id: str) -> dict:
         response = await self._call({
-            "version": 1, "action": "inspect", "workspace_id": workspace_id},
-            self.INSPECT_TIMEOUT)
+            "version": self._protocol_version, "action": "inspect",
+            "workspace_id": workspace_id}, self.INSPECT_TIMEOUT)
         if response.get("ok") is not True:
             raise RuntimeUnavailable(
                 _safe_error_code(response.get("error")), 503, retry_after=5)
@@ -661,7 +1033,8 @@ class UnixProvisionerClient:
         return report
 
     @staticmethod
-    def _decode_ensure(response: object) -> WorkerHandle:
+    def _decode_ensure(response: object, *, gateway_required: bool = False
+                       ) -> WorkerHandle:
         if not isinstance(response, dict) or response.get("ok") is not True:
             error = response.get("error") if isinstance(response, dict) else None
             raise RuntimeUnavailable(_safe_error_code(error), 503,
@@ -669,19 +1042,38 @@ class UnixProvisionerClient:
         handle = response.get("handle")
         keys = {"workspace_id", "container_id", "upstream", "service_token",
                 "config_version"}
+        if gateway_required:
+            keys |= {
+                "gateway_instance_id", "gateway_generation",
+                "gateway_upstream", "gateway_state", "worker_created",
+                "gateway_created",
+            }
         if not isinstance(handle, dict) or set(handle) != keys:
             raise RuntimeUnavailable("provisioner_invalid_response", 503,
                                      retry_after=5)
         if not all(isinstance(handle[key], str)
-                   for key in keys - {"config_version"}):
+                   for key in keys - {"config_version", "worker_created",
+                                      "gateway_created"}):
             raise RuntimeUnavailable("provisioner_invalid_response", 503,
                                      retry_after=5)
         if type(handle["config_version"]) is not int:
             raise RuntimeUnavailable("provisioner_invalid_response", 503,
                                      retry_after=5)
-        return WorkerHandle(handle["workspace_id"], handle["container_id"],
-                            handle["upstream"], handle["service_token"],
-                            handle["config_version"])
+        if gateway_required and (
+                type(handle["worker_created"]) is not bool
+                or type(handle["gateway_created"]) is not bool):
+            raise RuntimeUnavailable("provisioner_invalid_response", 503,
+                                     retry_after=5)
+        return WorkerHandle(
+            handle["workspace_id"], handle["container_id"],
+            handle["upstream"], handle["service_token"],
+            handle["config_version"],
+            gateway_instance_id=handle.get("gateway_instance_id", ""),
+            gateway_generation=handle.get("gateway_generation", ""),
+            gateway_upstream=handle.get("gateway_upstream", ""),
+            gateway_state=handle.get("gateway_state", "disabled"),
+            worker_created=handle.get("worker_created", False),
+            gateway_created=handle.get("gateway_created", False))
 
 
 def _safe_error_code(value: object) -> str:
