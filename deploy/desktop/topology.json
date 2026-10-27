@@ -31,6 +31,7 @@
     "container_workspace": "/workspace",
     "container_home": "/home/easel",
     "container_state": "/workspace/state",
+    "persistence_probe": "A3 前必须由 UID 10001 实际验证创建、SQLite 读写、文件锁、fsync、原子替换和重开；若 Windows 挂载不满足权限/锁语义，改用耐久 WSL ext4 根并记录 Windows 备份方式；/tmp 不得作为持久根。",
     "bind_source_rule": "WSL Docker CLI 可挂载 /mnt/c 与 WSL ext4 路径；/tmp 不具持久性，只用于 socket。worker 持久根必须使用耐久路径，推荐 C:\\Easel\\workspaces。"
   },
   "management": {
@@ -69,6 +70,7 @@
     "health_probe": {
       "mode": "docker_exec_required",
       "implemented": false,
+      "target": "从已核验 worker inspect 取得的不可复用 container_id；不得只用容器名。",
       "command": [
         "python",
         "-m",
@@ -77,6 +79,9 @@
         "--port",
         "7860"
       ],
+      "timeout_seconds": 10,
+      "success": "退出 0 且固定 healthcheck 的身份/workspace/config_version/container_id/ready 全部匹配；任意退出 0 不算通过。",
+      "execution_capability": "A3 必须再验证真实 Run 路由/身份；只通过 lifecycle-only check 不得标记执行能力 ready。",
       "contract": "只经固定 docker exec 命令核对 worker 身份/版本/就绪；不得把 WSL→容器 IP 的 HTTP 探测当作可行路径。"
     }
   },
@@ -122,32 +127,194 @@
       ],
       "management_bind": "control_network_ip_only",
       "management_port": 8897,
-      "management_bind_procedure": "gateway 先以 easel-control 为第一网络启动，解析自身 control 网络地址并绑定 management listener，再连接 easel-ws-{workspace_id}；不得在 worker 地址上绑定 0.0.0.0。",
-      "routing": {
-        "worker_target_template": "http://easel-worker-{workspace_id}:7860",
-        "control_upstream_template": "http://easel-gateway-{workspace_id}:8897",
-        "workspace_fixed": true,
-        "client_target_allowed": false
+      "management_bind_procedure": "provisioner 以 easel-control 创建 gateway 后 docker inspect 实际控制网络 endpoint，要求恰好一个 IPv4；将精确地址作为 EASEL_GATEWAY_BIND 在 start 前注入，绑定成功后才连接 easel-ws-{workspace_id}。地址缺失、歧义或启动前后变化均失败关闭；禁止 0.0.0.0、首张网卡或名称解析推断。",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/internal/lifecycle/health",
+          "query": []
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{run_id}",
+          "query": []
+        },
+        {
+          "method": "GET",
+          "path": "/internal/runs/{run_id}/events",
+          "query": [
+            {
+              "name": "after",
+              "type": "integer",
+              "required": false,
+              "default": 0,
+              "min": 0,
+              "max": "worker_max_event_id",
+              "repeat": "reject"
+            },
+            {
+              "name": "nonce",
+              "type": "string",
+              "required": false,
+              "min_length": 1,
+              "max_length": 128,
+              "encoding": "rfc3986_percent_decode_once",
+              "repeat": "reject"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{run_id}/stop",
+          "query": []
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{run_id}/questions/{question_id}/answer",
+          "query": []
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{run_id}/questions/status",
+          "query": []
+        },
+        {
+          "method": "GET",
+          "path": "/internal/sessions/{session_id}/messages",
+          "query": [
+            {
+              "name": "limit",
+              "type": "integer",
+              "required": false,
+              "default": 100,
+              "min": 1,
+              "max": 500,
+              "repeat": "reject"
+            },
+            {
+              "name": "offset",
+              "type": "integer",
+              "required": false,
+              "default": 0,
+              "min": 0,
+              "max": null,
+              "repeat": "reject"
+            }
+          ]
+        }
+      ],
+      "url_rules": {
+        "path": "只接受 origin-form；解码一次；拒绝绝对 URI、反斜杠、编码的 / 和 \\、%00、尾斜杠、重复斜杠、片段和越界路径。",
+        "query": "只允许 routes 列出的查询项；未知/重复/空值拒绝；查询顺序无关；不做二次解码；不使用 ; 分隔。",
+        "redirect": "不跟随 worker 的 3xx；3xx、Location 或非法响应直接失败，不把重定向结果当成功。"
+      },
+      "id_rules": {
+        "run_id": "^[0-9a-f]{32}$",
+        "session_id": "^[0-9a-f]{32}$",
+        "question_id": "解码后必须是单个路径段，1..256 字节，不得为 . 或 ..，不得含 / \\\\ ? # NUL CR LF"
+      },
+      "header_rules": {
+        "strip_inbound": [
+          "Cookie",
+          "Authorization",
+          "Forwarded",
+          "X-Forwarded-*",
+          "X-Easel-*"
+        ],
+        "rebuild": [
+          "X-Easel-Workspace-Id",
+          "X-Easel-Service-Token"
+        ],
+        "response_strip": [
+          "Set-Cookie",
+          "Location",
+          "Connection",
+          "Keep-Alive",
+          "Proxy-Authenticate",
+          "Proxy-Authorization",
+          "TE",
+          "Trailer",
+          "Transfer-Encoding",
+          "Upgrade"
+        ],
+        "browser_credentials": "浏览器 Cookie/Authorization/外来 X-Easel-* 和 X-Forwarded-* 永不传给 gateway 下游；由 control/gateway 可信侧重建设。"
+      },
+      "auth": {
+        "control_to_gateway": {
+          "scheme": "ed25519_control_assertion",
+          "private_key_source": "control 现有签名私钥；gateway 只读公钥；使用独立 domain separator",
+          "public_key_mount": "read_only",
+          "domain": "easel.desktop.gateway.v1",
+          "fields": [
+            "workspace_id",
+            "gateway_instance_id",
+            "gateway_generation",
+            "worker_container_id",
+            "config_version",
+            "method",
+            "path",
+            "canonical_query",
+            "body_sha256",
+            "issued_at",
+            "expires_at",
+            "nonce",
+            "request_id"
+          ],
+          "expires_seconds": 30,
+          "replay": "gateway 单实例内存 nonce 缓存，随过期淘汰；每次请求新 nonce；不持久化，不记录断言/凭证。",
+          "placement": "内部头，仅 control→gateway；gateway 先剥离外来同名/所有 X-Easel-* 头，再校验。"
+        },
+        "gateway_to_worker": {
+          "scheme": "worker_service_token",
+          "source": "provisioner 的 .credentials/<workspace_id>.env，由 provisioner 提供给 gateway；不接受 control 或客户端替换。",
+          "headers": [
+            "X-Easel-Workspace-Id",
+            "X-Easel-Service-Token"
+          ],
+          "binding": "gateway 固定 worker container_id 和 config_version；不按 workspace 名自动落到新实例。"
+        },
+        "independence": "control 签名私钥与每个 worker 的 service 凭证是两套独立凭证；gateway 不持有 control 私钥，worker 不持有 control 断言；浏览器凭证不参与。"
+      },
+      "instance_binding": {
+        "worker": "WorkerHandle.container_id 保持 worker 不可复用 Docker ID；gateway upstream 不能替代或覆盖它。",
+        "gateway": "WorkerHandle 新增 gateway_instance_id 与 gateway_generation；WorkerLease/control 绑定持久化二者，gateway 标签含 workspace、config_version、worker_container_id。",
+        "target": "gateway 启动时从 provisioner 核验结果获得固定 worker container_id/config_version/IP；不按容器名自动解析到新代次。",
+        "stop": "stop 请求同时携带 worker container_id 与 gateway_instance_id；旧 stop 不能删除新 gateway。",
+        "old_auth": "断言 audience 含 gateway ID/generation；旧断言不能访问新 gateway；旧 worker service 凭证不能访问新 worker。"
+      },
+      "recovery": {
+        "control_restart": "从现有受保护 signing key 重新加载；gateway/worker 不变，重新签发新断言即可，不重发旧凭证。",
+        "provisioner_restart": "重建 Unix socket；已有 gateway/worker 不删除；control 重连后按不可复用 ID 复核并继续，不重新签发不可用 token。",
+        "gateway_restart": "同一 gateway 容器/ID/generation 和公钥可继续；若容器被重建，则必须产生新 gateway ID/generation，control 使用新句柄，旧断言因 audience 不符被拒。",
+        "gateway_unavailable": "control 返回 503；不删除 active worker；Run 不标记 done；SSE 断开可带 after 恢复；POST 不自动重发。",
+        "gateway_replacement": "按旧 gateway_instance_id 停止旧 gateway，在核验过的同一 worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/SSE 可按游标恢复，POST 不自动重试。",
+        "control_key_unavailable": "gateway 无法验证 control 断言时返回 503；不得删除 worker，直到显式 drain/stop。",
+        "worker_replacement": "新 worker 使用新 container_id/service 凭证；旧 gateway 目标/凭证不匹配，必须 drain/stop 旧代次后重建。",
+        "config_revision": "config_version 变化视为新代次；旧 worker/gateway 先 drain/stop，禁止热换挂载或凭证。"
+      },
+      "limits": {
+        "max_header_bytes": 65536,
+        "max_body_bytes": 67108864,
+        "connect_timeout_seconds": 10,
+        "io_timeout_seconds": 120,
+        "sse_idle_timeout_seconds": 120,
+        "max_concurrent_requests": 8,
+        "max_concurrent_reason": "与现有 max_active_runs_total=8 对齐；每个 SSE 连接占用一个槽。",
+        "sse_backpressure": "逐块 write + drain；客户端慢时暂停上游读取，不缓存完整流；客户端断开立即取消上游读取。",
+        "post_retry": "不自动重发任何 POST；Run admission/idempotency 由 worker 与 control 继续校验。"
       },
       "worker_ports": [],
       "docker_socket": false,
-      "mounts": [],
+      "mounts": [
+        "control-public-key:/keys/control-public.key:ro"
+      ],
+      "workspace_mounts": [],
+      "database_mounts": [],
       "read_only_rootfs": true,
       "user": "10001:10001",
-      "service_auth": "provisioner 为每 workspace 签发独立 control→gateway 凭证；control 通过 WorkerHandle 的不透明字段持有，gateway 固定 workspace 并拒绝其他目标。",
-      "worker_auth": "gateway 只在 control 认证通过后，向固定 worker 转发内部身份头；凭证不写日志/磁盘，worker 不持有 gateway 凭证。",
       "worker_to_management": "blocked_by_bind_and_network",
-      "path_allowlist": [
-        "/internal/lifecycle/health",
-        "/internal/runs/{run_id}",
-        "/internal/runs/{run_id}/events",
-        "/internal/runs/{run_id}/stop",
-        "/internal/runs/{run_id}/question",
-        "/internal/runs/{run_id}/question/answer"
-      ],
-      "method_allowlist": "每个精确 path 单独固定方法；拒绝其它方法与未知路径。",
       "sse": "streaming_passthrough",
-      "failure_cleanup": "网关与 worker 同代次创建/停止；启动失败和 worker 停止都清理网关，不留下可达入口。"
+      "failure_cleanup": "gateway 与 worker 同代次创建/停止；启动失败和 worker 停止都清理 gateway；gateway 停止失败不得吞掉，不留下可达入口。"
     }
   },
   "broker": {
@@ -166,8 +333,8 @@
     "items": [
       "WSL provisioner socket 以 0660 + 补充组 1000 挂载进 control 容器，并用 SO_PEERCRED 允许 UID 10001。",
       "以固定 docker exec healthcheck 取代宿主到 worker 容器 IP 的 HTTP 健康探测。",
-      "新增每 workspace 受信 gateway，固定 management 监听在控制网络地址、精确路径/方法白名单与 SSE 透传。",
-      "修改 WorkerHandle upstream 指向 gateway，并把 gateway 创建/停止/失败清理纳入 RuntimeManager/provisioner 测试。"
+      "按 routes 精确表实现 gateway：control Ed25519 断言、worker service 凭证、实例 ID/代次、恢复和失败清理；补 A 凭证访问 B、重复/未知方法路径和环境失败反例。",
+      "修改 WorkerHandle（保留 worker container_id，增加 gateway_instance_id/gateway_generation）与 WorkerLease/stop 绑定，并补 A3/A4 接口测试。"
     ]
   }
 }

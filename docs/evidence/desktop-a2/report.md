@@ -3,6 +3,9 @@
 日期：2026-10-27（Asia/Shanghai）
 
 基线：`f1c4e5ef98ea756513071367919fe57fac7dbf17`（A1 验收通过）。
+2026-10-27 A2 R1：补齐精确 gateway 路由、查询白名单、两套凭证、实例代次与
+恢复协议；清理/探针测试已改为可汇总、可失败的实现。仍只有契约与临时资源
+实测，没有实现 gateway。
 本报告只覆盖 A2 的只读盘点、临时资源实测和拓扑设计提交，不证明 A3/A4
 执行 worker、真实 Harness、聊天闭环或正式 Linux 发布门槛。
 
@@ -87,7 +90,10 @@ Windows 可挂载的耐久路径（契约提议 `C:\Easel\workspaces`）。测�
 
 因此当前 A1/A2 形态不能把宿主 HTTP 探测作为健康门槛。提案使用固定
 `docker exec <worker> python -m easel.worker.lifecycle healthcheck --port 7860`，
-待主审批准后实现；A3 还要验证执行能力，不只 lifecycle。
+目标为核验过的不可复用 worker container_id（不能只按名称），固定 argv、10
+秒超时；退出 0 还要匹配 healthcheck 身份/workspace/config_version/
+container_id/ready，任意退出 0 不算通过。A3 还要验证真实 Run 路由/身份，
+不只 lifecycle。待主审批准后实现。
 
 ## 5. control→worker 网络
 
@@ -105,56 +111,101 @@ Windows 可挂载的耐久路径（契约提议 `C:\Easel\workspaces`）。测�
 结论：直接让 control 加入 worker 网络不是可接受契约。必须新增控制面到
 worker 的受信 gateway，或由主审批准另一种等价的单向网络设计；本次不实现。
 
-## 6. Broker/路径契约
+## 6. A2 R1 精确 gateway 契约
 
-- worker broker 仍为 `http://easel-sidecar-<workspace_id>:8899`。
-- sidecar 仍加入 `easel-control` 与 `easel-ws-<workspace_id>`；worker 无默认
-  路由、无宿主端口、无 Docker socket。
-- control broker upstream 仍为 `control:7861`；gateway 的 management 端口
-  不能复用为任意 broker/出口代理。
-- gateway 固定路径/方法白名单、SSE 流式透传、逐 workspace 认证和失败清理；
-  详见 `deploy/desktop/topology.json` 与 README。
+A2 R1 只修订契约与测试；没有实现 gateway。精确表以
+[`deploy/desktop/topology.json`](../../deploy/desktop/topology.json) 的
+`network.gateway.routes` 为准：
 
-## 7. 红绿
+| Method | Path | Query |
+|---|---|---|
+| GET | `/internal/lifecycle/health` | 无 |
+| POST | `/internal/runs/{run_id}` | 无 |
+| GET | `/internal/runs/{run_id}/events` | `after`（整数，可选，默认 0，>=0，最大 event_id）；`nonce`（字符串，可选，1..128，RFC3986 解码一次）；均拒绝重复/未知项 |
+| POST | `/internal/runs/{run_id}/stop` | 无 |
+| POST | `/internal/runs/{run_id}/questions/{question_id}/answer` | 无 |
+| POST | `/internal/runs/{run_id}/questions/status` | 无 |
+| GET | `/internal/sessions/{session_id}/messages` | `limit`（整数，可选，默认 100，1..500）；`offset`（整数，可选，默认 0，>=0）；均拒绝重复/未知项 |
+
+- 已移除不存在的 `/question`、`/question/answer`；历史读取使用
+  `/internal/sessions/{session_id}/messages`。
+- 路径只接受 origin-form，解码一次；拒绝绝对 URI、编码的 `/` 和 `\`、
+  `%00`、尾斜杠、重复斜杠、片段及越界 ID；`run_id`/`session_id` 为
+  32 位小写 hex，`question_id` 为单个 1..256 字节路径段。
+- 请求上限沿用/对齐现有 relay：header 64 KiB、body 64 MiB、连接 10 秒、
+  I/O 与 SSE idle 120 秒；每 gateway 最多 8 个并发请求/SSE。SSE 逐块
+  `write`+`drain`，客户端慢时暂停上游读取，不缓存完整流；客户端断开取消
+  上游；不自动重发 POST。
+- control→gateway 使用 control Ed25519 签名断言（30 秒、nonce、method/
+  path/query/body hash、workspace/gateway instance/generation/worker
+  container_id/config_version 绑定）；gateway 只读公钥。gateway→worker
+  使用 provisioner `.credentials` 提供的每 worker service 凭证。两者独立；
+  浏览器 Cookie/Authorization/外来 `X-Easel-*` 不进入下游，由可信侧重建。
+- `WorkerHandle.container_id` 仍是 worker 不可复用 Docker ID；
+  `gateway_instance_id`/`gateway_generation` 单独绑定。旧 stop 按旧 gateway
+  ID，不会删除新 gateway；旧断言 audience 不匹配新 gateway，旧 worker
+  service 凭证不能访问新 worker。
+- 恢复协议：control 重启只重载既有签名私钥；provisioner 重启只重建 socket，
+  已有 gateway/worker 不删；gateway 重建必须产生新 ID/generation，旧断言
+  失效；gateway 不可用时 control 503，不删 active worker，Run 不标记完成，
+  GET/SSE 可按 `after` 恢复，POST 不自动重发；gateway 更换在核验过的同一
+  worker 实例/config 上进行并保留 worker；config_version 变化必须
+  drain/stop 后重建。不存在 per-gateway 共享 token，因此不会出现“旧
+  gateway 配新 token”的不可用组合。
+
+## 7. 清理、探针反例与红绿
+
+### 清理和探针修订
+
+- A2 测试改用 `tests/multiuser/topology_support.py` 的逐项 inspect/归属/
+  删除/汇总逻辑；容器先于网络清理，避免 active endpoint 让网络删除失败。
+- 所有 `docker run` 客户端都有显式随机名称和 `easel.test.run-id` 标签；
+  Docker CLI 超时后仍按名称/标签清理。
+- 单项删除非零、删除超时、inspect 超时、归属不符、删除后已不存在、
+  named client CLI 超时均有纯逻辑测试；后续资源继续处理，最终错误不吞掉。
+- `_assert_wsl_blocked` 只接受约定 `returncode=3` 且 stdout 含 `BLOCKED`；
+  WSL 启动、解释器、探针脚本失败会作为基础设施错误变红。隔离测试先验证
+  两端容器回环 HTTP 200，再做跨网络探测。
+- socket 测试与真实 provisioner unauthorized 的区别保留：socket 测试证明
+  挂载与 peer UID；真实 provisioner 的 authorized/unauthorized 结果见第 2 节
+  手工实测，不冒充由 pytest 覆盖。
 
 ### 红
 
-在创建 `deploy/desktop/topology.json` 前运行契约测试：
+修复清理排序前，真实测试在清理阶段出现（测试业务探测本身已通过）：
 
 ```text
-C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/integration/multiuser/test_desktop_topology.py -q
-Fsssss                                                                   [100%]
-1 failed, 5 skipped in 0.27s
-FAILED ... test_desktop_topology_contract_is_explicit_and_secret_free
-AssertionError: A2 必须先提交 deploy/desktop/topology.json
+FAILED test_worker_http_is_blocked_from_windows_and_wsl
+FAILED test_bridge_control_and_worker_networks_are_isolated
+FAILED test_joining_control_to_worker_network_is_bidirectional
+3 failed, 6 passed
+A2 cleanup failed: network ... has active endpoints (...)
 ```
+
+这正是“测试成功但清理失败不得假绿”的红；修复为容器先于网络清理后消失。
 
 ### 绿
 
 ```text
 C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/integration/multiuser/test_desktop_topology.py -q
-.                                                                        [100%]
-1 passed in 0.13s
-```
+......sssss                                                              [100%]
+6 passed, 5 skipped in 0.09s
 
-真实临时资源（显式开关）：
-
-```text
 $env:EASEL_RUN_CONTAINER_TESTS = '1'
 C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/integration/multiuser/test_desktop_topology.py -q
-......                                                                   [100%]
-6 passed in 21.37s
+...........                                                              [100%]
+11 passed in 22.60s
 ```
 
-覆盖：Windows/WSL HTTP 被阻断、独立 bridge 隔离、control 加入 worker 网络的
-双向反例、Windows/WSL bind 可见性、WSL socket 挂载与 UID 10001 peer
-credential、静态契约无秘密。
+真实测试覆盖：Windows/WSL HTTP 阻断（严格 BLOCKED 契约）、独立 bridge
+隔离、control 加入 worker 网络的双向反例、Windows/WSL bind 可见性、WSL
+socket 挂载与 UID 10001 peer credential，以及所有契约/清理/探针反例。
 
 ### 回归与静态检查
 
 | 命令 | 结果 |
 |---|---|
-| `pytest tests/multiuser/test_desktop_deployment.py tests/test_document_paths.py -q` | **55 passed**（Desktop 45 + 文档 10） |
+| `pytest tests/multiuser/test_desktop_deployment.py tests/multiuser/test_topology_support.py tests/test_document_paths.py -q` | **64 passed** |
 | `pytest tests/multiuser/test_provisioner.py tests/multiuser/test_worker_lifecycle.py -q` | **107 passed, 1 skipped** |
 | `ruff check tests/integration/multiuser/test_desktop_topology.py` | 通过 |
 | `python -m json.tool deploy/desktop/topology.json` | 通过 |
@@ -162,11 +213,13 @@ credential、静态契约无秘密。
 
 ## 8. 清理与边界
 
-- 全部临时容器/网络使用随机 `easel-a2-*` 名称与 `easel.a2.test=<run>` 标签；
-  测试和手工探针按精确名称/标签清理。
-- 复查 `docker ps -a --filter label=easel.a2.test` 与
-  `docker network ls --filter label=easel.a2.test` 为空。
-- 未执行全局 `prune`，未停止/删除任何开发者容器、卷、网络或 ngrok 隧道。
+- 全部临时容器/网络使用随机 `easel-a2-*` 名称与
+  `easel.test.run-id=<run>` 标签；包括临时客户端；测试和手工探针按精确
+  名称/标签清理。
+- 最终复查 `docker ps -a --filter label=easel.test.run-id`、
+  `docker network ls --filter label=easel.test.run-id` 均无 A2 资源；
+  WSL `/tmp/easel-a2-*` 为空。
+- 未执行全局 `prune`；未停止/删除开发者容器、卷、网络或 ngrok 隧道。
 - `.scratch` 中的临时探针脚本/日志不进入提交。
 
 ## 9. 未执行与剩余限制
@@ -175,6 +228,8 @@ credential、静态契约无秘密。
 - 没有重新构建或启动 A1 control 镜像；A1 的登录/浏览器证据不变。
 - 没有执行真实 Harness、供应商调用、正式 Linux/XFS/防火墙/Chromium
   沙箱门槛。
+- 持久路径只证明 bind 可见性；A3 前还需 UID 10001 的真实创建/SQLite/
+  锁/fsync/原子替换/重开探针；`/tmp` 不得作为持久根。
 - 本机 Docker Desktop 的宿主到容器 IP HTTP 路径按本次实测判定为不可用；
   若 Docker Desktop 升级改变行为，需要重新跑 A2 实测并更新契约。
 - 设计批准前，不把 WSL/Windows 直连、host-network 或 control 加入 worker

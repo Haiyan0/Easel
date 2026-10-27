@@ -1,5 +1,6 @@
 {
   "task": "A2",
+  "revision": "R1",
   "baseline": "f1c4e5ef98ea756513071367919fe57fac7dbf17",
   "status": "proposed",
   "approval_required": true,
@@ -29,30 +30,48 @@
     "wsl_socket_unauthorized_uid": 1000,
     "windows_unc_socket_live_connect": "permission_denied_for_0660"
   },
+  "gateway_contract": {
+    "route_count": 7,
+    "methods_paths_exact": true,
+    "events_query": ["after", "nonce"],
+    "messages_query": ["limit", "offset"],
+    "control_to_gateway": "ed25519_control_assertion",
+    "gateway_to_worker": "worker_service_token",
+    "instance_binding": ["worker_container_id", "gateway_instance_id", "gateway_generation"],
+    "recovery_defined": true,
+    "gateway_implemented": false
+  },
   "tests": {
-    "red": {
-      "command": "python -m pytest tests/integration/multiuser/test_desktop_topology.py -q",
+    "initial_red": {
+      "reason": "topology.json missing",
       "result": "1 failed, 5 skipped",
       "seconds": 0.27
     },
-    "static_green": {
-      "command": "python -m pytest tests/integration/multiuser/test_desktop_topology.py::test_desktop_topology_contract_is_explicit_and_secret_free -q",
-      "result": "1 passed",
-      "seconds": 0.13
+    "r1_cleanup_red": {
+      "reason": "network active endpoints before container cleanup",
+      "result": "3 failed, 6 passed"
+    },
+    "static_and_pure_green": {
+      "command": "python -m pytest tests/integration/multiuser/test_desktop_topology.py -q",
+      "result": "6 passed, 5 skipped",
+      "seconds": 0.09
     },
     "real_green": {
       "command": "EASEL_RUN_CONTAINER_TESTS=1 python -m pytest tests/integration/multiuser/test_desktop_topology.py -q",
-      "result": "6 passed",
-      "seconds": 21.37
+      "result": "11 passed",
+      "seconds": 22.60
     },
-    "desktop_and_document_regression": "55 passed",
+    "desktop_topology_document_regression": "64 passed",
     "provisioner_and_lifecycle_regression": "107 passed, 1 skipped",
     "ruff": "passed",
     "json_tool": "passed"
   },
   "cleanup": {
+    "label": "easel.test.run-id",
     "a2_label_containers_remaining": 0,
     "a2_label_networks_remaining": 0,
+    "named_clients_remaining": 0,
+    "wsl_temp_remaining": 0,
     "global_prune": false,
     "developer_resources_touched": false
   }
