@@ -71,7 +71,7 @@ class Provisioner(Protocol):
         """按候选的精确实例/boot 激活；只能在受保护 CAS 之后调用。"""
 
     async def abort(self, workspace_id: str, worker_container_id: str,
-                    gateway_instance_id: str, *, attempt_id: str,
+                    gateway_instance_id: str, *, attempt_id: str, scope: str,
                     worker_created: bool,
                     gateway_created: bool) -> None:
         """激活失败时仅清理当前 attempt 的新建资源。"""
@@ -412,16 +412,30 @@ class RuntimeManager:
             final = await self._activate_candidate(
                 workspace_id, config_version, candidate, deadline)
         except asyncio.CancelledError:
-            await self._db(
-                self._store.fail_worker_gateway_refresh,
-                workspace_id, self.owner_id, staged.generation, self._now())
+            if candidate.worker_created or candidate.gateway_created:
+                await self._cleanup_candidate(
+                    workspace_id, candidate, staged, attempt_id)
+            else:
+                await self._db(
+                    self._store.fail_worker_gateway_refresh,
+                    workspace_id, self.owner_id, staged.generation,
+                    self._now())
             raise
         except Exception as error:
-            # refresh 失败不远程删除可能已被新 owner 采用的资源；
-            # 只恢复 ready/unavailable，保留 worker 与在途 Run。
-            await self._db(
-                self._store.fail_worker_gateway_refresh,
-                workspace_id, self.owner_id, staged.generation, self._now())
+            if candidate.worker_created or candidate.gateway_created:
+                cleaned = await self._cleanup_candidate(
+                    workspace_id, candidate, staged, attempt_id)
+                if not cleaned:
+                    raise RuntimeUnavailable(
+                        "worker_start_superseded", 503,
+                        retry_after=1) from error
+            else:
+                # 无本轮新建资源：仅恢复 ready/unavailable，保留 worker
+                # 与在途 Run。
+                await self._db(
+                    self._store.fail_worker_gateway_refresh,
+                    workspace_id, self.owner_id, staged.generation,
+                    self._now())
             raise RuntimeUnavailable(
                 getattr(error, "code", "gateway_unavailable"), 503,
                 retry_after=5) from error
@@ -680,6 +694,51 @@ class RuntimeManager:
         if remaining <= 0:
             raise RuntimeUnavailable("worker_start_timeout", 503,
                                      retry_after=5)
+        purpose = lease.cleanup_purpose
+        scope = lease.cleanup_scope
+        if purpose == "start_abort":
+            if scope not in ("gateway", "worker", "worker_gateway"):
+                raise RuntimeUnavailable("gateway_cleanup_incomplete", 503,
+                                         retry_after=5)
+            if not lease.attempt_id:
+                raise RuntimeUnavailable("gateway_abort_unknown_attempt", 503,
+                                         retry_after=5)
+            abort = getattr(self._provisioner, "abort", None)
+            if not callable(abort):
+                raise RuntimeUnavailable("gateway_cleanup_unavailable", 503)
+            try:
+                await asyncio.wait_for(
+                    abort(
+                        workspace_id, lease.container_id,
+                        lease.gateway_instance_id,
+                        attempt_id=lease.attempt_id, scope=scope,
+                        worker_created=scope in (
+                            "worker", "worker_gateway"),
+                        gateway_created=scope in (
+                            "gateway", "worker_gateway")),
+                    timeout=remaining)
+            except asyncio.TimeoutError:
+                raise RuntimeUnavailable("gateway_cleanup_timeout", 503,
+                                         retry_after=5) from None
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise RuntimeUnavailable(
+                    getattr(error, "code", "gateway_cleanup_failed"),
+                    503, retry_after=5) from error
+            if scope == "gateway":
+                if not await self._db(
+                        self._store.finish_gateway_abort,
+                        workspace_id, lease.generation, self._now(),
+                        self._lease_seconds):
+                    raise RuntimeUnavailable("gateway_cleanup_incomplete", 503,
+                                             retry_after=5)
+                return
+            await self._db(
+                self._store.stop_worker, workspace_id, self._now(),
+                generation=lease.generation, expected_state="stopping")
+            return
+        # 旧记录/业务 drain：默认完整 worker+gateway 停止。
         try:
             await asyncio.wait_for(
                 self._stop_lease(lease), timeout=remaining)
@@ -899,10 +958,17 @@ class RuntimeManager:
             return False
         if not (handle.worker_created or handle.gateway_created):
             return False
+        if handle.worker_created and handle.gateway_created:
+            scope = "worker_gateway"
+        elif handle.worker_created:
+            scope = "worker"
+        else:
+            scope = "gateway"
         claimed = await self._db(
             self._store.begin_worker_abort,
             workspace_id, self.owner_id, lease.generation, attempt_id,
-            self._now())
+            scope, bool(handle.worker_created),
+            bool(handle.gateway_created), self._now())
         if not claimed:
             return False
         abort = getattr(self._provisioner, "abort", None)
@@ -913,16 +979,25 @@ class RuntimeManager:
                 abort(
                     workspace_id, handle.container_id,
                     handle.gateway_instance_id, attempt_id=attempt_id,
-                    worker_created=handle.worker_created,
+                    scope=scope, worker_created=handle.worker_created,
                     gateway_created=handle.gateway_created),
                 timeout=CONFIRM_STOP_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            # 停止承诺保留在 DB，新 owner 不会采用；材料留给 recover_stop。
+            # 停止目的/范围/attempt 已持久化；新 owner 不会采用，恢复时
+            # 必须按同一 scope 继续，不能升级为完整 worker stop。
             raise RuntimeUnavailable(
                 getattr(error, "code", "gateway_cleanup_failed"), 503,
                 retry_after=5) from error
+        if scope == "gateway":
+            if not await self._db(
+                    self._store.finish_gateway_abort,
+                    workspace_id, lease.generation, self._now(),
+                    self._lease_seconds):
+                raise RuntimeUnavailable("gateway_cleanup_incomplete", 503,
+                                         retry_after=5)
+            return True
         if not await self._db(
                 self._store.stop_worker, workspace_id, self._now(),
                 generation=lease.generation, expected_state="stopping"):
@@ -1087,7 +1162,7 @@ class UnixProvisionerClient:
         return {"gateway": gateway}
 
     async def abort(self, workspace_id: str, worker_container_id: str,
-                    gateway_instance_id: str, *, attempt_id: str,
+                    gateway_instance_id: str, *, attempt_id: str, scope: str,
                     worker_created: bool, gateway_created: bool) -> None:
         if not self.gateway_required:
             return
@@ -1097,7 +1172,7 @@ class UnixProvisionerClient:
             "gateway_instance_id": gateway_instance_id,
             "worker_created": worker_created,
             "gateway_created": gateway_created,
-            "attempt_id": attempt_id}, self.STOP_TIMEOUT)
+            "attempt_id": attempt_id, "scope": scope}, self.STOP_TIMEOUT)
         if response.get("ok") is not True:
             raise RuntimeUnavailable(
                 _safe_error_code(response.get("error")), 503, retry_after=5)

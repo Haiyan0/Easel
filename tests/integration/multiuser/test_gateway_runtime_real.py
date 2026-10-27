@@ -73,15 +73,25 @@ def _image_id(tag: str) -> str:
     return image
 
 
+def _existing_or_build(tag: str, build_args: list[str]) -> str:
+    result = _docker("image", "inspect", "--format", "{{.Id}}", tag,
+                     check=False)
+    if result.returncode == 0:
+        image = result.stdout.strip()
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+            return image
+    _docker(*build_args, timeout=1800)
+    return _image_id(tag)
+
+
 @pytest.fixture(scope="module")
 def images() -> tuple[str, str]:
-    _docker("build", "-f", str(ROOT / "deploy/desktop/Dockerfile.gateway"),
-            "-t", GATEWAY_TAG, str(ROOT), timeout=1800)
-    _docker("build", "-f", str(ROOT / "deploy/multiuser/Dockerfile.worker"),
-            "--target", "execution", "-t", WORKER_TAG, str(ROOT),
-            timeout=1800)
-    gateway = _image_id(GATEWAY_TAG)
-    worker = _image_id(WORKER_TAG)
+    gateway = _existing_or_build(GATEWAY_TAG, [
+        "build", "-f", str(ROOT / "deploy/desktop/Dockerfile.gateway"),
+        "-t", GATEWAY_TAG, str(ROOT)])
+    worker = _existing_or_build(WORKER_TAG, [
+        "build", "-f", str(ROOT / "deploy/multiuser/Dockerfile.worker"),
+        "--target", "execution", "-t", WORKER_TAG, str(ROOT)])
     print("GATEWAY_IMAGE", gateway)
     print("WORKER_IMAGE", worker)
     return gateway, worker
@@ -587,4 +597,74 @@ def test_real_gateway_create_cli_timeout_cleans_created_container(
             assert attempts == []
     finally:
         _docker("container", "rm", "-f", name, check=False)
+        _docker("network", "rm", control_network, check=False)
+
+
+def test_real_gateway_only_abort_keeps_existing_worker_running(
+        tmp_path: pathlib.Path, images: tuple[str, str]) -> None:
+    """真实 Docker：仅创建新 gateway 的 abort 不删除既有 worker。"""
+    gateway_image, worker_image = images
+    run_label = "g2-gwonly-" + uuid.uuid4().hex[:12]
+    control_network = _control_network(run_label)
+    root = tmp_path / "root"
+    root.mkdir()
+    _, worker_public, _ = _keypair(tmp_path, "worker")
+    _, control_public, _ = _keypair(tmp_path, "control")
+    settings = provisioner.ProvisionerSettings(
+        image=worker_image, workspace_root=root,
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=worker_public,
+        gateway_image=gateway_image,
+        gateway_control_network=control_network,
+        gateway_public_key=control_public,
+        gateway_start_timeout=60.0)
+    service = provisioner.Provisioner(settings)
+    workspace = uuid.uuid4().hex
+    worker = f"easel-worker-{workspace}"
+    gateway = f"easel-gateway-{workspace}"
+    worker_id = ""
+    gateway_id = ""
+    try:
+        first = asyncio.run(service.ensure(workspace, 1, protocol_version=2))
+        assert first.worker_created is True
+        assert first.gateway_created is True
+        worker_id = first.container_id
+        gateway_id = first.gateway_instance_id
+        # 只删旧 gateway，保留真实 worker；随后 ensure 会创建新 gateway，
+        # 候选必须标记 worker_created=False / gateway_created=True。
+        asyncio.run(service._gateway.stop(workspace, worker_id, gateway_id))
+        second = asyncio.run(service.ensure(
+            workspace, 1, protocol_version=2, attempt_id="a" * 32))
+        assert second.container_id == worker_id
+        assert second.worker_created is False
+        assert second.gateway_created is True
+        assert second.gateway_instance_id != gateway_id
+        asyncio.run(service.abort(
+            workspace, worker_id, second.gateway_instance_id,
+            attempt_id="a" * 32, scope="gateway",
+            worker_created=False, gateway_created=True))
+        state = json.loads(_docker(
+            "container", "inspect", "--format", "{{json .State}}",
+            worker_id).stdout)
+        assert state.get("Running") is True
+        assert _docker("container", "inspect", second.gateway_instance_id,
+                       check=False).returncode != 0
+        print("GATEWAY_ONLY_KEPT_WORKER", json.dumps({
+            "worker": worker_id, "gateway_removed": second.gateway_instance_id,
+            "running": True}, sort_keys=True))
+        # 业务停止仍然可以完整删除既有 worker。
+        asyncio.run(service.stop(
+            workspace, worker_id, second.gateway_instance_id,
+            protocol_version=2))
+        assert _docker("container", "inspect", worker_id,
+                       check=False).returncode != 0
+    finally:
+        for name in (worker, gateway):
+            _docker("container", "rm", "-f", name, check=False)
+        if worker_id:
+            _docker("container", "rm", "-f", worker_id, check=False)
+        if gateway_id:
+            _docker("container", "rm", "-f", gateway_id, check=False)
+        _docker("network", "rm", f"easel-ws-{workspace}", check=False)
         _docker("network", "rm", control_network, check=False)

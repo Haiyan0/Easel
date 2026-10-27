@@ -174,6 +174,10 @@ worker→control 的 ws 地址被拒，但 control 仍是每个 workspace 网络
   config_version。任何字段不匹配都拒绝；只有 worker 物理就绪且 gateway
   available 后才写 ready。attempt 使迟到的 abort 在实例被新 owner 采用后
   CAS 失败，不能删除新代次资源。
+- 启动 abort 的停止目的/范围/attempt/目标会持久化到 Store v13；provisioner
+  另有持久 attempt 文件，重启后仍能验证精确 scope。gateway-only abort 只
+  删除本轮新 gateway，恢复后保留既有 worker/凭证/历史/Run，回到
+  ready/unavailable；不写成清空 worker 的假 stopped。
 - 不发布宿主端口、不挂 Docker socket、不挂 worker workspace/home、不读
   控制数据库；仅只读挂载 control 公钥；只读 rootfs、UID 10001、
   cap-drop ALL、no-new-privileges、固定资源上限。worker service 凭证由
@@ -341,6 +345,9 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
    gateway 重启新 boot 对账与精确 ID 停止；真实双 workspace 拓扑已运行。
    G2 R1 进一步收口 attempt 清理认领 fencing、refresh 崩溃恢复、
    worker_ready/available 分离同步，以及 cidfile 创建超时/取消清理。
+   G2 R2 追加 Store v13 停止目的/范围持久化与 provisioner 持久 attempt
+   文件，确保 gateway-only abort 在控制/provisioner 重启后仍不删除既有
+   worker。
 5. 公开 WorkerRelay/聊天入口与 A4 broker URL/受管 Agent 接线仍未实现；
    在 A4 验收前不宣称多用户聊天可用。
 
@@ -406,17 +413,20 @@ $env:EASEL_RUN_CONTAINER_TESTS = '1'
   tests/integration/multiuser/test_gateway_runtime_real.py -q
 ```
 
-G2 R1 静态结果：新增单元 **38 passed**；指定 provisioner/runtime/store/
-stop/gateway/拓扑回归 **284 passed, 6 skipped**；multiuser+拓扑全量
-**1257 passed, 9 skipped**（2 条既有 websockets/uvicorn deprecation warning）。
-真实测试 **2 passed**（341.40 秒），固定镜像为 gateway
+G2 R2 静态结果：新增单元 **39 passed**；指定 provisioner/runtime/store/
+stop/gateway/拓扑回归 **286 passed, 6 skipped**；multiuser+拓扑全量
+**1259 passed, 9 skipped**（2 条既有 websockets/uvicorn deprecation warning）。
+真实测试 **3 passed**（76.70 秒），固定镜像为 gateway
 `sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a`、
 worker execution
 `sha256:0d8ea2c3e6f21d3ba9cb12125f80dd851eef73c013d0fb24d7a69676dfab7ef4`；
 覆盖两个 workspace、签名 health/submit/events/question status/answer/stop/
 messages、跨 workspace 拒绝、worker 反向不可达、同容器 gateway 重启新 boot、
 旧断言 503→403、worker ID/在途 Run 保持、精确 ID drain，以及真实
-docker create 已创建后 CLI 超时的 cidfile 定向清理。详细证据见
+docker create 已创建后 CLI 超时的 cidfile 定向清理，以及 gateway-only abort
+清理失败恢复后既有真实 worker 容器仍 Running/ID 不变。详细证据见
+[`docs/evidence/desktop-g2-r2/report.md`](../../docs/evidence/desktop-g2-r2/report.md)，
+R1 证据保留在
 [`docs/evidence/desktop-g2-r1/report.md`](../../docs/evidence/desktop-g2-r1/report.md)，
 上一轮证据保留在
 [`docs/evidence/desktop-g2/report.md`](../../docs/evidence/desktop-g2/report.md)。

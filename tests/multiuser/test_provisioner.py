@@ -112,7 +112,7 @@ def test_protocol_v2_accepts_exact_activate_and_gateway_stop():
         "worker_container_id": "c" * 64,
         "gateway_instance_id": "b" * 64,
         "worker_created": True, "gateway_created": False,
-        "attempt_id": "d" * 32})
+        "attempt_id": "d" * 32, "scope": "worker"})
     assert abort.worker_created is True
     assert abort.gateway_created is False
 
@@ -182,17 +182,63 @@ def test_abort_is_fenced_by_current_attempt_registry(tmp_path):
             return "e" * 64
 
     service._gateway = FakeGateway()
-    service._attempts[WORKSPACE] = "a" * 32
+    candidate = WorkerHandle(
+        WORKSPACE, "c" * 64, "http://172.32.0.2:7860", "token", 3,
+        gateway_instance_id="b" * 64,
+        gateway_generation="d" * 32,
+        gateway_upstream="http://172.31.0.2:8897")
+    service._record_attempt(
+        WORKSPACE, "a" * 32, candidate,
+        worker_created=False, gateway_created=True)
     with pytest.raises(provisioner.ProvisionerError) as stale:
         asyncio.run(service.abort(
             WORKSPACE, "c" * 64, "b" * 64, attempt_id="d" * 32,
-            worker_created=False, gateway_created=True))
+            scope="gateway", worker_created=False, gateway_created=True))
     assert stale.value.code == "gateway_abort_superseded"
     assert stops == []
     asyncio.run(service.abort(
         WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
-        worker_created=False, gateway_created=True))
+        scope="gateway", worker_created=False, gateway_created=True))
     assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
+
+
+def test_gateway_only_abort_survives_provisioner_restart(tmp_path):
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    candidate = WorkerHandle(
+        WORKSPACE, "c" * 64, "http://172.32.0.2:7860", "token", 3,
+        gateway_instance_id="b" * 64,
+        gateway_generation="d" * 32,
+        gateway_upstream="http://172.31.0.2:8897")
+    first = provisioner.Provisioner(settings)
+    first._gateway = type("Gateway", (), {
+        "stop": lambda self, *args: None,
+        "current_instance_id": lambda self, *args: "",
+    })()
+    first._record_attempt(
+        WORKSPACE, "a" * 32, candidate,
+        worker_created=False, gateway_created=True)
+
+    stops = []
+
+    class FakeGateway:
+        async def stop(self, workspace_id, worker_id, gateway_id):
+            stops.append((workspace_id, worker_id, gateway_id))
+
+    restarted = provisioner.Provisioner(settings)
+    restarted._gateway = FakeGateway()
+    asyncio.run(restarted.abort(
+        WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+        scope="gateway", worker_created=False, gateway_created=True))
+    assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
+    assert list((tmp_path / "root" / ".gateway").glob(
+        "attempt-*.json")) == []
 
 
 def test_old_stop_tuple_refuses_worker_when_new_gateway_exists(tmp_path):

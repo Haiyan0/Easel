@@ -9,7 +9,7 @@
     "gateway_core": {
       "status": "assembled_not_public_relay",
       "task": "G2",
-      "review_round": "G2-R1",
+      "review_round": "G2-R2",
       "factory": "create_gateway_app",
       "runtime": "deploy/multiuser/gateway_runtime.py",
       "server": "easel/gateway/server.py",
@@ -81,7 +81,8 @@
       "legacy_policy": "v1 仅保留给未启用 gateway 的既有部署；gateway 启用时 v1 ensure/stop/inspect 失败关闭，v2 才携带 gateway 元数据。",
       "config_channel": "docker exec -i 固定命令 + 有界 stdin JSON；配置含 worker 目标/服务 token，但不进入 argv、状态输出或日志。",
       "status_channel": "docker exec 固定 status 命令读取容器内 0600 Unix socket；分别返回 worker_ready/worker_running、gateway configured/active/available 与 boot/实例/目标，不返回 worker service token。",
-      "attempt_fencing": "v2 ensure 携带 attempt_id；provisioner 记录每 workspace 当前 attempt。abort 必须匹配当前 attempt；Store 还要求 starting owner/generation/attempt 的原子 abort 认领，旧 owner 在接管后 CAS 失败，不发送删除。",
+      "attempt_fencing": "v2 ensure 携带 attempt_id；provisioner 在专属 attempt 文件持久化当前 attempt、worker/gateway 不可复用 ID、created 标记与 scope，重启后仍可恢复。abort 必须匹配该记录及请求 scope；Store 还要求 starting owner/generation/attempt 的原子 abort 认领，旧 owner 在接管后 CAS 失败，不发送删除。",
+      "cleanup_scope": "Store v13 持久化 cleanup_purpose/scope、attempt_id、worker/gateway 目标与 worker_created/gateway_created。gateway-only abort 恢复只删除新 gateway，并 finish_gateway_abort 保留既有 worker/凭证/历史/Run/容量/token 回到 ready/unavailable；worker/worker_gateway abort 按各自范围；只有 business drain/旧记录默认完整停止。恢复不因 provisioner 内存丢失扩大范围。",
       "create_tracking": "docker create 使用专属 cidfile；超时/取消等待 CLI 终结后按 cidfile 中不可复用 ID 清理；start/connect/configure/activate 取消也等待底层 CLI。清理失败保留 cidfile 并返回 gateway_create_cleanup_incomplete。",
       "activation": "configure 绑定实例与 worker 目标但不激活；activate 精确匹配 workspace/gateway_instance_id/boot_generation/worker_container_id/config_version。",
       "network_join": "create 前固定 control IPv4；仅控制网络 start 并 inspect 绑定；configure 后再 connect 唯一 worker 网络；最终 inspect 要求恰好 control+worker 两张网。"
@@ -345,7 +346,7 @@
         "control_restart": "从现有受保护 signing key 重新加载；gateway/worker 不变，重新签发新断言即可，不重发旧凭证。",
         "provisioner_restart": "重建 Unix socket；已有 gateway/worker 不删除；control 重连后按不可复用 ID 复核并继续，不重新签发不可用 token。",
         "gateway_restart": "每次 gateway 进程启动都必须生成新 boot_generation，即使同一容器/ID 重启也不能沿用旧代次；provisioner 经 status 读取新 boot，RuntimeManager 在 CAS 中保存新候选后再 activate；旧断言即使未过期也因 audience 不符被拒。容器被重建时同时产生新 gateway ID/generation。",
-        "gateway_unavailable": "provisioner status 从实际 inspect + 容器内 status/available 计算，不只看 active 或 worker health；隔离/不可达时 control 返回 503，不删除 active worker，不把 Run 改 done/failed/interrupted；SSE 断开可带 after 恢复，POST 不自动重发。物理恢复同 boot 时 RuntimeManager 通过 CAS 恢复 DB available；worker/sidecar 未就绪只拒绝派发。",
+        "gateway_unavailable": "provisioner status 从实际 inspect + 容器内 status/available 计算，不只看 active 或 worker health；隔离/不可达时 control 返回 503，不删除 active worker，不把 Run 改 done/failed/interrupted；SSE 断开可带 after 恢复，POST 不自动重发。物理恢复同 boot 时 RuntimeManager 通过 CAS 恢复 DB available；worker/sidecar 未就绪只拒绝派发。gateway-only 启动 abort 恢复后保持 worker 身份并回到 ready/unavailable，不写假 stopped。",
         "gateway_refresh_crash": "refresh 的 starting 租约保留 worker ID/gateway 候选/attempt；租约过期返回 refresh 而非 cold start。临时 ensure/activate 失败恢复 ready/unavailable，保留在途 Run；新 owner 用 begin refresh CAS 接管并重新握手，不把进程崩溃当作执行终止。",
         "gateway_replacement": "按旧 gateway_instance_id 停止旧 gateway，在核验过的同一 worker 实例/config 上创建新 gateway；不删除 worker；在途请求失败，GET/SSE 可按游标恢复，POST 不自动重试。",
         "control_key_unavailable": "gateway 无法验证 control 断言时返回 503；不得删除 worker，直到显式 drain/stop。",
@@ -389,8 +390,8 @@
     "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。"
   },
   "evidence": {
-    "report": "docs/evidence/desktop-g2-r1/report.md",
-    "red_green": "docs/evidence/desktop-g2-r1/red-green.md",
+    "report": "docs/evidence/desktop-g2-r2/report.md",
+    "red_green": "docs/evidence/desktop-g2-r2/red-green.md",
     "test_file": "tests/integration/multiuser/test_gateway_runtime_real.py",
     "previous": "docs/evidence/desktop-a2/report.md"
   },

@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-28",
+  "parent_commit": "65cec868d933679fc850b5e7c84f38dc75bcc22a",
+  "scope": ["G2-R2-01"],
+  "schema_version": 13,
+  "fixes": {
+    "G2-R2-01": "persist cleanup purpose/scope/created flags/attempt/targets; gateway-only abort recovery keeps existing worker and returns ready/unavailable; provisioner persists attempt record across restart; business/legacy records remain full stop"
+  },
+  "tests": {
+    "new_units": "39 passed",
+    "targeted_regression": "286 passed, 6 skipped",
+    "multiuser_and_desktop_static": "1259 passed, 9 skipped, 2 warnings",
+    "real_scenarios": "3 passed in 76.70s"
+  },
+  "fixed_images": {
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:0d8ea2c3e6f21d3ba9cb12125f80dd851eef73c013d0fb24d7a69676dfab7ef4"
+  },
+  "real_evidence": {
+    "gateway_only_abort_kept_worker_running": true,
+    "gateway_only_removed": "be8c973080d768830b1c2028905936407bb65aef983321035ebfd02f522afdd0",
+    "kept_worker": "b3bbc890c802b778cefb11fd4fed0f882d301e8da741de5c8f622c00e6e60872",
+    "two_workspace_restart": true,
+    "create_timeout_cleanup": true
+  },
+  "cleanup": "no easel-gateway/worker/sidecar containers or easel-g2/easel-ws networks remain",
+  "not_run": [
+    "public WorkerRelay/chat/frontend",
+    "A4 broker URL/managed Agent wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}

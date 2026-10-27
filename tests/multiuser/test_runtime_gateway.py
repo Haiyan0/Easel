@@ -44,6 +44,7 @@ class GatewayFake:
         self.gateway_created = False
         self.worker_ready = True
         self.attempt_id = ""
+        self.fail_abort: Exception | None = None
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
         return WorkerHandle(
@@ -129,16 +130,19 @@ class GatewayFake:
             (workspace_id, instance_id, gateway_instance_id))
 
     async def abort(self, workspace_id: str, worker_container_id: str,
-                    gateway_instance_id: str, *, attempt_id: str,
+                    gateway_instance_id: str, *, attempt_id: str, scope: str,
                     worker_created: bool, gateway_created: bool) -> None:
         self.abort_calls.append({
             "workspace": workspace_id,
             "worker": worker_container_id,
             "gateway": gateway_instance_id,
             "attempt_id": attempt_id,
+            "scope": scope,
             "worker_created": worker_created,
             "gateway_created": gateway_created,
         })
+        if self.fail_abort is not None:
+            raise self.fail_abort
 
 
 def _run(coro):
@@ -283,6 +287,7 @@ def test_activation_failure_cleans_only_created_candidate(tmp_path):
             assert abort["worker"] == WORKER
             assert abort["gateway"] == GATEWAY
             assert abort["attempt_id"] == fake.attempt_id
+            assert abort["scope"] == "worker_gateway"
             assert abort["worker_created"] is True
             assert abort["gateway_created"] is True
             assert store.get_worker_lease(
@@ -482,6 +487,72 @@ def test_expired_staged_refresh_recovers_same_worker_new_boot(tmp_path):
     _run(scenario())
 
 
+def test_gateway_only_abort_recovery_keeps_existing_worker(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            run = _running(first, user)
+            clock = Clock(1000)
+            fake = GatewayFake(first)
+            manager = RuntimeManager(
+                first, fake, gateway_required=True, clock=clock)
+            await manager.ensure_ready(user.workspace_id, 1)
+            lease = first.get_worker_lease(user.workspace_id)
+            assert lease is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1),
+                gateway_instance_id="f" * 64,
+                gateway_generation=NEW_BOOT,
+                gateway_state="staged",
+                worker_created=False,
+                gateway_created=True,
+                attempt_id="a" * 32)
+            staged = first.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                candidate, "a" * 32, 1001, 60)
+            assert staged is not None
+            fake.fail_abort = RuntimeUnavailable("gateway_cleanup_failed")
+            with pytest.raises(RuntimeUnavailable):
+                await manager._cleanup_candidate(
+                    user.workspace_id, candidate, staged, "a" * 32)
+            stopped = first.get_worker_lease(user.workspace_id)
+            assert stopped.state == "stopping"
+            assert stopped.cleanup_purpose == "start_abort"
+            assert stopped.cleanup_scope == "gateway"
+            assert stopped.cleanup_worker_created is False
+            assert stopped.cleanup_gateway_created is True
+            assert stopped.container_id == WORKER
+            assert first.get_run(user, run.id).status == "running"
+
+            clock.value = 1200
+            fake.fail_abort = None
+            recovered_manager = RuntimeManager(
+                second, fake, gateway_required=True, clock=clock,
+                poll_interval=0.01)
+            outcome, recovery = second.claim_worker_start(
+                user.workspace_id, 1, "owner-b", 1200, 60)
+            assert outcome == "recover_stop"
+            assert recovery is not None
+            await recovered_manager._recover_stop(
+                user.workspace_id, recovery, 1300)
+            after = second.get_worker_lease(user.workspace_id)
+            assert after.state == "ready"
+            assert after.gateway_state == "unavailable"
+            assert after.container_id == WORKER
+            assert after.service_token == "worker-service-token"
+            assert after.cleanup_scope == ""
+            assert fake.stop_calls == []
+            assert [call["scope"] for call in fake.abort_calls[-2:]] == [
+                "gateway", "gateway"]
+            assert first.get_run(user, run.id).status == "running"
+            release_count = first._connection.execute(
+                "SELECT release_count FROM runs WHERE id = ?",
+                (run.id,)).fetchone()[0]
+            assert release_count == 0
+    _run(scenario())
+
+
 def test_late_abort_loses_cas_after_new_owner_adopts(tmp_path):
     async def scenario():
         with Store.open(tmp_path / "db") as first, Store.open(
@@ -542,7 +613,7 @@ def test_abort_claim_fences_new_owner_until_stop_terminal(tmp_path):
                 handle, "a" * 32, 1001) is True
             assert first.begin_worker_abort(
                 user.workspace_id, "owner-a", lease.generation,
-                "a" * 32, 1002) is True
+                "a" * 32, "worker_gateway", True, True, 1002) is True
             outcome, current = second.claim_worker_start(
                 user.workspace_id, 1, "owner-b", 1003, 60)
             assert outcome == "draining"

@@ -255,9 +255,17 @@ docker create --name easel-gateway-<uuid> \
   临时故障恢复 ready/unavailable，不按冷启动中断在途 Run。abort 先取得
   Store 的 starting owner/generation/attempt 停止承诺，旧 owner 的迟到
   abort 不得删除新 owner 已采用的实例。
-- Store v12 只追加 `attempt_id`；refresh 以已有 worker `container_id`
-  区分，不把进程崩溃当执行终止。worker_ready/worker_running 与 gateway
-  available 分开报告。
+- Store v13 追加 `attempt_id` 与 `cleanup_purpose/cleanup_scope/
+  cleanup_worker_created/cleanup_gateway_created`；refresh 以已有 worker
+  `container_id` 区分，不把进程崩溃当执行终止。worker_ready/worker_running
+  与 gateway available 分开报告。
+- abort 的 purpose/scope/attempt/target 持久化；gateway-only 启动 abort
+  只删除新 gateway，失败恢复后保留既有 worker/凭证/历史/Run 回到
+  ready/unavailable，不写假 stopped。worker/worker_gateway 按各自范围；
+  只有业务 drain/旧记录默认完整停止。
+- provisioner 在 workspace 根 `.gateway/attempt-<workspace>.json` 持久化
+  当前 attempt 的不可复用目标、created 标记与 scope；进程重启后 abort
+  必须匹配该记录，内存丢失不得退回完整 stop。
 
 ### 每空间 sidecar
 

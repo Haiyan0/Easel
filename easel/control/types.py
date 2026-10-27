@@ -103,6 +103,10 @@ class WorkerHandle:
     gateway_upstream: str = ""
     gateway_state: str = "disabled"
     attempt_id: str = ""
+    cleanup_purpose: str = ""
+    cleanup_scope: str = ""
+    cleanup_worker_created: bool = False
+    cleanup_gateway_created: bool = False
     worker_created: bool = False
     gateway_created: bool = False
 
@@ -135,6 +139,10 @@ class WorkerLease:
     gateway_upstream: str = ""
     gateway_state: str = "disabled"
     attempt_id: str = ""
+    cleanup_purpose: str = ""
+    cleanup_scope: str = ""
+    cleanup_worker_created: bool = False
+    cleanup_gateway_created: bool = False
 
 
 @dataclass(frozen=True)

@@ -63,6 +63,10 @@ def test_frozen_v10_database_upgrades_without_gateway_assumption(tmp_path):
         assert lease.gateway_generation == ""
         assert lease.gateway_upstream == ""
         assert lease.gateway_state == "disabled"
+        assert lease.cleanup_purpose == ""
+        assert lease.cleanup_scope == ""
+        assert lease.cleanup_worker_created is False
+        assert lease.cleanup_gateway_created is False
 
     connection = sqlite3.connect(path)
     try:
