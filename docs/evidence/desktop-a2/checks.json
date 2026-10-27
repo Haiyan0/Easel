@@ -1,0 +1,59 @@
+{
+  "task": "A2",
+  "baseline": "f1c4e5ef98ea756513071367919fe57fac7dbf17",
+  "status": "proposed",
+  "approval_required": true,
+  "implementation_enabled": false,
+  "inventory": {
+    "wsl_version": 2,
+    "wsl_distro": "Ubuntu-26.04",
+    "wsl_kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "wsl_uid": 1000,
+    "wsl_gid": 1000,
+    "docker_desktop": "4.63.0 (220185)",
+    "docker_engine": "29.2.1",
+    "windows_context": "desktop-linux",
+    "wsl_context": "default",
+    "windows_repo": "C:\\Code\\Easel",
+    "wsl_repo": "/mnt/c/Code/Easel"
+  },
+  "measurements": {
+    "wsl_http_to_worker": "blocked",
+    "windows_http_to_worker": "blocked",
+    "container_local_lifecycle_health": 200,
+    "host_bridge_control_to_worker": "blocked",
+    "worker_to_host_bridge_control": "blocked",
+    "control_joined_worker_network": "bidirectional",
+    "control_bound_control_ip_worker_network": "control_to_worker_200_worker_to_control_refused",
+    "wsl_socket_mount_peer_uid": 10001,
+    "wsl_socket_unauthorized_uid": 1000,
+    "windows_unc_socket_live_connect": "permission_denied_for_0660"
+  },
+  "tests": {
+    "red": {
+      "command": "python -m pytest tests/integration/multiuser/test_desktop_topology.py -q",
+      "result": "1 failed, 5 skipped",
+      "seconds": 0.27
+    },
+    "static_green": {
+      "command": "python -m pytest tests/integration/multiuser/test_desktop_topology.py::test_desktop_topology_contract_is_explicit_and_secret_free -q",
+      "result": "1 passed",
+      "seconds": 0.13
+    },
+    "real_green": {
+      "command": "EASEL_RUN_CONTAINER_TESTS=1 python -m pytest tests/integration/multiuser/test_desktop_topology.py -q",
+      "result": "6 passed",
+      "seconds": 21.37
+    },
+    "desktop_and_document_regression": "55 passed",
+    "provisioner_and_lifecycle_regression": "107 passed, 1 skipped",
+    "ruff": "passed",
+    "json_tool": "passed"
+  },
+  "cleanup": {
+    "a2_label_containers_remaining": 0,
+    "a2_label_networks_remaining": 0,
+    "global_prune": false,
+    "developer_resources_touched": false
+  }
+}

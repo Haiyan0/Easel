@@ -1,0 +1,164 @@
+{
+  "schema": "easel.desktop.topology.v1",
+  "status": "proposed",
+  "measured_at": "2026-10-27",
+  "approval_required": true,
+  "implementation": {
+    "enabled": false,
+    "reason": "管理授权与路径可实测，但 control→worker 需要新增受信管理中继；按 A2 门禁先提交设计，不直接接运行时代码。"
+  },
+  "host": {
+    "platform": "Windows 11 Pro 10.0.26200",
+    "wsl": {
+      "version": 2,
+      "distro": "Ubuntu-26.04",
+      "kernel": "6.6.87.2-microsoft-standard-WSL2",
+      "uid": 1000,
+      "gid": 1000
+    },
+    "docker": {
+      "desktop": "4.63.0 (220185)",
+      "engine": "29.2.1",
+      "client_context": "desktop-linux",
+      "wsl_context": "default"
+    }
+  },
+  "paths": {
+    "windows_repo": "C:\\Code\\Easel",
+    "wsl_repo": "/mnt/c/Code/Easel",
+    "workspace_root_windows": "C:\\Easel\\workspaces",
+    "workspace_root_wsl": "/mnt/c/Easel/workspaces",
+    "container_workspace": "/workspace",
+    "container_home": "/home/easel",
+    "container_state": "/workspace/state",
+    "bind_source_rule": "WSL Docker CLI 可挂载 /mnt/c 与 WSL ext4 路径；/tmp 不具持久性，只用于 socket。worker 持久根必须使用耐久路径，推荐 C:\\Easel\\workspaces。"
+  },
+  "management": {
+    "provisioner": {
+      "location": "wsl2",
+      "distro": "Ubuntu-26.04",
+      "uid": 1000,
+      "gid": 1000,
+      "docker_context": "default",
+      "socket_service": "deploy/multiuser/provisioner.py"
+    },
+    "control": {
+      "location": "docker",
+      "service": "control",
+      "uid": 10001,
+      "supplemental_gid": 1000,
+      "docker_socket": false,
+      "host_network": false,
+      "published_ports": ["127.0.0.1:7861"]
+    },
+    "socket": {
+      "path": "/tmp/easel-runtime/provisioner.sock",
+      "parent_mode": "0750",
+      "mode": "0660",
+      "owner_uid": 1000,
+      "group_gid": 1000,
+      "container_mount": "/run/easel/provisioner.sock",
+      "launcher": "wsl2_docker_cli",
+      "windows_unc": "\\\\wsl.localhost\\Ubuntu-26.04\\tmp\\easel-runtime\\provisioner.sock",
+      "peer_cred": {
+        "required": true,
+        "allowed_uids": [10001]
+      },
+      "windows_native_peer_cred": false
+    },
+    "health_probe": {
+      "mode": "docker_exec_required",
+      "implemented": false,
+      "command": [
+        "python",
+        "-m",
+        "easel.worker.lifecycle",
+        "healthcheck",
+        "--port",
+        "7860"
+      ],
+      "contract": "只经固定 docker exec 命令核对 worker 身份/版本/就绪；不得把 WSL→容器 IP 的 HTTP 探测当作可行路径。"
+    }
+  },
+  "network": {
+    "control": {
+      "network": "easel-control",
+      "docker_socket": false,
+      "host_network": false
+    },
+    "worker": {
+      "name_template": "easel-ws-{workspace_id}",
+      "driver": "bridge",
+      "internal": true,
+      "ipv6": false,
+      "docker_socket": false,
+      "publish_all_ports": false,
+      "published_ports": []
+    },
+    "worker_ports": [],
+    "control_to_worker": {
+      "mode": "gateway_required",
+      "direct_bridge": "blocked",
+      "direct_host_network": "rejected_public_port_unreachable",
+      "direct_worker_network_join": "rejected_bidirectional"
+    },
+    "wsl_to_worker": {
+      "http": "blocked",
+      "tcp_connect": "observed_success_does_not_imply_http"
+    },
+    "windows_to_worker": {
+      "http": "blocked"
+    },
+    "worker_to_control": {
+      "mode": "denied_by_topology",
+      "direct_worker_network_join": "bidirectional_when_control_joined"
+    },
+    "gateway": {
+      "enabled": false,
+      "name_template": "easel-gateway-{workspace_id}",
+      "networks": [
+        "easel-control",
+        "easel-ws-{workspace_id}"
+      ],
+      "management_bind": "control_network_ip_only",
+      "worker_ports": [],
+      "docker_socket": false,
+      "mounts": [],
+      "read_only_rootfs": true,
+      "user": "10001:10001",
+      "service_auth": "每 workspace 独立的 control→gateway 凭证；网关固定 workspace，不接受客户端指定目标。",
+      "worker_auth": "网关通过固定 workspace 路由转发内部身份头；不记录或持久化凭证。",
+      "path_allowlist": [
+        "/internal/lifecycle/health",
+        "/internal/runs/{run_id}",
+        "/internal/runs/{run_id}/events",
+        "/internal/runs/{run_id}/stop",
+        "/internal/runs/{run_id}/question",
+        "/internal/runs/{run_id}/question/answer"
+      ],
+      "method_allowlist": "每个精确 path 单独固定方法；拒绝其它方法与未知路径。",
+      "sse": "streaming_passthrough",
+      "failure_cleanup": "网关与 worker 同代次创建/停止；启动失败和 worker 停止都清理网关，不留下可达入口。"
+    }
+  },
+  "broker": {
+    "worker_url_template": "http://easel-sidecar-{workspace_id}:8899",
+    "control_upstream": "control:7861",
+    "sidecar_network": "easel-control",
+    "worker_egress_port": 8898,
+    "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。"
+  },
+  "evidence": {
+    "report": "docs/evidence/desktop-a2/report.md",
+    "red_green": "docs/evidence/desktop-a2/red-green.md",
+    "test_file": "tests/integration/multiuser/test_desktop_topology.py"
+  },
+  "approval": {
+    "items": [
+      "WSL provisioner socket 以 0660 + 补充组 1000 挂载进 control 容器，并用 SO_PEERCRED 允许 UID 10001。",
+      "以固定 docker exec healthcheck 取代宿主到 worker 容器 IP 的 HTTP 健康探测。",
+      "新增每 workspace 受信 gateway，固定 management 监听在控制网络地址、精确路径/方法白名单与 SSE 透传。",
+      "修改 WorkerHandle upstream 指向 gateway，并把 gateway 创建/停止/失败清理纳入 RuntimeManager/provisioner 测试。"
+    ]
+  }
+}
