@@ -17,10 +17,50 @@ _MANAGED_FIELDS = frozenset({"revision", "agent", "broker"})
 _AGENT_FIELDS = frozenset({
     "runtime", "command", "model", "sandbox", "timeout",
     "codex_auto_approve"})
-_BROKER_FIELDS = frozenset({"url", "channel"})
+_LEGACY_BROKER_FIELDS = frozenset({"url", "channel"})
+_SIDECAR_BROKER_FIELDS = frozenset({"mode", "channel"})
 _RUNTIMES = ("acp", "opencode", "codex")
 _SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 _MAX_TIMEOUT = 86400
+WORKSPACE_SIDECAR_MODE = "workspace-sidecar"
+
+
+def _broker_channel(value: object) -> str:
+    if (not isinstance(value, str) or not value
+            or len(value) > 32
+            or not all(character.islower() or character.isdigit()
+                       or character == "_" for character in value)):
+        raise ValueError("managed broker channel is invalid")
+    return value
+
+
+def _broker_destination(value: object) -> dict:
+    """受管 broker 目的地：固定 URL 兼容或逐 workspace sidecar。
+
+    两种模式都只声明非秘密目的地；逐 Run token 仍由 BrokerService.issue
+    在接纳后签发。sidecar 模式不接受 URL、模板变量或客户端输入。
+    """
+    if not isinstance(value, dict):
+        raise ValueError("managed broker fields are invalid")
+    keys = set(value)
+    if keys == _SIDECAR_BROKER_FIELDS:
+        if value["mode"] != WORKSPACE_SIDECAR_MODE:
+            raise ValueError("managed broker mode is invalid")
+        return {"mode": WORKSPACE_SIDECAR_MODE,
+                "channel": _broker_channel(value["channel"])}
+    if keys != _LEGACY_BROKER_FIELDS:
+        raise ValueError("managed broker fields are invalid")
+    url = value["url"]
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        raise ValueError("managed broker url is invalid")
+    parsed = urlsplit(url)
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or parsed.path not in ("", "/")):
+        raise ValueError("managed broker url is invalid")
+    return {"url": url.rstrip("/"),
+            "channel": _broker_channel(value["channel"])}
 
 
 def load_signing_key(path: str | Path) -> Ed25519PrivateKey:
@@ -43,28 +83,6 @@ def _command(value: object) -> list[str]:
                    for part in value)):
         raise ValueError("managed agent command must be an argv array")
     return list(value)
-
-
-def _broker_destination(value: object) -> dict:
-    """受管 broker 目的地：只允许固定 URL + channel，不携带任何凭证。"""
-    if not isinstance(value, dict) or set(value) != _BROKER_FIELDS:
-        raise ValueError("managed broker fields are invalid")
-    url = value["url"]
-    channel = value["channel"]
-    if not isinstance(url, str) or not url or len(url) > 2048:
-        raise ValueError("managed broker url is invalid")
-    parsed = urlsplit(url)
-    if (parsed.scheme not in ("http", "https") or not parsed.netloc
-            or parsed.username is not None or parsed.password is not None
-            or parsed.query or parsed.fragment
-            or parsed.path not in ("", "/")):
-        raise ValueError("managed broker url is invalid")
-    if (not isinstance(channel, str) or not channel
-            or len(channel) > 32
-            or not all(character.islower() or character.isdigit()
-                       or character == "_" for character in channel)):
-        raise ValueError("managed broker channel is invalid")
-    return {"url": url.rstrip("/"), "channel": channel}
 
 
 def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:

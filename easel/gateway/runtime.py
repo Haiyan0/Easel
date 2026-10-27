@@ -30,6 +30,9 @@ GATEWAY_TMPFS = (
 GATEWAY_PIDS_LIMIT = 128
 GATEWAY_MEMORY_BYTES = 256 * 1024 ** 2
 GATEWAY_NANO_CPUS = 1_000_000_000
+_GATEWAY_CLI = (
+    "import sys; from easel.gateway.server import main; "
+    "sys.exit(main(sys.argv[1:]))")
 
 _WORKSPACE = re.compile(r"^[0-9a-f]{32}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -331,9 +334,11 @@ def sanitize_gateway_inspect(raw: object, *, workspace_id: str) -> dict:
         address = entry.get("IPAddress")
         if not address:
             # `docker create` 后、start 前 inspect 只填 IPAMConfig；
-            # 仍必须核对它与请求的固定 IPv4 一致。
+            # 容器停止后 IPAMConfig 也可能为空。两者都按空地址处理，
+            # 由调用方决定失败关闭/替换，而不是误判整个容器不受管。
             ipam = entry.get("IPAMConfig")
-            address = ipam.get("IPv4Address") if isinstance(ipam, dict) else ""
+            address = (ipam.get("IPv4Address") or "") \
+                if isinstance(ipam, dict) else ""
         if not isinstance(address, str):
             return empty
         addresses[str(name)] = address
@@ -644,7 +649,7 @@ class GatewayRuntime:
     async def _status(self, instance_id: str) -> dict:
         result = await self._docker(
             "exec", "--user", GATEWAY_USER, instance_id,
-            "python", "-m", "easel.gateway.server", "status",
+            "python", "-c", _GATEWAY_CLI, "status",
             "--control-socket", GATEWAY_CONTROL_SOCKET,
             timeout=10.0)
         if result.returncode != 0:
@@ -654,13 +659,29 @@ class GatewayRuntime:
             raise GatewayRuntimeError("gateway_status_invalid")
         return status
 
+    async def _status_when_started(self, instance_id: str, *,
+                                   running: bool) -> dict:
+        """容器 Running 后仍可能处于进程启动窗口；有界等待 status。"""
+        if not running:
+            raise GatewayRuntimeError("gateway_status_unavailable")
+        deadline = asyncio.get_running_loop().time() + \
+            float(self.settings.start_timeout)
+        last: GatewayRuntimeError | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                return await self._status(instance_id)
+            except GatewayRuntimeError as error:
+                last = error
+                await asyncio.sleep(0.1)
+        raise last or GatewayRuntimeError("gateway_status_unavailable")
+
     async def _control(self, instance_id: str, action: str,
                        payload: dict) -> dict:
         # CLI 自己构造 action 信封；这里只传受信 payload，避免双重包裹。
         data = json.dumps(payload, separators=(",", ":"))
         result = await self._run_cli(
             "exec", "-i", "--user", GATEWAY_USER, instance_id,
-            "python", "-m", "easel.gateway.server", action,
+            "python", "-c", _GATEWAY_CLI, action,
             "--control-socket", GATEWAY_CONTROL_SOCKET,
             timeout=10.0, input_text=data)
         lines = [line.strip() for line in str(result.stdout).splitlines()
@@ -689,6 +710,23 @@ class GatewayRuntime:
             raise GatewayRuntimeError("gateway_control_invalid")
         return status
 
+    async def _control_retry(self, instance_id: str, action: str,
+                             payload: dict) -> dict:
+        """gateway 刚启动时 control CLI 可能短暂失败；有界重试配置/激活。"""
+        deadline = asyncio.get_running_loop().time() + \
+            float(self.settings.start_timeout)
+        while True:
+            try:
+                return await self._control(instance_id, action, payload)
+            except GatewayRuntimeError as error:
+                if (error.code not in (
+                        "gateway_control_failed",
+                        "gateway_control_unavailable",
+                        "gateway_control_timeout")
+                        or asyncio.get_running_loop().time() >= deadline):
+                    raise
+                await asyncio.sleep(0.1)
+
     async def _wait_started(self, instance_id: str) -> dict:
         deadline = asyncio.get_running_loop().time() + \
             float(self.settings.start_timeout)
@@ -714,8 +752,14 @@ class GatewayRuntime:
 
     async def ensure(self, *, workspace_id: str, config_version: int,
                      worker_container_id: str, worker_origin: str,
-                     worker_service_token: str) -> GatewayCandidate:
-        """创建/复用/重启 gateway 并完成配置；返回未激活候选。"""
+                     worker_service_token: str,
+                     replace_unavailable: bool = False) -> GatewayCandidate:
+        """创建/复用/重启 gateway 并完成配置；返回未激活候选。
+
+        ``replace_unavailable`` 只供既有 Run 的受限恢复使用：同名 gateway
+        已停止或状态不可读时，按精确旧实例删除并在同一 worker 上创建新
+        gateway；绝不触碰 worker。
+        """
         workspace = _workspace(workspace_id)
         version = _version(config_version)
         worker = _container_id(worker_container_id, "gateway_worker_invalid")
@@ -746,9 +790,19 @@ class GatewayRuntime:
                         static_ok = False
                     if static_ok:
                         try:
-                            status = await self._status(
-                                report["gateway_instance_id"])
+                            status = await self._status_when_started(
+                                report["gateway_instance_id"],
+                                running=bool(
+                                    (existing.get("State") or {}).get(
+                                        "Running") is True))
                         except GatewayRuntimeError:
+                            if replace_unavailable:
+                                await self._remove_gateway(
+                                    report["gateway_instance_id"], workspace,
+                                    worker)
+                                return await self._create(
+                                    workspace, version, worker,
+                                    worker_origin, worker_service_token)
                             status = {}
                         if status.get("active") is True:
                             if verify_gateway_status(
@@ -773,9 +827,19 @@ class GatewayRuntime:
                             return await self._create(
                                 workspace, version, worker, worker_origin,
                                 worker_service_token)
-                        await self._configure(
-                            report, workspace, version, worker,
-                            worker_origin, worker_service_token)
+                        try:
+                            await self._configure(
+                                report, workspace, version, worker,
+                                worker_origin, worker_service_token)
+                        except GatewayRuntimeError:
+                            if replace_unavailable:
+                                await self._remove_gateway(
+                                    report["gateway_instance_id"], workspace,
+                                    worker)
+                                return await self._create(
+                                    workspace, version, worker,
+                                    worker_origin, worker_service_token)
+                            raise
                         return self._candidate(
                             workspace, version, worker, report,
                             await self._status(report["gateway_instance_id"]),
@@ -960,7 +1024,8 @@ class GatewayRuntime:
             "worker_origin": worker_origin,
             "worker_service_token": worker_service_token,
         }
-        configured = await self._control(instance_id, "configure", payload)
+        configured = await self._control_retry(
+            instance_id, "configure", payload)
         if not verify_gateway_status(
                 configured, self.settings, workspace_id=workspace,
                 worker_container_id=worker, config_version=version,
@@ -1025,7 +1090,7 @@ class GatewayRuntime:
             "worker_container_id": worker,
             "config_version": version,
         }
-        active = await self._control(gateway, "activate", payload)
+        active = await self._control_retry(gateway, "activate", payload)
         if not verify_gateway_status(
                 active, self.settings, workspace_id=workspace,
                 worker_container_id=worker, config_version=version,

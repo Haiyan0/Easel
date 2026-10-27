@@ -1424,7 +1424,12 @@ class RunManager:
             temporary = Path(name)
             try:
                 if hasattr(os, "fchmod"):
-                    os.fchmod(descriptor, 0o600)
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                    except OSError:
+                        # Windows bind mount 可能拒绝 fchmod；mkstemp 已按
+                        # 0o600 创建，不能把输出暂存误判为失败。
+                        pass
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     json.dump({"runId": run_id,
                                "workspaceId": self.workspace_id,

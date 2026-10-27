@@ -226,6 +226,7 @@ class EgressGateway:
     def __init__(self, policy: EgressPolicy | None = None, *,
                  proxy_url: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None,
+                 ca_file: str | Path | None = None,
                  policy_explicit: bool | None = None):
         if policy is not None and not isinstance(policy, EgressPolicy):
             raise TypeError("policy must be an EgressPolicy")
@@ -238,6 +239,16 @@ class EgressGateway:
             else bool(policy_explicit))
         self.proxy_url = _validate_proxy_url(proxy_url)
         self.transport = transport
+        if ca_file is not None:
+            ca_path = Path(ca_file)
+            try:
+                if not ca_path.is_file() or ca_path.stat().st_size == 0:
+                    raise OSError
+            except OSError:
+                raise ValueError("egress ca file is unavailable") from None
+            self.ca_file: str | None = str(ca_path)
+        else:
+            self.ca_file = None
 
     @property
     def configured(self) -> bool:
@@ -248,7 +259,7 @@ class EgressGateway:
 
     def with_transport(self, transport: httpx.AsyncBaseTransport) -> "EgressGateway":
         return EgressGateway(self.policy, proxy_url=self.proxy_url,
-                             transport=transport,
+                             transport=transport, ca_file=self.ca_file,
                              policy_explicit=self.policy_configured)
 
     def client(self) -> httpx.AsyncClient:
@@ -262,7 +273,8 @@ class EgressGateway:
                                      follow_redirects=False, timeout=timeout)
         if self.proxy_url is not None and self.policy_configured:
             return httpx.AsyncClient(proxy=self.proxy_url, trust_env=False,
-                                     follow_redirects=False, timeout=timeout)
+                                     follow_redirects=False, timeout=timeout,
+                                     verify=self.ca_file or True)
         raise DomainError("egress_unavailable", 503)
 
 
@@ -291,7 +303,9 @@ def parse_proxy_authority(target: str) -> tuple[str, int]:
 def load_policy(path: Path | str) -> EgressPolicy:
     """读取管理员出口策略文件；缺失或结构非法时明确失败。"""
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        # Windows PowerShell 5.1 的 UTF-8 写入常带 BOM；策略文件是管理员
+        # 手工维护的 JSON，接受 UTF-8-SIG 但不接受其他编码。
+        payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         raise ValueError("egress policy 文件不可读或不是合法 JSON") from error
     if not isinstance(payload, dict):

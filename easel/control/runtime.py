@@ -70,6 +70,12 @@ class Provisioner(Protocol):
                        config_version: int) -> dict:
         """按候选的精确实例/boot 激活；只能在受保护 CAS 之后调用。"""
 
+    async def restore_gateway(self, workspace_id: str,
+                              worker_container_id: str,
+                              config_version: int, *,
+                              attempt_id: str = "") -> WorkerHandle:
+        """只为已核验的同一 worker 重配/更换 gateway；绝不创建 worker。"""
+
     async def abort(self, workspace_id: str, worker_container_id: str,
                     gateway_instance_id: str, *, attempt_id: str, scope: str,
                     worker_created: bool,
@@ -169,20 +175,42 @@ class RuntimeManager:
 
         ``draining`` 仍允许结束/回答/回放；实例 ID 或配置代次不匹配时返回
         ``None``，调用方按中断收尾，不能把操作发到新代次伪装成原 Run。
+
+        gateway 暂不可用/refresh 进行中必须与 worker 身份消失区分：前者抛
+        ``RuntimeUnavailable``（503），绝不返回 None，避免后台对账把仍在
+        执行的 Run 误判为实例失效并结算。
         """
         lease = await self._db(self._store.get_worker_lease, workspace_id)
         if (lease is None or lease.container_id != container_id
-                or lease.state not in ("ready", "draining")
-                or lease.config_version != config_version
-                or not lease.upstream or not lease.service_token):
+                or lease.config_version != config_version):
+            return None
+        if lease.state == "starting":
+            if self._gateway_required and lease.container_id:
+                raise RuntimeUnavailable(
+                    "worker_gateway_refresh_in_progress", 503,
+                    retry_after=1)
+            return None
+        if lease.state == "stopping":
+            if (lease.cleanup_purpose == "start_abort"
+                    and lease.cleanup_scope == "gateway"):
+                # gateway-only abort 恢复期间既有 worker 仍必须保留。
+                raise RuntimeUnavailable(
+                    "gateway_cleanup_in_progress", 503, retry_after=1)
+            return None
+        if lease.state not in ("ready", "draining"):
+            return None
+        if not lease.upstream or not lease.service_token:
             return None
         if lease.gateway_instance_id:
             if lease.gateway_state != "available":
-                return None
+                raise RuntimeUnavailable(
+                    "gateway_unavailable", 503, retry_after=5)
             if not self._gateway_fields_valid(lease):
-                return None
+                raise RuntimeUnavailable(
+                    "gateway_unavailable", 503, retry_after=5)
         elif self._gateway_required:
-            return None
+            raise RuntimeUnavailable("gateway_unavailable", 503,
+                                     retry_after=5)
         return WorkerHandle(
             lease.workspace_id, lease.container_id,
             lease.upstream, lease.service_token, lease.config_version,
@@ -401,6 +429,86 @@ class RuntimeManager:
             # 可信 inspect/停止证据，不在这里结算 Run。
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
+        return await self._commit_gateway_candidate(
+            workspace_id, config_version, lease, candidate, attempt_id,
+            deadline)
+
+    async def restore_gateway(self, workspace_id: str, container_id: str,
+                              config_version: int) -> WorkerHandle | None:
+        """只为既有 worker 重配/更换 gateway；绝不创建或替换 worker。
+
+        返回 ``None`` 表示持久租约已不指向该实例（调用方可按实例消失处理）；
+        gateway 暂时不可用/refresh 在途则抛 ``RuntimeUnavailable``，调用方
+        只能返回 503，不得结算在途 Run。
+        """
+        self._validate_request(workspace_id, config_version)
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
+        if (lease is None or lease.container_id != container_id
+                or lease.config_version != config_version):
+            return None
+        if lease.state == "starting":
+            raise RuntimeUnavailable(
+                "worker_gateway_refresh_in_progress", 503, retry_after=1)
+        if lease.state == "stopping":
+            raise RuntimeUnavailable(
+                "worker_stopping", 503, retry_after=1)
+        if (lease.state not in ("ready", "draining")
+                or not lease.upstream or not lease.service_token):
+            return None
+        if lease.state == "draining":
+            # 不能把 draining 改成 starting 后恢复成 ready，否则会重新接纳
+            # 新任务；draining 中的 gateway 故障交给显式 drain/stop 处理。
+            raise RuntimeUnavailable(
+                "worker_draining", 503, retry_after=1)
+        deadline = self._clock() + self._ready_timeout
+        attempt_id = uuid.uuid4().hex
+        candidate = await self._restore_candidate(
+            workspace_id, container_id, config_version, deadline, attempt_id)
+        if candidate.container_id != lease.container_id:
+            raise RuntimeUnavailable("worker_identity_mismatch", 503,
+                                     retry_after=5)
+        return await self._commit_gateway_candidate(
+            workspace_id, config_version, lease, candidate, attempt_id,
+            deadline)
+
+    async def _restore_candidate(self, workspace_id: str, container_id: str,
+                                 config_version: int, deadline: float,
+                                 attempt_id: str) -> WorkerHandle:
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise RuntimeUnavailable("gateway_recovery_timeout", 503,
+                                     retry_after=5)
+        restore = getattr(self._provisioner, "restore_gateway", None)
+        if not callable(restore):
+            raise RuntimeUnavailable("gateway_recovery_unavailable", 503,
+                                     retry_after=5)
+        try:
+            handle = await asyncio.wait_for(
+                restore(workspace_id, container_id, config_version,
+                        attempt_id=attempt_id),
+                timeout=remaining)
+        except asyncio.TimeoutError:
+            raise RuntimeUnavailable("gateway_recovery_timeout", 503,
+                                     retry_after=5) from None
+        except asyncio.CancelledError:
+            raise
+        except RuntimeUnavailable:
+            raise
+        except Exception as error:
+            raise RuntimeUnavailable(
+                getattr(error, "code", "gateway_recovery_failed"), 503,
+                retry_after=5) from error
+        problem = self._handle_problem(
+            handle, workspace_id, config_version, gateway_required=True)
+        if problem is not None:
+            raise RuntimeUnavailable(problem, 503, retry_after=5)
+        return handle
+
+    async def _commit_gateway_candidate(
+            self, workspace_id: str, config_version: int, lease: WorkerLease,
+            candidate: WorkerHandle, attempt_id: str,
+            deadline: float) -> WorkerHandle:
+        """在受保护 CAS 中保存候选、激活并收口；refresh/restore 共用。"""
         staged = await self._db(
             self._store.begin_worker_gateway_refresh,
             workspace_id, lease.generation, self.owner_id, candidate,
@@ -549,6 +657,9 @@ class RuntimeManager:
                                      retry_after=5) from None
         except asyncio.CancelledError:
             # 调用方取消也要释放认领，避免遗留 starting 阻塞后续启动
+            await self._fail_start(workspace_id, lease)
+            raise
+        except RuntimeUnavailable:
             await self._fail_start(workspace_id, lease)
             raise
         except Exception as error:
@@ -1160,6 +1271,21 @@ class UnixProvisionerClient:
             raise RuntimeUnavailable("provisioner_invalid_response", 503,
                                      retry_after=5)
         return {"gateway": gateway}
+
+    async def restore_gateway(self, workspace_id: str,
+                              worker_container_id: str,
+                              config_version: int, *,
+                              attempt_id: str = "") -> WorkerHandle:
+        """受限 v2 恢复：只接受同一 worker ID/config，不创建新 worker。"""
+        if not self.gateway_required:
+            raise RuntimeUnavailable("gateway_disabled", 503)
+        response = await self._call({
+            "version": 2, "action": "restore_gateway",
+            "workspace_id": workspace_id,
+            "worker_container_id": worker_container_id,
+            "config_version": config_version,
+            "attempt_id": attempt_id}, self.ENSURE_TIMEOUT)
+        return self._decode_ensure(response, gateway_required=True)
 
     async def abort(self, workspace_id: str, worker_container_id: str,
                     gateway_instance_id: str, *, attempt_id: str, scope: str,

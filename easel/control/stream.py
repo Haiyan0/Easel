@@ -168,7 +168,18 @@ async def run_event_stream(
                 if pending is not None and pending in done:
                     try:
                         page = pending.result()
-                    finally:
+                    except DomainError as error:
+                        if error.status != 503:
+                            raise
+                        # gateway 暂时不可用：不结束已建立的 SSE，保留游标，
+                        # 按 Retry-After/轮询间隔继续；登录撤销仍由 recheck
+                        # 独立终止连接。POST 不在此路径自动重发。
+                        pending = None
+                        next_fetch = clock() + max(
+                            poll_interval,
+                            min(float(error.retry_after or 1), 5.0))
+                        continue
+                    else:
                         pending = None
                     next_fetch = now + poll_interval
                     break  # 处理新事件页

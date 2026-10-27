@@ -23,8 +23,9 @@ from easel.commands.gateway import cmd_gateway
 from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
 from easel.control.cli import (cmd_admin_backup, cmd_admin_bootstrap,
-                               cmd_admin_invite, cmd_admin_migrate_local,
-                               cmd_admin_restore, cmd_serve_control)
+                               cmd_admin_drain, cmd_admin_invite,
+                               cmd_admin_migrate_local, cmd_admin_restore,
+                               cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
 from easel.persona import persona_prefix
@@ -279,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="受控出口代理 URL，例如 http://127.0.0.1:8899")
     p_serve.add_argument("--egress-policy", default=None,
                          help="管理员出口策略 JSON（approved_hosts/approved_cidrs）")
+    p_serve.add_argument("--egress-ca-file", default=None,
+                         help="可选：受控出口额外信任的 PEM CA 文件")
     p_serve.add_argument("--provisioner-socket", default=None,
                          help="受限 provisioner 的本地 Unix socket；缺失时失败关闭")
     p_serve.add_argument(
@@ -308,6 +311,12 @@ def main(argv: list[str] | None = None) -> int:
     p_invite.add_argument("--ttl-seconds", type=int, default=604800,
                           help="邀请有效期秒数（默认 604800）")
     p_invite.set_defaults(func=cmd_admin_invite)
+    p_drain = admin_sub.add_parser(
+        "drain", help="drain 所有活动 workspace（停止/备份前）")
+    p_drain.add_argument("--control-dir", required=True)
+    p_drain.add_argument("--provisioner-socket", required=True)
+    p_drain.add_argument("--gateway-required", action="store_true")
+    p_drain.set_defaults(func=cmd_admin_drain)
     p_backup = admin_sub.add_parser(
         "backup", help="备份控制库、master key 与 workspace 持久区")
     p_backup.add_argument("--control-dir", required=True)

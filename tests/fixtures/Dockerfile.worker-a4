@@ -1,0 +1,15 @@
+# A4 真实测试专用 worker 镜像补丁。
+#
+# 复用已验收的 execution 基础镜像（chromium/Playwright 不在本轮重装），只
+# 覆盖本轮修复的 worker 会话原子写代码。生产镜像仍由 Dockerfile.worker 的
+# 完整多阶段构建产生；该文件不进入运行时默认入口。
+FROM easel-worker-execution:g2
+
+USER root
+COPY easel/worker/sessions.py /opt/easel/easel/worker/sessions.py
+COPY easel/worker/runs.py /opt/easel/easel/worker/runs.py
+RUN chown root:root /opt/easel/easel/worker/sessions.py \
+      /opt/easel/easel/worker/runs.py \
+ && chmod a-w /opt/easel/easel/worker/sessions.py \
+      /opt/easel/easel/worker/runs.py
+USER 10001:10001

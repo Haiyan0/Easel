@@ -16,11 +16,12 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import uvicorn
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..worker.sessions import (
     MESSAGE_FORMAT,
@@ -33,9 +34,14 @@ from .auth import AuthService
 from .broker import BrokerService
 from .config import ConfigService, load_master_key
 from .egress import EgressGateway, load_policy
+from .gateway_client import GatewayClient
 from .proxy import BrokerDestination, PinnedRunConfig, WorkerRelay
 from .runtime import RuntimeManager, UnixProvisionerClient
-from .snapshot import load_managed_agent_config, load_signing_key
+from .snapshot import (
+    WORKSPACE_SIDECAR_MODE,
+    load_managed_agent_config,
+    load_signing_key,
+)
 from .store import SCHEMA_VERSION, Store
 from .types import DomainError
 
@@ -446,24 +452,70 @@ def _report(error: DomainError) -> int:
 
 
 def build_relay_factory(*, signing_key, revision: int, agent: dict,
-                        broker_destination: BrokerDestination):
+                        broker_config: Mapping[str, str] | None = None,
+                        broker_destination: BrokerDestination | None = None,
+                        gateway_required: bool = False):
     """正式 control 装配：接纳后为每个 Run 签发最小 broker token。
 
     该函数被 CLI 与装配测试共同使用；不得在测试里用自造 provider 另起
     一条与生产不同的签发路径。
+
+    ``broker_config`` 为受管配置原始目的地标签：固定 URL 兼容模式或
+    ``workspace-sidecar``。sidecar URL 只从认证后重查的 workspace UUID
+    派生，绝不接受请求体/客户端地址；``broker_destination`` 仅保留给旧
+    调用方的固定目的地。
     """
-    def pinned_config(_actor):
+    if broker_config is not None and broker_destination is not None:
+        raise ValueError("broker configuration is ambiguous")
+    if broker_config is None and broker_destination is None:
+        raise ValueError("broker configuration is required")
+    if gateway_required and not isinstance(signing_key, Ed25519PrivateKey):
+        raise TypeError("gateway_required needs an Ed25519 signing key")
+    if broker_config is not None:
+        mode = broker_config.get("mode")
+        channel = broker_config.get("channel")
+        url = broker_config.get("url")
+        if mode == WORKSPACE_SIDECAR_MODE:
+            if set(broker_config) != {"mode", "channel"}:
+                raise ValueError("workspace-sidecar broker is invalid")
+        elif mode is None and set(broker_config) == {"url", "channel"}:
+            pass
+        else:
+            raise ValueError("managed broker configuration is invalid")
+        if not isinstance(channel, str) or not channel:
+            raise ValueError("managed broker channel is invalid")
+
+        def destination_for(actor) -> BrokerDestination:
+            if mode == WORKSPACE_SIDECAR_MODE:
+                workspace_id = getattr(actor, "workspace_id", "")
+                if (not isinstance(workspace_id, str)
+                        or _WORKSPACE_ID.fullmatch(workspace_id) is None):
+                    raise DomainError("invalid_workspace", 500)
+                return BrokerDestination(
+                    f"http://easel-sidecar-{workspace_id}:8899", channel)
+            if not isinstance(url, str):
+                raise TypeError("managed broker url is invalid")
+            return BrokerDestination(url, channel)
+    else:
+        def destination_for(_actor):
+            return broker_destination
+
+    def pinned_config(actor):
         return PinnedRunConfig(
             revision=revision, routes={}, agent=agent,
-            broker=broker_destination)
+            broker=destination_for(actor))
 
     def relay_factory(runtime, sessions, auth, store, http_client,
                       broker, db_runner):
+        gateway_client = None
+        if gateway_required:
+            gateway_client = GatewayClient(signing_key, http_client)
         return WorkerRelay(
             runtime, sessions, auth, store=store,
             signing_key=signing_key, config_provider=pinned_config,
             http_client=http_client, broker=broker,
-            db_runner=db_runner)
+            db_runner=db_runner, gateway_client=gateway_client,
+            gateway_required=gateway_required)
 
     return relay_factory
 
@@ -1307,6 +1359,32 @@ def cmd_admin_migrate_local(args) -> int:
     return 0
 
 
+def cmd_admin_drain(args) -> int:
+    """drain 所有活动 workspace；用于停止/备份前收尾。"""
+    socket = Path(args.provisioner_socket)
+    if not socket.exists():
+        print("错误：provisioner_unavailable", file=sys.stderr)
+        return 1
+    provisioner = UnixProvisionerClient(
+        socket, gateway_required=bool(getattr(args, "gateway_required", False)))
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            manager = RuntimeManager(
+                store, provisioner,
+                gateway_required=bool(
+                    getattr(args, "gateway_required", False)))
+            drained = asyncio.run(manager.drain_all())
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - provisioner/drain failures统一失败关闭
+        print("错误：worker_drain_failed", file=sys.stderr)
+        return 1
+    print(f"drained={len(drained)}")
+    for workspace in drained:
+        print(f"drained_workspace={workspace}")
+    return 0
+
+
 def cmd_serve_control(args) -> int:
     """启动 control HTTP 服务；应用在 lifespan 中管理自己的数据库线程。"""
     try:
@@ -1326,12 +1404,17 @@ def cmd_serve_control(args) -> int:
 
     # 逐 Run 签名密钥与受管 Agent 配置必须成对显式给出；只给其一视为
     # 配置错误而不是静默降级。两者都不给时保持任务入口 503。
+    gateway_required = bool(getattr(args, "gateway_required", False))
     snapshot_key_file = getattr(args, "snapshot_key_file", None)
     managed_config_file = getattr(args, "managed_agent_config", None)
     signing_key = None
     managed_agent = None
     if bool(snapshot_key_file) != bool(managed_config_file):
         print("错误：relay_config_incomplete", file=sys.stderr)
+        return 2
+    if gateway_required and signing_key is None and not snapshot_key_file:
+        # gateway 模式必须能逐请求签名；不得退回旧直连/无签名路径。
+        print("错误：gateway_requires_relay_config", file=sys.stderr)
         return 2
     if snapshot_key_file:
         try:
@@ -1357,14 +1440,13 @@ def cmd_serve_control(args) -> int:
     if signing_key is not None:
         revision, agent, broker_config = managed_agent
         try:
-            destination = BrokerDestination(
-                broker_config["url"], broker_config["channel"])
-        except (KeyError, ValueError):
+            relay_factory = build_relay_factory(
+                signing_key=signing_key, revision=revision, agent=agent,
+                broker_config=broker_config,
+                gateway_required=gateway_required)
+        except (KeyError, TypeError, ValueError):
             print("错误：managed_config_invalid", file=sys.stderr)
             return 2
-        relay_factory = build_relay_factory(
-            signing_key=signing_key, revision=revision, agent=agent,
-            broker_destination=destination)
         # 只投影可公开的只读元数据；argv、broker 地址与凭证不进入响应
         harness_summary = {
             "runtime": agent["runtime"],
@@ -1389,7 +1471,9 @@ def cmd_serve_control(args) -> int:
         # 在 broker 联网前返回 503，不能构造隐式默认策略冒充管理员配置。
         policy = None
     try:
-        egress = EgressGateway(policy=policy, proxy_url=egress_proxy)
+        egress = EgressGateway(
+            policy=policy, proxy_url=egress_proxy,
+            ca_file=getattr(args, "egress_ca_file", None))
     except ValueError:
         print("错误：egress_proxy_invalid", file=sys.stderr)
         return 2
@@ -1397,7 +1481,6 @@ def cmd_serve_control(args) -> int:
     # 受限 provisioner 必须可达才启动多人运行时；缺失时失败关闭，
     # 不回退到进程内 Docker 或“无隔离”模式。
     provisioner = None
-    gateway_required = bool(getattr(args, "gateway_required", False))
     provisioner_socket = getattr(args, "provisioner_socket", None)
     if gateway_required and not provisioner_socket:
         print("错误：gateway_required_needs_provisioner", file=sys.stderr)

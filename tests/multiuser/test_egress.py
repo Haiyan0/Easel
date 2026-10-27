@@ -231,3 +231,26 @@ def test_policy_file_loader_is_strict(tmp_path):
     missing = tmp_path / "missing.json"
     with pytest.raises(ValueError):
         load_policy(missing)
+
+
+def test_load_policy_accepts_utf8_bom(tmp_path):
+    from easel.control.egress import load_policy
+
+    path = tmp_path / "policy.json"
+    path.write_bytes(
+        b"\xef\xbb\xbf" +
+        b'{"approved_hosts":["example.test"],"approved_cidrs":[]}')
+    policy = load_policy(path)
+    assert "example.test" in policy.approved_hosts
+
+
+def test_egress_gateway_rejects_missing_ca_file(tmp_path):
+    from easel.control.egress import EgressGateway
+
+    with pytest.raises(ValueError):
+        EgressGateway(ca_file=tmp_path / "missing.pem")
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"not-a-cert")
+    gateway = EgressGateway(
+        policy=None, proxy_url="http://127.0.0.1:8899", ca_file=ca)
+    assert gateway.ca_file == str(ca)

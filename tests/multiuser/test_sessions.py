@@ -545,3 +545,21 @@ def test_large_history_count_and_latest_window(tmp_path):
     assert latest[-1]["content"] == "m2499"
     older = store.messages("big", limit=500, offset=1500)
     assert older[0]["content"] == "m1500"
+
+
+def test_atomic_write_tolerates_fchmod_permission_denied(tmp_path, monkeypatch):
+    """Docker Desktop /mnt/c 拒绝 fchmod；mkstemp 的 0600 已足够。"""
+    import os as os_module
+
+    from easel.worker import sessions as sessions_module
+
+    if not hasattr(os_module, "fchmod"):
+        pytest.skip("本平台没有 fchmod")
+
+    def reject(_descriptor, _mode):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(sessions_module.os, "fchmod", reject)
+    store = WorkspaceSessionStore(tmp_path, WORKSPACE_A)
+    store.bind("session-fchmod", "acp", "native", 1)
+    assert store.binding("session-fchmod")["native_id"] == "native"

@@ -596,11 +596,13 @@ def create_app(*, store: Store, auth: AuthService,
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, error: DomainError):
         # 只暴露错误码与请求 id；不回显令牌、SQL 或内部对象
+        headers = {"Cache-Control": "no-store"}
+        if error.retry_after is not None:
+            headers["Retry-After"] = str(int(error.retry_after))
         return JSONResponse(
             {"code": error.code, "detail": error.code,
              "request_id": _request_id(request)},
-            status_code=error.status,
-            headers={"Cache-Control": "no-store"})
+            status_code=error.status, headers=headers)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(request: Request, error: StarletteHTTPException):

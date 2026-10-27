@@ -498,9 +498,10 @@ def test_desktop_topology_contract_is_explicit_and_secret_free() -> None:
     data = json.loads(TOPOLOGY.read_text(encoding="utf-8"))
 
     assert data["schema"] == "easel.desktop.topology.v1"
-    assert data["status"] in {"proposed", "measured_unapproved"}
-    assert data["approval_required"] is True
-    assert data["implementation"]["enabled"] is False
+    assert data["status"] == "assembled_a4"
+    assert data["approval_required"] is False
+    assert data["implementation"]["enabled"] is True
+    assert data["implementation"]["control_relay"]["status"] == "assembled"
 
     forbidden = {
         "secret", "password", "authtoken", "private_key", "master_key",
@@ -550,7 +551,8 @@ def test_desktop_topology_contract_is_explicit_and_secret_free() -> None:
     assert network["wsl_to_worker"]["http"] == "blocked"
     assert network["windows_to_worker"]["http"] == "blocked"
     gateway = network["gateway"]
-    assert gateway["enabled"] is False
+    assert gateway["enabled"] is True
+    assert gateway["public_relay_enabled"] is True
     assert gateway["docker_socket"] is False
     assert gateway["worker_ports"] == []
     assert gateway["workspace_mounts"] == []

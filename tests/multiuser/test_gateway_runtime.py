@@ -312,3 +312,25 @@ def test_gateway_candidate_never_repr_secret(tmp_path):
         gateway_upstream=f"http://{CONTROL_IP}:8897",
         worker_created=False, gateway_created=False, active=False)
     assert TOKEN not in repr(candidate)
+
+
+def test_gateway_inspect_stopped_container_is_still_managed(tmp_path):
+    """停止后 IPAddress/IPAMConfig 为空，不得把受管 gateway 误判为不受管。"""
+    settings = _settings(tmp_path)
+    raw = _inspect(settings)
+    raw["State"] = {"Running": False, "Status": "exited"}
+    networks = raw["NetworkSettings"]["Networks"]
+    for name, entry in networks.items():
+        entry["IPAddress"] = ""
+        entry["IPAMConfig"] = (
+            {"IPv4Address": CONTROL_IP}
+            if name == settings.control_network else {})
+    report = sanitize_gateway_inspect(raw, workspace_id=WORKSPACE)
+    assert report["managed"] is True
+    assert report["gateway_instance_id"] == GATEWAY_ID
+    assert report["control_ip"] == CONTROL_IP
+    assert report["worker_ip"] == ""
+    assert verify_gateway_inspect(
+        raw, settings, workspace_id=WORKSPACE, config_version=3,
+        worker_container_id=WORKER, control_ip=CONTROL_IP,
+        worker_network_connected=True) is False

@@ -1,15 +1,15 @@
 {
   "schema": "easel.desktop.topology.v1",
-  "status": "proposed",
+  "status": "assembled_a4",
   "measured_at": "2026-10-27",
-  "approval_required": true,
+  "approval_required": false,
   "implementation": {
-    "enabled": false,
-    "reason": "G2 已接通 provisioner 的 gateway 容器、固定控制网 IPv4、可信配置/激活握手与 WorkerHandle/租约 CAS；公开 WorkerRelay/聊天入口与 A4 broker 接线仍未启用。",
+    "enabled": true,
+    "reason": "A4 已接通公开 control relay、control→gateway 逐请求 Ed25519 签名、逐 Run workspace-sidecar broker、正式 Desktop 启动/停止/诊断入口；真实 DeepSeek Harness/供应商、浏览器闭环和最终镜像仍留 A5/A6。",
     "gateway_core": {
-      "status": "assembled_not_public_relay",
-      "task": "G2",
-      "review_round": "G2-R3",
+      "status": "public_relay_assembled",
+      "task": "A4",
+      "review_round": "A4",
       "factory": "create_gateway_app",
       "runtime": "deploy/multiuser/gateway_runtime.py",
       "server": "easel/gateway/server.py",
@@ -23,9 +23,24 @@
       ],
       "activation": "进程启动生成新 boot_generation；可信 configure 只绑定目标，activate 精确匹配实例/boot 后才启用；之前所有管理请求 503 gateway_inactive。",
       "not_modified": [
-        "公开 WorkerRelay/聊天入口",
-        "A4 broker URL/受管 Agent 接线",
-        "真实 Harness/供应商"
+        "真实 DeepSeek Harness/供应商（A5/A6）",
+        "完整双用户浏览器闭环（A6）"
+      ]
+    },
+    "control_relay": {
+      "status": "assembled",
+      "client": "easel/control/gateway_client.py",
+      "factory": "easel.control.cli.build_relay_factory",
+      "transport": "direct（旧兼容）或 gateway_required（Desktop）",
+      "required_fail_closed": [
+        "gateway-required 缺签名私钥/受管配置/provider socket 启动失败",
+        "缺少 gateway 实例/代次/upstream 时任务入口 503，不回退直连或 service token",
+        "只对既有 Run 的原 worker ID/config 做受限 gateway 恢复，不创建新 worker"
+      ],
+      "tests": [
+        "tests/multiuser/test_gateway_client.py",
+        "tests/multiuser/test_gateway_relay.py",
+        "tests/integration/multiuser/test_desktop_chat_full.py"
       ]
     }
   },
@@ -72,7 +87,16 @@
       "supplemental_gid": 1000,
       "docker_socket": false,
       "host_network": false,
-      "published_ports": ["127.0.0.1:7861"]
+      "published_ports": [
+        "127.0.0.1:7861"
+      ],
+      "entry": "deploy/desktop/compose.workspace.yaml",
+      "scripts": [
+        "Initialize-WorkspaceEasel.ps1",
+        "Start-WorkspaceEasel.ps1",
+        "Status-WorkspaceEasel.ps1",
+        "Stop-WorkspaceEasel.ps1"
+      ]
     },
     "gateway_runtime": {
       "location": "docker",
@@ -85,7 +109,9 @@
       "cleanup_scope": "Store v13 持久化 cleanup_purpose/scope、attempt_id、worker/gateway 目标与 worker_created/gateway_created。gateway-only abort 恢复只删除新 gateway，并 finish_gateway_abort 保留既有 worker/凭证/历史/Run/容量/token 回到 ready/unavailable；worker/worker_gateway abort 按各自范围；只有 business drain/旧记录默认完整停止。恢复不因 provisioner 内存丢失扩大范围。provisioner completed tombstone 在 control 提交 DB 前保留；tombstone 写失败保持 pending，重试有限完成，不能假报收口。",
       "create_tracking": "docker create 使用专属 cidfile；超时/取消等待 CLI 终结后按 cidfile 中不可复用 ID 清理；start/connect/configure/activate 取消也等待底层 CLI。清理失败保留 cidfile 并返回 gateway_create_cleanup_incomplete。",
       "activation": "configure 绑定实例与 worker 目标但不激活；activate 精确匹配 workspace/gateway_instance_id/boot_generation/worker_container_id/config_version。",
-      "network_join": "create 前固定 control IPv4；仅控制网络 start 并 inspect 绑定；configure 后再 connect 唯一 worker 网络；最终 inspect 要求恰好 control+worker 两张网。"
+      "network_join": "create 前固定 control IPv4；仅控制网络 start 并 inspect 绑定；configure 后再 connect 唯一 worker 网络；最终 inspect 要求恰好 control+worker 两张网。",
+      "control_client": "easel/control/gateway_client.py 只使用受信 handle.gateway_upstream；每次请求重新读取 CAS 确认的 audience 并签名。",
+      "recovery": "既有 Run 的 gateway 失败只允许 provisioner.restore_gateway 在同一 worker ID/config 上重配/更换；GET/SSE 可按 after 继续，POST 不自动重发。"
     },
     "socket": {
       "path": "/tmp/easel-runtime/provisioner.sock",
@@ -98,7 +124,9 @@
       "windows_unc": "\\\\wsl.localhost\\Ubuntu-26.04\\tmp\\easel-runtime\\provisioner.sock",
       "peer_cred": {
         "required": true,
-        "allowed_uids": [10001]
+        "allowed_uids": [
+          10001
+        ]
       },
       "windows_native_peer_cred": false
     },
@@ -162,9 +190,9 @@
       "direct_worker_network_join": "bidirectional_when_control_joined"
     },
     "gateway": {
-      "enabled": false,
+      "enabled": true,
       "runtime_implemented": true,
-      "public_relay_enabled": false,
+      "public_relay_enabled": true,
       "name_template": "easel-gateway-{workspace_id}",
       "networks": [
         "easel-control",
@@ -379,7 +407,8 @@
       "user": "10001:10001",
       "worker_to_management": "blocked_by_bind_and_network",
       "sse": "streaming_passthrough",
-      "failure_cleanup": "gateway 与 worker 同代次创建/停止；启动/连接/配置/激活失败按本轮 worker_created/gateway_created 与不可复用 ID 清理；已有活跃 worker/gateway 不因一次 probe 失败删除；gateway 停止失败不得吞掉，不留下可达入口。"
+      "failure_cleanup": "gateway 与 worker 同代次创建/停止；启动/连接/配置/激活失败按本轮 worker_created/gateway_created 与不可复用 ID 清理；已有活跃 worker/gateway 不因一次 probe 失败删除；gateway 停止失败不得吞掉，不留下可达入口。",
+      "public_relay": "control WorkerRelay 只经 gateway_upstream 转发，逐请求签名；公开 SSE 仍由 control 层轮询持久事件。gateway 暂不可用只返回 503，不停止 worker、不撤销 broker token、不结算 Run。"
     }
   },
   "broker": {
@@ -387,13 +416,17 @@
     "control_upstream": "control:7861",
     "sidecar_network": "easel-control",
     "worker_egress_port": 8898,
-    "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。"
+    "worker_to_broker": "只经每 workspace sidecar 的精确 broker 路由；不复用该入口做 control 管理。",
+    "mode": "workspace-sidecar",
+    "control_client": "easel/control/gateway_client.py",
+    "pinned_config": "BrokerDestination 从认证后重查的 workspace UUID 派生 http://easel-sidecar-<workspace_id>:8899；旧固定 URL 配置继续兼容。"
   },
   "evidence": {
-    "report": "docs/evidence/desktop-g2-r3/report.md",
-    "red_green": "docs/evidence/desktop-g2-r3/red-green.md",
-    "test_file": "tests/integration/multiuser/test_gateway_runtime_real.py",
-    "previous": "docs/evidence/desktop-a2/report.md"
+    "report": "docs/evidence/desktop-a4/report.md",
+    "red_green": "docs/evidence/desktop-a4/red-green.md",
+    "checks": "docs/evidence/desktop-a4/checks.json",
+    "test_file": "tests/integration/multiuser/test_desktop_chat_full.py",
+    "previous": "docs/evidence/desktop-g2-r3/report.md"
   },
   "approval": {
     "items": [

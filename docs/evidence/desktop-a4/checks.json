@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-28",
+  "parent_commit": "785f556bc81c464f59de5105a02c12305b2e6265",
+  "scope": [
+    "A4.1",
+    "A4.2",
+    "A4.3",
+    "A4.4",
+    "A4.5"
+  ],
+  "schema_version": 13,
+  "fixes": {
+    "A4.1": "signed GatewayClient with exact final URL/query/UTF-8 body, header/cookie/auth stripping, no POST retry, no redirects, sanitized errors and Retry-After",
+    "A4.2": "gateway-required transport; gateway unavailable separated from worker identity loss; same-worker gateway-only restore; no worker stop/token revoke/Run settlement on transient gateway failure; GET/SSE resume, POST not replayed",
+    "A4.3": "workspace-sidecar broker mode derives per-workspace URL from authenticated UUID; legacy fixed URL remains compatible; formal serve-control requires signing/agent config in gateway mode; explicit egress CA",
+    "A4.4": "full Desktop compose plus Initialize/Start/Status/Stop scripts, one-time master and Ed25519 keys, control network, provisioner lifecycle and diagnostics",
+    "A4.5": "real public control→gateway→worker→sidecar→broker chain with ACP fixture subprocess and TLS fake provider; two-user isolation, permission/stop/history, gateway restart recovery"
+  },
+  "tests": {
+    "a4_targeted": "362 passed, 2 skipped (一次全量调用中一个既有 socket 环境错误，单文件重跑 12 passed)",
+    "multiuser_and_desktop_static": "1324 passed, 10 skipped, 2 warnings",
+    "g1_gateway": "120 passed, 2 warnings",
+    "real_chain": "1 passed in 85.26s (latest); repeated 1 passed in 75.05s / 83.88s",
+    "desktop_scripts_smoke": "initialize/start/status/stop passed; resources cleaned",
+    "full_pytest": "2650 passed, 62 failed, 86 skipped (failures in untouched setup/bash encoding and Starlette TestClient/httpx2 environment)"
+  },
+  "fixed_images": {
+    "control": "sha256:02a540d7403dc523d9fab0b27e57a96ed05e79a0fd445b91cd08b0c6747a9a7a",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:5969539ecd1918e7d767a206844500f4cc754330c713749bdecf51af9d8bc561"
+  },
+  "real_evidence": {
+    "workspaces": [
+      {
+        "workspace": "79d6dfb6ea0f42c584a3a6f4ff32bd1d",
+        "worker": "5383288fff938145e9dd2faed743bc5c4c0155d07327b23b33e940a12169589e",
+        "gateway": "265f143686ffaf4be3e611942dce6d72d3920be5a740ec76a8769014395cf504"
+      },
+      {
+        "workspace": "472b33aa161f4024a188040cc0570dc5",
+        "worker": "7b27aa0f2c36e1e9b16e89fa257a3ad1f086e1d318dc7169cbce8e33a7e5925e",
+        "gateway": "3f50c9ae00e4822541ee965d8285740264fb4c0183b0a493ddb4e79b28df4600"
+      }
+    ],
+    "provider_requests": 2,
+    "provider_model": "deepseek-chat",
+    "provider_sentinel_header_ok": true,
+    "cross_workspace_status": 404,
+    "wrong_channel_status": 404,
+    "gateway_restart_same_worker": true,
+    "gateway_replacement": {
+      "old": "265f143686ffaf4be3e611942dce6d72d3920be5a740ec76a8769014395cf504",
+      "new": "557a584d90c6fb98f630afa8971be554ba8b487607f1198fa87e7c8378a29647",
+      "same_worker": true,
+      "tokens": 1
+    },
+    "broker_tokens_before_after": [
+      1,
+      1
+    ],
+    "acp_adapter_not_restarted": true,
+    "no_published_gateway_worker_ports": true
+  },
+  "cleanup": "no easel-a4/script-test containers, networks or volumes remain; provisioner exited; fixed images retained",
+  "not_run": [
+    "ngrok public browser entry",
+    "real DeepSeek Harness",
+    "real provider billing",
+    "full two-user browser closure (A6)",
+    "production XFS/firewall/IPv6 gates"
+  ]
+}

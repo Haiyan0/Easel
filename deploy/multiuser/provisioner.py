@@ -82,7 +82,8 @@ WORKER_COMMAND = (
 )
 DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
 
-ACTIONS = ("ensure", "stop", "inspect", "activate", "abort")
+ACTIONS = ("ensure", "stop", "inspect", "activate", "abort",
+           "restore_gateway")
 
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PINNED_IMAGE = re.compile(
@@ -175,13 +176,16 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     action = data.get("action")
     if action not in ACTIONS:
         raise _reject("invalid_action")
-    if version == LEGACY_PROTOCOL_VERSION and action in ("activate", "abort"):
+    if version == LEGACY_PROTOCOL_VERSION and action in (
+            "activate", "abort", "restore_gateway"):
         raise _reject("unsupported_protocol")
     allowed = {"version", "action", "workspace_id"}
-    if action in ("ensure", "activate"):
+    if action in ("ensure", "activate", "restore_gateway"):
         allowed.add("config_version")
     if action == "ensure" and version == PROTOCOL_VERSION:
         allowed.add("attempt_id")
+    if action == "restore_gateway":
+        allowed.update({"worker_container_id", "attempt_id"})
     if action == "stop":
         allowed.add("instance_id")
         if version == PROTOCOL_VERSION:
@@ -204,7 +208,8 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
         raise _reject("invalid_workspace")
 
     config_version = data.get("config_version", 0)
-    if action in ("ensure", "activate") and "config_version" not in data:
+    if action in ("ensure", "activate", "restore_gateway") \
+            and "config_version" not in data:
         raise _reject("invalid_config_version")
     if not _valid_config_version(config_version):
         raise _reject("invalid_config_version")
@@ -273,6 +278,15 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
         if attempt_id and (not isinstance(attempt_id, str)
                            or re.fullmatch(r"[0-9a-f]{32}", attempt_id)
                            is None):
+            raise _reject("invalid_attempt_id")
+    elif action == "restore_gateway":
+        worker_container_id = data.get("worker_container_id")
+        if (not isinstance(worker_container_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(worker_container_id) is None):
+            raise _reject("invalid_instance")
+        attempt_id = data.get("attempt_id", "")
+        if (not isinstance(attempt_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None):
             raise _reject("invalid_attempt_id")
     return WorkerRequest(
         action, workspace_id, config_version, instance_id, version,
@@ -1128,7 +1142,13 @@ def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
     host = raw.get("HostConfig")
     if not isinstance(config, dict) or not isinstance(host, dict):
         return False
-    if config.get("Labels") != sidecar_labels(workspace_id):
+    labels = config.get("Labels")
+    expected_labels = sidecar_labels(workspace_id)
+    if (not isinstance(labels, dict)
+            or any(labels.get(key) != value
+                   for key, value in expected_labels.items())):
+        # Docker Desktop 会附加平台标签（如 wsl-distro）；只要求本项目
+        # 三个归属标签存在且精确匹配，不能因额外平台标签拒绝。
         return False
     if config.get("Image") != image or config.get("User") != WORKER_USER:
         return False
@@ -2168,7 +2188,8 @@ class Provisioner:
 
     async def _with_gateway(self, handle: WorkerHandle, protocol_version: int,
                             *, worker_created: bool,
-                            attempt_id: str = "") -> WorkerHandle:
+                            attempt_id: str = "",
+                            replace_unavailable: bool = False) -> WorkerHandle:
         """gateway 启用时只返回候选；v1 缺失元数据必须失败关闭。"""
         if not self.gateway_enabled:
             if protocol_version >= PROTOCOL_VERSION:
@@ -2183,7 +2204,8 @@ class Provisioner:
                 config_version=handle.config_version,
                 worker_container_id=handle.container_id,
                 worker_origin=handle.upstream,
-                worker_service_token=handle.service_token)
+                worker_service_token=handle.service_token,
+                replace_unavailable=replace_unavailable)
         except GatewayRuntimeError as error:
             raise ProvisionerError(error.code) from None
         result = replace(
@@ -2201,6 +2223,75 @@ class Provisioner:
                 worker_created=worker_created,
                 gateway_created=candidate.gateway_created)
         return result
+
+    async def restore_gateway(self, workspace_id: str,
+                              worker_container_id: str,
+                              config_version: int, *,
+                              attempt_id: str = "") -> WorkerHandle:
+        """只为同一已核验 worker 重配/更换 gateway；绝不创建/替换 worker。
+
+        控制面既有 Run 在 gateway 重启或实例失效后调用；所有目标由精确
+        worker ID、workspace 与 config_version 派生，调用方不能提供镜像、
+        命令、挂载或网络。worker 缺失/身份不符时失败关闭，绝不回退到
+        ensure 的冷启动路径。
+        """
+        if not self.gateway_enabled:
+            raise ProvisionerError("gateway_disabled")
+        if not attempt_id:
+            attempt_id = uuid.uuid4().hex
+        parse_request({
+            "version": PROTOCOL_VERSION, "action": "restore_gateway",
+            "workspace_id": workspace_id,
+            "worker_container_id": worker_container_id,
+            "config_version": config_version,
+            "attempt_id": attempt_id})
+        lock = self._locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            raw = await self._inspect_instance(worker_container_id)
+            if raw is None:
+                raise ProvisionerError("worker_identity_mismatch")
+            report = sanitize_inspect(raw)
+            if (not report["managed"]
+                    or report["workspace_id"] != workspace_id
+                    or report["instance_id"] != worker_container_id
+                    or report["config_version"] != config_version):
+                raise ProvisionerError("worker_identity_mismatch")
+            try:
+                paths = await asyncio.to_thread(
+                    existing_runtime_paths, self.settings.workspace_root,
+                    workspace_id)
+            except ProvisionerError:
+                raise ProvisionerError("worker_identity_mismatch") from None
+            sidecar_host = self._sidecar_host(workspace_id)
+            if not _verify_worker_static(
+                    raw, workspace_id=workspace_id,
+                    config_version=config_version,
+                    image=self.settings.image, paths=paths,
+                    public_key_file=self._worker_public_key):
+                raise ProvisionerError("worker_identity_mismatch")
+            if not verify_worker_wiring(
+                    raw, workspace_id=workspace_id,
+                    sidecar_host=sidecar_host):
+                raise ProvisionerError("worker_wiring_mismatch")
+            if not report["ready"]:
+                raise ProvisionerError("worker_not_ready")
+            try:
+                token = await asyncio.to_thread(
+                    _read_token, self.settings.workspace_root, workspace_id)
+            except ProvisionerError:
+                raise ProvisionerError("worker_credentials_mismatch") from None
+            if not _actual_token_matches(raw, token):
+                raise ProvisionerError("worker_credentials_mismatch")
+            if not await self._probe(
+                    workspace_id, config_version, worker_container_id):
+                raise ProvisionerError("worker_not_ready")
+            await self._ensure_sidecar(workspace_id)
+            handle = WorkerHandle(
+                workspace_id, worker_container_id, report["upstream"], token,
+                config_version)
+            return await self._with_gateway(
+                handle, PROTOCOL_VERSION, worker_created=False,
+                attempt_id=attempt_id, replace_unavailable=True)
 
     async def stop(self, workspace_id: str, instance_id: str,
                    gateway_instance_id: str = "", *,
@@ -2591,6 +2682,23 @@ class Provisioner:
                 request.gateway_instance_id, request.boot_generation,
                 request.config_version)
             return {"ok": True, **status}
+        if request.action == "restore_gateway":
+            handle = await self.restore_gateway(
+                request.workspace_id, request.worker_container_id,
+                request.config_version, attempt_id=request.attempt_id)
+            return {"ok": True, "handle": {
+                "workspace_id": handle.workspace_id,
+                "container_id": handle.container_id,
+                "upstream": handle.upstream,
+                "service_token": handle.service_token,
+                "config_version": handle.config_version,
+                "gateway_instance_id": handle.gateway_instance_id,
+                "gateway_generation": handle.gateway_generation,
+                "gateway_upstream": handle.gateway_upstream,
+                "gateway_state": handle.gateway_state,
+                "worker_created": handle.worker_created,
+                "gateway_created": handle.gateway_created,
+            }}
         if request.action == "abort":
             await self.abort(
                 request.workspace_id, request.worker_container_id,

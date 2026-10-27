@@ -1,6 +1,8 @@
 # Task A2：Desktop 完整拓扑契约与可行性报告
 
-状态：**A2 拓扑契约保留；A3 执行 worker 已实现；G1 独立 gateway 核心已实现并通过单元/真实 TCP 测试；G2 生命周期接线与 A4 仍未实现。**
+状态：**A2 拓扑契约保留；A3 执行 worker、G1 gateway 核心、G2 生命周期接线与
+A4 公开 relay/broker 装配均已实现。真实 DeepSeek Harness、真实供应商与完整
+双用户浏览器闭环仍留 A5/A6。**
 
 基线：`f1c4e5ef98ea756513071367919fe57fac7dbf17`（A1 验收通过）。
 本目录只增加 A2 契约、反例和证据；没有修改认证核心、A1 Compose
@@ -351,8 +353,9 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
    文件，确保 gateway-only abort 在控制/provisioner 重启后仍不删除既有
    worker。G2 R3 保留 completed attempt tombstone，使物理清理成功但
    control 未提交 DB 的恢复重试幂等成功。
-5. 公开 WorkerRelay/聊天入口与 A4 broker URL/受管 Agent 接线仍未实现；
-   在 A4 验收前不宣称多用户聊天可用。
+5. A4 已实现公开 WorkerRelay/聊天入口、gateway 逐请求签名与逐 workspace
+   broker URL/受管 Agent 接线；真实 Harness/供应商与完整浏览器闭环仍留
+   A5/A6。A4 前不得宣称多用户真实聊天已验收。
 
 主审若选择“control 加入 worker 网络 + 控制网络地址绑定”的替代方案，需要
 单独批准并补 worker→control 不可达的持续验证；本次契约不采用该方案。
@@ -433,3 +436,145 @@ R1 证据保留在
 [`docs/evidence/desktop-g2-r1/report.md`](../../docs/evidence/desktop-g2-r1/report.md)，
 上一轮证据保留在
 [`docs/evidence/desktop-g2/report.md`](../../docs/evidence/desktop-g2/report.md)。
+
+---
+
+# A4：公开 control relay、签名 gateway 与逐 workspace broker
+
+状态：**A4 装配已完成。** 公开已认证聊天入口现在经 G1/G2 gateway 到固定
+workspace worker；每 Run 的 broker 地址来自认证后重查的 workspace UUID，
+worker 只收到短期 Run token。真实 DeepSeek Harness/供应商与完整双用户
+浏览器闭环仍属于 A5/A6，不在本轮宣称通过。
+
+## 1. 正式路径
+
+```text
+浏览器 → control:7861（登录/CSRF/Origin/Run 账本）
+       → gateway（固定 control IPv4，Ed25519 逐请求断言）
+       → worker（固定 container_id/config_version，service token）
+       → sidecar（http://easel-sidecar-<workspace>:8899）
+       → control broker（最小 Run token + 不可变配置快照）
+       → 受控出口代理 → 模型协议
+```
+
+- control 只使用 `handle.gateway_upstream`，不直接访问 worker URL，也不把
+  浏览器 Cookie、Authorization、worker service token 发给 gateway。
+- 每个请求重新读取已 CAS 确认的 gateway 实例/boot/config audience 后签名；
+  JSON body 只序列化一次。GET 可按游标恢复；POST 不自动重发。
+- gateway 暂不可用返回稳定 503（可带 `Retry-After`），不停止 worker、不
+  撤销 broker token、不把 Run 结算为 interrupted。既有 Run 的恢复只允许
+  provisioner 在同一 worker ID/config 上重配/更换 gateway。
+- 公开 SSE 仍由 control 轮询持久事件；已建立连接遇到临时 503 保持连接并
+  继续按 after 拉取。
+
+## 2. 受管 Agent 配置
+
+`broker` 只接受两种非秘密标签：
+
+```json
+{
+  "revision": 1,
+  "agent": {
+    "runtime": "acp",
+    "command": ["python", "/workspace/agent-entry.py", "acp"],
+    "sandbox": "workspace-write",
+    "timeout": 300
+  },
+  "broker": {"mode": "workspace-sidecar", "channel": "chat"}
+}
+```
+
+- `workspace-sidecar` 只允许 `{mode, channel}`；地址固定派生为
+  `http://easel-sidecar-<workspace_id>:8899`，不接受 URL、模板变量或客户端
+  地址。
+- 旧固定 URL 兼容模式仍可写 `{"url": "https://broker.internal", "channel":
+  "chat"}`；两种模式不能混用。
+- 受管配置不得包含 provider Key；逐 Run token 由 `BrokerService.issue` 在
+  接纳后签发。
+
+## 3. 初始化与启动（Windows PowerShell）
+
+```powershell
+# 1) 一次性初始化专用卷、控制网络、master key 与 Ed25519 签名 key
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File deploy/desktop/Initialize-WorkspaceEasel.ps1 `
+  -Image sha256:<control-image-id> `
+  -ManagedAgentConfig C:\Easel\desktop\managed-agent.json `
+  -EgressPolicy C:\Easel\desktop\egress-policy.json `
+  -ProjectName easel-workspace-desktop
+
+# 2) 启动 WSL provisioner + control + egress
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File deploy/desktop/Start-WorkspaceEasel.ps1 `
+  -PublicOrigin https://<your-ngrok-domain> `
+  -Image sha256:<control-image-id> `
+  -WorkerImage sha256:<worker-image-id> `
+  -GatewayImage sha256:<gateway-image-id> `
+  -ProjectName easel-workspace-desktop
+
+# 3) 只读诊断
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File deploy/desktop/Status-WorkspaceEasel.ps1 `
+
+# 4) 先 drain 所有 workspace，再停止 control（保留卷/网络）
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File deploy/desktop/Stop-WorkspaceEasel.ps1 `
+  -ProjectName easel-workspace-desktop
+```
+
+初始化重复执行不会轮换 master key 或签名私钥；已有公钥缺失/不匹配时从现有
+私钥重建，不会覆盖私钥。worker/gateway 只得到 `C:\Easel\desktop\public`
+下的只读公钥副本；私钥只在 key 卷中，仅 control 可读。
+
+## 4. 端口、网络与资源
+
+- control 只发布 `127.0.0.1:7861`；gateway/worker/sidecar/egress 不发布宿主
+  端口，不挂 Docker socket。
+- 专用网络 `<project>-control`（bridge、非 internal、IPv4-only）；gateway
+  管理地址为 control 网络上的固定 IPv4。worker 仍使用每 workspace 的
+  `easel-ws-<workspace>` internal 网络。
+- worker/gateway 由 WSL2 provisioner 按需创建；sidecar 同时接入 workspace
+  网络和专用控制网络，broker upstream 固定为 `control:7861`。
+- Desktop 无条件使用 `--quota-mode none --allow-unquotaed` 时属于**开发
+  限制**；生产 XFS 配额门槛不变，不因 Desktop 通过而通过。
+
+## 5. 诊断码
+
+启动脚本在创建/启动任何资源前校验并输出稳定错误码，例如：
+
+```text
+control_image_unavailable / control_image_mismatch
+worker_or_gateway_image_mismatch
+volume_not_owned / network_not_owned / network_invalid
+workspace_keys_invalid / managed_config_missing
+public_file_missing:<name> / frontend_build_missing
+wsl_repo_missing / wsl_python_dependencies_missing
+provisioner_start_timeout / compose_config_invalid
+control_health_timeout / control_unhealthy
+```
+
+停止脚本默认要求 provisioner socket 与控制面可达；无法 drain 时返回
+`worker_drain_failed`/`provisioner_socket_missing`，不会静默停止 control。
+`-Force` 只用于已确认无活动任务后的强制停止。
+
+## 6. 本轮验收命令
+
+```powershell
+# gateway client / relay / runtime 恢复 / workspace broker
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest `
+  tests/multiuser/test_gateway_client.py `
+  tests/multiuser/test_gateway_relay.py `
+  tests/multiuser/test_runtime_gateway.py `
+  tests/multiuser/test_workspace_broker.py `
+  tests/multiuser/test_desktop_workspace.py -q
+
+# 真实 control→gateway→worker→sidecar→broker（协议夹具 + TLS fake provider）
+$env:EASEL_RUN_CONTAINER_TESTS = '1'
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest `
+  tests/integration/multiuser/test_desktop_chat_full.py -q -s
+```
+
+本轮真实证据、红绿与固定镜像见
+[docs/evidence/desktop-a4/report.md](../../docs/evidence/desktop-a4/report.md)。
+未运行 ngrok 公网浏览器、真实 DeepSeek Harness、真实供应商计费或 A6 双用户
+浏览器闭环；这些分别留待 A5/A6。

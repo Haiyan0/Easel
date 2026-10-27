@@ -23,10 +23,13 @@ class DomainError(Exception):
     错误信息不包含令牌、模型 Key 或其他秘密。
     """
 
-    def __init__(self, code: str, status: int):
+    def __init__(self, code: str, status: int, *,
+                 retry_after: int | None = None):
         super().__init__(code)
         self.code = code
         self.status = status
+        # 仅供瞬时不可用/限流响应；错误体仍只含稳定 code。
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)

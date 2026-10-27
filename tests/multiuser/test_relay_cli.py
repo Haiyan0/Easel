@@ -181,7 +181,7 @@ def test_formal_assembly_issues_working_run_scoped_broker_token(tmp_path):
     from easel.control.auth import AuthService
     from easel.control.broker import BrokerService
     from easel.control.cli import build_relay_factory
-    from easel.control.config import ConfigService, MASTER_KEY_BYTES
+    from easel.control.config import MASTER_KEY_BYTES, ConfigService
     from easel.control.egress import EgressGateway
     from easel.control.proxy import BrokerDestination
     from easel.control.sessions import SessionService
@@ -379,3 +379,81 @@ def test_serve_control_rejects_agent_config_with_secret_field(
     assert sentinel not in output.out
     assert captured == {}
     assert not (tmp_path / "control").exists()
+
+
+def _sidecar_agent_config(tmp_path):
+    return write_agent_config(tmp_path, {
+        "revision": 3,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "sandbox": "workspace-write", "timeout": 300},
+        "broker": {"mode": "workspace-sidecar", "channel": "chat"},
+    })
+
+
+def test_gateway_required_requires_relay_config_before_store(
+        tmp_path, monkeypatch, capsys):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--gateway-required",
+                 "--frontend-dir", str(frontend_build(tmp_path))])
+    output = capsys.readouterr()
+    assert code != 0
+    assert "gateway_requires_relay_config" in output.err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
+def test_gateway_required_requires_provisioner_socket(
+        tmp_path, monkeypatch, capsys):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    signing, _key = write_signing_key(tmp_path)
+    agent = _sidecar_agent_config(tmp_path)
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--snapshot-key-file", str(signing),
+                 "--managed-agent-config", str(agent),
+                 "--gateway-required",
+                 "--frontend-dir", str(frontend_build(tmp_path))])
+    output = capsys.readouterr()
+    assert code != 0
+    assert "gateway_required_needs_provisioner" in output.err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
+def test_gateway_required_formal_factory_wires_signed_client(
+        tmp_path, monkeypatch):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    signing, _key = write_signing_key(tmp_path)
+    agent = _sidecar_agent_config(tmp_path)
+    socket = tmp_path / "provisioner.sock"
+    socket.write_text("placeholder", encoding="ascii")
+
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--snapshot-key-file", str(signing),
+                 "--managed-agent-config", str(agent),
+                 "--gateway-required",
+                 "--provisioner-socket", str(socket),
+                 "--frontend-dir", str(frontend_build(tmp_path))])
+    assert code == 0
+    app = captured["app"]
+    with TestClient(app, base_url=ORIGIN):
+        relay = app.state.relay
+        assert isinstance(relay, WorkerRelay)
+        assert relay._gateway_required is True
+        assert relay._gateway_client is not None
+        identity = Identity("user-x", "a" * 32, "member")
+        config = relay._config_provider(identity)
+        assert config.broker.url == (
+            "http://easel-sidecar-" + "a" * 32 + ":8899")

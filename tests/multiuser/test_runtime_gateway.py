@@ -45,6 +45,9 @@ class GatewayFake:
         self.worker_ready = True
         self.attempt_id = ""
         self.fail_abort: Exception | None = None
+        self.restore_boot = NEW_BOOT
+        self.restore_calls = 0
+        self.fail_restore: Exception | None = None
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
         return WorkerHandle(
@@ -88,6 +91,20 @@ class GatewayFake:
             "boot_generation": boot_generation,
             "available": True,
         }}
+
+    async def restore_gateway(self, workspace_id: str,
+                              worker_container_id: str,
+                              config_version: int, *,
+                              attempt_id: str = "") -> WorkerHandle:
+        self.restore_calls += 1
+        if self.fail_restore is not None:
+            raise self.fail_restore
+        if worker_container_id != WORKER:
+            raise RuntimeUnavailable("worker_identity_mismatch", 503)
+        self.active = False
+        self.boot = self.restore_boot
+        self.attempt_id = attempt_id
+        return self.handle(workspace_id, config_version)
 
     async def inspect(self, workspace_id: str) -> dict:
         self.inspect_calls += 1
@@ -348,8 +365,10 @@ def test_bound_handle_requires_available_gateway_fields(tmp_path):
             assert handle.gateway_instance_id == GATEWAY
             store.mark_worker_gateway_unavailable(
                 user.workspace_id, 1, 1001)
-            assert await manager.bound_handle(
-                user.workspace_id, WORKER, 1) is None
+            with pytest.raises(RuntimeUnavailable) as unavailable:
+                await manager.bound_handle(user.workspace_id, WORKER, 1)
+            assert unavailable.value.code == "gateway_unavailable"
+            assert unavailable.value.status == 503
     _run(scenario())
 
 
@@ -644,3 +663,115 @@ def test_create_app_binds_gateway_required_runtime(tmp_path):
             assert app.state.runtime._gateway_required is True
     finally:
         store.close()
+
+
+def test_restore_gateway_keeps_same_worker_and_new_boot(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            first = await manager.ensure_ready(user.workspace_id, 1)
+            store.mark_worker_gateway_unavailable(
+                user.workspace_id, 1, 1001)
+            restored = await manager.restore_gateway(
+                user.workspace_id, first.container_id, 1)
+            assert restored is not None
+            assert restored.container_id == first.container_id
+            assert restored.gateway_instance_id == first.gateway_instance_id
+            assert restored.gateway_generation == NEW_BOOT
+            assert restored.gateway_state == "available"
+            assert fake.restore_calls == 1
+            assert fake.ensure_calls == 1
+            assert fake.stop_calls == []
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.gateway_state == "available"
+            assert lease.gateway_generation == NEW_BOOT
+    _run(scenario())
+
+
+def test_restore_gateway_refuses_other_worker_and_never_creates(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            assert await manager.restore_gateway(
+                user.workspace_id, "f" * 64, 1) is None
+            assert fake.restore_calls == 0
+            assert fake.ensure_calls == 1
+            assert fake.stop_calls == []
+    _run(scenario())
+
+
+def test_restore_gateway_propagates_worker_identity_failure(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            fake.fail_restore = RuntimeUnavailable(
+                "worker_identity_mismatch", 503)
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await manager.restore_gateway(user.workspace_id, WORKER, 1)
+            assert rejected.value.code == "worker_identity_mismatch"
+            assert fake.ensure_calls == 1
+            assert fake.stop_calls == []
+            assert store.get_worker_lease(
+                user.workspace_id).container_id == WORKER
+    _run(scenario())
+
+
+def test_bound_handle_refresh_in_progress_is_explicit_503(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+            staged = store.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                handle, "a" * 32, 1001, 120)
+            assert staged is not None
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await manager.bound_handle(user.workspace_id, WORKER, 1)
+            assert rejected.value.code == "worker_gateway_refresh_in_progress"
+            assert rejected.value.status == 503
+            with pytest.raises(RuntimeUnavailable) as restore:
+                await manager.restore_gateway(user.workspace_id, WORKER, 1)
+            assert restore.value.code == "worker_gateway_refresh_in_progress"
+            assert fake.stop_calls == []
+    _run(scenario())
+
+
+def test_bound_handle_gateway_only_abort_is_not_worker_gone(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+            attempt_id = "b" * 32
+            staged = store.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                handle, attempt_id, 1001, 120)
+            assert staged is not None
+            assert store.begin_worker_abort(
+                user.workspace_id, manager.owner_id, staged.generation,
+                attempt_id, "gateway", False, True, 1001) is True
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await manager.bound_handle(user.workspace_id, WORKER, 1)
+            assert rejected.value.code == "gateway_cleanup_in_progress"
+            assert fake.stop_calls == []
+            assert handle.container_id == WORKER
+    _run(scenario())

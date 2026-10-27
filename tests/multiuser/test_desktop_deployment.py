@@ -671,3 +671,35 @@ def test_operator_scripts_never_read_ngrok_or_master_key_contents():
         assert "ngrok.yml" not in text
         assert "get-content" not in text
         assert "invoke-restmethod" not in text
+
+
+def test_keygen_creates_signing_key_once_and_derives_public(tmp_path):
+    module = _load_keygen()
+    private = tmp_path / "snapshot.pem"
+    raw = tmp_path / "worker-public.key"
+    pem = tmp_path / "gateway-public.pem"
+    assert module.ensure_signing_key(private, raw, pem) == "created"
+    original = private.read_bytes()
+    assert module.ensure_signing_key(private, raw, pem) == "exists"
+    assert private.read_bytes() == original
+    assert len(raw.read_bytes()) == 32
+    assert pem.read_bytes().startswith(b"-----BEGIN PUBLIC KEY-----")
+    assert module.check_signing_key(private, raw, pem) == "exists"
+    # 公钥被替换时，从现有私钥重建，不轮换私钥。
+    raw.write_bytes(b"x" * 32)
+    assert module.ensure_signing_key(private, raw, pem) == "exists"
+    assert private.read_bytes() == original
+    assert len(raw.read_bytes()) == 32
+
+
+def test_keygen_never_rotates_when_only_public_key_exists(tmp_path):
+    module = _load_keygen()
+    private = tmp_path / "snapshot.pem"
+    raw = tmp_path / "worker-public.key"
+    pem = tmp_path / "gateway-public.pem"
+    raw.write_bytes(b"x" * 32)
+    with pytest.raises(ValueError) as rejected:
+        module.ensure_signing_key(private, raw, pem)
+    assert str(rejected.value) == "signing_key_incomplete"
+    assert not private.exists()
+    assert raw.read_bytes() == b"x" * 32

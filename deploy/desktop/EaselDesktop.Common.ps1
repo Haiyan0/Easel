@@ -191,3 +191,77 @@ function Test-EaselImagePin {
         throw 'control_image_mismatch'
     }
 }
+
+function Get-EaselWorkspaceNetworkName {
+    param([Parameter(Mandatory)][string]$ProjectName)
+    return "$ProjectName-control"
+}
+
+function Assert-EaselNetworkOwnership {
+    param(
+        [AllowNull()]$Labels,
+        [Parameter(Mandatory)][string]$ProjectName
+    )
+    if ($null -eq $Labels) {
+        throw 'network_not_owned'
+    }
+    if ([string]$Labels.'easel.desktop.project' -ne $ProjectName) {
+        throw 'network_not_owned'
+    }
+    if ([string]$Labels.'easel.desktop.role' -ne 'control-network') {
+        throw 'network_not_owned'
+    }
+}
+
+function Assert-EaselNetworkContract {
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$NetworkName
+    )
+    $inspect = Invoke-EaselDocker -Arguments @(
+        'network', 'inspect', $NetworkName)
+    if ($inspect.ExitCode -ne 0) {
+        throw 'network_inspect_failed'
+    }
+    $text = (($inspect.Output -join "`n").Trim())
+    if (-not $text) {
+        throw 'network_inspect_invalid'
+    }
+    try {
+        $parsed = $text | ConvertFrom-Json
+    }
+    catch {
+        throw 'network_inspect_invalid'
+    }
+    $items = @($parsed)
+    if ($items.Count -ne 1 -or $null -eq $items[0]) {
+        throw 'network_inspect_invalid'
+    }
+    $item = $items[0]
+    if ([string]$item.Name -ne $NetworkName) {
+        throw 'network_not_owned'
+    }
+    Assert-EaselNetworkOwnership -Labels $item.Labels `
+        -ProjectName $ProjectName
+    if ([string]$item.Driver -ne 'bridge' -or
+        [bool]$item.Internal -ne $false -or
+        [bool]$item.EnableIPv6 -ne $false) {
+        throw 'network_invalid'
+    }
+}
+
+function ConvertTo-EaselWslPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path.Length -lt 3 -or $Path[1] -ne ':' -or
+        [int][char]$Path[2] -ne 92 -or
+        $Path.Substring(0, 1) -notmatch '^[A-Za-z]$') {
+        throw 'path_not_windows_drive'
+    }
+    $drive = $Path.Substring(0, 1).ToLowerInvariant()
+    $rest = $Path.Substring(3).Replace('\', '/')
+    return "/mnt/$drive/$rest"
+}
+
+function Get-EaselWorkspaceComposePath {
+    return (Join-Path $PSScriptRoot 'compose.workspace.yaml')
+}

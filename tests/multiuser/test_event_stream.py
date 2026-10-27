@@ -655,8 +655,7 @@ def test_default_auth_check_window_bounds_revocation_within_five_seconds():
     真实静默撤销测试使用可控时钟，只能证明“到点会复查”，不能证明默认
     参数下最坏情况仍在 5 秒内关闭；这里直接约束默认常量关系。
     """
-    from easel.control.stream import (DEFAULT_AUTH_CHECK_SECONDS,
-                                      DEFAULT_POLL_SECONDS)
+    from easel.control.stream import DEFAULT_AUTH_CHECK_SECONDS, DEFAULT_POLL_SECONDS
 
     assert DEFAULT_AUTH_CHECK_SECONDS + DEFAULT_POLL_SECONDS <= 5.0
 
@@ -887,5 +886,54 @@ def test_crash_is_interrupted_without_retry(tmp_path):
                     ("POST", f"/internal/runs/{run_id}")]
         blocking.gate.set()
         await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_sse_survives_transient_gateway_unavailable():
+    """已建立的 SSE 遇 503 不结束，按 after 继续；撤销仍由 recheck 处理。"""
+    import time as _time
+
+    class Relay:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self.failed = False
+
+        async def events(self, actor, run_id, *, after=0):
+            self.calls.append(after)
+            if not self.failed:
+                self.failed = True
+                raise DomainError(
+                    "worker_gateway_unavailable", 503, retry_after=1)
+            return {
+                "runId": run_id, "state": "done",
+                "events": [
+                    {"eventId": 1, "event": "token", "data": "ok"},
+                    {"eventId": 2, "event": "state",
+                     "data": {"state": "done"}},
+                ],
+                "lastEventId": 2,
+            }
+
+    async def scenario() -> None:
+        relay = Relay()
+        frames: list[bytes] = []
+        start = _time.monotonic()
+
+        async def recheck() -> None:
+            return None
+
+        async for chunk in run_event_stream(
+                relay=relay, actor=None, run_id="f" * 32,
+                page={"runId": "f" * 32, "state": "running",
+                      "events": [], "lastEventId": 0},
+                recheck=recheck, clock=_time.monotonic,
+                poll_interval=0.01, heartbeat_seconds=60,
+                auth_check_seconds=60):
+            frames.append(chunk)
+            assert _time.monotonic() - start < 5
+        assert frames
+        assert any(b"event: state" in frame for frame in frames)
+        assert relay.calls == [0, 0]
 
     asyncio.run(scenario())

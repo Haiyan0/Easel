@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -19,18 +20,23 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
 from ..worker.config import run_input_digest, sign_run_snapshot
-from ..worker.guard import (SERVICE_TOKEN_HEADER, WORKSPACE_HEADER,
-                            no_client_auth, strip_request_headers)
+from ..worker.guard import (
+    SERVICE_TOKEN_HEADER,
+    WORKSPACE_HEADER,
+    no_client_auth,
+    strip_request_headers,
+)
 from ..worker.sessions import MAX_ATTACHMENTS, MAX_MESSAGE_BYTES
 from .auth import AuthService
+from .gateway_client import GatewayClient
 from .runtime import RuntimeUnavailable
 from .sessions import SessionService
-from .store import Store, TERMINAL_RUN_STATUSES
+from .store import TERMINAL_RUN_STATUSES, Store
 from .tasks import IMPLEMENTED_TASK_TYPES, entry_for_type
 from .types import DomainError, Identity, RunRecord, WorkerHandle
 
@@ -45,6 +51,12 @@ _ALLOWED_TASK_FIELDS = frozenset(
     {"sessionId", "turnId", "message", "attachments", "persona"})
 _MAX_IDENTIFIER = 256
 _MAX_PERSONA = 200
+# 这些错误表示 gateway/worker 暂时不可用，不能作为“实例已消失”的结算依据。
+_GATEWAY_TRANSIENT = frozenset({
+    "worker_not_ready", "worker_wiring_mismatch",
+    "worker_credentials_mismatch", "worker_start_superseded",
+    "worker_gateway_refresh_in_progress", "gateway_refresh_in_progress",
+})
 
 
 @dataclass(frozen=True)
@@ -177,6 +189,46 @@ def _safe_code(value: object, fallback: str) -> str:
     return fallback
 
 
+def _query_pairs(text: str) -> list[tuple[str, str]]:
+    """把 relay 内部已编码的 query 还原为待签名参数对。
+
+    只做一次严格 UTF-8 解码；不接受空段、缺等号或裸 ``+`` 作为空格。
+    canonical query 的最终编码由 GatewayClient 统一完成。
+    """
+    if not text:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for part in text.split("&"):
+        key, separator, value = part.partition("=")
+        if not separator or not key:
+            raise DomainError("invalid_request", 400)
+        try:
+            pairs.append((
+                unquote(key, encoding="utf-8", errors="strict"),
+                unquote(value, encoding="utf-8", errors="strict")))
+        except UnicodeDecodeError:
+            raise DomainError("invalid_request", 400) from None
+    return pairs
+
+
+def _question_segment(value: object) -> str:
+    """按 G1 契约编码权限问题 ID；拒绝路径分隔符与编码别名。"""
+    text = _text(value, maximum=_MAX_IDENTIFIER)
+    encoded = text.encode("utf-8")
+    if (len(encoded) > 256 or text in (".", "..")
+            or any(character in text for character in "/\\?#\x00\r\n")
+            or any(ord(character) < 32 or ord(character) == 127
+                   for character in text)):
+        raise DomainError("invalid_argument", 400)
+    try:
+        segment = quote(text, safe="-._~", encoding="utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise DomainError("invalid_argument", 400) from None
+    if not segment or segment in (".", ".."):
+        raise DomainError("invalid_argument", 400)
+    return segment
+
+
 class WorkerRelay:
     """授权、接纳与转发；所有资源查找回到 control Store 重查归属。"""
 
@@ -185,6 +237,8 @@ class WorkerRelay:
                  config_provider: PinnedConfigProvider | None = None,
                  http_client: httpx.AsyncClient | None = None,
                  broker=None, db_runner=None,
+                 gateway_client: GatewayClient | None = None,
+                 gateway_required: bool = False,
                  accepted_task_types: Iterable[str] | None = None,
                  request_lease_ttl: int = 60,
                  clock: Callable[[], float] = time.time,
@@ -199,6 +253,15 @@ class WorkerRelay:
             raise TypeError("auth must be an AuthService")
         if config_provider is not None and not callable(config_provider):
             raise TypeError("config_provider must be callable")
+        if gateway_client is not None and not isinstance(
+                gateway_client, GatewayClient):
+            raise TypeError("gateway_client must be a GatewayClient")
+        self._gateway_client = gateway_client
+        self._gateway_required = bool(gateway_required)
+        if self._gateway_required and self._gateway_client is None:
+            # 构造期不立即失败：未装配的正式 factory 仍可启动登录面，
+            # 任务入口由 _require_capabilities 明确 503；但绝不允许回退直连。
+            pass
         if not callable(system_clock):
             raise TypeError("system_clock must be callable")
         if type(snapshot_ttl) is not int or not 1 <= snapshot_ttl <= 86400:
@@ -244,6 +307,8 @@ class WorkerRelay:
             raise DomainError("capability_unavailable", 503)
         if not hasattr(self._signing_key, "sign"):
             raise DomainError("capability_unavailable", 503)
+        if self._gateway_required and self._gateway_client is None:
+            raise DomainError("capability_unavailable", 503)
 
     async def _ensure_ready(self, run: RunRecord) -> WorkerHandle:
         try:
@@ -256,6 +321,7 @@ class WorkerRelay:
         if (handle.workspace_id != run.workspace_id
                 or handle.config_version != run.config_version):
             raise DomainError("worker_mismatch", 502)
+        self._require_gateway_handle(handle)
         return handle
 
     async def _ensure_workspace_ready(self, workspace_id: str,
@@ -268,7 +334,18 @@ class WorkerRelay:
                 or handle.workspace_id != workspace_id
                 or handle.config_version != revision):
             raise DomainError("worker_mismatch", 502)
+        self._require_gateway_handle(handle)
         return handle
+
+    def _require_gateway_handle(self, handle: WorkerHandle) -> None:
+        """gateway 模式下没有完整可用目标时在启动/占容量之前失败关闭。"""
+        if not self._gateway_required:
+            return
+        if (not handle.gateway_instance_id
+                or not handle.gateway_generation
+                or not handle.gateway_upstream
+                or handle.gateway_state != "available"):
+            raise DomainError("worker_gateway_unavailable", 503)
 
     # ------------------------------------------------------------------
     # 接纳与派发
@@ -534,15 +611,88 @@ class WorkerRelay:
 
         不调用 ``ensure_ready``：既有 Run 不能启动、升级或替换实例，也
         不能在原实例失效后把操作发到另一代次伪装成原 Run。
+
+        gateway 暂不可用与 worker 身份消失必须区分：前者只允许在同一
+        worker ID/config 上恢复 gateway 并返回 503，后者才交给调用方按
+        原实例确认停止后结算。这里绝不调用 ``ensure_ready``。
         """
         container = binding.get("workerContainerId")
         if not isinstance(container, str) or not container:
             return None
-        handle = await self._lookup_existing(
-            run.workspace_id, container, run.config_version)
+        try:
+            handle = await self._lookup_existing(
+                run.workspace_id, container, run.config_version)
+        except RuntimeUnavailable as error:
+            if (self._gateway_required
+                    and (error.code.startswith("gateway_")
+                         or error.code in _GATEWAY_TRANSIENT)):
+                recovered = await self._restore_gateway_handle(
+                    run.workspace_id, container, run.config_version)
+                if recovered is not None:
+                    return recovered
+                raise DomainError(
+                    "worker_gateway_unavailable", 503,
+                    retry_after=error.retry_after) from None
+            raise DomainError(
+                "worker_unavailable", 503,
+                retry_after=error.retry_after) from None
         if handle is None:
             raise DomainError("worker_instance_gone", 409)
         return handle
+
+    async def _restore_gateway_handle(self, workspace_id: str,
+                                      container: str,
+                                      config_version: int
+                                      ) -> WorkerHandle | None:
+        """只允许为同一 worker ID/config 重配/更换 gateway，不启动 worker。"""
+        if not self._gateway_required:
+            return None
+        restore = getattr(self._runtime, "restore_gateway", None)
+        if not callable(restore):
+            return None
+        concurrent = False
+        try:
+            handle = await restore(workspace_id, container, config_version)
+        except RuntimeUnavailable as error:
+            if error.code == "worker_instance_gone":
+                return None
+            handle = None
+            concurrent = True
+        except Exception:  # noqa: BLE001 - 恢复失败统一按暂不可用处理
+            handle = None
+            concurrent = True
+        if handle is None and not concurrent:
+            # runtime 明确表示持久租约已不指向该实例：交给调用方确认停止。
+            return None
+        if (isinstance(handle, WorkerHandle)
+                and handle.workspace_id == workspace_id
+                and handle.container_id == container
+                and handle.config_version == config_version
+                and handle.gateway_instance_id
+                and handle.gateway_generation
+                and handle.gateway_upstream
+                and handle.gateway_state == "available"):
+            return handle
+        # 后台 reconciler 或并发请求可能已接管同一次 refresh；短暂读取
+        # 当前已 CAS 确认的租约，避免把“别人刚恢复完”误报为不可用。
+        # gateway 重启 + configure/activate 需要数秒，等待窗口覆盖该过程。
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                current = await self._lookup_existing(
+                    workspace_id, container, config_version)
+            except RuntimeUnavailable:
+                current = None
+            if current is None:
+                # 租约已不再指向该实例；不要为不存在的 worker 再等。
+                return None
+            if (current.gateway_instance_id
+                    and current.gateway_generation
+                    and current.gateway_upstream
+                    and current.gateway_state == "available"):
+                return current
+            await asyncio.sleep(0.1)
+        return None
 
     async def _lookup_existing(self, workspace_id: str, container: str,
                                config_version: int) -> WorkerHandle | None:
@@ -550,7 +700,8 @@ class WorkerRelay:
 
         ``RuntimeManager.bound_handle`` 以持久租约/代次实现；自定义 runtime
         可通过同名方法声明实例存活。两条路径都绝不调用 ``ensure_ready``，
-        因此不会启动、升级或替换实例。
+        因此不会启动、升级或替换实例。gateway 暂不可用由
+        ``RuntimeUnavailable`` 与 worker 身份消失（None）明确区分。
         """
         lookup = getattr(self._runtime, "bound_handle", None)
         if callable(lookup):
@@ -561,6 +712,12 @@ class WorkerRelay:
                     or handle.container_id != container
                     or handle.config_version != config_version):
                 return None
+            if self._gateway_required and not (
+                    handle.gateway_instance_id
+                    and handle.gateway_generation
+                    and handle.gateway_upstream
+                    and handle.gateway_state == "available"):
+                raise RuntimeUnavailable("gateway_unavailable", 503)
             return handle
         lease = await self._db(self._store.get_worker_lease, workspace_id)
         if (lease is None or lease.container_id != container
@@ -661,6 +818,7 @@ class WorkerRelay:
             raise DomainError("invalid_argument", 400)
         run = await self._owned_run(actor, self._require_run_id(payload))
         question_id = _text(payload.get("questionId"), maximum=256)
+        question_segment = _question_segment(question_id)
         answers = payload.get("answers")
         if not isinstance(answers, dict):
             raise DomainError("invalid_argument", 400)
@@ -683,7 +841,7 @@ class WorkerRelay:
         try:
             response = await self._worker_request(
                 handle, "POST",
-                f"/internal/runs/{run.id}/questions/{question_id}/answer",
+                f"/internal/runs/{run.id}/questions/{question_segment}/answer",
                 {"runId": run.id, "questionId": question_id,
                  "answers": dict(answers)})
         except DomainError as error:
@@ -819,8 +977,13 @@ class WorkerRelay:
                 and now - dispatched_at < self._dispatch_grace):
             # 派发结果未知：先等本次 POST 的宽限期，不抢在接纳前查询
             return False
-        handle = await self._lookup_existing(
-            workspace_id, container, int(row["configVersion"]))
+        try:
+            handle = await self._lookup_existing(
+                workspace_id, container, int(row["configVersion"]))
+        except RuntimeUnavailable:
+            # gateway/worker 暂时不可用不是“执行已结束”的证据；不调用停止，
+            # 不结算 Run，也不撤销仍在有效期内的 broker token。
+            return False
         if handle is None:
             # 句柄不可用不是“执行已结束”的证据；只有按原实例 ID 确认停止
             # （provisioner 幂等 stop 成功）才允许中断并释放容量。
@@ -831,9 +994,10 @@ class WorkerRelay:
             return False
         deadline = self._run_deadline(row)
         timed_out = now >= deadline
-        if timed_out:
-            # 截止后先撤销凭证限制新的模型调用，但仍保留任务预算直到
-            # 停止被确认；撤销本身不能证明外部副作用已结束。
+        if timed_out and not self._gateway_required:
+            # 直连模式的既有语义：截止后先撤销凭证限制新的模型调用，但仍
+            # 保留任务预算直到停止被确认。gateway 模式必须等成功读取状态，
+            # 不能把 gateway 暂时不可用当成撤销理由。
             await self._revoke_token_system(workspace_id, run_id)
         nonce = str(row.get("dispatchNonce") or "")
         suffix = f"&nonce={quote(nonce, safe='')}" if nonce else ""
@@ -857,6 +1021,10 @@ class WorkerRelay:
             await self._finish_system(
                 workspace_id, run_id, str(state))
             return True
+        if timed_out:
+            # gateway 模式只有在成功读取原实例状态后才撤销凭证；gateway
+            # 不可用时上面的异常路径不会触发撤销。
+            await self._revoke_token_system(workspace_id, run_id)
         if state in ("accepted", "reserved", "running"):
             await self._sync_system_status(workspace_id, run_id, "running")
         elif state == "awaiting_permission":
@@ -970,12 +1138,29 @@ class WorkerRelay:
 
         租约只用于空闲回收判定：请求进行中不得回收该 worker。释放失败时
         保留至 TTL 过期，不覆盖原始异常，也不永久阻塞后续回收。
+
+        gateway 断言因新 boot/实例失效被拒时，只为同一 worker 恢复
+        gateway。GET 可在恢复后重试一次；POST 已经发出，绝不自动重发。
         """
         lease_id = await self._db(
             self._store.begin_worker_request_lease,
             handle.workspace_id, self._request_lease_ttl)
         try:
-            return await self._send(handle, method, path, payload)
+            try:
+                return await self._send(handle, method, path, payload)
+            except DomainError as error:
+                if (not self._gateway_required
+                        or error.code != "worker_gateway_unavailable"):
+                    raise
+                recovered = await self._restore_gateway_handle(
+                    handle.workspace_id, handle.container_id,
+                    handle.config_version)
+                if recovered is None:
+                    raise
+                if method.upper() == "GET":
+                    return await self._send(recovered, method, path, payload)
+                # POST 不自动重发：恢复只为下一次用户重试准备同一 worker。
+                raise
         finally:
             try:
                 await self._db(
@@ -985,6 +1170,22 @@ class WorkerRelay:
 
     async def _send(self, handle: WorkerHandle, method: str,
                     path: str, payload: object) -> httpx.Response:
+        """按 transport 模式发送；gateway 模式绝不携带 worker service token。"""
+        if self._gateway_required:
+            return await self._gateway_send(handle, method, path, payload)
+        return await self._direct_send(handle, method, path, payload)
+
+    async def _gateway_send(self, handle: WorkerHandle, method: str,
+                            path: str, payload: object) -> httpx.Response:
+        if self._gateway_client is None:
+            raise DomainError("capability_unavailable", 503)
+        path_only, separator, query_text = path.partition("?")
+        query = _query_pairs(query_text) if separator else None
+        return await self._gateway_client.request(
+            handle, method, path_only, query=query, payload=payload)
+
+    async def _direct_send(self, handle: WorkerHandle, method: str,
+                           path: str, payload: object) -> httpx.Response:
         """固定 WorkerHandle 重建内部身份；先清洗最终合并的 Request。
 
         仅自行构造 headers 不够：``AsyncClient.build_request/send`` 会合并

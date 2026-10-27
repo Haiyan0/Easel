@@ -1846,3 +1846,49 @@ def test_ensure_without_public_key_fails_before_docker(tmp_path):
         asyncio.run(service.ensure(WORKSPACE, 3))
     assert rejected.value.code == "worker_public_key_unavailable"
     assert fake.calls == []
+
+
+def test_restore_gateway_protocol_is_v2_only_and_exact(tmp_path):
+    request = {
+        "version": 2, "action": "restore_gateway",
+        "workspace_id": WORKSPACE, "worker_container_id": "c" * 64,
+        "config_version": 3, "attempt_id": "a" * 32,
+    }
+    parsed = provisioner.parse_request(request)
+    assert parsed.action == "restore_gateway"
+    assert parsed.worker_container_id == "c" * 64
+    for broken in (
+            {**request, "version": 1},
+            {**request, "worker_container_id": "../escape"},
+            {**request, "attempt_id": ""},
+            {**request, "image": "evil"},
+            {**request, "config_version": None}):
+        with pytest.raises(provisioner.ProvisionerError):
+            provisioner.parse_request(broken)
+
+
+def test_restore_gateway_refuses_missing_worker_without_create(tmp_path):
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    calls: list[list[str]] = []
+
+    def runner(argv, *, timeout=120.0, input=None):
+        calls.append(list(argv))
+        target = argv[-1]
+        return subprocess.CompletedProcess(
+            argv, 1, "", f"Error: No such container: {target}")
+
+    service = provisioner.Provisioner(settings, run=runner)
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.restore_gateway(
+            WORKSPACE, "c" * 64, 3, attempt_id="a" * 32))
+    assert rejected.value.code == "worker_identity_mismatch"
+    assert calls
+    assert all("run" not in call[:2] for call in calls)
+    assert not (tmp_path / "root" / f"easel-worker-{WORKSPACE}").exists()
