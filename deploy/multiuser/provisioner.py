@@ -1676,17 +1676,51 @@ class Provisioner:
                 pass
             raise
 
-    async def _cleanup_failed_start(self, workspace_id: str,
-                                    instance_id: str | None = None) -> None:
-        """只清理本轮已取得 ID 的半成品；既有运行实例永不按名称删除。"""
+    @staticmethod
+    def _discard_cidfile(cidfile: Path) -> None:
+        """清理终态确认后删除追踪材料；失败只记录，不伪装清理成功。"""
         try:
-            if instance_id is not None:
-                await self._remove_instance(instance_id, workspace_id)
-        finally:
+            cidfile.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.error("worker cidfile 清理失败，保留追踪材料")
+
+    async def _await_cleanup(self, cleanup: asyncio.Task) -> None:
+        """等待本轮清理任务终结；外层取消不能把后台清理一起取消。"""
+        while not cleanup.done():
             try:
-                await self._stop_sidecar(workspace_id)
-            except ProvisionerError:
-                pass
+                await asyncio.wait({cleanup})
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+
+    async def _cleanup_start_attempt(
+            self, workspace_id: str, cidfile: Path,
+            run_task: asyncio.Task | None,
+            instance_id: str | None = None) -> None:
+        """等本轮 Docker CLI 终结后，按 cidfile ID 唯一清理本轮实例。
+
+        ``docker run`` 的 CLI 超时或取消不代表 daemon 未创建；必须等
+        to_thread 里的 CLI 真正结束后再读 cidfile。worker 未确认删除时
+        不停止 sidecar，也不删除 cidfile。清理失败向调用方抛出，由上层
+        返回可恢复错误。
+        """
+        if run_task is not None:
+            try:
+                await run_task
+            except BaseException:  # noqa: BLE001 - CLI 失败仍可能已创建
+                LOGGER.debug("worker run CLI 异常结束，仍读取 cidfile")
+        if instance_id is None:
+            instance_id = _read_cidfile(cidfile)
+        if instance_id is None:
+            # 无法得到精确目标：保留 sidecar 与追踪材料，明确失败。
+            raise ProvisionerError("worker_start_cleanup_incomplete")
+        await self._remove_instance(instance_id, workspace_id)
+        # 目标 ID 已确认消失；同名新代次或改动过的容器存在时，sidecar
+        # 仍可能被使用，不能为了清理本轮半成品而先拆它。
+        current = await self._inspect_raw(workspace_id)
+        if current is None:
+            await self._stop_sidecar(workspace_id)
+        self._discard_cidfile(cidfile)
 
     async def _stop_sidecar(self, workspace_id: str) -> None:
         """停止并确认删除本空间 sidecar；已不存在按幂等成功处理。"""
@@ -1811,12 +1845,15 @@ class Provisioner:
             config_version=config_version, paths=paths, env_file=env_file,
             public_key_file=self._worker_public_key, cidfile=cidfile)
         # build_run_argv 以 run 开头；_docker 自行添加 docker 可执行程序，
-        # 必须传完整 argv，不能丢弃 run。
+        # 必须传完整 argv，不能丢弃 run。run_task 与 cidfile 归本次
+        # ensure 所有：CLI 超时/取消都必须等它终结后再清理。
         instance_id: str | None = None
+        run_task: asyncio.Task | None = None
         try:
-            result = await self._docker(*argv, timeout=60.0)
+            run_task = asyncio.create_task(
+                self._docker(*argv, timeout=60.0))
+            result = await asyncio.shield(run_task)
             instance_id = _read_cidfile(cidfile)
-            cidfile.unlink(missing_ok=True)
             if result.returncode != 0 or instance_id is None:
                 raise ProvisionerError("worker_start_failed")
 
@@ -1838,16 +1875,37 @@ class Provisioner:
                 if (report["ready"]
                         and await self._probe(workspace_id, config_version,
                                               instance_id)):
+                    self._discard_cidfile(cidfile)
                     return WorkerHandle(workspace_id, instance_id,
                                         report["upstream"], token,
                                         config_version)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
             raise ProvisionerError("worker_not_ready")
-        except BaseException:
-            await self._cleanup_failed_start(workspace_id, instance_id)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(self._cleanup_start_attempt(
+                workspace_id, cidfile, run_task, instance_id))
+            try:
+                await self._await_cleanup(cleanup)
+            except ProvisionerError as error:
+                LOGGER.error(
+                    "worker 启动取消后的清理未完成 code=%s，保留 cidfile",
+                    error.code)
+            except BaseException:  # noqa: BLE001 - 取消仍保留追踪材料
+                LOGGER.error("worker 启动取消后的清理未完成，保留 cidfile")
             raise
-        finally:
-            cidfile.unlink(missing_ok=True)
+        except BaseException as failure:
+            cleanup = asyncio.create_task(self._cleanup_start_attempt(
+                workspace_id, cidfile, run_task, instance_id))
+            try:
+                await self._await_cleanup(cleanup)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - 转成可恢复清理错误
+                raise ProvisionerError(
+                    "worker_start_cleanup_incomplete") from failure
+            if isinstance(failure, ProvisionerError):
+                raise
+            raise ProvisionerError("worker_start_failed") from failure
 
     async def stop(self, workspace_id: str, instance_id: str) -> None:
         """只停止调用方取得的那个物理实例；同名新容器绝不受影响。

@@ -186,7 +186,12 @@ docker run -d --name easel-worker-<uuid> \
   缺凭据、错误旧 token、大小写不符或重复 Env 键均失败关闭，不自动轮换、
   删除或重建活跃实例。
 - `--cidfile` 只用于取得本轮 `docker run` 的不可复用容器 ID；健康循环、
-  失败清理和 exited 重建都只使用该 ID，不按同名容器反推归属。
+  失败清理和 exited 重建都只使用该 ID，不按同名容器反推归属。CLI 超时/
+  取消不等于 daemon 未创建：provisioner 会等待 in-thread CLI 真正结束，
+  再读取 cidfile 并按 ID 清理。worker 删除未确认、inspect/daemon 错误或
+  sidecar 停止失败时保留 cidfile（不含 token）并返回
+  `worker_start_cleanup_incomplete`；不先把仍可能被 worker 使用的 sidecar
+  拆掉。取消路径的清理任务独立运行，外层等待者不能把它取消。
 - `docker inspect` 经 provisioner 输出前只保留白名单字段；Env、宿主路径和
   未知标签被丢弃。`Running + Status=running + 健康` 才可作为 ready；paused、
   restarting、缺状态、ready=false 或 exec 探针失败都只返回未就绪，不删除

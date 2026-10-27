@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-27",
+  "a3_baseline": "81589c0f24f3507b954e46b37ce85d181c619520",
+  "reviewed_commit": "a384d2a0048eb80c786d8d1b0356cd6712146a95",
+  "scope": ["A3-R2-01"],
+  "tests": {
+    "focused": "191 passed, 1 skipped",
+    "multiuser_and_desktop_static": "1091 passed, 9 skipped",
+    "real_docker_cli_timeout_cleanup": "1 passed in 8.80s"
+  },
+  "real_cleanup": {
+    "image": "python:3.12-slim (local fixed image)",
+    "container_created_before_timeout": true,
+    "cidfile_id_cleanup": true,
+    "container_removed": true,
+    "network_removed": true
+  },
+  "not_run": [
+    "gateway",
+    "A4",
+    "real DeepSeek Harness/provider",
+    "Chromium sandbox",
+    "full multiuser chat",
+    "ACP/SIGTERM rerun (no worker app change this round)"
+  ]
+}

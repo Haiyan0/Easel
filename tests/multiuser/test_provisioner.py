@@ -12,12 +12,16 @@ import json
 import pathlib
 import subprocess
 import sys
+import threading
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from easel.worker.guard import (SERVICE_TOKEN_HEADER, WORKSPACE_HEADER,
-                                verify_worker_request)
+from easel.worker.guard import (
+    SERVICE_TOKEN_HEADER,
+    WORKSPACE_HEADER,
+    verify_worker_request,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy" / "multiuser" / "provisioner.py"
@@ -474,7 +478,10 @@ class FakeDocker:
                  instance_inspect_stdout: str | None = None,
                  network_inspect_stdout: str | None = None,
                  exec_returncode: int = 0,
-                 exec_timeout: bool = False):
+                 exec_timeout: bool = False,
+                 run_timeout_after_create: bool = False,
+                 run_gate: threading.Event | None = None,
+                 run_replacement: dict | None = None):
         self.root = root
         self.container = existing
         self.network = network
@@ -489,6 +496,11 @@ class FakeDocker:
         self.network_inspect_stdout = network_inspect_stdout
         self.exec_returncode = exec_returncode
         self.exec_timeout = exec_timeout
+        self.run_timeout_after_create = run_timeout_after_create
+        self.run_gate = run_gate
+        self.run_started = threading.Event()
+        self.run_replacement = run_replacement
+        self.last_cidfile: pathlib.Path | None = None
         self.exec_payload: dict | None = None
         self.calls: list[list[str]] = []
         self.stopped: list[str] = []
@@ -531,6 +543,9 @@ class FakeDocker:
                 return _not_found(target)
             return _ok(json.dumps([self.container]))
         if args[:1] == ["run"]:
+            if self.run_gate is not None:
+                self.run_started.set()
+                self.run_gate.wait(timeout=10)
             if self.run_returncode != 0:
                 return subprocess.CompletedProcess(argv, self.run_returncode,
                                                    "", "")
@@ -546,8 +561,13 @@ class FakeDocker:
                 self.container["Config"]["Env"] = env
             cidfile = _cidfile_arg(args)
             if cidfile is not None:
-                pathlib.Path(cidfile).write_text(
+                self.last_cidfile = pathlib.Path(cidfile)
+                self.last_cidfile.write_text(
                     self.container["Id"] + "\n", encoding="ascii")
+            if self.run_timeout_after_create:
+                if self.run_replacement is not None:
+                    self.container = self.run_replacement
+                raise subprocess.TimeoutExpired(argv, 60.0)
             return _ok(self.container["Id"] + "\n")
         if args[:1] == ["exec"]:
             if self.exec_timeout:
@@ -972,6 +992,99 @@ def test_new_start_cleanup_uses_only_the_created_instance_id(
     assert rejected.value.code == "worker_not_ready"
     assert fake.removed == [created["Id"]]
     assert provisioner.container_name(WORKSPACE) not in fake.removed
+
+
+def test_ensure_run_timeout_after_cidfile_cleans_created_instance(
+        tmp_path):
+    """CLI 超时不等于 daemon 未创建；必须读 cidfile 后按实例 ID 清理。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root, run_timeout_after_create=True)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_start_failed"
+    assert fake.container is None
+    assert fake.removed == ["f" * 64]
+    assert fake.last_cidfile is not None
+    assert not fake.last_cidfile.exists()
+
+
+def test_ensure_cancel_waits_for_cli_and_cleans_late_cidfile(tmp_path):
+    """取消 await 不会停止 to_thread；等 CLI 写完后仍按 cidfile ID 清理。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    gate = threading.Event()
+    fake = FakeDocker(root, run_gate=gate)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    async def scenario():
+        task = asyncio.create_task(service.ensure(WORKSPACE, 3))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, fake.run_started.wait, 2.0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5.0)
+        assert fake.container is None
+        assert fake.removed == ["f" * 64]
+        assert fake.last_cidfile is not None
+        assert not fake.last_cidfile.exists()
+
+    asyncio.run(scenario())
+
+
+def test_ensure_cleanup_failure_keeps_cidfile_and_does_not_stop_sidecar(
+        tmp_path):
+    """清理 rm 失败时保留追踪材料，不吞错，也不先拆 sidecar。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root, run_timeout_after_create=True, rm_failure=True)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_start_cleanup_incomplete"
+    assert fake.container is not None
+    assert fake.last_cidfile is not None and fake.last_cidfile.exists()
+    assert fake.stopped == []
+
+
+def test_ensure_cleanup_inspect_failure_keeps_cidfile(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    fake = FakeDocker(root, run_timeout_after_create=True,
+                      instance_inspect_error="Error response from daemon: "
+                                             "inspect unavailable\n")
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_start_cleanup_incomplete"
+    assert fake.last_cidfile is not None and fake.last_cidfile.exists()
+    assert fake.removed == []
+
+
+def test_ensure_timeout_cleanup_never_removes_same_name_other_generation(
+        tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    other = _valid_container(root)
+    other["Id"] = "e" * 64
+    fake = FakeDocker(root, run_timeout_after_create=True,
+                      run_replacement=other)
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 3))
+    assert rejected.value.code == "worker_start_failed"
+    assert fake.container is other
+    assert fake.removed == []
+    assert fake.stopped == []
+    assert fake.last_cidfile is not None
+    assert not fake.last_cidfile.exists()
 
 
 def test_ensure_accepts_docker_bare_no_new_privileges_form(tmp_path,

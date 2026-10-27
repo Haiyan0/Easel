@@ -173,7 +173,9 @@ class FakeDocker:
                  sidecar_stop_failure: bool = False,
                  invalid_sidecar: bool = False,
                  sidecar_network_internal: bool = False,
-                 probe_failure: str | None = None):
+                 probe_failure: str | None = None,
+                 worker_run_timeout_after_create: bool = False,
+                 worker_rm_failure: bool = False):
         self.root = root
         self.policy = policy
         self.workspace = workspace
@@ -182,6 +184,9 @@ class FakeDocker:
         self.sidecar_stop_failure = sidecar_stop_failure
         self.invalid_sidecar = invalid_sidecar
         self.probe_failure = probe_failure
+        self.worker_run_timeout_after_create = worker_run_timeout_after_create
+        self.worker_rm_failure = worker_rm_failure
+        self.last_cidfile: pathlib.Path | None = None
         self.sidecar_runs = 0
         self.containers: dict[str, dict] = {}
         self.workspace_network = False
@@ -251,6 +256,11 @@ class FakeDocker:
                 self.root, env=env, workspace=self.workspace)
             self.containers[name] = raw
             _write_cidfile(args, raw["Id"])
+            if "--cidfile" in args:
+                self.last_cidfile = pathlib.Path(
+                    args[args.index("--cidfile") + 1])
+            if self.worker_run_timeout_after_create:
+                raise subprocess.TimeoutExpired(argv, 60.0)
             return _ok(raw["Id"] + "\n")
         if args[:1] == ["exec"]:
             if self.probe_failure == "timeout":
@@ -284,6 +294,12 @@ class FakeDocker:
         if args[:1] == ["rm"]:
             target = args[-1]
             self.removed.append(target)
+            worker = self.containers.get(
+                provisioner.container_name(self.workspace))
+            if (self.worker_rm_failure and worker is not None
+                    and target == worker["Id"]):
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "rm failed\n")
             for name, raw in list(self.containers.items()):
                 if target in (name, raw["Id"]):
                     del self.containers[name]
@@ -376,6 +392,46 @@ def test_probe_failure_does_not_create_or_touch_sidecar(tmp_path,
     assert fake.containers[provisioner.container_name(WORKSPACE)] is worker
     assert provisioner.sidecar_container_name(WORKSPACE) not in fake.containers
     assert fake.stopped == [] and fake.removed == []
+
+
+def test_worker_timeout_cleanup_failure_preserves_sidecar_and_cidfile(
+        tmp_path, monkeypatch):
+    """worker 未确认删除时，不能先拆仍有使用者的 sidecar 或删追踪材料。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path)
+    fake = FakeDocker(
+        root, settings.sidecar_policy,
+        worker_run_timeout_after_create=True, worker_rm_failure=True)
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_start_cleanup_incomplete"
+    sidecar = provisioner.sidecar_container_name(WORKSPACE)
+    assert sidecar in fake.containers
+    assert provisioner.container_name(WORKSPACE) in fake.containers
+    assert sidecar not in fake.stopped
+    assert fake.last_cidfile is not None and fake.last_cidfile.exists()
+
+
+def test_worker_timeout_cleanup_success_removes_only_this_round(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = _settings(tmp_path)
+    fake = FakeDocker(
+        root, settings.sidecar_policy, worker_run_timeout_after_create=True)
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "worker_start_failed"
+    assert provisioner.container_name(WORKSPACE) not in fake.containers
+    assert provisioner.sidecar_container_name(WORKSPACE) not in fake.containers
+    assert fake.last_cidfile is not None and not fake.last_cidfile.exists()
 
 
 def test_valid_sidecar_is_reused(tmp_path, monkeypatch):
