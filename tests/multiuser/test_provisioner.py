@@ -237,8 +237,158 @@ def test_gateway_only_abort_survives_provisioner_restart(tmp_path):
         WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
         scope="gateway", worker_created=False, gateway_created=True))
     assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
-    assert list((tmp_path / "root" / ".gateway").glob(
-        "attempt-*.json")) == []
+    records = list((tmp_path / "root" / ".gateway").glob(
+        "attempt-*.json"))
+    assert len(records) == 1
+    completed = json.loads(records[0].read_text(encoding="utf-8"))
+    assert completed["status"] == "completed"
+    # control 尚未提交 DB 时重试同一 abort：幂等成功且不再次 stop。
+    asyncio.run(restarted.abort(
+        WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+        scope="gateway", worker_created=False, gateway_created=True))
+    assert stops == [(WORKSPACE, "c" * 64, "b" * 64)]
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(restarted.abort(
+            WORKSPACE, "c" * 64, "b" * 64, attempt_id="d" * 32,
+            scope="gateway", worker_created=False, gateway_created=True))
+    # 新 attempt 接管后，旧 completed 重试不能被当作成功。
+    restarted._record_attempt(
+        WORKSPACE, "e" * 32,
+        WorkerHandle(
+            WORKSPACE, "f" * 64, "http://172.32.0.2:7860", "token", 3,
+            gateway_instance_id="1" * 64,
+            gateway_generation="2" * 32,
+            gateway_upstream="http://172.31.0.2:8897"),
+        worker_created=False, gateway_created=True)
+    with pytest.raises(provisioner.ProvisionerError):
+        asyncio.run(restarted.abort(
+            WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+            scope="gateway", worker_created=False, gateway_created=True))
+
+
+def test_completed_abort_recovers_control_crash_before_db_commit(tmp_path):
+    from easel.control.runtime import RuntimeManager
+    from easel.control.store import Store
+
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    stops = []
+
+    class FakeGateway:
+        async def stop(self, workspace_id, worker_id, gateway_id):
+            stops.append((workspace_id, worker_id, gateway_id))
+
+    with Store.open(tmp_path / "db") as first, Store.open(
+            tmp_path / "db") as second:
+        user = first.create_user("A")
+        workspace = user.workspace_id
+        conversation = first.create_conversation(user)
+        run = first.reserve_run(user, conversation.id, "req", "digest", 1)
+        first.mark_running(user, run.id)
+        lease = first.claim_worker_start(
+            workspace, 1, "owner", 1000, 60)[1]
+        assert lease is not None
+        handle = WorkerHandle(
+            workspace, "c" * 64, "http://172.32.0.2:7860", "token", 1,
+            gateway_instance_id="b" * 64,
+            gateway_generation="d" * 32,
+            gateway_upstream="http://172.31.0.2:8897")
+        assert first.stage_worker_gateway_start(
+            workspace, "owner", lease.generation, handle, "a" * 32,
+            1001) is True
+        assert first.begin_worker_abort(
+            workspace, "owner", lease.generation, "a" * 32,
+            "gateway", False, True, 1002) is True
+
+        service = provisioner.Provisioner(settings)
+        service._gateway = FakeGateway()
+        service._record_attempt(
+            workspace, "a" * 32, handle,
+            worker_created=False, gateway_created=True)
+        asyncio.run(service.abort(
+            workspace, handle.container_id, handle.gateway_instance_id,
+            attempt_id="a" * 32, scope="gateway",
+            worker_created=False, gateway_created=True))
+        # control 在物理成功与 finish_gateway_abort 之间崩溃：DB 仍 stopping。
+        assert first.get_worker_lease(workspace).state == "stopping"
+
+        restarted = provisioner.Provisioner(settings)
+        restarted._gateway = FakeGateway()
+        class Adapter:
+            async def abort(self, *args, **kwargs):
+                return await restarted.abort(*args, **kwargs)
+
+        manager = RuntimeManager(
+            second, Adapter(), gateway_required=True, clock=lambda: 1200)
+        stopping = second.get_worker_lease(workspace)
+        assert stopping is not None
+        asyncio.run(manager._recover_stop(workspace, stopping, 1300))
+        after = second.get_worker_lease(workspace)
+        assert after is not None
+        assert after.state == "ready"
+        assert after.gateway_state == "unavailable"
+        assert after.container_id == handle.container_id
+        assert after.service_token == handle.service_token
+        assert first.get_run(user, run.id).status == "running"
+        assert stops == [(workspace, handle.container_id,
+                          handle.gateway_instance_id)]
+        record_path = (tmp_path / "root" / ".gateway"
+                       / f"attempt-{workspace}.json")
+        assert json.loads(record_path.read_text())["status"] == "completed"
+
+
+def test_completed_record_write_failure_keeps_pending_and_retry(tmp_path):
+    settings = provisioner.ProvisionerSettings(
+        image=IMAGE, workspace_root=tmp_path / "root",
+        socket_path=tmp_path / "provisioner.sock",
+        quota_mode="none", allow_unquotaed=True,
+        worker_public_key=_write_public_key(tmp_path / "worker.pub"),
+        gateway_image=IMAGE,
+        gateway_control_network="easel-control",
+        gateway_public_key=_write_public_key(tmp_path / "gateway.pub"))
+    service = provisioner.Provisioner(settings)
+    stops = []
+
+    class FakeGateway:
+        async def stop(self, workspace_id, worker_id, gateway_id):
+            stops.append((workspace_id, worker_id, gateway_id))
+
+    service._gateway = FakeGateway()
+    candidate = WorkerHandle(
+        WORKSPACE, "c" * 64, "http://172.32.0.2:7860", "token", 3,
+        gateway_instance_id="b" * 64,
+        gateway_generation="d" * 32,
+        gateway_upstream="http://172.31.0.2:8897")
+    service._record_attempt(
+        WORKSPACE, "a" * 32, candidate,
+        worker_created=False, gateway_created=True)
+    original = service._persist_attempt
+
+    def fail_completed(workspace_id, record):
+        if record.get("status") == "completed":
+            raise OSError("disk full")
+        return original(workspace_id, record)
+
+    service._persist_attempt = fail_completed
+    with pytest.raises(provisioner.ProvisionerError) as failure:
+        asyncio.run(service.abort(
+            WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+            scope="gateway", worker_created=False, gateway_created=True))
+    assert failure.value.code == "gateway_abort_record_failed"
+    path = tmp_path / "root" / ".gateway" / f"attempt-{WORKSPACE}.json"
+    assert json.loads(path.read_text())["status"] == "pending"
+
+    service._persist_attempt = original
+    asyncio.run(service.abort(
+        WORKSPACE, "c" * 64, "b" * 64, attempt_id="a" * 32,
+        scope="gateway", worker_created=False, gateway_created=True))
+    assert json.loads(path.read_text())["status"] == "completed"
 
 
 def test_old_stop_tuple_refuses_worker_when_new_gateway_exists(tmp_path):

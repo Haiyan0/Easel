@@ -264,8 +264,12 @@ docker create --name easel-gateway-<uuid> \
   ready/unavailable，不写假 stopped。worker/worker_gateway 按各自范围；
   只有业务 drain/旧记录默认完整停止。
 - provisioner 在 workspace 根 `.gateway/attempt-<workspace>.json` 持久化
-  当前 attempt 的不可复用目标、created 标记与 scope；进程重启后 abort
-  必须匹配该记录，内存丢失不得退回完整 stop。
+  当前 attempt 的不可复用目标、created 标记、scope 与 status
+  （pending/completed）；物理 abort 成功后保留 completed tombstone，同一
+  attempt/ID/scope 的 control 未提交重试幂等成功；新 attempt 写新记录取代
+  旧记录。进程重启后 abort 必须匹配该记录，内存丢失不得退回完整 stop。
+- completed 记录写入失败时保持 pending 并返回 `gateway_abort_record_failed`；
+  重试按同 ID/范围做幂等终态核验后再提交 completed，不假报已收口。
 
 ### 每空间 sidecar
 

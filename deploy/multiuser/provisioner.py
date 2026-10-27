@@ -2080,7 +2080,12 @@ class Provisioner:
             "worker_created": bool(worker_created),
             "gateway_created": bool(gateway_created),
             "scope": scope,
+            "status": "pending",
         }
+        self._persist_attempt(workspace_id, record)
+
+    def _persist_attempt(self, workspace_id: str, record: dict) -> None:
+        """原子持久 attempt 状态；completed tombstone 不得被提前删除。"""
         path = self._attempt_path(workspace_id)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = path.with_name(path.name + ".tmp")
@@ -2091,7 +2096,14 @@ class Provisioner:
             os.chmod(temporary, 0o600)
         except OSError:
             pass
-        os.replace(temporary, path)
+        try:
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         self._attempts[workspace_id] = record
 
     def _load_attempt(self, workspace_id: str) -> dict | None:
@@ -2111,6 +2123,7 @@ class Provisioner:
         scope = payload.get("scope")
         wc = payload.get("worker_created")
         gc = payload.get("gateway_created")
+        status = payload.get("status", "pending")
         if (not isinstance(attempt_id, str)
                 or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
                 or not isinstance(worker, str)
@@ -2120,7 +2133,8 @@ class Provisioner:
                 or scope not in ("gateway", "worker", "worker_gateway")
                 or type(wc) is not bool or type(gc) is not bool
                 or wc != (scope in ("worker", "worker_gateway"))
-                or gc != (scope in ("gateway", "worker_gateway"))):
+                or gc != (scope in ("gateway", "worker_gateway"))
+                or status not in ("pending", "completed")):
             return None
         record = {
             "attempt_id": attempt_id,
@@ -2129,6 +2143,7 @@ class Provisioner:
             "worker_created": wc,
             "gateway_created": gc,
             "scope": scope,
+            "status": status,
         }
         self._attempts[workspace_id] = record
         return record
@@ -2289,6 +2304,10 @@ class Provisioner:
                     or record["gateway_created"] != gateway_created
                     or record["scope"] != scope):
                 raise ProvisionerError("gateway_abort_superseded")
+            if record.get("status") == "completed":
+                # 物理清理已完成、control 可能尚未提交 DB；同 attempt/ID/
+                # scope 的重试直接幂等成功，不再次执行破坏操作。
+                return
             if scope in ("gateway", "worker_gateway"):
                 assert self._gateway is not None
                 try:
@@ -2300,9 +2319,14 @@ class Provisioner:
             if scope in ("worker", "worker_gateway"):
                 await self._stop_worker_locked(
                     workspace_id, worker_container_id)
-            self._clear_attempt(
-                workspace_id, worker_container_id=worker_container_id,
-                gateway_instance_id=gateway_instance_id)
+            completed = dict(record)
+            completed["status"] = "completed"
+            try:
+                self._persist_attempt(workspace_id, completed)
+            except OSError:
+                # 物理已完成但 tombstone 未持久化：保持 pending，重试可
+                # 幂等重做终态核验；绝不能假报已收口。
+                raise ProvisionerError("gateway_abort_record_failed") from None
 
     async def activate(self, workspace_id: str, worker_container_id: str,
                        gateway_instance_id: str, boot_generation: str,

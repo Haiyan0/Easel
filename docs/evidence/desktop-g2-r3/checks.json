@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-28",
+  "parent_commit": "14bfff0636caa63cccf8ec6a36b7b462a9f3e0a1",
+  "scope": ["G2-R3-01"],
+  "schema_version": 13,
+  "fixes": {
+    "G2-R3-01": "abort physical success persists completed tombstone; same attempt/IDs/scope retry is idempotent; record write failure keeps pending; new attempt supersedes old tombstone; stale/mismatched requests fail closed"
+  },
+  "tests": {
+    "g2_units": "39 passed",
+    "targeted_regression": "288 passed, 6 skipped",
+    "multiuser_and_desktop_static": "1261 passed, 9 skipped, 2 warnings",
+    "real_scenarios": "3 passed in 78.08s"
+  },
+  "fixed_images": {
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:0d8ea2c3e6f21d3ba9cb12125f80dd851eef73c013d0fb24d7a69676dfab7ef4"
+  },
+  "real_evidence": {
+    "gateway_only_abort_kept_worker_running": true,
+    "gateway_only_removed": "7a95f45eb3a1dfe30aacdda22b152bc7ddf16c3895ce3d74a82f1727a15d636c",
+    "kept_worker": "3f87209c183c40a306717d3be105620df1fe0915ec99d061bdea0964ab6e4b68",
+    "uncommitted_control_recovery": true,
+    "record_write_failure_retry": true
+  },
+  "cleanup": "no easel-gateway/worker/sidecar containers or easel-g2/easel-ws networks remain",
+  "not_run": [
+    "public WorkerRelay/chat/frontend",
+    "A4 broker URL/managed Agent wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}
