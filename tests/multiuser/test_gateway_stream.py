@@ -15,6 +15,7 @@ from easel.gateway.auth import (
     GATEWAY_ASSERTION_HEADER,
     GatewayAudience,
     GatewayConfig,
+    GatewayError,
     sign_gateway_assertion,
 )
 
@@ -140,6 +141,55 @@ class SlowCloseStream(httpx.AsyncByteStream):
         self.close_started.set()
         await self.close_gate.wait()
         self.closed.set()
+
+
+class CloseFailingStream(httpx.AsyncByteStream):
+    """底层关闭抛错且不标记 closed；用于关闭失败终态反例。"""
+
+    def __init__(self, chunks=(), *, read_error: bool = False,
+                 hang: bool = False, close_gate: asyncio.Event | None = None):
+        self.chunks = list(chunks)
+        self.read_error = read_error
+        self.hang = hang
+        self.close_gate = close_gate
+        self.close_started = asyncio.Event()
+        self.closed = False
+        self.aclose_calls = 0
+        self.yielded = 0
+
+    async def __aiter__(self):
+        if self.hang:
+            await asyncio.Event().wait()
+            return
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+        if self.read_error:
+            raise httpx.ReadError(
+                "fixture-read-error token=" + TOKEN)
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.close_started.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
+        raise OSError(
+            "fixture-close-error token=" + TOKEN + " host=worker.internal:7860")
+
+
+class CloseCancelledStream(httpx.AsyncByteStream):
+    """底层关闭被取消；关闭未确认，不能释放额度。"""
+
+    def __init__(self):
+        self.closed = False
+        self.aclose_calls = 0
+
+    async def __aiter__(self):
+        yield b'{"ok":true}'
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        raise asyncio.CancelledError()
 
 
 def stream_handler(streams: list[GatedStream], gate: asyncio.Event):
@@ -992,5 +1042,326 @@ def test_absolute_uri_is_rejected_as_a_path():
 
         assert requests == []
         await app.state.gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def _close_failure_limits(**overrides):
+    values = {
+        "max_concurrent_requests": 2,
+        "max_concurrent_streams": 1,
+        "connect_timeout": 1.0,
+        "io_timeout": 5.0,
+    }
+    values.update(overrides)
+    return GatewayLimits(**values)
+
+
+def _assert_isolated(controller, stream, *, expected_calls: int = 1):
+    assert stream.aclose_calls == expected_calls
+    assert not stream.closed
+    assert controller.active_requests == 1
+
+
+def test_streaming_close_failure_is_failed_terminal_and_isolates():
+    async def scenario():
+        stream = CloseFailingStream([b"data: one\n\n"])
+        app = make_app(
+            _slow_close_handler(stream, "text/event-stream"),
+            limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = f"/internal/runs/{RUN}/events"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-stream"),
+                method="GET", query=b"after=0")
+            assert isinstance(response, StreamingResponse)
+            iterator = response.body_iterator
+            assert await iterator.__anext__() == b"data: one\n\n"
+
+            # 关闭失败不能被当作正常 EOF；异常必须到达读取者。
+            with pytest.raises(GatewayError) as failure:
+                await iterator.__anext__()
+            assert failure.value.code == "gateway_upstream_close_failed"
+            assert failure.value.status == 502
+            assert TOKEN not in str(failure.value)
+            assert "worker.internal" not in str(failure.value)
+
+            # background 重复等待同一失败终态，不再调用底层关闭。
+            with pytest.raises(GatewayError) as background_failure:
+                await response.background()
+            assert background_failure.value.code == \
+                "gateway_upstream_close_failed"
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-stream-2"),
+                method="GET", query=b"after=0")
+            assert second.status_code == 503
+            assert b'"error":"gateway_unavailable"' in second.body
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_read_error_with_close_failure_is_not_normal_eof():
+    async def scenario():
+        stream = CloseFailingStream(
+            [b"data: one\n\n"], read_error=True)
+        app = make_app(
+            _slow_close_handler(stream, "text/event-stream"),
+            limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = f"/internal/runs/{RUN}/events"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-read"),
+                method="GET", query=b"after=0")
+            iterator = response.body_iterator
+            assert await iterator.__anext__() == b"data: one\n\n"
+            with pytest.raises(GatewayError) as failure:
+                await iterator.__anext__()
+            assert failure.value.code == "gateway_upstream_close_failed"
+            assert TOKEN not in str(failure.value)
+            assert "worker.internal" not in str(failure.value)
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-read-2"),
+                method="GET", query=b"after=0")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_idle_with_close_failure_is_not_normal_eof():
+    async def scenario():
+        stream = CloseFailingStream(hang=True)
+        app = make_app(
+            _slow_close_handler(stream, "text/event-stream"),
+            limits=_close_failure_limits(io_timeout=0.05))
+        controller = app.state.gateway
+        path = f"/internal/runs/{RUN}/events"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-idle"),
+                method="GET", query=b"after=0")
+            iterator = response.body_iterator
+            with pytest.raises(GatewayError) as failure:
+                await iterator.__anext__()
+            assert failure.value.code == "gateway_upstream_close_failed"
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-idle-2"),
+                method="GET", query=b"after=0")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_buffered_close_failure_returns_sanitized_error_and_isolates():
+    async def scenario():
+        stream = CloseFailingStream([b'{"ok":true}'])
+        upstream = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                _slow_close_handler(stream, "application/json")))
+        app = make_app(
+            None, http_client=upstream, limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = "/internal/lifecycle/health"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, nonce="close-fail-buffered"),
+                method="GET")
+            assert response.status_code == 502
+            assert b'"error":"gateway_upstream_close_failed"' in response.body
+            assert TOKEN.encode() not in response.body
+            assert b"worker.internal" not in response.body
+            assert not upstream.is_closed
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, nonce="close-fail-buffered-2"),
+                method="GET")
+            assert second.status_code == 503
+            assert not upstream.is_closed
+            await controller.aclose()
+            assert not upstream.is_closed
+        finally:
+            await upstream.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_buffered_read_error_with_close_failure_is_not_success():
+    async def scenario():
+        stream = CloseFailingStream(
+            [b'{"partial":true}'], read_error=True)
+        app = make_app(
+            _slow_close_handler(stream, "application/json"),
+            limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = "/internal/lifecycle/health"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, nonce="close-fail-buffered-read"),
+                method="GET")
+            assert response.status_code == 502
+            assert b'"error":"gateway_upstream_close_failed"' in response.body
+            assert TOKEN.encode() not in response.body
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for(
+                    "GET", path, nonce="close-fail-buffered-read-2"),
+                method="GET")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_buffered_idle_with_close_failure_is_not_success():
+    async def scenario():
+        stream = CloseFailingStream(hang=True)
+        app = make_app(
+            _slow_close_handler(stream, "application/json"),
+            limits=_close_failure_limits(io_timeout=0.05))
+        controller = app.state.gateway
+        path = "/internal/lifecycle/health"
+        try:
+            response = await _handle(
+                controller, path,
+                headers_for("GET", path, nonce="close-fail-buffered-idle"),
+                method="GET")
+            assert response.status_code == 502
+            assert b'"error":"gateway_upstream_close_failed"' in response.body
+            _assert_isolated(controller, stream)
+
+            second = await _handle(
+                controller, path,
+                headers_for(
+                    "GET", path, nonce="close-fail-buffered-idle-2"),
+                method="GET")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_failed_close_cancel_race_keeps_single_terminal_and_slot():
+    async def scenario():
+        gate = asyncio.Event()
+        stream = CloseFailingStream(
+            [b"data: one\n\n"], close_gate=gate)
+        app = make_app(
+            _slow_close_handler(stream, "text/event-stream"),
+            limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = f"/internal/runs/{RUN}/events"
+        response = await _handle(
+            controller, path,
+            headers_for("GET", path, query={"after": "0"},
+                        nonce="close-fail-cancel"),
+            method="GET", query=b"after=0")
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == b"data: one\n\n"
+        eof = asyncio.create_task(iterator.__anext__())
+        background = None
+        try:
+            await asyncio.wait_for(stream.close_started.wait(), 1)
+            background = asyncio.create_task(response.background())
+            await asyncio.sleep(0)
+            background.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await background
+            assert controller.active_requests == 1
+            assert not stream.closed
+
+            gate.set()
+            with pytest.raises(GatewayError) as failure:
+                await eof
+            assert failure.value.code == "gateway_upstream_close_failed"
+            _assert_isolated(controller, stream)
+
+            with pytest.raises(GatewayError):
+                await response.background()
+            assert stream.aclose_calls == 1
+            assert controller.active_requests == 1
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, query={"after": "0"},
+                            nonce="close-fail-cancel-2"),
+                method="GET", query=b"after=0")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            gate.set()
+            if not eof.done():
+                eof.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await eof
+            if background is not None and not background.done():
+                background.cancel()
+            await controller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_cancel_terminal_keeps_slot_and_isolates():
+    async def scenario():
+        stream = CloseCancelledStream()
+        app = make_app(
+            _slow_close_handler(stream, "application/json"),
+            limits=_close_failure_limits())
+        controller = app.state.gateway
+        path = "/internal/lifecycle/health"
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _handle(
+                    controller, path,
+                    headers_for("GET", path, nonce="close-cancel"),
+                    method="GET")
+            assert stream.aclose_calls == 1
+            assert not stream.closed
+            assert controller.active_requests == 1
+
+            second = await _handle(
+                controller, path,
+                headers_for("GET", path, nonce="close-cancel-2"),
+                method="GET")
+            assert second.status_code == 503
+            assert _leftover_tasks() == []
+        finally:
+            await controller.aclose()
 
     asyncio.run(scenario())

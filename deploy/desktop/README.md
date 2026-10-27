@@ -238,7 +238,10 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 - 上游清理：每个上游响应只有一个 cleanup task，直接消费原始
   `AsyncByteStream`，不让 `aiter_raw` 在自然 EOF 取得首次关闭所有权；EOF、
   异常、超时、主动关闭、断连和 background 共享该任务。取消等待者不取消
-  cleanup，底层关闭完成后才释放槽位。
+  cleanup，底层关闭完成后才释放槽位。关闭抛错或取消时保留失败终态和槽位，
+  隔离整个实例（后续 503 `gateway_unavailable`）；重复关闭共享同一脱敏
+  失败结果，缓冲响应返回明确 502，流式响应按传输失败结束。不关闭调用者
+  注入的共享 client，也不重试业务请求。
 - Content-Length 在 `int` 转换前按十进制位数与 body 上限做有界比较；超长值
   明确 413，不产生 500。重复/冲突 framing 规则不变。
 
@@ -302,7 +305,8 @@ CR、LF）。路径只接受 origin-form，解码一次，拒绝绝对 URI、编
 3. gateway 精确路由/查询表、control 签名断言、worker service 凭证、
    请求上限、SSE 背压与失败清理：G1 已实现独立核心并覆盖认证/路由/转发/
    流式反例；跨 workspace 断言、错误公钥和真实 TCP 转发已测试。R1 进一步
-   固定唯一关闭任务、最终出站 URL、验签前快速拒绝和超长 Content-Length。
+   固定唯一关闭任务、最终出站 URL、验签前快速拒绝和超长 Content-Length；
+   R2 收口底层关闭失败：保留槽位与失败终态，隔离实例，不伪成功。
 4. `WorkerHandle` 保留 worker container_id、新增 gateway instance/
    generation，`WorkerLease`/stop 绑定：仍待 G2，未在本轮修改。
 
@@ -347,11 +351,14 @@ G1 gateway 核心：
   tests/multiuser/test_gateway_tcp.py -q
 ```
 
-G1 R1 结果为 **112 passed**；覆盖唯一上游关闭任务/慢关闭取消、最终出站
-URL、验签前快速拒绝慢 body/槽位、超长 Content-Length、真实 ASGI send
+G1 R2 结果为 **120 passed**；在 R1 的唯一上游关闭任务/慢关闭取消、最终
+出站 URL、验签前快速拒绝慢 body/槽位、超长 Content-Length、真实 ASGI send
 背压/断连，以及真实 TCP（临时 worker guard + gateway）的合法转发、
-跨 workspace/错误断言拒绝、stop/history 和 SSE/断连清理；测试后两个
-uvicorn 线程均退出。详细红绿与边界见
+跨 workspace/错误断言拒绝、stop/history 和 SSE/断连清理之上，新增 streaming、
+buffered、read/idle 收尾的关闭失败隔离，以及失败关闭并发等待/取消竞争。
+测试后两个 uvicorn 线程均退出。详细红绿与边界见
+[`docs/evidence/desktop-g1-r2/report.md`](../../docs/evidence/desktop-g1-r2/report.md)，
+R1 证据保留在
 [`docs/evidence/desktop-g1-r1/report.md`](../../docs/evidence/desktop-g1-r1/report.md)，
-上一轮证据保留在
+最早一轮证据保留在
 [`docs/evidence/desktop-g1/report.md`](../../docs/evidence/desktop-g1/report.md)。

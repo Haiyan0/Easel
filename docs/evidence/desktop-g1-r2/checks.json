@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-28",
+  "reviewed_commit": "174af25f8b69b52e0914b091a53d486bb4f0b885",
+  "scope": ["G1-R2-01"],
+  "fixes": {
+    "G1-R2-01": "close success/failure/cancellation are explicit terminal states; failure keeps slot, isolates instance and raises sanitized 502; repeated waiters share one task; injected client stays open"
+  },
+  "tests": {
+    "new_close_failure_cases": "8 passed",
+    "gateway_core": "120 passed, 2 warnings",
+    "affected_regression": "226 passed",
+    "multiuser_and_desktop_static": "1211 passed, 9 skipped, 2 warnings"
+  },
+  "red": "8 failed, 24 deselected before implementation",
+  "real_evidence": {
+    "streaming": [
+      "EOF close failure raises GatewayError, not StopAsyncIteration",
+      "read/idle close failure does not finish normally",
+      "repeated background close reads same failed terminal"
+    ],
+    "buffered": [
+      "close failure returns sanitized 502 gateway_upstream_close_failed",
+      "read/idle close failure is not reported as success",
+      "injected shared client remains open"
+    ],
+    "cancellation": [
+      "cancelling one waiter does not cancel the unique cleanup",
+      "slot stays occupied and instance is isolated",
+      "no duplicate aclose and no leftover task"
+    ],
+    "tcp": "existing real loopback uvicorn test still passed"
+  },
+  "docker_resources": "none",
+  "ngrok_or_provider": "not used",
+  "not_run": [
+    "G2 container lifecycle/address binding/public-key mount",
+    "A4 control/WorkerHandle/schema wiring",
+    "real DeepSeek Harness/provider",
+    "ngrok",
+    "Chromium",
+    "full multiuser chat"
+  ]
+}

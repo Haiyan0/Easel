@@ -14,6 +14,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -139,43 +140,70 @@ class _Slot:
         self._released = True
         self._limiter.release(self.stream)
 
+    def isolate(self) -> None:
+        self._limiter.isolate()
+
+
+class _CleanupState(Enum):
+    RUNNING = "running"
+    CLOSED = "closed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
 
 class _ResponseCleanup:
-    """每请求唯一的上游关闭任务；所有等待者共享同一完成状态。
+    """每请求唯一的上游关闭任务；所有等待者共享同一完成终态。
 
     httpx 的 ``response.is_closed`` 会在底层 ``stream.aclose`` 完成前置真；
     因此这里不把它当关闭完成证据，也不让读取协程取得 EOF 关闭所有权。
-    只有本任务的 ``response.aclose`` 完成后才释放槽位；等待者取消不会
-    取消这个任务。
+    只有本任务的 ``response.aclose`` 成功后才释放槽位；关闭失败或取消时
+    保留失败终态、隔离实例并继续占用槽位。等待者取消不会取消这个任务。
     """
 
     def __init__(self, response: httpx.Response, slot: _Slot) -> None:
         self.response = response
         self._slot = slot
+        self._state = _CleanupState.RUNNING
         self._task: asyncio.Task | None = None
 
     def start(self) -> asyncio.Task:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
+            self._task.add_done_callback(self._retrieve_result)
         return self._task
 
     async def close(self) -> None:
         task = self.start()
         await asyncio.shield(task)
 
-    async def _run(self) -> None:
-        cancelled = False
+    @staticmethod
+    def _retrieve_result(task: asyncio.Task) -> None:
+        # 取消路径只 start() 不等待；这里取回异常，避免后台静默丢失。
+        if task.cancelled():
+            return
         try:
-            try:
-                await self.response.aclose()
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
-            except Exception:  # noqa: BLE001 - 关闭失败不能吞掉终态
-                LOGGER.error("gateway 上游响应关闭失败")
-        finally:
-            if not cancelled:
-                await self._slot.release()
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def _run(self) -> None:
+        try:
+            await self.response.aclose()
+        except asyncio.CancelledError:
+            self._state = _CleanupState.CANCELLED
+            self._slot.isolate()
+            LOGGER.error("gateway 上游响应关闭被取消，实例已隔离")
+            raise
+        except Exception:  # noqa: BLE001 - 关闭失败必须进入失败终态
+            self._state = _CleanupState.FAILED
+            self._slot.isolate()
+            LOGGER.error("gateway 上游响应关闭失败，实例已隔离")
+            # 不链接底层异常：其中可能含地址、token 或响应内容。
+            raise GatewayError(
+                "gateway_upstream_close_failed", 502) from None
+        else:
+            self._state = _CleanupState.CLOSED
+            await self._slot.release()
 
 
 class _ConcurrencyLimiter:
@@ -190,8 +218,12 @@ class _ConcurrencyLimiter:
         self._stream_limit = min(streams, max(0, maximum - 1))
         self._active = 0
         self._active_streams = 0
+        self._isolated = False
 
     def acquire(self, stream: bool) -> _Slot:
+        if self._isolated:
+            # 关闭失败后上游资源是否释放未知，禁收新请求；直到实例重启。
+            raise GatewayError("gateway_unavailable", 503)
         if self._active >= self._maximum:
             raise GatewayError("gateway_busy", 429, retry_after=1)
         if stream and self._active_streams >= self._stream_limit:
@@ -205,6 +237,9 @@ class _ConcurrencyLimiter:
         self._active = max(0, self._active - 1)
         if stream:
             self._active_streams = max(0, self._active_streams - 1)
+
+    def isolate(self) -> None:
+        self._isolated = True
 
     @property
     def active(self) -> int:
