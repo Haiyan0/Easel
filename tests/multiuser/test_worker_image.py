@@ -72,6 +72,52 @@ def test_build_smoke_checks_files_modules_worker_mode_and_fake_harness():
     assert "acp-profile.json" in text
 
 
+def test_runtime_build_pins_node_pnpm_and_actually_builds_harness():
+    text = _text(DOCKERFILE)
+    assert "FROM ${NODE_IMAGE} AS dsh-build" in text
+    assert "ARG NODE_IMAGE=node@sha256:" in text
+    assert "ARG PNPM_VERSION=11.28.5" in text
+    assert 'corepack prepare "pnpm@${PNPM_VERSION}" --activate' in text
+    assert "pnpm install --frozen-lockfile" in text
+    assert "pnpm run build:native-system" in text
+    assert "./node_modules/typescript/bin/tsc -b tsconfig.host.json" in text
+    assert ("pnpm exec tsdown --config-loader native "
+            "--env.DSH_BUILD_FACE host") in text
+    assert "test -f apps/cli/lib/bin.js" in text
+    assert "COPY --from=dsh-build /opt/dsh /opt/dsh" in text
+    assert ("COPY --from=dsh-build /usr/local/bin/node "
+            "/usr/local/bin/node") in text
+    assert 'DSH_COMMIT="${DSH_COMMIT}"' in text
+    executable_text = "\n".join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith("#"))
+    # 运行阶段不得再在线安装 Node/npm，也不得只装 prod 依赖而不构建。
+    assert "nodejs npm" not in executable_text
+    assert "npm ci --omit=dev" not in executable_text
+    assert "npm install --omit=dev" not in executable_text
+    assert "pnpm install --frozen-lockfile --prod" not in executable_text
+
+
+def test_require_dsh_runs_real_acp_profile_and_native_runtime():
+    smoke = _text(SMOKE)
+    for marker in (
+            "verify_managed_profile.validate_manifest",
+            "verify_managed_profile.verify_installation",
+            "smoke_harness.run_smoke",
+            "acp-profile.json"):
+        assert marker in smoke
+    verifier = _text(ROOT / "deploy" / "multiuser"
+                     / "verify_managed_profile.py")
+    assert "apps/cli/lib/bin.js" in verifier
+    assert "flock" in verifier
+    assert "native/system/packages/entry/lib/flock.js" in verifier
+    harness = _text(ROOT / "deploy" / "multiuser" / "smoke_harness.py")
+    for marker in (
+            "initialize", "session/new", "sessionCapabilities",
+            "easel-broker", "deepseek-chat", "session/close"):
+        assert marker in harness
+
+
 def test_build_context_excludes_skill_secrets_tests_and_caches():
     lines = {line.strip() for line in _text(DOCKERIGNORE).splitlines()}
     for pattern in (

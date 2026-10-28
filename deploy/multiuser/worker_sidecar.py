@@ -135,6 +135,33 @@ async def _handle_broker(reader: asyncio.StreamReader,
                 continue
             headers.append((name.strip(), value.strip()))
 
+        # 真实 Harness 的 OpenAI-compatible provider 只发送标准
+        # ``Authorization: Bearer``；control broker 的 opaque token 边界使用
+        # ``x-easel-broker-token``。只对已批准的 broker 路径做等价映射，
+        # 并丢弃 Authorization，避免把 worker 侧 token 透传到 control/上游。
+        # 旧的显式 ``x-easel-broker-token``（A4 夹具）继续兼容；两种来源
+        # 同时出现时拒绝，防止下游采用与 sidecar 不同的那一个。
+        authorization = [value for name, value in headers
+                         if name.lower() == "authorization"]
+        existing_token = [value for name, value in headers
+                          if name.lower() == "x-easel-broker-token"]
+        if authorization:
+            if len(authorization) != 1 or existing_token:
+                await _error(writer, 400, "Bad Request")
+                return
+            scheme, separator, credential = authorization[0].partition(" ")
+            if (not separator or scheme.lower() != "bearer"
+                    or not credential or len(credential) > 512
+                    or any(ord(character) < 33 or ord(character) > 126
+                           for character in credential)):
+                await _error(writer, 400, "Bad Request")
+                return
+            headers = [
+                (name, value) for name, value in headers
+                if name.lower() not in ("authorization",
+                                        "x-easel-broker-token")]
+            headers.append(("x-easel-broker-token", credential))
+
         content_length = 0
         seen_length = False
         for name, value in headers:

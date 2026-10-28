@@ -1,0 +1,40 @@
+{
+  "date": "2026-10-28",
+  "baseline_commit": "04271949a8ce2b14d6d618063b2a0eb7fb355579",
+  "scope": ["A5.1", "A5.2", "A5.3", "A5.4"],
+  "harness": {
+    "local_repository": "C:/Users/hyh/Desktop/deepseek-harness",
+    "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+    "package_version": "0.2.1-rc.2",
+    "node": "24.22.1",
+    "node_image": "node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c",
+    "pnpm": "11.28.5",
+    "profile": "acp",
+    "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-acp-app"]
+  },
+  "build": {
+    "dsh_build_image": "sha256:dafce72f323ec4719b2f8fafdeb0922856862aa6f3153bd6c2688ac78cd1844b",
+    "dsh_build_size_bytes": 1051123543,
+    "pnpm_lock_sha256": "4637cca3b89c4c8d5a147321710e597aa62ec2444a3772ab542be5690893dfe4",
+    "cli_bin_sha256": "80112efe368efb1a39720c7ada0af00442e5131fb2744edaaff8a3e8bb499e6f",
+    "native_flock": "linux-x64/bin/glibc/system.node",
+    "acp_smoke": "harness_acp_smoke=ok model=easel-broker/deepseek-chat",
+    "native_probe": "flock-ok",
+    "runtime_image": "sha256:6830c2b4b2f3424dde6fff492803c05cbe77cc03d4e5921a14e26e3a7d738434"
+  },
+  "tests": {
+    "static_sidecar": "16 passed",
+    "managed_profile": "15 passed",
+    "unit_suite": "1388 passed, 10 skipped, 2 warnings in 169.47s (tests/multiuser + tests/integration/multiuser/test_desktop_topology.py)",
+    "real_harness_integration": "2 passed in 65.93s",
+    "a4_fixture_container_regression": "1 passed in 76.53s",
+    "tool_permission": "真实 Harness tool_calls -> ACP session/request_permission -> question 回答 -> bash 执行 -> role=tool 结果回传；provider 审计 2 个 tool 回合",
+    "not_run": [
+      "real DeepSeek provider request (no provider credential used)",
+      "A6 two-user public browser closure",
+      "A7 operations",
+      "Chromium hardened sandbox/XFS/Linux firewall production gates"
+    ]
+  },
+  "cleanup": "verified 2026-10-28: no easel-a5 containers/networks/volumes, no /tmp/easel-a5-* or provisioner processes; test images retained for review"
+}

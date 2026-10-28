@@ -21,26 +21,44 @@ provisioner socket 挂进 worker。
 
 ## 1. 固定镜像与 Harness
 
-构建最终镜像前，管理员必须提供已验收的 Harness commit 和真实 ACP profile：
+最终 runtime 镜像使用仓库内的受管公开配置：
+`deploy/multiuser/managed/acp-profile.json` 固定 Harness commit
+`687f282e8625c6b8d11ff58211a90524be2e4317`（`0.2.1-rc.2`）、Node
+`24.22.1`、pnpm `11.28.5` 与公开 `acp` bundle；同目录
+`acp.patch.yml` 是 Harness 原生 patch，指向本空间 sidecar broker。
 
 ```bash
 docker build -f deploy/multiuser/Dockerfile.worker \
-  --build-arg DSH_COMMIT=<已验收 commit> \
+  --target runtime \
+  --build-arg DSH_COMMIT=687f282e8625c6b8d11ff58211a90524be2e4317 \
   -t easel-worker:<tag> .
 ```
 
-- `DSH_COMMIT` 为空、clone 后 `rev-parse` 不匹配、或缺少
-  `deploy/multiuser/managed/acp-profile.json` 时构建失败。
+受限网络可额外传
+`--build-arg APT_MIRROR=https://<debian-mirror>`；它只改写构建期 apt
+源，不改变运行镜像或宿主/WSL 全局配置。默认仍是 Debian 官方 CDN。
+
+- `DSH_COMMIT` 为空、与 manifest commit 不匹配、clone 后 `rev-parse`
+  不匹配、或缺少 `managed/acp-profile.json`/`acp.patch.yml` 时构建失败。
 - 构建阶段职责：`base`（生命周期入口）→ `chromium`（固定浏览器）→
   `execution`（Web/ACP/技能代码与受管依赖）→ `runtime`（真实 Harness）。
+- 独立 `dsh-build` 阶段按 digest 固定 Node、按精确版本激活 pnpm，
+  `pnpm install --frozen-lockfile` 安装完整构建依赖，实际执行
+  `build:native-system`、`tsc -b tsconfig.host.json` 与 `tsdown` Host
+  构建，产出 `apps/cli/lib/bin.js`；最终镜像只复制已构建 `/opt/dsh` 和
+  固定 `node`，运行阶段不再安装 npm/pnpm/pip。
 - `execution` 复制 `web/`、`skills/`、公开 `agents/workspace/`，安装
-  `deploy/multiuser/requirements-worker.txt` 中全部固定版本依赖，并实际
-  执行 `smoke_worker.py --check-files`：检查文件/模块、worker 沙箱参数、
-  worker Web 入口加载合法测试签名快照，并通过受管假 ACP 完成
-  initialize/session/new/session/prompt 与共享规则/技能/路径/环境校验。
-  该冒烟代替不了真实 DSH/供应商 Harness 验证。
+  `deploy/multiuser/requirements-worker.txt` 中全部固定版本依赖，并执行
+  `smoke_worker.py --check-files`：检查文件/模块、worker 沙箱参数、worker
+  Web 入口与受管假 ACP。该 execution 冒烟仍不代表真实 DSH。
+- `runtime` 以 UID 10001 执行
+  `smoke_worker.py --check-files --require-dsh`（代码/checkout/受管配置
+  只读；实际运行容器再由 provisioner 以只读 rootfs 启动）：核对固定
+  commit、CLI 构建产物、Node 引擎、Linux 原生 flock、profile/patch
+  只读性，并启动真实 Harness 完成 ACP `initialize`/`session/new`，确认
+  默认模型是 `easel-broker/deepseek-chat`。缺任一条件直接使构建失败。
 - 依赖只在构建阶段安装；运行阶段不做在线 npm/pip 安装。
-- Python/Node/Playwright/Chromium 版本在 Dockerfile 与 requirements 中固定；
+- Python/Playwright/Chromium 版本在 Dockerfile 与 requirements 中固定；
   `/opt/easel`、`/opt/dsh`、`/opt/easel/managed` 构建后只读。
 - `.dockerignore` 排除 `.env*`、outputs、profiles、浏览器状态、数据库、
   HOME、审计/任务文档、tests，以及补 COPY `skills/` 后可能带入的旧公众号

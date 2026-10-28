@@ -1,0 +1,43 @@
+# Easel 受管 ACP overlay。
+#
+# 这是 Harness 原生 cordis patch schema，不是 Easel manifest；对应的
+# Easel manifest 是同目录 acp-profile.json。文件只包含公开路由与模型信息，
+# 不含任何供应商 Key、broker token 或用户凭证。
+#
+# 真实 Harness 的 dsh-acp-app 默认使用 dsh-llm-deepseek（Messages 协议）。
+# A5 不改写 Harness 源码，而是使用仓内已有的 llm-pi-ai OpenAI-completions
+# provider 指向本空间 sidecar 的精确 broker 路径：
+#   {EASEL_BROKER_URL}/internal/broker/chat
+# 由 pi-ai 追加 /chat/completions 与 /models。逐 Run token 只来自
+# EASEL_BROKER_TOKEN；workspace/run 身份来自对应环境变量，均不落盘。
+
+- id: agent-default-model
+  config:
+    provider: easel-broker
+    model: deepseek-chat
+
+- id: acp
+  config:
+    provider: easel-broker
+    model: deepseek-chat
+
+- id: llm-pi-ai
+  config:
+    providers:
+      easel-broker:
+        displayName: Easel 本空间 broker
+        api: openai-completions
+        baseURL: !!js "(() => { const base = process.env.EASEL_BROKER_URL; if (!base) throw new Error('EASEL_BROKER_URL is missing'); return base + '/internal/broker/chat'; })()"
+        apiKeyEnv: EASEL_BROKER_TOKEN
+        headers:
+          x-easel-workspace-id: !!js "(() => { const value = process.env.EASEL_WORKSPACE_ID; if (!value) throw new Error('EASEL_WORKSPACE_ID is missing'); return value; })()"
+          x-easel-run-id: !!js "(() => { const value = process.env.EASEL_RUN_ID; if (!value) throw new Error('EASEL_RUN_ID is missing'); return value; })()"
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+        models:
+          - id: deepseek-chat
+            name: DeepSeek Chat (Easel broker)
+            contextWindow: 65536
+            maxTokens: 4096
+            reasoningEfforts: false

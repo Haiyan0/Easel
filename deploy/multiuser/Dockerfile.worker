@@ -1,8 +1,10 @@
 # Task 8 worker 镜像。
 #
-# 构建链：base（最小生命周期）→ chromium（真实浏览器）→ runtime（最终）。
-# 未指定 --target 时构建最终 runtime；缺少固定的 Harness commit 或经验证的
-# ACP profile 会构建失败，绝不产出“看起来能跑”的未固定镜像。
+# 构建链：dsh-build（固定 Harness 源码/Linux 构建）与
+# base（最小生命周期）→ chromium（真实浏览器）→ execution（worker 代码）
+# → runtime（真实 Harness 最终镜像）。未指定 --target 时构建最终 runtime；
+# 缺少固定的 Harness commit 或经验证的 ACP profile 会构建失败，绝不产出
+# “看起来能跑”的未固定镜像。
 #
 #   docker build -f deploy/multiuser/Dockerfile.worker \
 #     --build-arg DSH_COMMIT=<已验收 commit> -t easel-worker:<tag> .
@@ -12,6 +14,58 @@
 #     -t easel-worker-test:base .
 
 ARG PYTHON_VERSION=3.11.12
+# Node 24.22.1 满足 Harness engines（^22.19.0 || >=24.0.0）。镜像按 digest
+# 固定；pnpm 也在构建期按精确版本激活，运行阶段不再安装 npm/pnpm。
+ARG NODE_IMAGE=node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c
+ARG PNPM_VERSION=11.28.5
+FROM ${NODE_IMAGE} AS dsh-build
+
+ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
+ARG DSH_COMMIT=""
+ARG PNPM_VERSION=11.28.5
+
+ENV CI=1 \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+RUN printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-retries \
+ && test -n "${DSH_COMMIT}" \
+      || { echo "DSH_COMMIT 必须固定为已验收的 Harness commit" >&2; exit 1; } \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates git build-essential python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN corepack enable \
+ && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+ && test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+# 从公开仓库取固定 commit；不使用宿主 node_modules 或未固定 tarball。
+# GitHub 若拒绝按 SHA 取，可回退到该版本 tag；随后仍强制核对完整 SHA。
+RUN git init /opt/dsh \
+ && git -C /opt/dsh remote add origin "${DSH_REPOSITORY}" \
+ && (git -C /opt/dsh fetch --depth 1 origin "${DSH_COMMIT}" \
+     || git -C /opt/dsh fetch --depth 1 origin \
+          refs/tags/dsh-v0.2.1-rc.2) \
+ && git -C /opt/dsh checkout --detach FETCH_HEAD \
+ && test "$(git -C /opt/dsh rev-parse HEAD)" = "${DSH_COMMIT}"
+
+WORKDIR /opt/dsh
+# 完整构建依赖 frozen 安装；不能只 prod install、也不能无锁 npm install。
+RUN pnpm install --frozen-lockfile
+
+# 实际执行 Linux 原生组件与 Host/CLI 构建。tsdown 为所有 workspace 包
+# 生成运行产物（含 apps/cli/lib/bin.js），不是只把源码放进镜像。
+RUN pnpm run build:native-system \
+ && node --max-old-space-size=4096 \
+      ./node_modules/typescript/bin/tsc -b tsconfig.host.json \
+ && pnpm exec tsdown --config-loader native --env.DSH_BUILD_FACE host \
+ && test -f apps/cli/lib/bin.js \
+ && test -f apps/cli/lib/profile-boot.js \
+ && node apps/cli/lib/bin.js --help >/dev/null
+
+# 构建输入与产物摘要进入构建日志，便于复现核对（不含任何凭证）。
+RUN sha256sum pnpm-lock.yaml apps/cli/lib/bin.js
+
 FROM python:${PYTHON_VERSION}-slim-bookworm AS base
 
 ARG FASTAPI_VERSION=0.115.6
@@ -60,7 +114,19 @@ CMD ["python", "-m", "easel.worker.lifecycle", "serve", \
 FROM base AS chromium
 
 ARG PLAYWRIGHT_VERSION=1.49.1
+# 默认使用 Debian 官方 CDN；受限网络可用 --build-arg APT_MIRROR=<base URL>
+# 指定只读构建期镜像站，不改宿主/WSL 全局配置。
+ARG APT_MIRROR=https://deb.debian.org
 USER root
+# Debian CDN 偶发 502；apt 自身重试，避免把网络瞬断误报成依赖不可用。
+RUN printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-retries
+RUN if [ "${APT_MIRROR}" != "https://deb.debian.org" ]; then \
+      for file in /etc/apt/sources.list /etc/apt/sources.list.d/*; do \
+        if [ -f "$file" ]; then \
+          sed -i -E "s|https?://deb\\.debian\\.org|${APT_MIRROR}|g" "$file"; \
+        fi; \
+      done; \
+    fi
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates fonts-liberation fonts-noto-cjk \
@@ -93,6 +159,8 @@ COPY skills ./skills
 # 缺少 agents/workspace/AGENTS.md 会在发送 prompt 前失败。
 COPY agents ./agents
 COPY deploy/multiuser/smoke_worker.py ./deploy/multiuser/smoke_worker.py
+COPY deploy/multiuser/smoke_harness.py ./deploy/multiuser/smoke_harness.py
+COPY deploy/multiuser/verify_managed_profile.py ./deploy/multiuser/verify_managed_profile.py
 COPY deploy/multiuser/worker_sidecar.py ./deploy/multiuser/worker_sidecar.py
 COPY deploy/multiuser/egress_proxy.py ./deploy/multiuser/egress_proxy.py
 RUN chown -R root:root /opt/easel \
@@ -103,11 +171,11 @@ USER 10001:10001
 RUN python deploy/multiuser/smoke_worker.py --check-files
 CMD ["python", "-m", "easel.worker.server", "serve",      "--host", "0.0.0.0", "--port", "7860"]
 
-# 最终阶段：锁定管理员受管的 DeepSeek Harness commit 与已验收 ACP profile。
-# managed/acp-profile.json 必须由管理员按实际验收结果提供；仓库不伪造。
+# 最终阶段：固定源码构建的真实 DeepSeek Harness runtime 与受管 ACP profile。
+# 构建阶段已完成 frozen 安装、Linux 原生组件和 Host/CLI 构建；这里只复制
+# 已构建产物与固定 Node 运行时，运行阶段不再联网安装 npm/pnpm/pip。
 FROM execution AS runtime
 
-ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
 ARG DSH_COMMIT=""
 
 USER root
@@ -117,23 +185,13 @@ RUN test -n "${DSH_COMMIT}" \
  && test -f /opt/easel/managed/acp-profile.json \
       || { echo "缺少经验证的 managed/acp-profile.json" >&2; exit 1; }
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git nodejs npm \
- && rm -rf /var/lib/apt/lists/*
-RUN git init /opt/dsh \
- && git -C /opt/dsh remote add origin "${DSH_REPOSITORY}" \
- && git -C /opt/dsh fetch --depth 1 origin "${DSH_COMMIT}" \
- && git -C /opt/dsh checkout --detach FETCH_HEAD \
- && test "$(git -C /opt/dsh rev-parse HEAD)" = "${DSH_COMMIT}"
-# 依赖只允许在构建时安装；运行阶段不做在线 npm/pip 安装。
-RUN cd /opt/dsh \
- && if [ -f package-lock.json ]; then npm ci --omit=dev; \
-    elif [ -f pnpm-lock.yaml ]; then corepack enable \
-      && pnpm install --frozen-lockfile --prod; \
-    else npm install --omit=dev; fi
+COPY --from=dsh-build /opt/dsh /opt/dsh
+COPY --from=dsh-build /usr/local/bin/node /usr/local/bin/node
 RUN chmod -R a-w /opt/dsh /opt/easel/managed
 
 USER 10001:10001
-# 真实 Harness 门槛：只验证固定 checkout/profile 与实际文件权限；
-# 没有管理员提供的 commit/profile 时构建在本阶段之前即失败。
-RUN python deploy/multiuser/smoke_worker.py --check-files --require-dsh
+# 真实 Harness 门槛：固定 checkout、CLI 构建产物、Node 引擎、原生 flock、
+# profile/patch 只读性，以及真实 initialize/session/new。任何一项失败都
+# 中止构建，不再用 .git/HEAD 或文件权限冒充 runtime 验收。
+RUN DSH_COMMIT="${DSH_COMMIT}" \
+      python deploy/multiuser/smoke_worker.py --check-files --require-dsh

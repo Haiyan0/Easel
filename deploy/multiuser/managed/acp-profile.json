@@ -1,0 +1,38 @@
+{
+  "manifest": "easel.managed-acp-profile/1",
+  "harness": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
+    "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+    "package_version": "0.2.1-rc.2",
+    "node_engines": "^22.19.0 || >=24.0.0",
+    "node": "24.22.1",
+    "pnpm": "11.28.5",
+    "profile": "acp",
+    "bundles": [
+      "@deepseek-ai/dsh-base",
+      "@deepseek-ai/dsh-acp-app"
+    ]
+  },
+  "command": [
+    "node",
+    "/opt/dsh/apps/cli/lib/bin.js",
+    "--profile",
+    "acp",
+    "--patch",
+    "/opt/easel/managed/acp.patch.yml"
+  ],
+  "patch": "acp.patch.yml",
+  "broker": {
+    "mode": "workspace-sidecar",
+    "channel": "chat"
+  },
+  "provider": {
+    "id": "easel-broker",
+    "api": "openai-completions",
+    "model": "deepseek-chat"
+  },
+  "validated": {
+    "date": "2026-10-28",
+    "scope": "A5 Linux runtime and broker adapter"
+  }
+}

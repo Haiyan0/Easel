@@ -249,17 +249,42 @@ def _check_worker_entry(code_root: Path) -> None:
 
 
 def _check_dsh() -> None:
+    """最终镜像门槛：固定源码、真实 CLI/profile、原生依赖与 ACP 握手。"""
     code_root = _code_root()
     dsh = Path("/opt/dsh")
+    managed_dir = code_root / "managed"
+    profile = managed_dir / "acp-profile.json"
+    patch = managed_dir / "acp.patch.yml"
     if not dsh.is_dir() or not (dsh / ".git").exists():
         _fail("缺少已固定的 /opt/dsh checkout")
-    profile = code_root / "managed" / "acp-profile.json"
-    if not profile.is_file():
-        _fail("缺少 managed/acp-profile.json")
-    for path in (dsh / ".git" / "HEAD", profile):
+    for path in (dsh / ".git" / "HEAD", profile, patch):
+        if not path.is_file():
+            _fail(f"缺少受管 Harness 文件：{path}")
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o222:
             _fail(f"受管 Harness 配置必须只读：{path} mode={oct(mode)}")
+
+    deploy_dir = Path(__file__).resolve().parent
+    if str(deploy_dir) not in sys.path:
+        sys.path.insert(0, str(deploy_dir))
+    import smoke_harness  # noqa: PLC0415
+    import verify_managed_profile  # noqa: PLC0415
+
+    try:
+        manifest = verify_managed_profile.validate_manifest(
+            json.loads(profile.read_text(encoding="utf-8")),
+            expected_commit=os.environ.get("DSH_COMMIT") or None,
+            patch_root=managed_dir)
+        details = verify_managed_profile.verify_installation(
+            manifest, dsh_root=dsh, managed_root=managed_dir)
+        acp = smoke_harness.run_smoke(profile)
+    except (verify_managed_profile.ProfileError,
+            smoke_harness.SmokeError) as error:
+        _fail(f"真实 Harness profile/ACP 门槛失败：{error}")
+    print(
+        "DSH_PROFILE_OK commit={} node={} patch_sha256={} model={}".format(
+            details["commit"], details["node"],
+            details["patch_sha256"], acp["model"]))
 
 
 def main(argv: list[str] | None = None) -> int:

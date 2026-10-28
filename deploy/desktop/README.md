@@ -476,7 +476,9 @@ worker 只收到短期 Run token。真实 DeepSeek Harness/供应商与完整双
   "revision": 1,
   "agent": {
     "runtime": "acp",
-    "command": ["python", "/workspace/agent-entry.py", "acp"],
+    "command": ["node", "/opt/dsh/apps/cli/lib/bin.js",
+                "--profile", "acp",
+                "--patch", "/opt/easel/managed/acp.patch.yml"],
     "sandbox": "workspace-write",
     "timeout": 300
   },
@@ -491,6 +493,11 @@ worker 只收到短期 Run token。真实 DeepSeek Harness/供应商与完整双
   "chat"}`；两种模式不能混用。
 - 受管配置不得包含 provider Key；逐 Run token 由 `BrokerService.issue` 在
   接纳后签发。
+- A5 起正式 ACP 命令来自
+  `deploy/multiuser/managed/acp-profile.json`（固定 Harness commit 与
+  公开 `acp` profile），必须使用对应 `runtime` worker 镜像；Harness 的
+  OpenAI-compatible provider 只访问本空间 sidecar broker，供应商 Key
+  仍只在 control。
 
 ## 3. 初始化与启动（Windows PowerShell）
 

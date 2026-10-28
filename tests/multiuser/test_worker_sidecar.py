@@ -145,6 +145,69 @@ def test_broker_relay_rejects_non_allowlisted_routes(method, target):
     asyncio.run(scenario())
 
 
+def test_broker_accepts_openai_bearer_and_maps_to_internal_token():
+    """真实 Harness 只发 OpenAI Bearer；sidecar 必须换成 control 的 token 头。"""
+    async def scenario():
+        upstream = FakeUpstream()
+        await upstream.start()
+        server = await asyncio.start_server(
+            lambda reader, writer: sidecar._handle_broker(
+                reader, writer, ("127.0.0.1", upstream.port)),
+            "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            body = b'{"model":"m","stream":true,"messages":[]}'
+            response = await _broker_roundtrip(port, _request(
+                "POST", "/internal/broker/chat/chat/completions", body,
+                extra=("Authorization: Bearer token-sentinel\r\n"
+                       "x-easel-workspace-id: " + "a" * 32 + "\r\n"
+                       "x-easel-run-id: run-1")))
+            assert b"200 OK" in response.split(b"\r\n", 1)[0]
+            received = upstream.requests[0]
+            assert received["headers"]["x-easel-broker-token"] == (
+                "token-sentinel")
+            assert "authorization" not in received["headers"]
+            assert received["body"] == body
+        finally:
+            server.close()
+            await server.wait_closed()
+            await upstream.stop()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("authorization,extra", [
+    ("Basic dXNlcjpwYXNz", ""),
+    ("Bearer", ""),
+    ("Bearer ", ""),
+    ("Bearer two tokens", ""),
+    ("Bearer token", "x-easel-broker-token: other\r\n"),
+])
+def test_broker_rejects_ambiguous_or_malformed_authorization(
+        authorization, extra):
+    async def scenario():
+        upstream = FakeUpstream()
+        await upstream.start()
+        server = await asyncio.start_server(
+            lambda reader, writer: sidecar._handle_broker(
+                reader, writer, ("127.0.0.1", upstream.port)),
+            "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            headers = f"Authorization: {authorization}"
+            if extra:
+                headers += "\r\n" + extra.rstrip("\r\n")
+            response = await _broker_roundtrip(port, _request(
+                "POST", "/internal/broker/chat/chat/completions", b"{}",
+                extra=headers))
+            assert b"400" in response.split(b"\r\n", 1)[0]
+            assert upstream.requests == []
+        finally:
+            server.close()
+            await server.wait_closed()
+            await upstream.stop()
+    asyncio.run(scenario())
+
+
 def test_broker_relay_rejects_chunked_body_before_upstream():
     async def scenario():
         upstream = FakeUpstream()

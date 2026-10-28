@@ -49,6 +49,133 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sse(self, payload: dict) -> None:
+        self.wfile.write(
+            b"data: " +
+            json.dumps(payload, ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _stream(self, model: str, *, drop: bool = False) -> None:
+        """OpenAI chat.completion.chunk SSE；drop=True 时故意不发终止事件。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        base = {
+            "id": "fixture-completion",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+        }
+        chunks = [
+            {**base, "choices": [{
+                "index": 0, "delta": {"role": "assistant"},
+                "finish_reason": None}]},
+        ]
+        text = "fake-provider-ok"
+        for index in range(0, len(text), 7):
+            chunks.append({**base, "choices": [{
+                "index": 0, "delta": {"content": text[index:index + 7]},
+                "finish_reason": None}]})
+        chunks.append({**base, "choices": [{
+            "index": 0, "delta": {}, "finish_reason": "stop"}]})
+        for chunk in chunks:
+            self._sse(chunk)
+            if drop:
+                # 只发第一块后断开，模拟上游中途断流。
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(2)
+                except OSError:
+                    pass
+                return
+        self._sse({**base, "choices": [], "usage": {
+            "prompt_tokens": 1, "completion_tokens": 3,
+            "total_tokens": 4}})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _stream_tool_call(self, model: str) -> None:
+        """标准 OpenAI tool_calls 流：请求 Harness 以提权方式执行一次 echo。
+
+        参数带 ``sandbox_permissions``/``justification``，Harness 必须先经
+        ACP ``session/request_permission`` 征求用户同意，才执行工具。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        base = {
+            "id": "fixture-tool-call",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+        }
+        arguments = json.dumps({
+            "description": "Echo an A5 tool marker",
+            "command": "echo harness-tool-ok",
+            "sandbox_permissions": "danger-full-access",
+            "justification": "A5 verification needs one unsandboxed echo",
+        }, ensure_ascii=False, separators=(",", ":"))
+        chunks = [
+            {**base, "choices": [{
+                "index": 0, "finish_reason": None,
+                "delta": {"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": "call_a5_harness_tool",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": ""}}]}}]},
+            {**base, "choices": [{
+                "index": 0, "finish_reason": None,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": arguments}}]}}]},
+            {**base, "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        for chunk in chunks:
+            self._sse(chunk)
+        self._sse({**base, "choices": [], "usage": {
+            "prompt_tokens": 1, "completion_tokens": 3,
+            "total_tokens": 4}})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    @staticmethod
+    def _has_tool_result(body: object) -> bool:
+        """请求里是否已带工具结果（第二回合），避免再次发起工具调用。"""
+        if not isinstance(body, dict):
+            return False
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return False
+        return any(isinstance(message, dict) and message.get("role") == "tool"
+                   for message in messages)
+
+    @staticmethod
+    def _prompt_text(body: object) -> str:
+        if not isinstance(body, dict):
+            return ""
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        parts: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+        return "\n".join(parts)
+
     def do_GET(self) -> None:
         self._record(b"")
         if self.path == "/v1/models":
@@ -64,11 +191,39 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/v1/chat/completions",):
             self._json(404, {"error": "not_found"})
             return
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            payload = {}
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(model, str) or not model:
+            model = "fixture-chat"
+        prompt = self._prompt_text(payload)
+        if "harness-401" in prompt:
+            self._json(401, {"error": {
+                "type": "authentication_error", "message": "fake auth"}})
+            return
+        if "harness-429" in prompt:
+            self._json(429, {"error": {
+                "type": "rate_limit_error", "message": "fake rate limit"}})
+            return
+        if "harness-500" in prompt:
+            self._json(500, {"error": {
+                "type": "api_error", "message": "fake server error"}})
+            return
+        stream = isinstance(payload, dict) and payload.get("stream") is True
+        if stream:
+            if "harness-tool" in prompt and not self._has_tool_result(payload):
+                # 首回合：让真实 Harness 发起一次需要审批的工具调用。
+                self._stream_tool_call(model)
+                return
+            self._stream(model, drop="harness-drop" in prompt)
+            return
         self._json(200, {
             "id": "fixture-completion",
             "object": "chat.completion",
             "created": 0,
-            "model": "fixture-chat",
+            "model": model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant",
