@@ -83,6 +83,8 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
         mismatches.append("engine")
 
     checks = (
+        ("engineContext", ("engine", "context")),
+        ("engineId", ("engine", "id")),
         ("workerImage", ("images", "worker")),
         ("gatewayImage", ("images", "gateway")),
         ("workspaceRoot", ("workspaceRoot",)),
@@ -105,6 +107,8 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
     if not isinstance(socket_info, dict):
         mismatches.append("socket")
         return mismatches
+    if "socketUid" in expected and socket_info.get("uid") != expected["socketUid"]:
+        mismatches.append("socketUid")
     if "socketGid" in expected and socket_info.get("gid") != expected["socketGid"]:
         mismatches.append("socketGid")
     if ("socketMode" in expected

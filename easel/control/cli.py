@@ -1422,6 +1422,45 @@ def cmd_admin_resume(args) -> int:
         return 1
 
 
+def cmd_admin_stop_complete(args) -> int:
+    """成功 Stop 后记录 barrier/项目/配置 fencing；不清除屏障。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            record = store.complete_stop(
+                args.barrier_id, args.project, args.config_sha256,
+                int(time.time()))
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 完成记录失败不得假报成功
+        print("错误：stop_completion_failed", file=sys.stderr)
+        return 1
+    print(f"stop_completed={record['barrierId']}")
+    return 0
+
+
+def cmd_admin_reopen(args) -> int:
+    """仅按成功完成记录原子恢复接纳；失败/取消屏障保持关闭。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            barrier = store.admission_barrier()
+            if barrier is None:
+                print("barrier=none")
+                return 0
+            reopened = store.reopen_after_completed_stop(
+                args.barrier_id, args.project, args.config_sha256,
+                int(time.time()))
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 重开失败不得假报已恢复
+        print("错误：admission_barrier_reopen_failed", file=sys.stderr)
+        return 1
+    if not reopened:
+        print("错误：admission_barrier_not_reopenable", file=sys.stderr)
+        return 1
+    print(f"reopened={args.barrier_id}")
+    return 0
+
+
 def cmd_admin_barrier_status(args) -> int:
     """只读打印当前停止接纳屏障，供 Start 诊断。"""
     try:

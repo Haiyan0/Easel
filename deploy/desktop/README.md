@@ -519,7 +519,8 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 # 4) 先 drain 所有 workspace，再停止 control（保留卷/网络）
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File deploy/desktop/Stop-WorkspaceEasel.ps1 `
-  -ProjectName easel-workspace-desktop
+  -ProjectName easel-workspace-desktop `
+  -DataRoot C:\Easel\desktop
 ```
 
 初始化重复执行不会轮换 master key 或签名私钥；已有公钥缺失/不匹配时从现有
@@ -528,14 +529,22 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 可见的卷中。egress 使用独立的 `<project>-egress` 策略卷，只挂载
 `/policy/egress-policy.json`，不挂 key 卷。
 
-Start 在复用既有 provisioner 前，会以 control 的 UID 10001 在固定镜像内
-执行只读 `provisioner_identity.py check`，核对实际 Docker context/engine、
-worker/gateway 镜像、workspace 根、控制网络、broker upstream、worker/gateway
-公钥指纹、egress policy 指纹、socket GID/mode/allowed UID。配置漂移会返回
+Start/Status 的公钥基准不是宿主副本，而是 key 卷内私钥派生出的 worker raw
+公钥与 gateway PEM 公钥 SHA-256；`keygen --check --fingerprints` 同时验证
+卷内公钥与私钥一致。宿主 `DataRoot/public` 副本、key 卷策略和 egress 卷
+策略必须与这些可信摘要完全一致，否则返回 `public_copy_mismatch` /
+`policy_copy_mismatch`，不自动换 key。
+
+Start 只读采集 Windows Docker CLI 与指定 WSL 的 Engine ID，两者必须一致；
+WSL context、socket 属主 UID、主 GID（必须等于 control 的 ProvisionerGid）、
+mode 660 与 allowed UID 10001 写入 expectedIdentity。采集失败或 Engine 不同
+即失败关闭。随后在固定镜像内以 UID 10001 执行只读
+`provisioner_identity.py check`，精确核对 Engine ID/context、镜像、workspace
+根、网络、broker upstream、key/policy 指纹和 socket 身份。配置漂移返回
 `provisioner_config_mismatch`；错误服务或读取失败返回
 `provisioner_identity_unavailable`，脚本不会盲删活跃 socket 或停止实例。
-新建 provisioner 后同样核验。Status 会检查实际端口、挂载、密钥、配置卷、
-egress 隔离、provisioner 身份和停止屏障；任一必需项失败返回非零并输出
+新建 provisioner 后同样核验。Status 复用同一契约，并检查实际端口、挂载、
+密钥、配置卷、egress 隔离和停止屏障；任一必需项失败返回非零并输出
 `status=failed failures=...`。
 
 ## 4. 端口、网络与资源
@@ -560,6 +569,11 @@ worker_or_gateway_image_mismatch
 volume_not_owned / network_not_owned / network_invalid
 workspace_keys_invalid / managed_config_missing
 public_file_missing:<name> / frontend_build_missing
+public_copy_mismatch:<name> / policy_copy_mismatch
+workspace_key_fingerprints_missing / policy_copy_missing
+docker_engine_unavailable / wsl_docker_engine_unavailable
+docker_engine_mismatch / docker_context_unavailable
+provisioner_gid_mismatch / provisioner_socket_owner_unknown
 wsl_repo_missing / wsl_python_dependencies_missing
 provisioner_start_timeout / compose_config_invalid
 provisioner_config_mismatch / provisioner_identity_unavailable
@@ -571,16 +585,21 @@ control_health_timeout / control_unhealthy
 屏障，再 drain 并复核没有活跃 Run、请求租约或 starting/ready/draining/
 stopping 实例。无法 drain 或复核失败时返回
 `worker_drain_failed`/`worker_drain_incomplete`/`provisioner_socket_missing`，
-不会静默停止 control。屏障在 control 停止后自然失效；若 Stop 失败或取消，
-屏障保留为失败关闭状态，使用以下命令显式恢复：
+不会静默停止 control。成功 down 后 Stop 用一次性 control 容器写入
+`stop_completion`（barrier ID、项目、expected-identity SHA-256）；失败或
+取消没有该记录。屏障不会在 control 停止后自然失效。
+
+Start 看到屏障时只调用 `admin reopen`：仅当当前 barrier ID、项目、配置
+摘要与完成记录完全匹配，且持久状态无活跃 Run/请求/未收口实例，才原子清除
+并继续；因此正常 Stop→Start 可直接重开，连续多轮成立。失败/取消/旧记录/
+新 barrier 保持失败关闭，需显式恢复：
 
 ```powershell
 docker exec <control-container> python -m easel admin resume `
   --control-dir /srv/easel/control
 ```
 
-Start 检测到残留屏障会返回 `admission_barrier_active`，必须先 resume 再
-重开。`-Force` 只用于已确认无活动任务后的强制停止。
+`-Force` 只用于已确认无活动任务后的强制停止。
 
 ## 6. 本轮验收命令
 
@@ -613,6 +632,8 @@ A4 R1 定向回归：
 ```
 
 本轮真实证据、红绿与固定镜像见
+[docs/evidence/desktop-a4-r2/report.md](../../docs/evidence/desktop-a4-r2/report.md)。
+R1 的证据保留在
 [docs/evidence/desktop-a4-r1/report.md](../../docs/evidence/desktop-a4-r1/report.md)。
 未运行 ngrok 公网浏览器、真实 DeepSeek Harness、真实供应商计费或 A6 双用户
 浏览器闭环；这些分别留待 A5/A6。

@@ -13,6 +13,7 @@ param(
     [string]$ProjectName = 'easel-workspace-desktop',
     [string]$Distro = 'Ubuntu-26.04',
     [string]$WslRepo = '/mnt/c/Code/Easel',
+    [string]$DataRoot = 'C:\Easel\desktop',
     [switch]$Force
 )
 
@@ -54,6 +55,9 @@ try {
     $socketCheck = Invoke-Wsl -Arguments @(
         '-d', $Distro, '--', 'bash', '-lc', "test -S '$socket'")
     $workerDrained = $false
+    $barrierId = ''
+    $controlImage = ''
+    $configSha256 = ''
     if (-not $Force -and $socketCheck.ExitCode -eq 0 -and $controlId) {
         $drain = Invoke-EaselDocker -Arguments @(
             'exec', $controlId, 'python', '-m', 'easel', 'admin', 'drain',
@@ -68,11 +72,28 @@ try {
         $workerDrained = $true
         foreach ($line in $drain.Output) {
             if ("$line".StartsWith('barrier=')) {
-                Write-Output ("admission_barrier=" + $line.Substring(8))
+                $barrierId = "$line".Substring(8)
+                Write-Output ("admission_barrier=" + $barrierId)
             }
             if ("$line" -eq 'verified=settled') {
                 Write-Output 'drain_verified=settled'
             }
+        }
+        if (-not $barrierId) {
+            throw 'stop_barrier_missing'
+        }
+        $expectedFile = Join-Path (Join-Path $DataRoot 'logs') `
+            'provisioner-expected.json'
+        if (-not (Test-Path -LiteralPath $expectedFile -PathType Leaf)) {
+            throw 'stop_identity_config_missing'
+        }
+        $configSha256 = Get-EaselFileSha256 -Path $expectedFile
+        $image = Invoke-EaselDocker -Arguments @(
+            'inspect', '--format', '{{.Image}}', $controlId)
+        $controlImage = (($image.Output -join '').Trim())
+        if ($image.ExitCode -ne 0 -or
+            $controlImage -notmatch '^sha256:[0-9a-f]{64}$') {
+            throw 'control_image_unavailable'
         }
     }
     elseif (-not $Force -and $socketCheck.ExitCode -eq 0) {
@@ -103,6 +124,22 @@ try {
     }
     $kill = Invoke-Wsl -Arguments @(
         '-d', $Distro, '--', 'pkill', '-f', $socket)
+    if (-not $Force) {
+        # control 已停止后才写完成记录；down 失败不会留下可重开承诺。
+        $complete = Invoke-EaselDocker -Arguments @(
+            'run', '--rm', '--network', 'none', '--user', '10001:10001',
+            '--entrypoint', 'python',
+            '--mount', "type=volume,src=$($volumes.Control),dst=/srv/easel/control",
+            $controlImage, '-m', 'easel', 'admin', 'stop-complete',
+            '--control-dir', '/srv/easel/control',
+            '--barrier-id', $barrierId,
+            '--project', $ProjectName,
+            '--config-sha256', $configSha256)
+        if ($complete.ExitCode -ne 0) {
+            throw 'stop_completion_failed'
+        }
+        Write-Output "stop_completed=$barrierId"
+    }
     Write-Output ("stopped project={0} drained={1} network={2}" -f `
         $ProjectName, $workerDrained, $network)
     exit 0

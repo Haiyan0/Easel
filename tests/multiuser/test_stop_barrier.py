@@ -12,6 +12,8 @@ from easel.control.runtime import RuntimeManager, RuntimeUnavailable
 from easel.control.store import Store
 from easel.control.types import DomainError, WorkerHandle
 
+PROJECT = "easel-workspace-desktop"
+
 
 class StopProvisioner:
     def __init__(self) -> None:
@@ -138,6 +140,100 @@ def test_drain_all_does_not_report_success_while_stopping(tmp_path):
             assert current is not None and current.state == "stopping"
 
     _run(scenario())
+
+
+def test_completed_stop_reopens_twice_with_exact_fence(tmp_path):
+    with Store.open(tmp_path / "db") as store:
+        first = store.set_admission_barrier("stop-1", "desktop-stop", 1000)
+        assert first["id"] == "stop-1"
+        assert store.complete_stop(
+            "stop-1", PROJECT, "a" * 64, 1001)["barrierId"] == "stop-1"
+        assert store.reopen_after_completed_stop(
+            "stop-1", PROJECT, "a" * 64, 1002) is True
+        assert store.admission_barrier() is None
+
+        store.set_admission_barrier("stop-2", "desktop-stop", 2000)
+        store.complete_stop("stop-2", PROJECT, "a" * 64, 2001)
+        assert store.reopen_after_completed_stop(
+            "stop-2", PROJECT, "a" * 64, 2002) is True
+        assert store.admission_barrier() is None
+
+
+def test_failed_stop_barrier_and_stale_completion_cannot_reopen(tmp_path):
+    with Store.open(tmp_path / "db") as store:
+        store.set_admission_barrier("stop-1", "desktop-stop", 1000)
+        assert store.reopen_after_completed_stop(
+            "stop-1", PROJECT, "a" * 64, 1001) is False
+        assert store.admission_barrier()["id"] == "stop-1"
+        store.complete_stop("stop-1", PROJECT, "a" * 64, 1002)
+        assert store.reopen_after_completed_stop(
+            "stop-1", PROJECT, "b" * 64, 1003) is False
+        assert store.reopen_after_completed_stop(
+            "stop-1", "other-project", "a" * 64, 1003) is False
+        assert store.reopen_after_completed_stop(
+            "stop-0", PROJECT, "a" * 64, 1003) is False
+        assert store.admission_barrier()["id"] == "stop-1"
+
+        # 新 Stop 建立新屏障后，旧完成记录不能清除新屏障。
+        assert store.clear_admission_barrier("stop-1") is True
+        store.set_admission_barrier("stop-2", "desktop-stop", 2000)
+        assert store.reopen_after_completed_stop(
+            "stop-1", PROJECT, "a" * 64, 2001) is False
+        assert store.admission_barrier()["id"] == "stop-2"
+
+
+def test_complete_stop_refuses_when_active_work_remains(tmp_path):
+    with Store.open(tmp_path / "db") as store:
+        user = store.create_user("A")
+        conversation = store.create_conversation(user, "stop")
+        run = store.reserve_run(
+            user, conversation.id, "turn", "digest", 0)
+        store.set_admission_barrier("stop-1", "desktop-stop", 1000)
+        with pytest.raises(DomainError) as rejected:
+            store.complete_stop("stop-1", PROJECT, "a" * 64, 1001)
+        assert rejected.value.code == "worker_drain_incomplete"
+        assert store.admission_barrier()["id"] == "stop-1"
+        assert store.get_run(user, run.id).status == "reserved"
+
+
+def test_admin_stop_complete_and_reopen_cli_fence(tmp_path, capsys):
+    control = tmp_path / "control"
+    control.mkdir()
+    with Store.open(control / "control.sqlite3") as store:
+        store.set_admission_barrier("stop-1", "desktop-stop", 1000)
+    complete = SimpleNamespace(
+        control_dir=str(control), barrier_id="stop-1", project=PROJECT,
+        config_sha256="a" * 64)
+    assert cli.cmd_admin_stop_complete(complete) == 0
+    assert "stop_completed=stop-1" in capsys.readouterr().out
+    with Store.open(control / "control.sqlite3") as store:
+        assert store.admission_barrier()["id"] == "stop-1"
+
+    reopen = SimpleNamespace(
+        control_dir=str(control), barrier_id="stop-1", project=PROJECT,
+        config_sha256="a" * 64)
+    assert cli.cmd_admin_reopen(reopen) == 0
+    assert "reopened=stop-1" in capsys.readouterr().out
+
+    failed = SimpleNamespace(
+        control_dir=str(control), barrier_id="stop-1", project=PROJECT,
+        config_sha256="a" * 64)
+    assert cli.cmd_admin_reopen(failed) == 0
+    assert "barrier=none" in capsys.readouterr().out
+
+
+def test_admin_reopen_refuses_failure_barrier(tmp_path, capsys):
+    control = tmp_path / "control"
+    control.mkdir()
+    with Store.open(control / "control.sqlite3") as store:
+        store.set_admission_barrier("stop-1", "desktop-stop", 1000)
+    reopen = SimpleNamespace(
+        control_dir=str(control), barrier_id="stop-1", project=PROJECT,
+        config_sha256="a" * 64)
+    assert cli.cmd_admin_reopen(reopen) == 1
+    assert "admission_barrier_not_reopenable" in capsys.readouterr().err
+    with Store.open(control / "control.sqlite3") as store:
+        assert store.admission_barrier()["id"] == "stop-1"
 
 
 def test_corrupt_barrier_fails_closed(tmp_path):

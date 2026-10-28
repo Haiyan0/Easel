@@ -25,7 +25,8 @@ from easel.commands.skill import cmd_skill
 from easel.control.cli import (cmd_admin_backup, cmd_admin_barrier_status,
                                cmd_admin_bootstrap, cmd_admin_drain,
                                cmd_admin_invite, cmd_admin_migrate_local,
-                               cmd_admin_restore, cmd_admin_resume,
+                               cmd_admin_reopen, cmd_admin_restore,
+                               cmd_admin_resume, cmd_admin_stop_complete,
                                cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
@@ -327,6 +328,20 @@ def main(argv: list[str] | None = None) -> int:
     p_resume.add_argument("--barrier-id", default=None,
                           help="只清除指定屏障，避免误放行")
     p_resume.set_defaults(func=cmd_admin_resume)
+    p_stop_complete = admin_sub.add_parser(
+        "stop-complete", help="记录一次成功 Stop 的完成 fencing")
+    p_stop_complete.add_argument("--control-dir", required=True)
+    p_stop_complete.add_argument("--barrier-id", required=True)
+    p_stop_complete.add_argument("--project", required=True)
+    p_stop_complete.add_argument("--config-sha256", required=True)
+    p_stop_complete.set_defaults(func=cmd_admin_stop_complete)
+    p_reopen = admin_sub.add_parser(
+        "reopen", help="仅按匹配的成功 Stop 记录恢复接纳")
+    p_reopen.add_argument("--control-dir", required=True)
+    p_reopen.add_argument("--barrier-id", required=True)
+    p_reopen.add_argument("--project", required=True)
+    p_reopen.add_argument("--config-sha256", required=True)
+    p_reopen.set_defaults(func=cmd_admin_reopen)
     p_barrier = admin_sub.add_parser(
         "barrier-status", help="只读打印当前停止接纳屏障")
     p_barrier.add_argument("--control-dir", required=True)

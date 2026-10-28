@@ -14,6 +14,7 @@ INITIALIZE = DEPLOY / "Initialize-WorkspaceEasel.ps1"
 START = DEPLOY / "Start-WorkspaceEasel.ps1"
 STOP = DEPLOY / "Stop-WorkspaceEasel.ps1"
 STATUS = DEPLOY / "Status-WorkspaceEasel.ps1"
+COMMON = DEPLOY / "EaselDesktop.Common.ps1"
 KEYGEN = DEPLOY / "keygen.py"
 
 
@@ -99,20 +100,25 @@ def test_initialize_binds_key_creation_and_private_network():
 
 
 def test_start_diagnoses_missing_dependencies_before_starting():
-    text = START.read_text(encoding="utf-8")
+    text = (START.read_text(encoding="utf-8") +
+            COMMON.read_text(encoding="utf-8"))
     for marker in (
             "worker-public.key", "public_file_missing",
             "managed_config_missing", "workspace_keys_invalid",
             "frontend_build_missing", "wsl_python_dependencies_missing",
             "provisioner_start_timeout", "compose_config_invalid",
             "control_health_timeout", "Assert-EaselNetworkContract",
-            "Assert-EaselVolumeContract"):
+            "Assert-EaselVolumeContract", "public_copy_mismatch",
+            "docker_engine_mismatch", "provisioner_gid_mismatch"):
         assert marker.lower() in text.lower()
     for marker in (
             "provisioner-expected.json", "Invoke-ProvisionerIdentityCheck",
             "provisioner_identity_unavailable",
             "provisioner_config_mismatch",
-            "provisioner_identity_mismatch", "admission_barrier_active"):
+            "provisioner_identity_mismatch", "admission_barrier_active",
+            "public_copy_mismatch", "docker_engine_mismatch",
+            "Get-EaselKeyFingerprints", "Get-EaselEngineIdentity",
+            "admin", "reopen"):
         assert marker in text
     _assert_no_authtoken_read(text)
 
@@ -123,6 +129,9 @@ def test_stop_drains_before_stopping_and_status_fails_closed():
     assert "--barrier" in stop
     assert "admission_barrier" in stop
     assert "drain_verified" in stop
+    assert "stop_completed" in stop
+    assert "stop-complete" in stop
+    assert "DataRoot" in stop
     assert "worker_drain_failed" in stop
     assert "'down'" in stop
     assert "provisioner_socket_missing" in stop
@@ -135,6 +144,47 @@ def test_stop_drains_before_stopping_and_status_fails_closed():
             "admission_barrier"):
         assert marker in status
     _assert_no_authtoken_read(status)
+
+
+def test_keygen_fingerprints_are_derived_from_the_real_private_key(
+        tmp_path):
+    import hashlib
+
+    def make(directory: Path):
+        directory.mkdir()
+        command = [
+            sys.executable, str(KEYGEN), "--ensure",
+            "--path", str(directory / "master.key"),
+            "--signing-key", str(directory / "snapshot.pem"),
+            "--worker-public", str(directory / "worker-public.key"),
+            "--gateway-public", str(directory / "gateway-public.pem"),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True,
+                                check=False)
+        assert result.returncode == 0, result.stderr
+        check = subprocess.run(
+            command[:2] + ["--check"] + command[3:] + ["--fingerprints"],
+            capture_output=True, text=True, check=False)
+        assert check.returncode == 0, check.stderr
+        assert "PRIVATE KEY" not in check.stdout
+        assert check.stdout.count("_sha256=") == 2
+        values = {}
+        for line in check.stdout.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.endswith("_sha256"):
+                values[name] = value
+        workers = (directory / "worker-public.key").read_bytes()
+        gateway = (directory / "gateway-public.pem").read_bytes()
+        assert values["worker_public_sha256"] == hashlib.sha256(
+            workers).hexdigest()
+        assert values["gateway_public_sha256"] == hashlib.sha256(
+            gateway).hexdigest()
+        return values
+
+    first = make(tmp_path / "first")
+    second = make(tmp_path / "second")
+    assert first["worker_public_sha256"] != second["worker_public_sha256"]
+    assert first["gateway_public_sha256"] != second["gateway_public_sha256"]
 
 
 def test_keygen_cli_creates_master_and_signing_keys(tmp_path):

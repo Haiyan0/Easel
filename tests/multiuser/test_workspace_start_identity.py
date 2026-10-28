@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,17 +25,35 @@ pytestmark = pytest.mark.skipif(
     reason="需要 Windows PowerShell")
 
 
-def _wrapper(tmp_path: Path, identity_exit: int) -> Path:
+def _wrapper(tmp_path: Path, identity_exit: int, *,
+             keygen_mismatch: bool = False,
+             engine_mismatch: bool = False,
+             engine_failure: bool = False,
+             barrier: str = "none",
+             reopen_exit: int = 0) -> Path:
     data = tmp_path / "data"
     workspace = tmp_path / "workspaces"
     public = data / "public"
     public.mkdir(parents=True)
     workspace.mkdir()
-    for name, content in (
-            ("worker-public.key", "worker"),
-            ("gateway-public.pem", "gateway"),
-            ("egress-policy.json", "{}")):
+    contents = {
+        "worker-public.key": "worker",
+        "gateway-public.pem": "gateway",
+        "egress-policy.json": "{}",
+    }
+    for name, content in contents.items():
         (public / name).write_text(content, encoding="utf-8")
+    worker_hash = hashlib.sha256(
+        contents["worker-public.key"].encode()).hexdigest()
+    gateway_hash = hashlib.sha256(
+        contents["gateway-public.pem"].encode()).hexdigest()
+    policy_hash = hashlib.sha256(
+        contents["egress-policy.json"].encode()).hexdigest()
+    trusted_worker = "0" * 64 if keygen_mismatch else worker_hash
+    trusted_gateway = "0" * 64 if keygen_mismatch else gateway_hash
+    trusted_policy = "0" * 64 if keygen_mismatch else policy_hash
+    windows_engine = "bad" if engine_failure else "engine-test"
+    wsl_engine = "other-engine" if engine_mismatch else "engine-test"
     log = tmp_path / "calls.log"
     wrapper = tmp_path / "run-start.ps1"
     wrapper.write_text(
@@ -42,6 +61,14 @@ def _wrapper(tmp_path: Path, identity_exit: int) -> Path:
 $env:STUB_LOG = '{log}'
 $env:STUB_PROJECT = '{PROJECT}'
 $env:STUB_IDENTITY_EXIT = '{identity_exit}'
+$env:STUB_TRUSTED_WORKER = '{trusted_worker}'
+$env:STUB_TRUSTED_GATEWAY = '{trusted_gateway}'
+$env:STUB_TRUSTED_POLICY = '{trusted_policy}'
+$env:STUB_WINDOWS_ENGINE = '{windows_engine}'
+$env:STUB_WSL_ENGINE = '{wsl_engine}'
+$env:STUB_CONTEXT = 'desktop-linux'
+$env:STUB_BARRIER = '{barrier}'
+$env:STUB_REOPEN_EXIT = '{reopen_exit}'
 function Add-StubCall([string]$text) {{
     Add-Content -LiteralPath $env:STUB_LOG -Value $text
 }}
@@ -50,6 +77,28 @@ function global:docker {{
     $items = @($args)
     Add-StubCall ('docker ' + ($items -join ' '))
     $global:LASTEXITCODE = 0
+    $joined = $items -join ' '
+    if ($joined -match 'keygen\\.py' -and $joined -match 'fingerprints') {{
+        Write-Output 'key=exists'
+        Write-Output 'signing_key=exists'
+        Write-Output ('worker_public_sha256=' + $env:STUB_TRUSTED_WORKER)
+        Write-Output ('gateway_public_sha256=' + $env:STUB_TRUSTED_GATEWAY)
+        return
+    }}
+    if ($joined -match 'sha256sum') {{
+        Write-Output ($env:STUB_TRUSTED_POLICY + '  /keys/egress-policy.json')
+        Write-Output ($env:STUB_TRUSTED_POLICY + '  /policy/egress-policy.json')
+        return
+    }}
+    if ($items.Count -ge 2 -and $items[0] -eq 'info' -and
+        $items[1] -eq '--format') {{
+        Write-Output $env:STUB_WINDOWS_ENGINE
+        return
+    }}
+    if ($items.Count -ge 1 -and $items[0] -eq 'context') {{
+        Write-Output $env:STUB_CONTEXT
+        return
+    }}
     if ($items.Count -ge 2 -and $items[0] -eq 'image' -and
         $items[1] -eq 'inspect') {{
         Write-Output $items[$items.Count - 1]
@@ -86,7 +135,15 @@ function global:docker {{
     }}
     if ($items.Count -ge 3 -and $items[0] -eq 'exec' -and
         ($items -join ' ') -match 'barrier-status') {{
-        Write-Output 'barrier=none'
+        Write-Output ('barrier=' + $env:STUB_BARRIER)
+        return
+    }}
+    if ($items.Count -ge 3 -and $items[0] -eq 'exec' -and
+        ($items -join ' ') -match ' admin reopen ') {{
+        $global:LASTEXITCODE = [int]$env:STUB_REOPEN_EXIT
+        if ($global:LASTEXITCODE -eq 0) {{
+            Write-Output 'reopened=stop-test'
+        }}
         return
     }}
     return
@@ -104,6 +161,22 @@ function global:wsl.exe {{
         }}
         return
     }}
+    if ($text -match 'docker info --format') {{
+        Write-Output $env:STUB_WSL_ENGINE
+        return
+    }}
+    if ($text -match 'docker context show') {{
+        Write-Output $env:STUB_CONTEXT
+        return
+    }}
+    if ($text -match ' id -u') {{
+        Write-Output '1000'
+        return
+    }}
+    if ($text -match ' id -g') {{
+        Write-Output '1000'
+        return
+    }}
     return
 }}
 & '{START}' -PublicOrigin 'https://easel.test' -Image '{CONTROL}' `
@@ -116,8 +189,16 @@ exit $LASTEXITCODE
     return wrapper
 
 
-def _run(tmp_path: Path, identity_exit: int) -> tuple[subprocess.CompletedProcess, str]:
-    wrapper = _wrapper(tmp_path, identity_exit)
+def _run(tmp_path: Path, identity_exit: int, *,
+         keygen_mismatch: bool = False,
+         engine_mismatch: bool = False,
+         engine_failure: bool = False,
+         barrier: str = "none",
+         reopen_exit: int = 0) -> tuple[subprocess.CompletedProcess, str]:
+    wrapper = _wrapper(
+        tmp_path, identity_exit, keygen_mismatch=keygen_mismatch,
+        engine_mismatch=engine_mismatch, engine_failure=engine_failure,
+        barrier=barrier, reopen_exit=reopen_exit)
     log = tmp_path / "calls.log"
     result = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -151,6 +232,45 @@ def test_start_rejects_wrong_service_without_removing_socket(tmp_path):
     assert "provisioner_identity_unavailable" in result.stderr
     assert "provisioner_identity.py" in calls
     assert "rm -f" not in calls
+
+
+def test_start_rejects_host_public_copy_not_derived_from_control_key(tmp_path):
+    result, calls = _run(tmp_path, 0, keygen_mismatch=True)
+    assert result.returncode != 0
+    assert "public_copy_mismatch:worker" in result.stderr
+    assert "docker compose" not in calls
+
+
+def test_start_rejects_windows_wsl_engine_drift(tmp_path):
+    result, calls = _run(tmp_path, 0, engine_mismatch=True)
+    assert result.returncode != 0
+    assert "docker_engine_mismatch" in result.stderr
+    assert "provisioner_identity.py" not in calls
+    assert "docker compose" not in calls
+
+
+def test_start_rejects_uncollectable_engine_identity(tmp_path):
+    result, calls = _run(tmp_path, 0, engine_failure=True)
+    assert result.returncode != 0
+    assert "docker_engine_unavailable" in result.stderr
+    assert "provisioner_identity.py" not in calls
+    assert "docker compose" not in calls
+
+
+def test_start_reopens_only_completed_stop_barrier(tmp_path):
+    result, calls = _run(
+        tmp_path, 0, barrier="stop-completed", reopen_exit=0)
+    assert result.returncode == 0, result.stderr
+    assert "admin reopen" in calls
+    assert "admission_barrier_reopened=stop-completed" in result.stdout
+
+
+def test_start_keeps_failure_barrier_closed(tmp_path):
+    result, calls = _run(
+        tmp_path, 0, barrier="stop-failed", reopen_exit=1)
+    assert result.returncode != 0
+    assert "admission_barrier_active" in result.stderr
+    assert "admin reopen" in calls
 
 
 def test_status_missing_resources_exits_nonzero(tmp_path):

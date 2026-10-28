@@ -11,6 +11,7 @@ gateway 只得到派生公钥。公钥缺失时可从现有私钥重建，但绝
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import secrets
 import sys
@@ -180,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="worker 只读公钥（32 字节 raw）")
     parser.add_argument("--gateway-public", default=None,
                         help="gateway 只读公钥（PEM）")
+    parser.add_argument("--fingerprints", action="store_true",
+                        help="从私钥派生公钥并只输出 SHA-256，不输出 key 内容")
     args = parser.parse_args(argv)
     signing = (args.signing_key, args.worker_public, args.gateway_public)
     signing_count = sum(value is not None for value in signing)
@@ -188,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     if args.path is None and signing_count == 0:
         print("错误：key_path_missing", file=sys.stderr)
+        return 4
+    if args.fingerprints and signing_count != 3:
+        print("错误：signing_key_incomplete", file=sys.stderr)
         return 4
     try:
         if args.ensure:
@@ -204,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
             if signing_count:
                 status = check_signing_key(*signing)
                 print(f"signing_key={status}")
+        if args.fingerprints:
+            key = _load_private(Path(args.signing_key))
+            raw, pem = _public_bytes(key)
+            print(f"worker_public_sha256={hashlib.sha256(raw).hexdigest()}")
+            print(f"gateway_public_sha256={hashlib.sha256(pem).hexdigest()}")
     except (OSError, ValueError) as error:
         print(f"错误：{error}", file=sys.stderr)
         # 3/4 是稳定的诊断码；调用脚本不必依赖 stderr 文本或解析 key 内容。

@@ -269,6 +269,119 @@ function ConvertTo-EaselWslPath {
     return "/mnt/$drive/$rest"
 }
 
+function Get-EaselFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    # 不依赖 Get-FileHash 的模块自动加载；受限/子 PowerShell 也能稳定使用。
+    $stream = [IO.File]::Open(
+        $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $algorithm.ComputeHash($stream)
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-EaselKeyFingerprints {
+    param(
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string]$KeyVolume
+    )
+    # keygen 从 key 卷内真实私钥派生公钥；输出的摘要才是可信基准。
+    $result = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--user', '10001:10001', '--entrypoint', 'python',
+        '--mount', "type=volume,src=$KeyVolume,dst=/keys,readonly",
+        $Image, '/opt/easel/deploy/desktop/keygen.py', '--check',
+        '--path', '/keys/master.key',
+        '--signing-key', '/keys/snapshot.pem',
+        '--worker-public', '/keys/worker-public.key',
+        '--gateway-public', '/keys/gateway-public.pem',
+        '--fingerprints')
+    if ($result.ExitCode -ne 0) {
+        throw 'workspace_keys_invalid'
+    }
+    $values = @{}
+    foreach ($line in $result.Output) {
+        if ("$line" -match '^(worker_public_sha256|gateway_public_sha256)=([0-9a-f]{64})$') {
+            $values[$Matches[1]] = $Matches[2]
+        }
+    }
+    if (-not $values.ContainsKey('worker_public_sha256') -or
+        -not $values.ContainsKey('gateway_public_sha256')) {
+        throw 'workspace_key_fingerprints_missing'
+    }
+    return [pscustomobject]@{
+        Worker = $values['worker_public_sha256']
+        Gateway = $values['gateway_public_sha256']
+    }
+}
+
+function Get-EaselPolicyDigests {
+    param(
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string]$KeyVolume,
+        [Parameter(Mandatory)][string]$EgressVolume
+    )
+    $result = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--user', '10001:10001', '--entrypoint', 'sha256sum',
+        '--mount', "type=volume,src=$KeyVolume,dst=/keys,readonly",
+        '--mount', "type=volume,src=$EgressVolume,dst=/policy,readonly",
+        $Image, '/keys/egress-policy.json', '/policy/egress-policy.json')
+    if ($result.ExitCode -ne 0) {
+        throw 'policy_copy_missing'
+    }
+    $digests = @{}
+    foreach ($line in $result.Output) {
+        if ("$line" -match '^([0-9a-f]{64})\s+(/keys/egress-policy\.json|/policy/egress-policy\.json)$') {
+            $digests[$Matches[2]] = $Matches[1]
+        }
+    }
+    if (-not $digests.ContainsKey('/keys/egress-policy.json') -or
+        -not $digests.ContainsKey('/policy/egress-policy.json')) {
+        throw 'policy_copy_missing'
+    }
+    return [pscustomobject]@{
+        Keys = $digests['/keys/egress-policy.json']
+        Egress = $digests['/policy/egress-policy.json']
+    }
+}
+
+function Assert-EaselPublicCopies {
+    param(
+        [Parameter(Mandatory)]$Fingerprints,
+        [Parameter(Mandatory)]$Policy,
+        [Parameter(Mandatory)][string]$PublicDir
+    )
+    $worker = Get-EaselFileSha256 -Path (
+        Join-Path $PublicDir 'worker-public.key')
+    $gateway = Get-EaselFileSha256 -Path (
+        Join-Path $PublicDir 'gateway-public.pem')
+    $policyHash = Get-EaselFileSha256 -Path (
+        Join-Path $PublicDir 'egress-policy.json')
+    if ($worker -ne $Fingerprints.Worker) {
+        throw 'public_copy_mismatch:worker'
+    }
+    if ($gateway -ne $Fingerprints.Gateway) {
+        throw 'public_copy_mismatch:gateway'
+    }
+    if ($Policy.Keys -ne $Policy.Egress -or $policyHash -ne $Policy.Keys) {
+        throw 'policy_copy_mismatch'
+    }
+    return [pscustomobject]@{
+        Worker = $Fingerprints.Worker
+        Gateway = $Fingerprints.Gateway
+        Policy = $Policy.Keys
+    }
+}
+
 function Get-EaselWorkspaceComposePath {
     return (Join-Path $PSScriptRoot 'compose.workspace.yaml')
 }

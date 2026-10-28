@@ -146,6 +146,9 @@ def test_identity_compare_rejects_image_root_network_and_key_drift():
         "workerPublicSha256": worker,
         "gatewayPublicSha256": gateway,
         "policySha256": policy,
+        "engineContext": "desktop-linux",
+        "engineId": "engine-123",
+        "socketUid": 1000,
         "socketGid": 1000,
         "socketMode": "660",
         "allowedUid": 10001,
@@ -172,9 +175,11 @@ def test_identity_compare_rejects_image_root_network_and_key_drift():
     drifted["workspaceRoot"] = "/other"
     drifted["networks"]["sidecar"] = "other-net"
     drifted["keys"]["workerPublicSha256"] = "0" * 64
+    drifted["engine"] = {"context": "other-context", "id": "other-engine"}
+    drifted["socket"]["uid"] = 9999
     assert set(client.compare_identity(expected, drifted)) >= {
         "gatewayImage", "workspaceRoot", "sidecarNetwork",
-        "workerPublicSha256"}
+        "workerPublicSha256", "engineContext", "engineId", "socketUid"}
 
     missing_engine = json.loads(json.dumps(actual))
     missing_engine["engine"] = {}

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -617,6 +618,7 @@ class Store:
     # ------------------------------------------------------------------
 
     _ADMISSION_BARRIER_KEY = "admission_barrier"
+    _STOP_COMPLETION_KEY = "stop_completion"
 
     def _admission_barrier_locked(self) -> dict | None:
         row = self._connection.execute(
@@ -675,6 +677,99 @@ class Store:
             self._connection.execute(
                 "DELETE FROM control_state WHERE key = ?",
                 (self._ADMISSION_BARRIER_KEY,))
+            return True
+
+    def _stop_completion_locked(self) -> dict | None:
+        row = self._connection.execute(
+            "SELECT value FROM control_state WHERE key = ?",
+            (self._STOP_COMPLETION_KEY,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError):
+            raise DomainError("stop_completion_corrupt", 500) from None
+        if not isinstance(value, dict):
+            raise DomainError("stop_completion_corrupt", 500)
+        return value
+
+    def stop_completion(self) -> dict | None:
+        """读取成功 Stop 的完成记录；失败/取消 Stop 没有该记录。"""
+        with self._read_transaction():
+            return self._stop_completion_locked()
+
+    @staticmethod
+    def _stop_fence(barrier_id: str, project: str,
+                    config_sha256: str) -> tuple[str, str, str]:
+        if (not isinstance(barrier_id, str) or not barrier_id
+                or len(barrier_id) > 128):
+            raise DomainError("invalid_argument", 400)
+        if (not isinstance(project, str) or not project or len(project) > 128):
+            raise DomainError("invalid_argument", 400)
+        if (not isinstance(config_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None):
+            raise DomainError("invalid_argument", 400)
+        return barrier_id, project, config_sha256
+
+    def complete_stop(self, barrier_id: str, project: str,
+                      config_sha256: str, now: int) -> dict:
+        """成功停止后写入带 barrier/项目/配置 fencing 的完成记录。
+
+        不在此处清除屏障：Start 必须复核当前屏障、完成记录、配置摘要与
+        持久终态全部匹配后才允许原子重开。
+        """
+        barrier_id, project, config_sha256 = self._stop_fence(
+            barrier_id, project, config_sha256)
+        stamp = int(now)
+        with self._transaction():
+            barrier = self._admission_barrier_locked()
+            if barrier is None or barrier.get("id") != barrier_id:
+                raise DomainError("admission_barrier_mismatch", 409)
+            status = self.drain_status(stamp)
+            if not status["settled"]:
+                raise DomainError("worker_drain_incomplete", 409)
+            value = {
+                "barrierId": barrier_id,
+                "project": project,
+                "configSha256": config_sha256,
+                "completedAt": stamp,
+            }
+            self._connection.execute(
+                "INSERT OR REPLACE INTO control_state"
+                " (key, value, updated_at) VALUES (?, ?, ?)",
+                (self._STOP_COMPLETION_KEY,
+                 json.dumps(value, sort_keys=True, separators=(",", ":")),
+                 stamp))
+            return value
+
+    def reopen_after_completed_stop(self, barrier_id: str, project: str,
+                                    config_sha256: str, now: int) -> bool:
+        """仅清除与成功完成记录、项目和配置摘要完全匹配的屏障。"""
+        barrier_id, project, config_sha256 = self._stop_fence(
+            barrier_id, project, config_sha256)
+        stamp = int(now)
+        with self._transaction():
+            barrier = self._admission_barrier_locked()
+            if barrier is None or barrier.get("id") != barrier_id:
+                return False
+            completion = self._stop_completion_locked()
+            if (completion is None
+                    or completion.get("barrierId") != barrier_id
+                    or completion.get("project") != project
+                    or completion.get("configSha256") != config_sha256):
+                return False
+            if not self.drain_status(stamp)["settled"]:
+                return False
+            self._connection.execute(
+                "DELETE FROM control_state WHERE key = ?",
+                (self._ADMISSION_BARRIER_KEY,))
+            completion = dict(completion)
+            completion["reopenedAt"] = stamp
+            self._connection.execute(
+                "UPDATE control_state SET value = ?, updated_at = ?"
+                " WHERE key = ?",
+                (json.dumps(completion, sort_keys=True, separators=(",", ":")),
+                 stamp, self._STOP_COMPLETION_KEY))
             return True
 
     def drain_status(self, now: int) -> dict:

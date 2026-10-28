@@ -1,0 +1,75 @@
+{
+  "date": "2026-10-28",
+  "baseline_commit": "f5451df4a1f752605ed17fcb2f7434258ddb3011",
+  "scope": [
+    "A4-R2-01",
+    "A4-R2-02",
+    "A4-R2-03"
+  ],
+  "fixes": {
+    "A4-R2-01": "keygen --fingerprints derives trusted worker/gateway public digests from the control private key; host copies and key/egress/public policy copies must match",
+    "A4-R2-02": "Start/Status collect Windows and WSL Engine ID/context and socket UID/GID/mode; compare_identity requires exact engine/socket expectations; collection failure closes",
+    "A4-R2-03": "successful Stop writes fenced stop_completion; Start atomically reopens only on exact barrier/project/config/state match; failure/cancel barriers stay closed"
+  },
+  "tests": {
+    "r2_targeted": "118 passed in 43.36s",
+    "multiuser_and_desktop_static": "1361 passed, 10 skipped, 2 warnings in 180.74s",
+    "g1_gateway": "120 passed, 2 warnings in 2.20s",
+    "real_chain": "1 passed in 88.44s",
+    "real_material_isolation": "1 passed in 8.84s",
+    "powershell_start_identity": "9 passed (keygen drift, engine mismatch/failure, barrier reopen/refuse, wrong service)",
+    "desktop_two_rounds": "Stop1 stop_completed=stop-0de83fdfa18e43d2ae1282108ff859c4; Start2 reopened same; Stop2 stop_completed=stop-d07f50f4f84f43348db4030fad9a392b",
+    "real_key_drift": "Start returned public_copy_mismatch:worker for key volume A + host public B; valid A restart succeeded",
+    "full_pytest": "2690 passed, 60 failed, 87 skipped (failures in untouched setup/bash encoding and Starlette TestClient/httpx2 environment)"
+  },
+  "fixed_images": {
+    "control": "sha256:1d9c559e97f172381da28dbbec4e1afeb008405cddbea972c0f2baecff7deb16",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc61f4f24"
+  },
+  "real_evidence": {
+    "engine": "4c5b9122-bd30-42bd-af1e-019c5053a914",
+    "wsl_context": "default",
+    "wsl_uid_gid": [
+      1000,
+      1000
+    ],
+    "workspaces": [
+      {
+        "workspace": "8f3d65578e6f4494b2e4c7a9f72ef60d",
+        "worker": "8ef8a08a3a513662b5315bb7ab2d2a1cb87d48ec698f458efeaba3291e34ee4d",
+        "gateway": "f6d614f14ea38024bdd1076ba3b74d8b44e4c735ca16f8b532ff260e5b961c56"
+      },
+      {
+        "workspace": "1bd0b34547c8486fb5d015d27c9ec015",
+        "worker": "ea339d130546dbc3aa23596937d9ae323681741f7c641e32dd55c21bdb9a5eb7",
+        "gateway": "a816b8f1f0f986e6d12115c7dfc148b79e2c4cc3e71b37c68c953fae260ab7c3"
+      }
+    ],
+    "provider_requests": 2,
+    "provider_model": "deepseek-chat",
+    "provider_sentinel_header_ok": true,
+    "cross_workspace_status": 404,
+    "wrong_channel_status": 404,
+    "gateway_restart_same_worker": true,
+    "gateway_replacement": {
+      "old": "f6d614f14ea38024bdd1076ba3b74d8b44e4c735ca16f8b532ff260e5b961c56",
+      "new": "fe2b1f0ccb7a97d63370c4893295aa7d04da7dac135366dc3e164eb5326790a7",
+      "same_worker": true,
+      "tokens": 1
+    },
+    "broker_tokens_before_after": [
+      1,
+      1
+    ],
+    "no_published_gateway_worker_ports": true
+  },
+  "cleanup": "no A4/R2/smoke containers, networks, volumes or provisioner processes remain; fixed images retained",
+  "not_run": [
+    "second real Docker daemon Engine drift (no global context changes)",
+    "ngrok public browser entry",
+    "real DeepSeek Harness",
+    "real provider billing",
+    "full two-user browser closure (A6)"
+  ]
+}

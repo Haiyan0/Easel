@@ -38,6 +38,54 @@ function Invoke-Wsl {
     }
 }
 
+function Get-EaselEngineIdentity {
+    $windows = Invoke-EaselDocker -Arguments @(
+        'info', '--format', '{{.ID}}')
+    $windowsId = (($windows.Output -join '').Trim())
+    if ($windows.ExitCode -ne 0 -or
+        $windowsId -notmatch '^[0-9A-Za-z:._-]{8,128}$') {
+        throw 'docker_engine_unavailable'
+    }
+    $wsl = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'info', '--format', '{{.ID}}')
+    $wslId = (($wsl.Output -join '').Trim())
+    if ($wsl.ExitCode -ne 0 -or
+        $wslId -notmatch '^[0-9A-Za-z:._-]{8,128}$') {
+        throw 'wsl_docker_engine_unavailable'
+    }
+    if ($windowsId -ne $wslId) {
+        throw "docker_engine_mismatch:$windowsId/$wslId"
+    }
+    $context = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'context', 'show')
+    $contextName = (($context.Output -join '').Trim())
+    if ($context.ExitCode -ne 0 -or -not $contextName) {
+        throw 'docker_context_unavailable'
+    }
+    return [pscustomobject]@{ Context = $contextName; Id = $wslId }
+}
+
+function Get-EaselSocketIdentity {
+    $uid = Invoke-Wsl -Arguments @('-d', $Distro, '--', 'id', '-u')
+    $gid = Invoke-Wsl -Arguments @('-d', $Distro, '--', 'id', '-g')
+    $uidText = (($uid.Output -join '').Trim())
+    $gidText = (($gid.Output -join '').Trim())
+    $uidValue = 0
+    $gidValue = 0
+    if ($uid.ExitCode -ne 0 -or
+        -not [int]::TryParse($uidText, [ref]$uidValue) -or $uidValue -lt 0) {
+        throw 'provisioner_socket_owner_unknown'
+    }
+    if ($gid.ExitCode -ne 0 -or
+        -not [int]::TryParse($gidText, [ref]$gidValue) -or $gidValue -lt 0) {
+        throw 'provisioner_socket_group_unknown'
+    }
+    if ($gidValue -ne $ProvisionerGid) {
+        throw "provisioner_gid_mismatch:$gidValue/$ProvisionerGid"
+    }
+    return [pscustomobject]@{ Uid = $uidValue; Gid = $gidValue }
+}
+
 function Invoke-ProvisionerIdentityCheck {
     param(
         [Parameter(Mandatory)][string]$SocketPath,
@@ -65,6 +113,7 @@ try {
     Assert-EaselDocker
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
     $network = Get-EaselWorkspaceNetworkName -ProjectName $ProjectName
+    $publicDir = Join-Path $DataRoot 'public'
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
 
     $networkState = 'missing'
@@ -200,21 +249,18 @@ try {
         }
 
         if ($controlImage) {
-            $keyCheck = Invoke-EaselDocker -Arguments @(
-                'run', '--rm', '--user', '10001:10001',
-                '--entrypoint', 'python',
-                '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
-                $controlImage,
-                '/opt/easel/deploy/desktop/keygen.py', '--check',
-                '--path', '/keys/master.key',
-                '--signing-key', '/keys/snapshot.pem',
-                '--worker-public', '/keys/worker-public.key',
-                '--gateway-public', '/keys/gateway-public.pem')
-            if ($keyCheck.ExitCode -ne 0) {
-                Add-Failure 'workspace_keys_invalid'
-            }
-            else {
+            try {
+                $fingerprints = Get-EaselKeyFingerprints -Image $controlImage `
+                    -KeyVolume $volumes.Keys
+                $policyDigests = Get-EaselPolicyDigests -Image $controlImage `
+                    -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress
+                $null = Assert-EaselPublicCopies `
+                    -Fingerprints $fingerprints -Policy $policyDigests `
+                    -PublicDir $publicDir
                 Write-Output 'workspace_keys=valid'
+            }
+            catch {
+                Add-Failure "workspace_keys_invalid:$($_.Exception.Message)"
             }
             $configCheck = Invoke-EaselDocker -Arguments @(
                 'run', '--rm', '--user', '10001:10001',
@@ -335,6 +381,17 @@ try {
         Write-Output 'provisioner_socket=present'
         $expectedFile = Join-Path (Join-Path $DataRoot 'logs') `
             'provisioner-expected.json'
+        $engineIdentity = $null
+        $socketIdentity = $null
+        try {
+            $engineIdentity = Get-EaselEngineIdentity
+            $socketIdentity = Get-EaselSocketIdentity
+            Write-Output ("provisioner_engine={0}/{1}" -f `
+                $engineIdentity.Context, $engineIdentity.Id)
+        }
+        catch {
+            Add-Failure "provisioner_engine_unverifiable:$($_.Exception.Message)"
+        }
         if (-not $controlImage) {
             Add-Failure 'provisioner_identity_image_unavailable'
         }
@@ -342,6 +399,30 @@ try {
             Add-Failure 'provisioner_expected_missing'
         }
         else {
+            try {
+                $expected = Get-Content -LiteralPath $expectedFile -Raw |
+                    ConvertFrom-Json
+            }
+            catch {
+                $expected = $null
+            }
+            if ($null -eq $expected -or
+                -not ($expected.PSObject.Properties.Name -contains 'engineId') -or
+                -not ($expected.PSObject.Properties.Name -contains 'engineContext') -or
+                -not ($expected.PSObject.Properties.Name -contains 'socketUid')) {
+                Add-Failure 'provisioner_expected_incomplete'
+            }
+            elseif ($null -ne $engineIdentity -and (
+                    [string]$expected.engineId -ne $engineIdentity.Id -or
+                    [string]$expected.engineContext -ne $engineIdentity.Context)) {
+                Add-Failure 'provisioner_engine_drift'
+            }
+            elseif ($null -ne $socketIdentity -and (
+                    [int]$expected.socketUid -ne $socketIdentity.Uid -or
+                    [int]$expected.socketGid -ne $socketIdentity.Gid -or
+                    [string]$expected.socketMode -ne '660')) {
+                Add-Failure 'provisioner_socket_identity_drift'
+            }
             $identity = Invoke-ProvisionerIdentityCheck -SocketPath $socket `
                 -ExpectedFile $expectedFile -Image $controlImage
             if ($identity.ExitCode -eq 0) {

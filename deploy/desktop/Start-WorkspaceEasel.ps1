@@ -99,6 +99,56 @@ except OSError:
         '-d', $Distro, '--', 'python3', '-c', $code, $SocketPath)).ExitCode -eq 0
 }
 
+function Get-EaselEngineIdentity {
+    # Windows CLI 与指定 WSL 必须指向同一个 daemon；context 别名可不同，
+    # Engine ID 必须完全一致，采集失败一律失败关闭。
+    $windows = Invoke-EaselDocker -Arguments @(
+        'info', '--format', '{{.ID}}')
+    $windowsId = (($windows.Output -join '').Trim())
+    if ($windows.ExitCode -ne 0 -or
+        $windowsId -notmatch '^[0-9A-Za-z:._-]{8,128}$') {
+        throw 'docker_engine_unavailable'
+    }
+    $wsl = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'info', '--format', '{{.ID}}')
+    $wslId = (($wsl.Output -join '').Trim())
+    if ($wsl.ExitCode -ne 0 -or
+        $wslId -notmatch '^[0-9A-Za-z:._-]{8,128}$') {
+        throw 'wsl_docker_engine_unavailable'
+    }
+    if ($windowsId -ne $wslId) {
+        throw "docker_engine_mismatch:$windowsId/$wslId"
+    }
+    $context = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'context', 'show')
+    $contextName = (($context.Output -join '').Trim())
+    if ($context.ExitCode -ne 0 -or -not $contextName) {
+        throw 'docker_context_unavailable'
+    }
+    return [pscustomobject]@{ Context = $contextName; Id = $wslId }
+}
+
+function Get-EaselSocketIdentity {
+    $uid = Invoke-Wsl -Arguments @('-d', $Distro, '--', 'id', '-u')
+    $gid = Invoke-Wsl -Arguments @('-d', $Distro, '--', 'id', '-g')
+    $uidText = (($uid.Output -join '').Trim())
+    $gidText = (($gid.Output -join '').Trim())
+    $uidValue = 0
+    $gidValue = 0
+    if ($uid.ExitCode -ne 0 -or
+        -not [int]::TryParse($uidText, [ref]$uidValue) -or $uidValue -lt 0) {
+        throw 'provisioner_socket_owner_unknown'
+    }
+    if ($gid.ExitCode -ne 0 -or
+        -not [int]::TryParse($gidText, [ref]$gidValue) -or $gidValue -lt 0) {
+        throw 'provisioner_socket_group_unknown'
+    }
+    if ($gidValue -ne $ProvisionerGid) {
+        throw "provisioner_gid_mismatch:$gidValue/$ProvisionerGid"
+    }
+    return [pscustomobject]@{ Uid = $uidValue; Gid = $gidValue }
+}
+
 function Invoke-ProvisionerIdentityCheck {
     param(
         [Parameter(Mandatory)][string]$SocketPath,
@@ -153,19 +203,14 @@ try {
         }
     }
 
-    $keyCheck = Invoke-EaselDocker -Arguments @(
-        'run', '--rm', '--user', '10001:10001',
-        '--entrypoint', 'python',
-        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
-        $Image,
-        '/opt/easel/deploy/desktop/keygen.py', '--check',
-        '--path', '/keys/master.key',
-        '--signing-key', '/keys/snapshot.pem',
-        '--worker-public', '/keys/worker-public.key',
-        '--gateway-public', '/keys/gateway-public.pem')
-    if ($keyCheck.ExitCode -ne 0) {
-        throw 'workspace_keys_invalid'
-    }
+    $fingerprints = Get-EaselKeyFingerprints -Image $Image `
+        -KeyVolume $volumes.Keys
+    $policyDigests = Get-EaselPolicyDigests -Image $Image `
+        -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress
+    $trustedPublic = Assert-EaselPublicCopies -Fingerprints $fingerprints `
+        -Policy $policyDigests -PublicDir $publicDir
+    $engineIdentity = Get-EaselEngineIdentity
+    $socketIdentity = Get-EaselSocketIdentity
     $configCheck = Invoke-EaselDocker -Arguments @(
         'run', '--rm', '--user', '10001:10001', '--entrypoint', 'sh',
         '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
@@ -203,15 +248,6 @@ try {
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
     $wslWorkspace = ConvertTo-EaselWslPath -Path $WorkspaceRoot
     $wslPublic = ConvertTo-EaselWslPath -Path $publicDir
-    $workerKeyHash = (Get-FileHash -LiteralPath `
-        (Join-Path $publicDir 'worker-public.key') `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
-    $gatewayKeyHash = (Get-FileHash -LiteralPath `
-        (Join-Path $publicDir 'gateway-public.pem') `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
-    $policyHash = (Get-FileHash -LiteralPath `
-        (Join-Path $publicDir 'egress-policy.json') `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
     $expectedIdentity = [ordered]@{
         workerImage = $WorkerImage
         gatewayImage = $GatewayImage
@@ -219,10 +255,13 @@ try {
         sidecarNetwork = $network
         gatewayControlNetwork = $network
         brokerUpstream = 'control:7861'
-        workerPublicSha256 = $workerKeyHash
-        gatewayPublicSha256 = $gatewayKeyHash
-        policySha256 = $policyHash
-        socketGid = $ProvisionerGid
+        workerPublicSha256 = $trustedPublic.Worker
+        gatewayPublicSha256 = $trustedPublic.Gateway
+        policySha256 = $trustedPublic.Policy
+        engineContext = $engineIdentity.Context
+        engineId = $engineIdentity.Id
+        socketUid = $socketIdentity.Uid
+        socketGid = $socketIdentity.Gid
         socketMode = '660'
         allowedUid = 10001
     }
@@ -233,6 +272,7 @@ try {
         $identityExpectedPath,
         ($expectedIdentity | ConvertTo-Json -Compress),
         (New-Object System.Text.UTF8Encoding($false)))
+    $identityConfigSha256 = Get-EaselFileSha256 -Path $identityExpectedPath
 
     $alreadyRunning = $false
     $socketExists = Invoke-Wsl -Arguments @(
@@ -386,8 +426,23 @@ try {
         throw 'admission_barrier_status_failed'
     }
     if ($barrierText -and $barrierText -ne 'barrier=none') {
-        # 上次 Stop 未完成时保持失败关闭；必须显式 resume 后才能重开。
-        throw "admission_barrier_active:$barrierText"
+        if (-not $barrierText.StartsWith('barrier=')) {
+            throw "admission_barrier_status_invalid:$barrierText"
+        }
+        $barrierId = $barrierText.Substring(8)
+        # 只有成功 Stop 写入且 barrier/项目/配置摘要完全匹配的完成记录
+        # 才能自动重开；失败/取消/旧记录保持失败关闭。
+        $reopen = Invoke-EaselDocker -Arguments @(
+            'exec', $containerId, 'python', '-m', 'easel', 'admin', 'reopen',
+            '--control-dir', '/srv/easel/control',
+            '--barrier-id', $barrierId,
+            '--project', $ProjectName,
+            '--config-sha256', $identityConfigSha256)
+        if ($reopen.ExitCode -ne 0) {
+            throw ("admission_barrier_active:" +
+                (($reopen.Output -join ',').Trim()))
+        }
+        Write-Output "admission_barrier_reopened=$barrierId"
     }
 
     Write-Output ("started project={0} origin={1} port={2} control={3} worker={4} gateway={5} network={6} provisioner_socket={7}" -f `
