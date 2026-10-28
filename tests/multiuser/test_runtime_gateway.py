@@ -48,10 +48,13 @@ class GatewayFake:
         self.restore_boot = NEW_BOOT
         self.restore_calls = 0
         self.fail_restore: Exception | None = None
+        self.next_worker = ""
+        self.report_worker_container = ""
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
         return WorkerHandle(
-            workspace_id, WORKER, WORKER_ORIGIN, TOKEN, version,
+            workspace_id, self.next_worker or WORKER, WORKER_ORIGIN, TOKEN,
+            version,
             gateway_instance_id=GATEWAY,
             gateway_generation=self.boot,
             gateway_upstream=GATEWAY_UPSTREAM,
@@ -112,10 +115,11 @@ class GatewayFake:
         assert lease is not None
         # 物理事实独立于 Store；不得用 DB gateway_state 构造 available。
         available = bool(self.available and self.active)
+        reported = self.report_worker_container or lease.container_id
         return {
             "workspace_id": workspace_id,
-            "container_id": lease.container_id,
-            "instance_id": lease.container_id,
+            "container_id": reported,
+            "instance_id": reported,
             "config_version": lease.config_version,
             "ready": available and self.worker_ready,
             "worker_ready": self.worker_ready,
@@ -130,7 +134,7 @@ class GatewayFake:
                 "managed": True,
                 "workspace_id": workspace_id,
                 "config_version": lease.config_version,
-                "worker_container_id": lease.container_id,
+                "worker_container_id": reported,
                 "gateway_instance_id": GATEWAY,
                 "boot_generation": self.boot,
                 "available": available,
@@ -390,6 +394,30 @@ def test_worker_unready_is_rejected_without_failing_or_deleting(tmp_path):
             assert lease.container_id == WORKER
             assert fake.stop_calls == []
             assert store.get_run(user, run.id).status == "running"
+    _run(scenario())
+
+
+def test_missing_worker_identity_fails_ready_lease_and_restarts(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            run = _running(store, user)
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            first = await manager.ensure_ready(user.workspace_id, 1)
+            assert first.container_id == WORKER
+            # 容器消失：物理 inspect 返回不同实例；下一次 ensure_ready 必须
+            # 失败旧租约、中断旧 Run，并在同一调用内重建新 worker。
+            fake.report_worker_container = "a" * 64
+            fake.next_worker = "f" * 64
+            second = await manager.ensure_ready(user.workspace_id, 1)
+            assert second.container_id == "f" * 64
+            assert fake.ensure_calls == 2
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == "f" * 64
+            assert store.get_run(user, run.id).status == "interrupted"
     _run(scenario())
 
 

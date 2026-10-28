@@ -542,8 +542,16 @@ class WorkerRelay:
                 "inputDigest": envelope["input_digest"],
             },
         }
-        response = await self._worker_request(
-            handle, "POST", f"/internal/runs/{run.id}", body)
+        try:
+            response = await self._worker_request(
+                handle, "POST", f"/internal/runs/{run.id}", body)
+        except DomainError as error:
+            # worker 明确拒绝（会话忙/请求非法）表示本 Run 未落地；必须
+            # 结算并撤销 token，不能让 reserved 行永久占用容量。网络类
+            # 502 仍交给后台对账，避免把可能已派发的 Run 误判失败。
+            if error.status in (400, 409):
+                await self._converge(actor, run, "interrupted")
+            raise
         try:
             result = response.json()
         except ValueError:
@@ -603,6 +611,19 @@ class WorkerRelay:
     async def _binding(self, actor: Identity, run: RunRecord) -> dict:
         return await self._db(
             self._store.run_dispatch_state, actor, run.id)
+
+    async def _current_workspace_handle(
+            self, workspace_id: str) -> WorkerHandle | None:
+        """当前租约指向的同 workspace 实例；只读，不启动或替换 worker。"""
+        lease = await self._db(self._store.get_worker_lease, workspace_id)
+        if (lease is None or lease.state not in ("ready", "draining")
+                or not lease.container_id):
+            return None
+        try:
+            return await self._lookup_existing(
+                workspace_id, lease.container_id, lease.config_version)
+        except RuntimeUnavailable:
+            return None
 
     async def _existing_handle(self, run: RunRecord,
                                binding: Mapping[str, object]
@@ -919,7 +940,13 @@ class WorkerRelay:
             except DomainError as error:
                 if error.code != "worker_instance_gone":
                     raise
-                raise DomainError("worker_unavailable", 502) from None
+                # worker 实例被重建后，历史仍在本 workspace 的持久状态目录；
+                # 消息快照可直接从当前同 workspace 实例读取，不创建新
+                # worker，也不把读请求发到别的 workspace。
+                handle = await self._current_workspace_handle(
+                    actor.workspace_id)
+                if handle is None:
+                    raise DomainError("worker_unavailable", 502) from None
             if handle is None:
                 return {"sessionId": conversation.id, "messages": []}
         response = await self._worker_request(

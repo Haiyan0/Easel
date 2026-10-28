@@ -1183,7 +1183,16 @@ class RunManager:
             raise DomainError("capability_unavailable", 503)
         conversation_id = request["sessionId"]
         if conversation_id in self._active_conversations:
-            raise DomainError("conversation_busy", 409)
+            holder = self._active_conversations[conversation_id]
+            holder_state = self.registry.state(holder)
+            holder_task = self._tasks.get(holder)
+            if (holder_state in TERMINAL_STATES
+                    or (holder_task is not None and holder_task.done())):
+                # 上一轮 supervisor 已到终态/任务已结束但锁未释放：修复
+                # 陈旧锁。终态 Run 不可能仍在执行，不能永久阻塞同会话。
+                self._active_conversations.pop(conversation_id, None)
+            else:
+                raise DomainError("conversation_busy", 409)
         command = _command(agent.get("command"), str(runtime))
         model = agent.get("model")
         if model is not None and (not isinstance(model, str)
@@ -1205,7 +1214,11 @@ class RunManager:
             native_id = binding.get("native_id") or ""
             if not native_id and self._sessions.messages(
                     conversation_id, limit=1):
-                raise DomainError("session_binding_incomplete", 409)
+                if conversation_id in self._active_conversations:
+                    raise DomainError("session_binding_incomplete", 409)
+                # 上次启动在建立 native session 前失败（无活动 Run）：
+                # 允许本轮重新 session/new 并写回新的 native id，保留
+                # 已存的 Easel 消息历史；不能永久卡死该会话。
         else:
             self._sessions.bind(
                 conversation_id, str(runtime), "", self._native_version,

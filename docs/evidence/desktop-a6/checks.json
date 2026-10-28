@@ -1,0 +1,103 @@
+{
+  "date": "2026-10-28/29",
+  "baseline_commit": "1e70afab0a55bee4cf41f985b691b6ebbf82c604",
+  "scope": ["A6.1", "A6.2", "A6.3", "A6.4"],
+  "images": {
+    "control": "sha256:2209ce6d1a4dc5889810ff5e9c1ac7e0b3db7d33d21ad496cf17d6960d50ea87",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_harness": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+    "worker_harness_size_bytes": 2689778768,
+    "a5_original_worker": "sha256:6830c2b4b2f3424dde6fff492803c05cbe77cc03d4e5921a14e26e3a7d738434"
+  },
+  "harness": {
+    "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+    "node": "24.22.1",
+    "pnpm": "11.28.5",
+    "build_gate": "DSH_PROFILE_OK commit=687f282e8625c6b8d11ff58211a90524be2e4317 node=24.22.1 patch_sha256=8ebd72c06981bd099fd3d8e1da1370c61e8b4826bf0972cc0ffc528b1254ad09 model=easel-broker/deepseek-chat; WORKER_SMOKE_OK",
+    "source_hash_match": {
+      "worker/runs.py": "6e5b92366d25b149505192ee9536f32ea1987c46cf9149934c0682234f88fd6f",
+      "control/proxy.py": "15da3d08516126101b93ef575f58258802dd6b73ec1309b66dc55d469fbe60ca",
+      "control/runtime.py": "d37efde6591d3477c0d848d798ab1eb749ea081dd93f823f98f3b122d5722368"
+    }
+  },
+  "browser": {
+    "engine": "Chromium 151.0.7922.34 (Playwright, headless)",
+    "platform": "Windows 11 Pro + Docker Desktop + WSL Ubuntu-26.04",
+    "local_tls": "localhost self-signed cert + Chromium SPKI pin; ignore_https_errors=false",
+    "ngrok": {
+      "status": "pass",
+      "public_origin": "https://acts-revise-unrented.ngrok-free.dev",
+      "certificate": "public CA, no pin, no ignore",
+      "cookie": "Secure + HttpOnly + SameSite",
+      "tunnel_stopped": true
+    }
+  },
+  "tests": {
+    "frontend_unit": "118 passed",
+    "frontend_build": "npm run build ok",
+    "frontend_lint": "oxlint ok",
+    "unit_suite": "1393 passed, 10 skipped, 2 warnings in 203.37s (tests/multiuser + tests/integration/multiuser/test_desktop_topology.py)",
+    "a4_fixture_container_regression": "1 passed in 86.88s",
+    "a5_real_harness_regression": "2 passed in 75.17s (A5 original worker image 6830c2b4...)",
+    "a6_browser_matrix": "4 passed, 1 skipped in 290.63s",
+    "a6_real_provider": "skipped/not-run: no approved managed channel/credential; did not read developer .env/HOME"
+  },
+  "a6_evidence": {
+    "a6_1": {
+      "provider_chat": 6,
+      "two_contexts": true,
+      "refresh_relogin": true,
+      "native_resume": true,
+      "cross_workspace_404": true,
+      "screenshots": ["01-a-two-rounds.png", "02-a-after-relogin.png", "03-b-two-rounds.png"]
+    },
+    "a6_2": {
+      "tool_allow_provider_requests": 2,
+      "tool_deny_provider_requests": 2,
+      "tool_deny_executed": false,
+      "retry_same_turn_runs": 1,
+      "double_click_runs": 1,
+      "sse_after_cursor": true,
+      "slow_events_monotonic": true,
+      "stop_state": "cancelled",
+      "stop_token_revoked": true,
+      "stop_capacity_released": true,
+      "logout_stream_close_seconds": 0.03,
+      "logout_old_cookie_401": true,
+      "logout_background_run": "done",
+      "screenshots": ["04-permission.png"]
+    },
+    "a6_3": {
+      "control_restart": "honest terminal (failed); no duplicate prompt; new run ok",
+      "gateway_restart": "same worker/gateway IDs; token not revoked until terminal; after replay; 1 provider request",
+      "worker_rebuild": "old run interrupted; token revoked; new worker; native history resumed; 2 assistant messages",
+      "provider_failures": ["401", "429", "500", "stream-drop"],
+      "provider_failure_notice": "Agent 执行失败，请检查本机 CLI、登录和模型配置",
+      "provider_failure_requests_each": 1,
+      "old_history_preserved": true,
+      "bad_broker_channel": "control startup fail-closed: managed_config_invalid, exit 2",
+      "startup_failure": "worker binding/stale-lock recovery; provider 0; new run ok after config restore",
+      "secret_boundary": "sentinel absent from UI/API/logs/worker env; no worker/gateway published ports",
+      "provider_auth": "Bearer sentinel only at control broker",
+      "screenshots": ["05-failure.png"]
+    },
+    "a6_4": {
+      "ngrok_public_https": "pass",
+      "real_provider_request": "not-run"
+    }
+  },
+  "product_fixes": [
+    "control runtime: ready-lease worker identity mismatch fails old lease and rebuilds within one ensure_ready",
+    "control proxy: message history falls back to current same-workspace worker after instance rebuild",
+    "control proxy: worker 400/409 dispatch rejection settles reserved run and revokes token",
+    "worker: failed startup with empty native binding is recoverable when no active run",
+    "worker: stale terminal conversation lock self-heals"
+  ],
+  "not_run": [
+    "real DeepSeek provider request (no approved managed channel/credential)",
+    "A6 UI wrong-public-key negative (covered by existing gateway/worker signature regressions)",
+    "A7 backup/upgrade/rollback/restore",
+    "production Chromium hardened sandbox/XFS quota/Linux firewall/IPv6 gates"
+  ],
+  "cleanup": "verified 2026-10-29: no easel.a6.browser containers/networks/volumes; no easel-worker/gateway/sidecar/ws leftovers; no /tmp/easel-a6-* or provisioner processes; ngrok processes 0; test images retained for review"
+}

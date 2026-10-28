@@ -185,6 +185,57 @@ def test_concurrent_same_request_admits_once(tmp_path):
         verify.close()
 
 
+class RejectingTransport(CountingTransport):
+    """POST 派发被 worker 明确拒绝（会话忙/非法请求）。"""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/internal/runs/" in request.url.path:
+            await request.aread()
+            with self._lock:
+                self.calls.append({
+                    "method": request.method,
+                    "url": str(request.url),
+                    "headers": dict(request.headers),
+                    "body": b"",
+                })
+            return httpx.Response(
+                409, json={"code": "conversation_busy"}, request=request)
+        return await super().handle_async_request(request)
+
+
+def test_worker_dispatch_rejection_settles_reserved_run(tmp_path):
+    """worker 明确 409 时不能留下永久 reserved；容量必须可再接纳。"""
+    database = tmp_path / "control.sqlite3"
+    store = Store.connect(database)
+    try:
+        owner = store.create_user("Owner")
+        conversation = store.create_conversation(owner, "冲突会话")
+        transport = RejectingTransport()
+
+        async def scenario() -> None:
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(store, handle_for(owner),
+                                   Ed25519PrivateKey.generate(), client)
+                with pytest.raises(DomainError) as rejected:
+                    await relay.submit(owner, {
+                        "sessionId": conversation.id,
+                        "turnId": "turn-rejected",
+                        "message": "被拒绝",
+                    })
+                assert rejected.value.status == 409
+
+        asyncio.run(scenario())
+        runs = store.list_runs(owner, conversation.id)
+        assert len(runs) == 1
+        assert runs[0].status == "interrupted"
+        # 容量已释放：同一会话的新请求仍可被接纳（随后同样被 worker 拒绝）。
+        again = store.reserve_run(
+            owner, conversation.id, "turn-after", "digest-after", REVISION)
+        assert again.status == "reserved"
+    finally:
+        store.close()
+
+
 def test_request_digest_conflict(tmp_path):
     database = tmp_path / "control.sqlite3"
     store = Store.connect(database)

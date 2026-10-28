@@ -291,6 +291,33 @@ class BlockingExecutor:
         return "结束"
 
 
+class RecoveringExecutor:
+    """首次执行失败（模拟启动失败），后续执行成功。"""
+
+    def __init__(self) -> None:
+        self.prompts = 0
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+        if self.prompts == 1:
+            raise RuntimeError("startup boom")
+        return "恢复成功"
+
+
+class BindThenRecoverExecutor:
+    """首轮建立 native 绑定后失败，终态锁可被安全修复。"""
+
+    def __init__(self) -> None:
+        self.prompts = 0
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+        bind("native-recovered")
+        if self.prompts == 1:
+            raise RuntimeError("startup boom")
+        return "恢复成功"
+
+
 class AskingExecutor:
     def __init__(self) -> None:
         self.prompts = 0
@@ -307,6 +334,62 @@ class AskingExecutor:
 # ---------------------------------------------------------------------------
 # 重连回放
 # ---------------------------------------------------------------------------
+
+
+def test_failed_startup_binding_is_repaired_for_next_run(tmp_path):
+    """启动失败留下的空 native 绑定不能永久阻塞同会话新 Run。"""
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            user = store.create_user("Owner")
+            conversation = store.create_conversation(user, "启动失败恢复")
+            key = Ed25519PrivateKey.generate()
+            executor = RecoveringExecutor()
+            manager = make_manager(
+                make_paths(tmp_path), user.workspace_id, key, executor)
+            transport = WorkerTransport({user.workspace_id: manager})
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(store, client, signing_key=key)
+                first = (await relay.submit(
+                    user, payload(conversation.id, turn_id="turn-1")))["runId"]
+                await wait_until(
+                    lambda: manager.state(first) == "failed")
+                # 控制库同步终态，排除 control 侧会话互斥的干扰。
+                await relay.events(user, first, after=0)
+                second = (await relay.submit(
+                    user, payload(conversation.id, turn_id="turn-2")))["runId"]
+                assert second != first
+                await wait_until(
+                    lambda: manager.state(second) == "done")
+                assert executor.prompts == 2
+    asyncio.run(scenario())
+
+
+def test_stale_terminal_conversation_lock_is_repaired(tmp_path):
+    """终态 Run 遗留的陈旧会话锁不能阻塞同会话新 Run。"""
+    async def scenario() -> None:
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            user = store.create_user("Owner")
+            conversation = store.create_conversation(user, "陈旧锁")
+            key = Ed25519PrivateKey.generate()
+            executor = BindThenRecoverExecutor()
+            manager = make_manager(
+                make_paths(tmp_path), user.workspace_id, key, executor)
+            transport = WorkerTransport({user.workspace_id: manager})
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(store, client, signing_key=key)
+                first = (await relay.submit(
+                    user, payload(conversation.id, turn_id="turn-1")))["runId"]
+                await wait_until(
+                    lambda: manager.state(first) == "failed")
+                await relay.events(user, first, after=0)
+                # 模拟 supervisor 终态后漏释放锁：终态 Run 不应永久占用。
+                manager._active_conversations[conversation.id] = first
+                second = (await relay.submit(
+                    user, payload(conversation.id, turn_id="turn-2")))["runId"]
+                assert second != first
+                await wait_until(
+                    lambda: manager.state(second) == "done")
+    asyncio.run(scenario())
 
 
 def test_reconnect_replays_without_prompt(tmp_path):

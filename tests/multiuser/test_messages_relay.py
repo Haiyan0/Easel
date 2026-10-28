@@ -225,6 +225,57 @@ def test_lifespan_owns_http_client_and_forwards_db_runner(tmp_path):
     assert args[4].is_closed, "lifespan 退出时必须关闭共享 HTTP 客户端"
 
 
+def test_messages_falls_back_to_current_instance_after_worker_rebuild(
+        tmp_path):
+    """旧 Run 绑定的实例消失后，历史仍从同 workspace 当前实例读取。"""
+    store = Store.connect(tmp_path / "control.sqlite3")
+    try:
+        member = store.create_user("Member")
+        conversation = store.create_conversation(member, "重建会话")
+        run = store.reserve_run(
+            member, conversation.id, "turn", "digest", REVISION)
+        assert store.claim_run_dispatch(
+            member, run.id, "nonce", "container-old", now=1000)
+        assert store.mark_run_dispatched(member, run.id, "nonce")
+        outcome, lease = store.claim_worker_start(
+            member.workspace_id, REVISION, "owner", 1000, 120)
+        assert outcome == "started"
+        handle = WorkerHandle(
+            member.workspace_id, "container-" + member.workspace_id,
+            "http://worker-member.test",
+            "service-token-" + member.workspace_id, REVISION)
+        assert store.complete_worker_start(
+            member.workspace_id, "owner", lease.generation, handle, 1000, 120)
+
+        transport = SnapshotTransport()
+        runtime = StaticRuntime({
+            member.workspace_id: "http://worker-member.test"})
+
+        async def scenario() -> None:
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = WorkerRelay(
+                    runtime, SessionService(store), AuthService(store),
+                    store=store, signing_key=Ed25519PrivateKey.generate(),
+                    http_client=client, config_provider=provider)
+                result = await relay.messages(member, conversation.id,
+                                              limit=10, offset=0)
+                assert result["messages"] == [
+                    {"role": "user", "content": "第一问"},
+                    {"role": "assistant", "content": "第一答"},
+                ]
+
+        asyncio.run(scenario())
+        assert len(transport.calls) == 1
+        call = transport.calls[0]
+        assert call["path"] == f"/internal/sessions/{conversation.id}/messages"
+        # 读取发往当前新实例，而不是已消失的旧实例
+        assert call["headers"]["x-easel-service-token"] == (
+            "service-token-" + member.workspace_id)
+        assert runtime.calls == []
+    finally:
+        store.close()
+
+
 def test_relay_messages_without_run_does_not_start_worker(tmp_path):
     store = Store.connect(tmp_path / "control.sqlite3")
     try:

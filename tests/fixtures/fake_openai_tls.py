@@ -10,6 +10,7 @@ import json
 import os
 import ssl
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -97,6 +98,68 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def _stream_slow(self, model: str) -> None:
+        """A6 慢速流：约 8 秒逐块输出，供浏览器断网后按 after 续接。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        base = {
+            "id": "fixture-slow",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+        }
+        pieces = ["slow-start "]
+        pieces.extend(f"slow-chunk-{index:02d} " for index in range(1, 13))
+        pieces.append("slow-end-ok")
+        try:
+            self._sse({**base, "choices": [{
+                "index": 0, "delta": {"role": "assistant"},
+                "finish_reason": None}]})
+            for piece in pieces:
+                self._sse({**base, "choices": [{
+                    "index": 0, "delta": {"content": piece},
+                    "finish_reason": None}]})
+                time.sleep(0.8)
+            self._sse({**base, "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "stop"}]})
+            self._sse({**base, "choices": [], "usage": {
+                "prompt_tokens": 1, "completion_tokens": 3,
+                "total_tokens": 4}})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # 浏览器/worker 中断连接：慢流仅用于测试，安静退出。
+            self.close_connection = True
+
+    def _stream_hang(self, model: str) -> None:
+        """A6 挂起流：持续输出直到 worker 停止或连接断开（最长 5 分钟）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        base = {
+            "id": "fixture-hang",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+        }
+        try:
+            self._sse({**base, "choices": [{
+                "index": 0, "delta": {"role": "assistant"},
+                "finish_reason": None}]})
+            for index in range(600):
+                self._sse({**base, "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"hang-token-{index:03d} "},
+                    "finish_reason": None}]})
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
     def _stream_tool_call(self, model: str) -> None:
         """标准 OpenAI tool_calls 流：请求 Harness 以提权方式执行一次 echo。
 
@@ -155,6 +218,39 @@ class Handler(BaseHTTPRequestHandler):
                    for message in messages)
 
     @staticmethod
+    def _content_text(message: object) -> str:
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if (isinstance(block, dict)
+                        and isinstance(block.get("text"), str)):
+                    parts.append(block["text"])
+            return "\n".join(parts)
+        return ""
+
+    @classmethod
+    def _last_user_text(cls, body: object) -> str:
+        """当前轮 user 文本：跳过 Harness 末尾的运行上下文快照消息。"""
+        if not isinstance(body, dict):
+            return ""
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = cls._content_text(message)
+            if text.lstrip().startswith("Current runtime context"):
+                continue
+            return text
+        return ""
+
+    @staticmethod
     def _prompt_text(body: object) -> str:
         if not isinstance(body, dict):
             return ""
@@ -198,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model") if isinstance(payload, dict) else None
         if not isinstance(model, str) or not model:
             model = "fixture-chat"
-        prompt = self._prompt_text(payload)
+        prompt = self._last_user_text(payload)
         if "harness-401" in prompt:
             self._json(401, {"error": {
                 "type": "authentication_error", "message": "fake auth"}})
@@ -213,6 +309,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         stream = isinstance(payload, dict) and payload.get("stream") is True
         if stream:
+            if "harness-hang" in prompt:
+                # A6 停止/注销在途长流：持续输出直到 worker 终止连接。
+                self._stream_hang(model)
+                return
+            if "harness-slow" in prompt:
+                # A6 浏览器断网重连：约 8 秒慢速流，服务端继续执行。
+                self._stream_slow(model)
+                return
             if "harness-tool" in prompt and not self._has_tool_result(payload):
                 # 首回合：让真实 Harness 发起一次需要审批的工具调用。
                 self._stream_tool_call(model)

@@ -132,13 +132,23 @@ class RuntimeManager:
         """返回已就绪、身份已核验的句柄；不可用时抛 ``RuntimeUnavailable``。"""
         self._validate_request(workspace_id, config_version)
         deadline = self._clock() + self._ready_timeout
+        identity_retried = False
         while True:
             outcome, lease = await self._claim(workspace_id, config_version)
             if outcome == "ready":
                 if not self._gateway_required:
                     return self._handle_from_lease(lease, config_version)
-                return await self._ready_gateway(
-                    workspace_id, config_version, lease, deadline)
+                try:
+                    return await self._ready_gateway(
+                        workspace_id, config_version, lease, deadline)
+                except RuntimeUnavailable as error:
+                    # 身份不符时 `_ready_gateway` 已失败旧租约；重新认领会
+                    # 走新代次创建。只允许一次，避免租约 CAS 失败时死循环。
+                    if (error.code == "worker_identity_mismatch"
+                            and not identity_retried):
+                        identity_retried = True
+                        continue
+                    raise
             if outcome == "started":
                 return await self._start(workspace_id, config_version, lease,
                                          deadline)
@@ -394,8 +404,13 @@ class RuntimeManager:
                     "gateway_inspect_failed", 503, retry_after=5) from error
             if not self._report_worker_matches(
                     report, workspace_id, config_version, lease):
+                # 物理实例身份与 ready 租约不一致 = 原 worker 已消失或其
+                # 名字已被新实例占用。旧租约不能继续复用，必须先按代次
+                # 失败旧状态（中断其残留 Run、撤销 token），再允许同一
+                # ensure_ready 重新认领并创建新代次。
+                await self._fail_ready(workspace_id, lease)
                 raise RuntimeUnavailable(
-                    "worker_identity_mismatch", 503, retry_after=5)
+                    "worker_identity_mismatch", 503, retry_after=0)
             # 身份匹配不等于可派发；worker/sidecar 物理未就绪时只拒绝，
             # 不删除 worker，也不把 gateway 刷新当成冷启动。
             if not self._report_worker_ready(report):
