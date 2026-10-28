@@ -1,0 +1,57 @@
+{
+  "date": "2026-10-29",
+  "baseline_commit": "acef78b3ae3b1b1f318a297bf2c5cb06200aa76b",
+  "scope": ["A6-R1-01"],
+  "review": "docs/superpowers/audits/2026-10-29-desktop-a6-review-round-1.md",
+  "fix": [
+    "worker _prepare: registry terminal state alone no longer clears a live conversation lock; only an absent or done holder task self-heals",
+    "rejected same-conversation turn returns conversation_busy(409) before adapter/message/binding side effects"
+  ],
+  "images": {
+    "worker_harness_r1": "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993",
+    "worker_harness_r1_size_bytes": 2689779306,
+    "worker_harness_a6_preserved": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+    "control_unchanged": "sha256:2209ce6d1a4dc5889810ff5e9c1ac7e0b3db7d33d21ad496cf17d6960d50ea87",
+    "gateway_unchanged": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "build_gate": "DSH_PROFILE_OK commit=687f282e8625c6b8d11ff58211a90524be2e4317 node=24.22.1 patch_sha256=8ebd72c06981bd099fd3d8e1da1370c61e8b4826bf0972cc0ffc528b1254ad09 model=easel-broker/deepseek-chat; WORKER_SMOKE_OK",
+    "source_hash_match": {
+      "easel/worker/runs.py": "f2498cecb5cf9306753d80b14a1179fa63615cb629996335e36833b63d537235"
+    }
+  },
+  "tests": {
+    "new_red_before_fix": [
+      "test_cancel_cleanup_keeps_conversation_lock_until_holder_task_ends: Failed: DID NOT RAISE DomainError",
+      "test_real_acp_gated_cancel_blocks_new_prompt_until_cleanup_closes: Failed: DID NOT RAISE DomainError"
+    ],
+    "new_green": "2 passed, 27 deselected in 8.09s",
+    "preserved_recovery": "2 passed, 12 deselected in 0.47s (stale terminal lock + failed startup empty binding)",
+    "affected_regression": "213 passed, 5 skipped in 56.51s (runs/sessions/proxy/messages relay/event stream/session runs/stop barrier/stop recovery/runtime gateway/ACP)",
+    "full_multiuser_topology": "1395 passed, 10 skipped, 2 warnings in 166.53s",
+    "browser_targeted": "2 passed, 3 deselected in 254.14s; A6_2_PASS hang_state=cancelled logout=0.03s; A6_3_PASS gateway_restart_same_id=true provider_chat=16 no A6_STARTUP_RETRY"
+  },
+  "physical_closure": {
+    "first_state_during_gate": "cancelled",
+    "first_stop_pending": true,
+    "holder_task_done": false,
+    "fixture_cancel_waiting": true,
+    "fixture_cancel_completed_before_gate": false,
+    "old_acp_process_alive": true,
+    "second_submit": "conversation_busy",
+    "second_audit_methods_added": 0,
+    "second_messages_added": 0,
+    "binding_after_reject": "native-session",
+    "old_acp_process_closed_after_stop": true,
+    "pool_empty_after_stop": true,
+    "new_initialize_after_resume": 2,
+    "new_prompt_after_resume": 2,
+    "resumed_binding": "native-session"
+  },
+  "not_run": [
+    "real DeepSeek provider request (no approved managed channel/credential; did not read developer .env/HOME)",
+    "full A6 browser/ngrok/frontend matrix (frontend, ngrok and control unchanged; original A6 evidence retained)",
+    "A7 backup/upgrade/rollback/restore",
+    "production Chromium hardened sandbox/XFS quota/Linux firewall/IPv6 gates",
+    "wrong-public-key and runtime missing-broker UI negatives (remain as in A6)"
+  ],
+  "cleanup": "verified 2026-10-29: no easel.a6.browser containers/networks/volumes; no easel-worker/gateway/sidecar/ws containers; no /tmp/easel-a6-* or provisioner process; ngrok processes 0; pre-existing easel-a1-* networks untouched; test images retained for review"
+}

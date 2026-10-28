@@ -5,8 +5,22 @@ import sys
 import time
 
 runtime = sys.argv[1]
-mode = os.environ.get("FAKE_HARNESS_MODE", "normal")
-audit = os.environ["FAKE_HARNESS_AUDIT"]
+
+
+def option(name):
+    """可选命令行参数优先于环境变量；受管 worker 只允许通过 argv 传测试
+    模式，因为运行环境按 allowlist 构建，不会透传 FAKE_HARNESS_*。"""
+    flag = "--" + name
+    if flag in sys.argv[2:]:
+        return sys.argv[sys.argv.index(flag) + 1]
+    return None
+
+
+mode = option("mode") or os.environ.get("FAKE_HARNESS_MODE", "normal")
+audit = option("audit") or os.environ["FAKE_HARNESS_AUDIT"]
+# gated-cancel：取消后在此文件出现前保持取消清理未完成，测试据此确定性交错。
+cancel_gate = option("cancel-gate") or os.environ.get(
+    "FAKE_HARNESS_CANCEL_GATE", "")
 # 可选的原生 ID 前缀：真实 TCP 集成用它区分两个 worker 的绑定；未设置时保持原值。
 native = os.environ.get("FAKE_HARNESS_NATIVE", "").strip()
 thread_id = f"{native}-thread" if native else "native-thread"
@@ -59,6 +73,21 @@ def record_runtime(session_id):
 
 def multiuser_reply(session_id):
     return f"{os.environ.get('EASEL_WORKSPACE_ID', '')}:{session_id}"
+
+
+def wait_cancel_gate():
+    """取消清理 gate：只有测试显式创建文件才继续回复 session/cancel。
+
+    用文件作为跨进程确定性信号；有界等待只用于失败时防止测试进程永久
+    挂起，正常验收不依赖超时推进。
+    """
+    if not cancel_gate:
+        return
+    deadline = time.monotonic() + 30
+    while not os.path.exists(cancel_gate):
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
 
 
 def permission():
@@ -125,7 +154,12 @@ while True:
         reply(message, {})
     elif method in ("turn/interrupt", "session/cancel"):
         if method == "session/cancel" and pending_prompt is not None and mode != "ignore-cancel":
-            if mode == "slow-cancel":
+            if mode == "gated-cancel":
+                with open(audit, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(
+                        {"method": "fixture/cancel-waiting"}) + "\n")
+                wait_cancel_gate()
+            elif mode == "slow-cancel":
                 time.sleep(0.3)
             with open(audit, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"method": "fixture/cancel-completed"}) + "\n")
@@ -138,11 +172,15 @@ while True:
                       if mode == "multiuser" else "你好")
         if mode in ("permission", "permission-secret"):
             permission()
-        if mode in ("hang", "slow-cancel", "ignore-cancel"):
-            pending_prompt = message
-            if runtime == "codex":
-                reply(message, {"turn": {"id": turn_id}})
-            continue
+        if mode in ("hang", "slow-cancel", "ignore-cancel", "gated-cancel"):
+            if mode == "gated-cancel" and cancel_gate and os.path.exists(cancel_gate):
+                # 取消清理已被测试放行：后续轮次正常完成，证明可以续接。
+                pass
+            else:
+                pending_prompt = message
+                if runtime == "codex":
+                    reply(message, {"turn": {"id": turn_id}})
+                continue
         if mode == "delayed":
             # 真实 SIGTERM 验收用：让 Run 在宽限期内仍处于执行中。
             time.sleep(float(os.environ.get(

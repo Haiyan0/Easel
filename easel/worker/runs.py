@@ -1184,12 +1184,13 @@ class RunManager:
         conversation_id = request["sessionId"]
         if conversation_id in self._active_conversations:
             holder = self._active_conversations[conversation_id]
-            holder_state = self.registry.state(holder)
             holder_task = self._tasks.get(holder)
-            if (holder_state in TERMINAL_STATES
-                    or (holder_task is not None and holder_task.done())):
-                # 上一轮 supervisor 已到终态/任务已结束但锁未释放：修复
-                # 陈旧锁。终态 Run 不可能仍在执行，不能永久阻塞同会话。
+            # 持久状态可能先被 stop 写成 cancelled，但 supervisor/ACP 取消
+            # 清理仍在进行（session/cancel、子进程与连接关闭）。只有 holder
+            # task 确实结束后才可判定陈旧锁；否则继续互斥，避免同 native
+            # 会话重叠执行或把第二轮的失败误记到第一轮清理上。
+            if holder_task is None or holder_task.done():
+                # holder 已退出但锁未释放：修复真正的陈旧锁。
                 self._active_conversations.pop(conversation_id, None)
             else:
                 raise DomainError("conversation_busy", 409)

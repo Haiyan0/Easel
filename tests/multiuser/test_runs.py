@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -1486,5 +1487,216 @@ def test_run_manager_active_runs_and_drain_gate(tmp_path):
         executor.gate("run-drain").set()
         await asyncio.wait_for(executor.done("run-drain").wait(), 2)
         await wait_until(lambda: manager.active_runs() == 0)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# A6-R1-01：持久终态 != executor 已退出，取消清理期间必须保持同会话互斥
+# ---------------------------------------------------------------------------
+
+
+class SlowCancelExecutor:
+    """首轮取消后停在清理 gate，模拟 ACP session/cancel 与进程关闭未完成。"""
+
+    def __init__(self) -> None:
+        self.prompts = 0
+        self.started = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_gate = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def __call__(self, request, context, bind, emit, ask):
+        self.prompts += 1
+        if not request.native_id:
+            bind("native-slow")
+        if self.prompts == 1:
+            self.started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cleanup_started.set()
+                await self.cleanup_gate.wait()
+                self.cleanup_completed.set()
+                raise
+        emit("token", "续接成功")
+        return "续接成功"
+
+
+def test_cancel_cleanup_keeps_conversation_lock_until_holder_task_ends(tmp_path):
+    """registry 先写 cancelled 时，持有 task 的清理 gate 仍应拦住同会话。"""
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    executor = SlowCancelExecutor()
+    manager = make_manager(paths, key, executor)
+    sessions = WorkspaceSessionStore(paths.state_root, WORKSPACE)
+    agent = {"runtime": "acp", "command": ["fixture-acp"],
+             "sandbox": "read-only"}
+    conversation = "conversation-slow"
+    first = sign(key, run_id="run-slow-1", session_id=conversation,
+                 message="第一轮", routes={}, agent=agent)
+    blocked = sign(key, run_id="run-slow-2", session_id=conversation,
+                   message="清理中的第二轮", routes={}, agent=agent)
+    resumed = sign(key, run_id="run-slow-3", session_id=conversation,
+                   message="清理完成后第三轮", routes={}, agent=agent)
+
+    async def scenario() -> None:
+        await manager.submit(
+            "run-slow-1", first, request_for(conversation, "第一轮", first))
+        await asyncio.wait_for(executor.started.wait(), 5)
+        stop_task = asyncio.create_task(manager.stop("run-slow-1"))
+        await asyncio.wait_for(executor.cleanup_started.wait(), 5)
+
+        # stop 已写持久终态，但 supervisor 仍停在 ACP 取消清理。
+        assert manager.state("run-slow-1") == "cancelled"
+        assert not stop_task.done()
+        holder = manager._tasks.get("run-slow-1")
+        assert holder is not None and not holder.done()
+
+        with pytest.raises(DomainError) as rejected:
+            await manager.submit(
+                "run-slow-2", blocked,
+                request_for(conversation, "清理中的第二轮", blocked))
+        assert rejected.value.code == "conversation_busy"
+        assert executor.prompts == 1
+        assert manager.state("run-slow-2") == "failed"
+        messages = manager.messages(conversation)["messages"]
+        assert [message["role"] for message in messages] == ["user"]
+        assert messages[0]["content"] == "第一轮"
+        assert sessions.binding(conversation)["native_id"] == "native-slow"
+
+        executor.cleanup_gate.set()
+        assert await asyncio.wait_for(stop_task, 5) == {
+            "runId": "run-slow-1", "state": "cancelled"}
+        assert executor.cleanup_completed.is_set()
+
+        await manager.submit(
+            "run-slow-3", resumed,
+            request_for(conversation, "清理完成后第三轮", resumed))
+        await wait_until(lambda: manager.state("run-slow-3") == "done")
+        assert executor.prompts == 2
+        assert sessions.binding(conversation)["native_id"] == "native-slow"
+        messages = manager.messages(conversation)["messages"]
+        assert [message["role"] for message in messages] == [
+            "user", "user", "assistant"]
+        assert messages[1]["content"] == "清理完成后第三轮"
+
+    asyncio.run(scenario())
+
+
+def test_real_acp_gated_cancel_blocks_new_prompt_until_cleanup_closes(tmp_path,
+                                                                      monkeypatch):
+    """真实 ACP 子进程停在 session/cancel 时，同会话新 Run 不得进入执行。"""
+    from easel.harnesses import acp as acp_module
+
+    # 取消协议预算放大到 30s，保证 gate 交错由文件信号决定而非 2s 超时。
+    monkeypatch.setattr(acp_module, "TIMEOUT_HARNESS_CANCEL", 30)
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "harness_rpc.py"
+    audit_path = tmp_path / "acp-audit.jsonl"
+    gate = tmp_path / "acp-cancel-gate"
+    command = [sys.executable, str(fixture), "acp",
+               "--mode", "gated-cancel", "--audit", str(audit_path),
+               "--cancel-gate", str(gate)]
+    agent = {"runtime": "acp", "command": command, "sandbox": "read-only",
+             "timeout": 60}
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    manager = RunManager(
+        workspace_id=WORKSPACE, paths=paths,
+        public_key=key.public_key(), executor=None,
+        base_env=dict(os.environ),
+        clock=lambda: CLOCK, recover=False, shutdown_grace=0.2)
+    conversation = "conversation-acp"
+    first = sign(key, run_id="run-acp-1", session_id=conversation,
+                 message="第一轮", routes={}, agent=agent)
+    blocked = sign(key, run_id="run-acp-2", session_id=conversation,
+                   message="取消清理中的第二轮", routes={}, agent=agent)
+    resumed = sign(key, run_id="run-acp-3", session_id=conversation,
+                   message="清理完成后第三轮", routes={}, agent=agent)
+
+    def methods() -> list[str]:
+        if not audit_path.exists():
+            return []
+        observed = []
+        for line in audit_path.read_text(
+                encoding="utf-8", errors="replace").splitlines():
+            try:
+                observed.append(json.loads(line).get("method") or "")
+            except json.JSONDecodeError:
+                # 子进程正在追加时可能读到半行；等待下一次轮询。
+                continue
+        return observed
+
+    def pooled_processes():
+        from easel.harnesses import rpc as rpc_module
+        loop = asyncio.get_running_loop()
+        return [entry["rpc"].process
+                for key, entry in rpc_module._POOLS.get(loop, {}).items()
+                if key[2] == conversation]
+
+    async def scenario() -> None:
+        stop_task = None
+        try:
+            await manager.submit(
+                "run-acp-1", first, request_for(conversation, "第一轮", first))
+            await wait_until(lambda: "session/prompt" in methods(), 10)
+            stop_task = asyncio.create_task(manager.stop("run-acp-1"))
+            await wait_until(
+                lambda: "fixture/cancel-waiting" in methods(), 10)
+
+            # 真实子进程停在取消 gate：旧 ACP 连接与进程尚未关闭。
+            assert not stop_task.done()
+            assert manager.state("run-acp-1") == "cancelled"
+            holder = manager._tasks.get("run-acp-1")
+            assert holder is not None and not holder.done()
+            assert "fixture/cancel-completed" not in methods()
+            processes = pooled_processes()
+            assert len(processes) == 1
+            old_process = processes[0]
+            assert old_process.returncode is None, "旧 ACP 子进程仍在运行"
+            before = methods()
+
+            with pytest.raises(DomainError) as rejected:
+                await manager.submit(
+                    "run-acp-2", blocked,
+                    request_for(conversation, "取消清理中的第二轮", blocked))
+            assert rejected.value.code == "conversation_busy"
+            assert methods() == before, "旧进程关闭前不得出现新 initialize/prompt"
+            assert old_process.returncode is None
+            messages = manager.messages(conversation)["messages"]
+            assert [message["role"] for message in messages] == ["user"]
+            assert WorkspaceSessionStore(
+                paths.state_root, WORKSPACE).binding(
+                    conversation)["native_id"] == "native-session"
+
+            gate.write_text("release", encoding="utf-8")
+            assert await asyncio.wait_for(stop_task, 10) == {
+                "runId": "run-acp-1", "state": "cancelled"}
+            await wait_until(
+                lambda: "fixture/cancel-completed" in methods(), 10)
+            assert old_process.returncode is not None, "旧 ACP 进程未关闭"
+            assert not pooled_processes()
+
+            await manager.submit(
+                "run-acp-3", resumed,
+                request_for(conversation, "清理完成后第三轮", resumed))
+            await wait_until(lambda: manager.state("run-acp-3") == "done", 10)
+            observed = methods()
+            assert observed.count("initialize") == 2
+            assert observed.count("session/prompt") == 2
+            assert WorkspaceSessionStore(
+                paths.state_root, WORKSPACE).binding(
+                    conversation)["native_id"] == "native-session"
+            messages = manager.messages(conversation)["messages"]
+            assert [message["role"] for message in messages] == [
+                "user", "user", "assistant"]
+            assert messages[1]["content"] == "清理完成后第三轮"
+        finally:
+            gate.write_text("release", encoding="utf-8")
+            if stop_task is not None:
+                await asyncio.gather(stop_task, return_exceptions=True)
+            await manager.aclose()
+            from easel.harnesses.rpc import close_sessions
+            await close_sessions(workspace_id=WORKSPACE)
 
     asyncio.run(scenario())

@@ -45,8 +45,10 @@ PROVIDER_MODEL = "deepseek-chat"
 CONTROL_TAG = "easel-control-test:a6"
 GATEWAY_TAG = "easel-gateway-test:g2"
 HARNESS_IMAGE_ID = (
-    "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9")
-SCREENSHOTS = ROOT / "docs" / "evidence" / "desktop-a6" / "screenshots"
+    "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993")
+SCREENSHOTS = pathlib.Path(os.environ.get(
+    "EASEL_A6_SCREENSHOTS",
+    ROOT / "docs" / "evidence" / "desktop-a6" / "screenshots"))
 CONTROL_COOKIE = "__Host-easel_session"
 
 pytestmark = pytest.mark.skipif(
