@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     初始化完整 Desktop 开发拓扑的专用卷、控制网络与两类 key。
 
@@ -86,7 +86,8 @@ try {
 
     $volumeSpecs = @(
         [pscustomobject]@{ Name = $volumes.Control; Role = 'control' },
-        [pscustomobject]@{ Name = $volumes.Keys; Role = 'keys' }
+        [pscustomobject]@{ Name = $volumes.Keys; Role = 'keys' },
+        [pscustomobject]@{ Name = $volumes.Egress; Role = 'egress-policy' }
     )
     foreach ($spec in $volumeSpecs) {
         $inspect = Invoke-EaselDocker -Arguments @(
@@ -136,8 +137,9 @@ try {
         'run', '--rm', '--user', '0:0', '--entrypoint', 'sh',
         '--mount', "type=volume,src=$($volumes.Control),dst=/data",
         '--mount', "type=volume,src=$($volumes.Keys),dst=/keys",
+        '--mount', "type=volume,src=$($volumes.Egress),dst=/policy",
         $Image,
-        '-c', 'chown 10001:10001 /data /keys && chmod 750 /data /keys')
+        '-c', 'chown 10001:10001 /data /keys /policy && chmod 750 /data /keys /policy')
     if ($chown.ExitCode -ne 0) {
         throw 'volume_permission_failed'
     }
@@ -159,14 +161,19 @@ try {
     $copyConfig = Invoke-EaselDocker -Arguments @(
         'run', '--rm', '--user', '0:0', '--entrypoint', 'sh',
         '--mount', "type=volume,src=$($volumes.Keys),dst=/keys",
+        '--mount', "type=volume,src=$($volumes.Egress),dst=/policy",
         '--mount', "type=bind,src=$ManagedAgentConfig,dst=/src/managed.json,readonly",
         '--mount', "type=bind,src=$EgressPolicy,dst=/src/policy.json,readonly",
         $Image,
         '-c',
-        ('cp /src/managed.json /keys/managed-agent.json && ' +
+        ('find /policy -mindepth 1 -maxdepth 1 -exec rm -rf {} + && ' +
+         'cp /src/managed.json /keys/managed-agent.json && ' +
          'cp /src/policy.json /keys/egress-policy.json && ' +
-         'chown 10001:10001 /keys/managed-agent.json /keys/egress-policy.json && ' +
-         'chmod 600 /keys/managed-agent.json /keys/egress-policy.json'))
+         'cp /src/policy.json /policy/egress-policy.json && ' +
+         'chown 10001:10001 /keys/managed-agent.json /keys/egress-policy.json ' +
+         '/policy/egress-policy.json && ' +
+         'chmod 600 /keys/managed-agent.json /keys/egress-policy.json ' +
+         '/policy/egress-policy.json'))
     if ($copyConfig.ExitCode -ne 0) {
         throw 'config_copy_failed'
     }
@@ -195,8 +202,9 @@ try {
     if (-not $keyStatus) {
         throw 'key_status_missing'
     }
-    Write-Output ("initialized project={0} control_volume={1} key_volume={2} network={3} {4}" -f `
-        $ProjectName, $volumes.Control, $volumes.Keys, $network, $keyStatus)
+    Write-Output ("initialized project={0} control_volume={1} key_volume={2} egress_volume={3} network={4} {5}" -f `
+        $ProjectName, $volumes.Control, $volumes.Keys, $volumes.Egress,
+        $network, $keyStatus)
     exit 0
 }
 catch {

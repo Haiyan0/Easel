@@ -72,6 +72,7 @@ function Get-EaselVolumeNames {
     return [pscustomobject]@{
         Control = "$ProjectName-control"
         Keys = "$ProjectName-keys"
+        Egress = "$ProjectName-egress"
     }
 }
 
@@ -136,14 +137,20 @@ function Set-EaselComposeEnvironment {
 function Assert-EaselVolumeContract {
     param(
         [Parameter(Mandatory)][string]$ProjectName,
-        [Parameter(Mandatory)]$Volumes
+        [Parameter(Mandatory)]$Volumes,
+        [switch]$IncludeEgress
     )
     # Start/Test 不得跳过 Initialize 的归属复核。原始 volume inspect 必须
     # 恰好返回一个对象，且实际 Name/项目/角色标签都匹配；不接受自动接管。
+    # A1 登录编排没有 egress 卷；只有 Workspace 编排显式要求第三卷。
     $specs = @(
         [pscustomobject]@{ Name = $Volumes.Control; Role = 'control' },
         [pscustomobject]@{ Name = $Volumes.Keys; Role = 'keys' }
     )
+    if ($IncludeEgress) {
+        $specs += [pscustomobject]@{
+            Name = $Volumes.Egress; Role = 'egress-policy' }
+    }
     foreach ($spec in $specs) {
         $inspect = Invoke-EaselDocker -Arguments @(
             'volume', 'inspect', $spec.Name)

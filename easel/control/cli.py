@@ -1369,11 +1369,22 @@ def cmd_admin_drain(args) -> int:
         socket, gateway_required=bool(getattr(args, "gateway_required", False)))
     try:
         with Store.open(_control_db(args.control_dir)) as store:
+            barrier = None
+            if bool(getattr(args, "barrier", False)):
+                # 屏障必须先于 drain 写入控制库，才对所有 control 进程生效。
+                barrier = store.set_admission_barrier(
+                    f"stop-{uuid.uuid4().hex}", "desktop-stop",
+                    int(time.time()))
+                print(f"barrier={barrier['id']}")
             manager = RuntimeManager(
                 store, provisioner,
                 gateway_required=bool(
                     getattr(args, "gateway_required", False)))
             drained = asyncio.run(manager.drain_all())
+            status = store.drain_status(int(time.time()))
+            if not status["settled"]:
+                print("错误：worker_drain_incomplete", file=sys.stderr)
+                return 1
     except DomainError as error:
         return _report(error)
     except Exception:  # noqa: BLE001 - provisioner/drain failures统一失败关闭
@@ -1382,6 +1393,49 @@ def cmd_admin_drain(args) -> int:
     print(f"drained={len(drained)}")
     for workspace in drained:
         print(f"drained_workspace={workspace}")
+    print("verified=settled")
+    return 0
+
+
+def cmd_admin_resume(args) -> int:
+    """清除停止接纳屏障；只由显式恢复入口调用。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            barrier = store.admission_barrier()
+            if barrier is None:
+                print("barrier=none")
+                return 0
+            barrier_id = str(barrier.get("id", ""))
+            requested = getattr(args, "barrier_id", None)
+            if requested is not None and requested != barrier_id:
+                print("错误：admission_barrier_mismatch", file=sys.stderr)
+                return 1
+            if not store.clear_admission_barrier(barrier_id):
+                print("错误：admission_barrier_clear_failed", file=sys.stderr)
+                return 1
+            print(f"cleared={barrier_id}")
+            return 0
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 恢复必须失败关闭
+        print("错误：admission_barrier_resume_failed", file=sys.stderr)
+        return 1
+
+
+def cmd_admin_barrier_status(args) -> int:
+    """只读打印当前停止接纳屏障，供 Start 诊断。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            barrier = store.admission_barrier()
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 诊断失败不得报告无屏障
+        print("错误：admission_barrier_status_failed", file=sys.stderr)
+        return 1
+    if barrier is None:
+        print("barrier=none")
+    else:
+        print(f"barrier={barrier.get('id', '')}")
     return 0
 
 

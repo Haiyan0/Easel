@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     校验并启动完整 Desktop 开发拓扑（WSL provisioner + control + egress）。
 
@@ -66,7 +66,7 @@ function Invoke-Wsl {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $lines = & $wsl.Source @Arguments 2>&1
+        $lines = & wsl.exe @Arguments 2>&1
         $code = $LASTEXITCODE
     }
     finally {
@@ -99,6 +99,28 @@ except OSError:
         '-d', $Distro, '--', 'python3', '-c', $code, $SocketPath)).ExitCode -eq 0
 }
 
+function Invoke-ProvisionerIdentityCheck {
+    param(
+        [Parameter(Mandatory)][string]$SocketPath,
+        [Parameter(Mandatory)][string]$ExpectedFile
+    )
+    # 以 control 的 UID/GID 运行固定镜像内的只读客户端；只传 socket 与
+    # 非秘密期望 JSON，不把 key 内容或 Docker socket 暴露给容器。
+    $wslExpected = ConvertTo-EaselWslPath -Path $ExpectedFile
+    return Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'run', '--rm',
+        '--network', 'none', '--read-only',
+        '--user', '10001:10001', '--group-add', [string]$ProvisionerGid,
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+        '--entrypoint', 'python',
+        '--mount', "type=bind,src=$SocketPath,dst=/run/provisioner.sock,readonly",
+        '--mount', "type=bind,src=$wslExpected,dst=/expected.json,readonly",
+        $Image,
+        '/opt/easel/deploy/desktop/provisioner_identity.py',
+        'check', '--socket', '/run/provisioner.sock',
+        '--expected', '/expected.json')
+}
+
 try {
     $PublicOrigin = Resolve-EaselOrigin -Origin $PublicOrigin
     $Image = Resolve-EaselImage -Image $Image
@@ -117,7 +139,8 @@ try {
         throw 'compose_missing'
     }
 
-    Assert-EaselVolumeContract -ProjectName $ProjectName -Volumes $volumes
+    Assert-EaselVolumeContract -ProjectName $ProjectName -Volumes $volumes `
+        -IncludeEgress
     Assert-EaselNetworkContract -ProjectName $ProjectName `
         -NetworkName $network
     Test-EaselImagePin -Image $Image
@@ -178,15 +201,69 @@ try {
     }
 
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
-    $alreadyRunning = Test-ProvisionerSocket -SocketPath $socket
-    if (-not $alreadyRunning) {
-        $stale = Invoke-Wsl -Arguments @(
-            '-d', $Distro, '--', 'rm', '-f', $socket)
-        if ($stale.ExitCode -ne 0) {
-            throw 'provisioner_socket_stale'
+    $wslWorkspace = ConvertTo-EaselWslPath -Path $WorkspaceRoot
+    $wslPublic = ConvertTo-EaselWslPath -Path $publicDir
+    $workerKeyHash = (Get-FileHash -LiteralPath `
+        (Join-Path $publicDir 'worker-public.key') `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $gatewayKeyHash = (Get-FileHash -LiteralPath `
+        (Join-Path $publicDir 'gateway-public.pem') `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $policyHash = (Get-FileHash -LiteralPath `
+        (Join-Path $publicDir 'egress-policy.json') `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expectedIdentity = [ordered]@{
+        workerImage = $WorkerImage
+        gatewayImage = $GatewayImage
+        workspaceRoot = $wslWorkspace
+        sidecarNetwork = $network
+        gatewayControlNetwork = $network
+        brokerUpstream = 'control:7861'
+        workerPublicSha256 = $workerKeyHash
+        gatewayPublicSha256 = $gatewayKeyHash
+        policySha256 = $policyHash
+        socketGid = $ProvisionerGid
+        socketMode = '660'
+        allowedUid = 10001
+    }
+    $logDir = Join-Path $DataRoot 'logs'
+    $null = New-Item -ItemType Directory -Path $logDir -Force
+    $identityExpectedPath = Join-Path $logDir 'provisioner-expected.json'
+    [IO.File]::WriteAllText(
+        $identityExpectedPath,
+        ($expectedIdentity | ConvertTo-Json -Compress),
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    $alreadyRunning = $false
+    $socketExists = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'bash', '-lc', "test -S '$socket'")
+    if ($socketExists.ExitCode -eq 0) {
+        if (Test-ProvisionerSocket -SocketPath $socket) {
+            $identity = Invoke-ProvisionerIdentityCheck -SocketPath $socket `
+                -ExpectedFile $identityExpectedPath
+            if ($identity.ExitCode -eq 0) {
+                $alreadyRunning = $true
+            }
+            elseif ($identity.ExitCode -eq 3) {
+                # 配置漂移明确拒绝；不杀活跃实例，由操作员 drain/受控重启。
+                throw ("provisioner_config_mismatch:" +
+                    (($identity.Output -join ',').Trim()))
+            }
+            else {
+                throw 'provisioner_identity_unavailable'
+            }
         }
-        $wslWorkspace = ConvertTo-EaselWslPath -Path $WorkspaceRoot
-        $wslPublic = ConvertTo-EaselWslPath -Path $publicDir
+        else {
+            # 无监听者的陈旧 socket 才可删除；能连接但不是本协议的
+            # 服务已在上面失败关闭，绝不盲删。
+            $stale = Invoke-Wsl -Arguments @(
+                '-d', $Distro, '--', 'rm', '-f', $socket)
+            if ($stale.ExitCode -ne 0) {
+                throw 'provisioner_socket_stale'
+            }
+        }
+    }
+    if (-not $alreadyRunning) {
         $lines = @(
             '#!/usr/bin/env bash',
             'set -e',
@@ -225,14 +302,27 @@ try {
         }
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
         $started = $false
+        $identityFailed = $false
         while ((Get-Date) -lt $deadline) {
             if (Test-ProvisionerSocket -SocketPath $socket) {
-                $started = $true
-                break
+                $identity = Invoke-ProvisionerIdentityCheck `
+                    -SocketPath $socket -ExpectedFile $identityExpectedPath
+                if ($identity.ExitCode -eq 0) {
+                    $started = $true
+                    break
+                }
+                if ($identity.ExitCode -eq 3) {
+                    throw ("provisioner_identity_mismatch:" +
+                        (($identity.Output -join ',').Trim()))
+                }
+                $identityFailed = $true
             }
             Start-Sleep -Seconds 1
         }
         if (-not $started) {
+            if ($identityFailed) {
+                throw 'provisioner_identity_unavailable'
+            }
             throw 'provisioner_start_timeout'
         }
     }
@@ -244,6 +334,7 @@ try {
         "EASEL_DESKTOP_PROJECT=$ProjectName",
         "EASEL_CONTROL_VOLUME=$($volumes.Control)",
         "EASEL_KEY_VOLUME=$($volumes.Keys)",
+        "EASEL_EGRESS_VOLUME=$($volumes.Egress)",
         "EASEL_CONTROL_PORT=$Port",
         "EASEL_CONTROL_NETWORK=$network",
         "EASEL_PROVISIONER_GID=$ProvisionerGid",
@@ -285,6 +376,18 @@ try {
     }
     if (-not $healthy) {
         throw 'control_health_timeout'
+    }
+
+    $barrier = Invoke-EaselDocker -Arguments @(
+        'exec', $containerId, 'python', '-m', 'easel', 'admin',
+        'barrier-status', '--control-dir', '/srv/easel/control')
+    $barrierText = (($barrier.Output -join '').Trim())
+    if ($barrier.ExitCode -ne 0) {
+        throw 'admission_barrier_status_failed'
+    }
+    if ($barrierText -and $barrierText -ne 'barrier=none') {
+        # 上次 Stop 未完成时保持失败关闭；必须显式 resume 后才能重开。
+        throw "admission_barrier_active:$barrierText"
     }
 
     Write-Output ("started project={0} origin={1} port={2} control={3} worker={4} gateway={5} network={6} provisioner_socket={7}" -f `

@@ -22,9 +22,10 @@ from easel.commands.doctor import cmd_doctor
 from easel.commands.gateway import cmd_gateway
 from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
-from easel.control.cli import (cmd_admin_backup, cmd_admin_bootstrap,
-                               cmd_admin_drain, cmd_admin_invite,
-                               cmd_admin_migrate_local, cmd_admin_restore,
+from easel.control.cli import (cmd_admin_backup, cmd_admin_barrier_status,
+                               cmd_admin_bootstrap, cmd_admin_drain,
+                               cmd_admin_invite, cmd_admin_migrate_local,
+                               cmd_admin_restore, cmd_admin_resume,
                                cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
@@ -316,7 +317,20 @@ def main(argv: list[str] | None = None) -> int:
     p_drain.add_argument("--control-dir", required=True)
     p_drain.add_argument("--provisioner-socket", required=True)
     p_drain.add_argument("--gateway-required", action="store_true")
+    p_drain.add_argument(
+        "--barrier", action="store_true",
+        help="drain 前建立跨进程停止接纳屏障（Desktop Stop 使用）")
     p_drain.set_defaults(func=cmd_admin_drain)
+    p_resume = admin_sub.add_parser(
+        "resume", help="清除停止接纳屏障，恢复新任务接纳")
+    p_resume.add_argument("--control-dir", required=True)
+    p_resume.add_argument("--barrier-id", default=None,
+                          help="只清除指定屏障，避免误放行")
+    p_resume.set_defaults(func=cmd_admin_resume)
+    p_barrier = admin_sub.add_parser(
+        "barrier-status", help="只读打印当前停止接纳屏障")
+    p_barrier.add_argument("--control-dir", required=True)
+    p_barrier.set_defaults(func=cmd_admin_barrier_status)
     p_backup = admin_sub.add_parser(
         "backup", help="备份控制库、master key 与 workspace 持久区")
     p_backup.add_argument("--control-dir", required=True)

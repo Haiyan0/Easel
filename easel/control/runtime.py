@@ -292,20 +292,34 @@ class RuntimeManager:
                        expected_state="stopping")
 
     async def drain_all(self) -> list[str]:
-        """为本地备份/升级顺序 drain 所有活动 workspace，返回已处理空间。
+        """drain 所有活动 workspace，并复核持久终态后才返回。
 
-        备份调用方必须在本方法返回后重新读取租约；仍处于 starting/stopping
-        等中间态时不得开始文件系统备份。单个空间 drain 的失败原样向上抛出，
-        不把“部分 drain”伪装成已完成。
+        Stop 调用方必须先建立跨进程接纳屏障；本方法仍只负责收尾现有实例。
+        starting/stopping 是其他进程正在进行的中间态：等待其落定，超时则
+        失败关闭，绝不把“仍在停止中”报告为已完成。已接纳 Run 的
+        stop/events/answer 仍可正常走既有句柄。
         """
-        leases = await self._db(self._store.list_worker_leases)
         drained: list[str] = []
-        for lease in leases:
-            if lease.state not in ("starting", "ready", "draining", "stopping"):
-                continue
-            await self.drain(lease.workspace_id)
-            drained.append(lease.workspace_id)
-        return drained
+        seen: set[str] = set()
+        deadline = self._clock() + self._drain_timeout
+        while True:
+            leases = await self._db(self._store.list_worker_leases)
+            for lease in leases:
+                if lease.state not in ("ready", "draining"):
+                    continue
+                if lease.workspace_id in seen:
+                    continue
+                seen.add(lease.workspace_id)
+                await self.drain(lease.workspace_id)
+                drained.append(lease.workspace_id)
+            status = await self._db(
+                self._store.drain_status, self._now())
+            if status["settled"]:
+                return drained
+            if self._clock() >= deadline:
+                raise RuntimeUnavailable(
+                    "worker_drain_incomplete", 503, retry_after=5)
+            await asyncio.sleep(self._poll_interval)
 
     async def collect_idle(self, now: float) -> list[str]:
         """回收超过空闲阈值且无任务/请求的实例，返回真正停止的 workspace。
@@ -446,13 +460,47 @@ class RuntimeManager:
         if (lease is None or lease.container_id != container_id
                 or lease.config_version != config_version):
             return None
+        now = self._now()
+        takeover_owner: str | None = None
+        takeover_attempt: str | None = None
+        takeover_starting = False
         if lease.state == "starting":
-            raise RuntimeUnavailable(
-                "worker_gateway_refresh_in_progress", 503, retry_after=1)
-        if lease.state == "stopping":
-            raise RuntimeUnavailable(
-                "worker_stopping", 503, retry_after=1)
-        if (lease.state not in ("ready", "draining")
+            if lease.lease_expires_at > now:
+                raise RuntimeUnavailable(
+                    "worker_gateway_refresh_in_progress", 503, retry_after=1)
+            if not lease.upstream or not lease.service_token:
+                return None
+            # 旧 owner 的 refresh 租约已过期：保留同一 worker ID/config，
+            # 用 owner/generation/attempt + 过期时间 CAS 接管。物理恢复仍只
+            # 走 provisioner.restore_gateway，绝不冷启动或替换 worker。
+            takeover_starting = True
+            takeover_owner = lease.owner_id or None
+            takeover_attempt = lease.attempt_id or None
+        elif lease.state == "stopping":
+            if (lease.cleanup_purpose == "start_abort"
+                    and lease.cleanup_scope == "gateway"):
+                if lease.lease_expires_at > now:
+                    raise RuntimeUnavailable(
+                        "gateway_cleanup_in_progress", 503, retry_after=1)
+                await self._recover_stop(
+                    workspace_id, lease, self._clock() + self._ready_timeout)
+                refreshed = await self._db(
+                    self._store.get_worker_lease, workspace_id)
+                if (refreshed is None
+                        or refreshed.container_id != container_id
+                        or refreshed.config_version != config_version):
+                    return None
+                if refreshed.state != "ready":
+                    raise RuntimeUnavailable(
+                        "gateway_cleanup_incomplete", 503, retry_after=1)
+                lease = refreshed
+            else:
+                raise RuntimeUnavailable(
+                    "worker_stopping", 503, retry_after=1)
+        allowed_state = (lease.state in ("ready", "draining")
+                         or (lease.state == "starting"
+                             and takeover_starting))
+        if (not allowed_state
                 or not lease.upstream or not lease.service_token):
             return None
         if lease.state == "draining":
@@ -469,7 +517,9 @@ class RuntimeManager:
                                      retry_after=5)
         return await self._commit_gateway_candidate(
             workspace_id, config_version, lease, candidate, attempt_id,
-            deadline)
+            deadline, expected_owner=takeover_owner,
+            expected_attempt=takeover_attempt,
+            expires_at_or_before=(now if takeover_starting else None))
 
     async def _restore_candidate(self, workspace_id: str, container_id: str,
                                  config_version: int, deadline: float,
@@ -507,12 +557,17 @@ class RuntimeManager:
     async def _commit_gateway_candidate(
             self, workspace_id: str, config_version: int, lease: WorkerLease,
             candidate: WorkerHandle, attempt_id: str,
-            deadline: float) -> WorkerHandle:
+            deadline: float, *, expected_owner: str | None = None,
+            expected_attempt: str | None = None,
+            expires_at_or_before: int | None = None) -> WorkerHandle:
         """在受保护 CAS 中保存候选、激活并收口；refresh/restore 共用。"""
         staged = await self._db(
             self._store.begin_worker_gateway_refresh,
             workspace_id, lease.generation, self.owner_id, candidate,
-            attempt_id, self._now(), self._lease_seconds)
+            attempt_id, self._now(), self._lease_seconds,
+            expected_owner=expected_owner,
+            expected_attempt=expected_attempt,
+            expires_at_or_before=expires_at_or_before)
         if staged is None:
             raise RuntimeUnavailable("worker_start_superseded", 503,
                                      retry_after=1)

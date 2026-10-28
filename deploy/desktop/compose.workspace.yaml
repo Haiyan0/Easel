@@ -93,13 +93,15 @@ services:
       - --port
       - "8899"
       - --policy
-      - /keys/egress-policy.json
+      - /policy/egress-policy.json
     networks:
       control:
         aliases:
           - egress
     volumes:
-      - keys:/keys:ro
+      # 出口代理只获得专用策略卷，绝不挂 control key 卷；master key 与
+      # Ed25519 私钥只存在于 control 进程可见的 keys 卷。
+      - egress:/policy:ro
     healthcheck:
       test:
         - CMD
@@ -125,3 +127,6 @@ volumes:
   keys:
     external: true
     name: ${EASEL_KEY_VOLUME:?请设置 key 卷}
+  egress:
+    external: true
+    name: ${EASEL_EGRESS_VOLUME:?请设置出口策略卷}

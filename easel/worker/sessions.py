@@ -19,6 +19,8 @@ from pathlib import Path, PurePosixPath
 
 from easel.control.types import DomainError
 
+from .fsutil import best_effort_fchmod, fsync_directory
+
 try:  # POSIX
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -100,19 +102,14 @@ def _atomic_write(path: Path, data: dict) -> None:
             dir=path.parent, prefix=path.name, suffix=".tmp")
         temporary = Path(name)
         try:
-            if hasattr(os, "fchmod"):
-                try:
-                    os.fchmod(descriptor, 0o600)
-                except OSError:
-                    # Windows bind mount（Docker Desktop /mnt/c）可能拒绝
-                    # fchmod；mkstemp 已按 0o600 创建，不能因此拒绝写会话。
-                    pass
+            best_effort_fchmod(descriptor, path.parent)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(data, stream, ensure_ascii=False,
                           separators=(",", ":"), sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(path)
+            fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
     except OSError:
@@ -379,13 +376,7 @@ class WorkspaceSessionStore:
                 dir=directory, prefix=f".{path.name}.", suffix=".tmp")
             temporary = Path(name)
             try:
-                if hasattr(os, "fchmod"):
-                    try:
-                        os.fchmod(descriptor, 0o600)
-                    except OSError:
-                        # Windows bind mount 可能拒绝 fchmod；mkstemp 已按
-                        # 0o600 创建，不能把会话写入误判为失败。
-                        pass
+                best_effort_fchmod(descriptor, directory)
                 if path.exists():
                     # 读取/校验异常只归为损坏；写入临时文件失败仍按磁盘
                     # 写入失败处理，不能误报为消息损坏。
@@ -413,23 +404,9 @@ class WorkspaceSessionStore:
                 os.close(descriptor)
             os.replace(temporary, path)
             temporary = None
-            if os.name == "posix":
-                # 目录项持久化，确保 replace 在掉电后仍可见。Windows
-                # bind mount 可能不支持目录 fsync（EINVAL/EPERM）；此时
-                # 数据文件已 fsync 且原子替换完成，不把已知平台限制
-                # 误报为会话写入失败。
-                try:
-                    directory_fd = os.open(directory, os.O_RDONLY)
-                except OSError:
-                    directory_fd = None
-                if directory_fd is not None:
-                    try:
-                        try:
-                            os.fsync(directory_fd)
-                        except OSError:
-                            pass
-                    finally:
-                        os.close(directory_fd)
+            # 目录项持久化；只有明确开发挂载的已知不支持错误可容忍，
+            # 原生 Linux 的目录 fsync EIO/ENOSPC 一律失败。
+            fsync_directory(directory)
         except DomainError:
             raise
         except OSError:

@@ -584,6 +584,27 @@ class ObservingSessions(WorkspaceSessionStore):
         return super().append_message_once(session_id, run_id, message)
 
 
+def test_stage_output_directory_fsync_eio_is_not_reported_success(
+        tmp_path, monkeypatch):
+    import easel.worker.runs as runs_module
+
+    paths = make_paths(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    manager = make_manager(paths, key, PausingExecutor({}, {}, {}))
+    monkeypatch.setattr(
+        runs_module, "fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError(5, "io error")))
+    with pytest.raises(DomainError) as rejected:
+        manager._stage_output("run-a", "回答")
+    assert (rejected.value.code, rejected.value.status) == (
+        "output_storage_failed", 500)
+    # 失败不得伪报成功，但原子 replace 已完成；保留暂存输出供重开恢复。
+    staged = paths.state_root / "finalizing" / "run-a.json"
+    assert json.loads(staged.read_text(encoding="utf-8"))["content"] == "回答"
+    assert list((paths.state_root / "finalizing").glob(".*.tmp")) == []
+    asyncio.run(manager.aclose())
+
+
 def test_output_storage_failure_never_publishes_done(tmp_path):
     paths = make_paths(tmp_path)
     key = Ed25519PrivateKey.generate()

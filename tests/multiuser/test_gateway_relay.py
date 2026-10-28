@@ -123,6 +123,7 @@ def _dispatched(store: Store, user: Identity, conversation, run,
         "input_digest": "digest", "expires_at": 9999,
         "routes": {}, "agent": {}}))
     store.claim_run_dispatch(user, run.id, "nonce", container, now=900)
+    store.mark_run_dispatched(user, run.id, "nonce")
     store.mark_running(user, run.id)
 
 
@@ -344,6 +345,48 @@ def test_gateway_answer_encodes_question_id(tmp_path):
         _assert_gateway_signature(key, captured, _handle(user.workspace_id))
 
 
+def test_gateway_get_waits_for_concurrent_refresh_instead_of_immediate_503(
+        tmp_path):
+    class ConcurrentRuntime(StaticRuntime):
+        def __init__(self, handle):
+            super().__init__(handle)
+            self.bound_calls = 0
+            self.restore_error = RuntimeUnavailable(
+                "worker_gateway_refresh_in_progress", 503)
+
+        async def bound_handle(self, workspace_id, container_id,
+                                config_version):
+            self.bound_calls += 1
+            if 1 < self.bound_calls < 4:
+                raise RuntimeUnavailable(
+                    "worker_gateway_refresh_in_progress", 503)
+            return self.handle
+
+    with Store.open(tmp_path / "db") as store:
+        user = store.create_user("A")
+        conversation = store.create_conversation(user, "refresh")
+        run = store.reserve_run(
+            user, conversation.id, "turn", "digest", REVISION)
+        _dispatched(store, user, conversation, run)
+        runtime = ConcurrentRuntime(_handle(user.workspace_id))
+        transport = GatewayTransport([
+            (503, {"error": "gateway_inactive"}, None),
+        ])
+        key = Ed25519PrivateKey.generate()
+
+        async def scenario():
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = _relay(store, runtime, client, key)
+                page = await relay.events(user, run.id, after=0)
+                assert page["state"] == "running"
+
+        asyncio.run(scenario())
+        assert runtime.restore_calls
+        assert runtime.bound_calls >= 4
+        assert [item["method"] for item in transport.requests] == [
+            "GET", "GET"]
+
+
 def test_gateway_client_none_with_gateway_required_is_unavailable(tmp_path):
     with Store.open(tmp_path / "db") as store:
         user = store.create_user("A")
@@ -392,6 +435,7 @@ def test_reconciler_gateway_unavailable_keeps_run_and_token(tmp_path):
             "input_digest": "digest", "expires_at": now - 900,
             "routes": {}, "agent": {"timeout": 1}}))
         store.claim_run_dispatch(user, run.id, "nonce", WORKER, now=now - 1000)
+        store.mark_run_dispatched(user, run.id, "nonce")
         store.mark_running(user, run.id)
         store._connection.execute(
             "UPDATE runs SET created_at = ? WHERE id = ?",
@@ -399,7 +443,6 @@ def test_reconciler_gateway_unavailable_keeps_run_and_token(tmp_path):
         store._connection.commit()
         runtime = StaticRuntime(_handle(user.workspace_id))
         transport = GatewayTransport([
-            (503, {"error": "gateway_inactive"}, None),
             (503, {"error": "gateway_inactive"}, None),
         ])
         key = Ed25519PrivateKey.generate()
@@ -415,5 +458,9 @@ def test_reconciler_gateway_unavailable_keeps_run_and_token(tmp_path):
                 assert store.count_active_runs() == 1
                 assert broker.revoked == []
                 assert runtime.stop_calls == []
+                # 已派发且已过 deadline：必须真正发出状态 GET；gateway 503
+                # 后不得继续发送 stop，也不得撤销 token 或释放容量。
+                assert [item["method"] for item in transport.requests] == ["GET"]
+                assert "/events" in transport.requests[0]["url"]
 
         asyncio.run(scenario())

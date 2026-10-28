@@ -58,20 +58,26 @@ def test_workspace_compose_binds_signing_keys_and_gateway_mode():
     assert not any("/workspace" in str(item) for item in volumes)
 
 
-def test_workspace_compose_egress_has_no_ports_or_docker_socket():
+def test_workspace_compose_egress_uses_policy_volume_only():
     compose = _compose()
     egress = compose["services"]["egress"]
     assert "ports" not in egress
     assert egress["read_only"] is True
     assert egress["cap_drop"] == ["ALL"]
     assert egress["user"] == "10001:10001"
+    assert egress["volumes"] == ["egress:/policy:ro"]
     assert not any("docker.sock" in str(item)
                    for item in egress["volumes"])
+    assert "/policy/egress-policy.json" in egress["command"]
+    assert "/keys" not in " ".join(str(part) for part in egress["command"])
     assert "command" in egress and any(
         "egress_proxy.py" in str(part) for part in egress["command"])
     assert compose["networks"]["control"]["external"] is True
     assert compose["volumes"]["keys"]["external"] is True
     assert compose["volumes"]["control"]["external"] is True
+    assert compose["volumes"]["egress"]["external"] is True
+    assert compose["volumes"]["egress"]["name"].startswith(
+        "${EASEL_EGRESS_VOLUME")
 
 
 def test_initialize_binds_key_creation_and_private_network():
@@ -84,6 +90,9 @@ def test_initialize_binds_key_creation_and_private_network():
     assert "workspace-sidecar" in text
     assert "managed-agent.json" in text
     assert "egress-policy.json" in text
+    assert "egress-policy" in text
+    assert "volumes.Egress" in text
+    assert "/policy/egress-policy.json" in text
     _assert_no_authtoken_read(text)
     assert "chmod 777" not in text
     assert "chmod 666" not in text
@@ -99,19 +108,32 @@ def test_start_diagnoses_missing_dependencies_before_starting():
             "control_health_timeout", "Assert-EaselNetworkContract",
             "Assert-EaselVolumeContract"):
         assert marker.lower() in text.lower()
+    for marker in (
+            "provisioner-expected.json", "Invoke-ProvisionerIdentityCheck",
+            "provisioner_identity_unavailable",
+            "provisioner_config_mismatch",
+            "provisioner_identity_mismatch", "admission_barrier_active"):
+        assert marker in text
     _assert_no_authtoken_read(text)
 
 
-def test_stop_drains_before_stopping_and_status_is_read_only():
+def test_stop_drains_before_stopping_and_status_fails_closed():
     stop = STOP.read_text(encoding="utf-8")
     assert "admin drain" in stop
+    assert "--barrier" in stop
+    assert "admission_barrier" in stop
+    assert "drain_verified" in stop
     assert "worker_drain_failed" in stop
     assert "'down'" in stop
     assert "provisioner_socket_missing" in stop
     status = STATUS.read_text(encoding="utf-8")
-    assert "worker_leases" in status
-    assert "api_health" in status
-    assert "provisioner_socket" in status
+    for marker in (
+            "worker_leases", "api_health", "provisioner_socket",
+            "Add-Failure", "status=failed", "exit 1",
+            "control_mounts", "workspace_keys", "workspace_config",
+            "egress_policy_mount", "provisioner_identity",
+            "admission_barrier"):
+        assert marker in status
     _assert_no_authtoken_read(status)
 
 

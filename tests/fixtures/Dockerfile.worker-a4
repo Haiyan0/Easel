@@ -6,10 +6,13 @@
 FROM easel-worker-execution:g2
 
 USER root
+COPY easel/worker/fsutil.py /opt/easel/easel/worker/fsutil.py
 COPY easel/worker/sessions.py /opt/easel/easel/worker/sessions.py
 COPY easel/worker/runs.py /opt/easel/easel/worker/runs.py
-RUN chown root:root /opt/easel/easel/worker/sessions.py \
+RUN chown root:root /opt/easel/easel/worker/fsutil.py \
+      /opt/easel/easel/worker/sessions.py \
       /opt/easel/easel/worker/runs.py \
- && chmod a-w /opt/easel/easel/worker/sessions.py \
+ && chmod a-w /opt/easel/easel/worker/fsutil.py \
+      /opt/easel/easel/worker/sessions.py \
       /opt/easel/easel/worker/runs.py
 USER 10001:10001

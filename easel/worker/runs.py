@@ -37,6 +37,7 @@ from .config import (
     run_snapshot_fingerprint,
     verify_run_snapshot,
 )
+from .fsutil import best_effort_fchmod, fsync_directory
 from .sessions import (
     MAX_ATTACHMENTS,
     SUPPORTED_RUNTIMES,
@@ -1423,13 +1424,7 @@ class RunManager:
                 dir=path.parent, prefix=".stage-", suffix=".tmp")
             temporary = Path(name)
             try:
-                if hasattr(os, "fchmod"):
-                    try:
-                        os.fchmod(descriptor, 0o600)
-                    except OSError:
-                        # Windows bind mount 可能拒绝 fchmod；mkstemp 已按
-                        # 0o600 创建，不能把输出暂存误判为失败。
-                        pass
+                best_effort_fchmod(descriptor, path.parent)
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     json.dump({"runId": run_id,
                                "workspaceId": self.workspace_id,
@@ -1438,6 +1433,7 @@ class RunManager:
                     stream.flush()
                     os.fsync(stream.fileno())
                 temporary.replace(path)
+                fsync_directory(path.parent)
             finally:
                 temporary.unlink(missing_ok=True)
         except OSError:

@@ -29,7 +29,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -390,6 +390,17 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "ALTER TABLE worker_leases ADD COLUMN cleanup_worker_created INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE worker_leases ADD COLUMN cleanup_gateway_created INTEGER NOT NULL DEFAULT 0",
     ),
+    # 版本 14：跨进程停止接纳屏障。Stop 在 drain 之前写入该行，所有 control
+    # 进程的 workspace 创建、worker 启动与 Run 接纳都在同一事务内复查。
+    (
+        """
+        CREATE TABLE control_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """,
+    ),
 )
 
 
@@ -592,6 +603,7 @@ class Store:
         workspace_id = uuid.uuid4().hex
         stamp = _now()
         with self._transaction():
+            self._require_admission_open_locked()
             self._connection.execute(
                 "INSERT INTO users (id, display_name, role, created_at) VALUES (?, ?, ?, ?)",
                 (user_id, display_name, role, stamp))
@@ -599,6 +611,94 @@ class Store:
                 "INSERT INTO workspaces (id, owner_user_id, state, config_version, created_at)"
                 " VALUES (?, ?, 'ready', 0, ?)", (workspace_id, user_id, stamp))
         return Identity(user_id, workspace_id, role)
+
+    # ------------------------------------------------------------------
+    # 停止接纳屏障
+    # ------------------------------------------------------------------
+
+    _ADMISSION_BARRIER_KEY = "admission_barrier"
+
+    def _admission_barrier_locked(self) -> dict | None:
+        row = self._connection.execute(
+            "SELECT value FROM control_state WHERE key = ?",
+            (self._ADMISSION_BARRIER_KEY,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError):
+            raise DomainError("admission_barrier_corrupt", 500) from None
+        if not isinstance(value, dict):
+            raise DomainError("admission_barrier_corrupt", 500)
+        return value
+
+    def _require_admission_open_locked(self) -> None:
+        if self._admission_barrier_locked() is not None:
+            raise DomainError("admission_closed", 503, retry_after=1)
+
+    def admission_barrier(self) -> dict | None:
+        """读取当前停止接纳屏障；跨进程以控制库为准。"""
+        with self._read_transaction():
+            return self._admission_barrier_locked()
+
+    def set_admission_barrier(self, barrier_id: str, reason: str,
+                              now: int) -> dict:
+        """原子建立屏障；已有屏障时原样返回，便于安全重试 Stop。"""
+        if (not isinstance(barrier_id, str) or not barrier_id
+                or len(barrier_id) > 128):
+            raise DomainError("invalid_argument", 400)
+        if (not isinstance(reason, str) or not reason
+                or len(reason) > 128):
+            raise DomainError("invalid_argument", 400)
+        stamp = int(now)
+        with self._transaction():
+            existing = self._admission_barrier_locked()
+            if existing is not None:
+                return existing
+            value = {"id": barrier_id, "reason": reason, "setAt": stamp}
+            self._connection.execute(
+                "INSERT INTO control_state (key, value, updated_at)"
+                " VALUES (?, ?, ?)",
+                (self._ADMISSION_BARRIER_KEY,
+                 json.dumps(value, sort_keys=True, separators=(",", ":")),
+                 stamp))
+            return value
+
+    def clear_admission_barrier(self, barrier_id: str | None = None) -> bool:
+        """清除屏障；指定 ID 时只允许清除同一屏障，避免误放行。"""
+        with self._transaction():
+            existing = self._admission_barrier_locked()
+            if existing is None:
+                return False
+            if barrier_id is not None and existing.get("id") != barrier_id:
+                return False
+            self._connection.execute(
+                "DELETE FROM control_state WHERE key = ?",
+                (self._ADMISSION_BARRIER_KEY,))
+            return True
+
+    def drain_status(self, now: int) -> dict:
+        """返回停止能否安全完成所需的全部持久事实。"""
+        stamp = int(now)
+        runs = self._connection.execute(
+            "SELECT COUNT(*) AS total FROM runs"
+            f" WHERE status NOT IN ({_placeholders(TERMINAL_RUN_STATUSES)})",
+            TERMINAL_RUN_STATUSES).fetchone()["total"]
+        requests = self._connection.execute(
+            "SELECT COUNT(*) AS total FROM request_leases"
+            " WHERE expires_at > ?", (stamp,)).fetchone()["total"]
+        leases = [
+            {"workspaceId": row["workspace_id"], "state": row["state"]}
+            for row in self._connection.execute(
+                "SELECT workspace_id, state FROM worker_leases"
+                " WHERE state IN ('starting', 'ready', 'draining', 'stopping')"
+                " ORDER BY workspace_id").fetchall()]
+        return {
+            "activeRuns": int(runs),
+            "activeRequests": int(requests),
+            "activeLeases": leases,
+            "settled": int(runs) == 0 and int(requests) == 0 and not leases,
+        }
 
     def list_workspace_ids(self) -> list[str]:
         """按稳定顺序列出全部 workspace；仅供本地备份/迁移枚举。"""
@@ -649,6 +749,7 @@ class Store:
         stamp = _now()
         with self._transaction():
             self._require_admin(actor)
+            self._require_admission_open_locked()
             self._connection.execute(
                 "INSERT INTO users (id, display_name, role, created_at)"
                 " VALUES (?, ?, 'member', ?)",
@@ -816,6 +917,7 @@ class Store:
             raise DomainError("invalid_argument", 400)
         now = int(now)
         with self._transaction():
+            self._require_admission_open_locked()
             self._require_ready_workspace(workspace_id)
             lease = self._worker_lease_row(workspace_id)
             if lease is None:
@@ -918,12 +1020,35 @@ class Store:
     def begin_worker_gateway_refresh(
             self, workspace_id: str, generation: int, owner_id: str,
             handle: WorkerHandle, attempt_id: str, now: int,
-            lease_seconds: int) -> WorkerLease | None:
-        """ready/expired-refresh→starting CAS；递增 generation 使旧持有者失效。"""
+            lease_seconds: int, *, expected_owner: str | None = None,
+            expected_attempt: str | None = None,
+            expires_at_or_before: int | None = None) -> WorkerLease | None:
+        """ready/过期 refresh→starting CAS；递增 generation 使旧持有者失效。
+
+        接管崩溃遗留的 starting 时必须同时匹配旧 owner/attempt 与过期时间；
+        任一前提变化都返回 None，迟到旧控制面不能覆盖新代次。
+        """
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise DomainError("invalid_argument", 400)
         attempt_id = _text(attempt_id)
         now = int(now)
+        where = (" WHERE workspace_id = ? AND generation = ?"
+                 " AND (state = 'ready'"
+                 "      OR (state = 'starting' AND container_id <> ''))")
+        values: list[object] = [
+            _text(owner_id), now, now + lease_seconds, now,
+            handle.gateway_instance_id, handle.gateway_generation,
+            handle.gateway_upstream, attempt_id, _text(workspace_id),
+            int(generation)]
+        if expected_owner is not None:
+            where += " AND owner_id = ?"
+            values.append(_text(expected_owner))
+        if expected_attempt is not None:
+            where += " AND attempt_id = ?"
+            values.append(_text(expected_attempt))
+        if expires_at_or_before is not None:
+            where += " AND lease_expires_at <= ?"
+            values.append(int(expires_at_or_before))
         with self._transaction():
             cursor = self._connection.execute(
                 "UPDATE worker_leases SET state = 'starting', owner_id = ?,"
@@ -933,13 +1058,8 @@ class Store:
                 " gateway_upstream = ?, gateway_state = 'staged',"
                 " attempt_id = ?, cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0"
-                " WHERE workspace_id = ? AND generation = ?"
-                " AND (state = 'ready'"
-                "      OR (state = 'starting' AND container_id <> ''))",
-                (_text(owner_id), now, now + lease_seconds, now,
-                 handle.gateway_instance_id, handle.gateway_generation,
-                 handle.gateway_upstream, attempt_id, _text(workspace_id),
-                 int(generation)))
+                + where,
+                tuple(values))
             if cursor.rowcount != 1:
                 return None
             return self._worker_lease_row(_text(workspace_id))
@@ -2177,6 +2297,7 @@ class Store:
                         or existing["input_digest"] != input_digest):
                     raise DomainError("request_conflict", 409)
                 return _run_record(existing)
+            self._require_admission_open_locked()
             self._require_conversation_free(workspace_id, conversation_id)
             self._require_capacity(workspace_id)
             run_id = uuid.uuid4().hex

@@ -83,7 +83,7 @@ WORKER_COMMAND = (
 DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
 
 ACTIONS = ("ensure", "stop", "inspect", "activate", "abort",
-           "restore_gateway")
+           "restore_gateway", "identity")
 
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PINNED_IMAGE = re.compile(
@@ -177,8 +177,12 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     if action not in ACTIONS:
         raise _reject("invalid_action")
     if version == LEGACY_PROTOCOL_VERSION and action in (
-            "activate", "abort", "restore_gateway"):
+            "activate", "abort", "restore_gateway", "identity"):
         raise _reject("unsupported_protocol")
+    if action == "identity":
+        if set(data) != {"version", "action"}:
+            raise _reject("unknown_field")
+        return WorkerRequest(action, "")
     allowed = {"version", "action", "workspace_id"}
     if action in ("ensure", "activate", "restore_gateway"):
         allowed.add("config_version")
@@ -2566,6 +2570,66 @@ class Provisioner:
             and report["gateway_available"])
         return report
 
+    async def identity(self) -> dict:
+        """只读返回实际运行配置的脱敏身份；不返回任何秘密内容。"""
+        try:
+            socket_stat = self.settings.socket_path.stat()
+        except OSError:
+            raise ProvisionerError("identity_socket_unavailable") from None
+        context = await self._docker("context", "show", timeout=15.0)
+        if context.returncode != 0:
+            raise ProvisionerError("docker_context_unavailable")
+        engine = await self._docker(
+            "info", "--format", "{{.ID}}", timeout=15.0)
+        if engine.returncode != 0:
+            raise ProvisionerError("docker_engine_unavailable")
+        engine_id = str(engine.stdout or "").strip()
+        if not engine_id:
+            raise ProvisionerError("docker_engine_unavailable")
+        context_name = str(context.stdout or "").strip()
+        if not context_name:
+            raise ProvisionerError("docker_context_unavailable")
+
+        def digest(path: Path | None) -> str:
+            if path is None:
+                return ""
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                raise ProvisionerError("identity_file_unavailable") from None
+            return hashlib.sha256(data).hexdigest()
+
+        worker_key = digest(self._worker_public_key)
+        gateway_key = digest(self.settings.gateway_public_key)
+        policy = digest(self.settings.sidecar_policy)
+        return {
+            "protocol": PROTOCOL_VERSION,
+            "engine": {"context": context_name, "id": engine_id},
+            "images": {
+                "worker": self.settings.image,
+                "gateway": self.settings.gateway_image,
+            },
+            "workspaceRoot": str(Path(self.settings.workspace_root).resolve()),
+            "networks": {
+                "sidecar": self.settings.sidecar_network,
+                "gatewayControl": self.settings.gateway_control_network,
+            },
+            "brokerUpstream": self.settings.broker_upstream,
+            "keys": {
+                "workerPublicSha256": worker_key,
+                "gatewayPublicSha256": gateway_key,
+            },
+            "policySha256": policy,
+            "socket": {
+                "path": str(self.settings.socket_path),
+                "uid": int(socket_stat.st_uid),
+                "gid": int(socket_stat.st_gid),
+                "mode": f"{stat.S_IMODE(socket_stat.st_mode):03o}",
+                "allowedUids": sorted(int(uid)
+                                      for uid in self.settings.allowed_uids),
+            },
+        }
+
     async def _probe(self, workspace_id: str, config_version: int,
                      instance_id: str) -> bool:
         """对不可复用容器 ID 执行固定 healthcheck，不探测宿主到容器 IP。"""
@@ -2654,6 +2718,8 @@ class Provisioner:
                 pass
 
     async def _dispatch(self, request: WorkerRequest) -> dict:
+        if request.action == "identity":
+            return {"ok": True, "identity": await self.identity()}
         if request.action == "ensure":
             handle = await self.ensure(
                 request.workspace_id, request.config_version,

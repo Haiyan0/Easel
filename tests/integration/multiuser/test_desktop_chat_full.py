@@ -479,6 +479,18 @@ def _control_volume(image: str, volume: str, run_id: str) -> None:
             image, "10001:10001", "/data")
 
 
+def _policy_volume(image: str, volume: str, policy: pathlib.Path,
+                   run_id: str) -> None:
+    _docker("volume", "create", *_label_args(run_id), volume)
+    _docker("run", "--rm", "--user", "0:0", *_label_args(run_id),
+            "-v", f"{volume}:/policy",
+            "-v", f"{policy}:/src/egress-policy.json:ro",
+            "--entrypoint", "sh", image, "-c",
+            "cp /src/egress-policy.json /policy/egress-policy.json && "
+            "chown 10001:10001 /policy/egress-policy.json && "
+            "chmod 600 /policy/egress-policy.json")
+
+
 def _sqlite_active_tokens(control: str, run_id: str) -> int:
     code = (
         "import sqlite3,sys,time;"
@@ -510,6 +522,7 @@ def test_public_control_gateway_sidecar_broker_chain(
     fake_name = f"easel-a4-provider-{run_id}"
     control_volume = f"easel-a4-control-data-{run_id}"
     keys_volume = f"easel-a4-keys-{run_id}"
+    egress_volume = f"easel-a4-egress-policy-{run_id}"
     root = tmp_path / "workspaces"
     root.mkdir()
     keys = tmp_path / "keys"
@@ -542,7 +555,7 @@ def test_public_control_gateway_sidecar_broker_chain(
         for container in labeled:
             _docker("container", "rm", "-f", container, check=False)
         _docker("network", "rm", control_network, check=False)
-        for volume in (control_volume, keys_volume):
+        for volume in (control_volume, keys_volume, egress_volume):
             _docker("volume", "rm", volume, check=False)
         for user in users:
             user.client.close()
@@ -565,6 +578,8 @@ def test_public_control_gateway_sidecar_broker_chain(
         _docker("network", "create", *_label_args(run_id), control_network)
         _control_volume(control_image, control_volume, run_id)
         _init_volume(control_image, keys_volume, keys, run_id)
+        _policy_volume(control_image, egress_volume,
+                       keys / "egress-policy.json", run_id)
 
         provisioner_command = " ".join([
             ("cd /mnt/c/Code/Easel && "
@@ -639,11 +654,11 @@ def test_public_control_gateway_sidecar_broker_chain(
             "--security-opt", "no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--network", control_network, "--network-alias", "egress",
-            "-v", f"{keys_volume}:/keys:ro",
+            "-v", f"{egress_volume}:/policy:ro",
             control_image,
             "python", "deploy/multiuser/egress_proxy.py", "--listen",
             "0.0.0.0", "--port", "8899", "--policy",
-            "/keys/egress-policy.json")
+            "/policy/egress-policy.json")
 
         _docker(
             "run", "-d", "--name", fake_name, *_label_args(run_id),

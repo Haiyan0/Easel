@@ -752,6 +752,122 @@ def test_bound_handle_refresh_in_progress_is_explicit_503(tmp_path):
     _run(scenario())
 
 
+def test_expired_starting_refresh_is_taken_over_by_same_worker_only(tmp_path):
+    """旧 control 在 refresh staged 后崩溃：新控制面用 CAS 接管并发起恢复。"""
+    async def scenario():
+        path = tmp_path / "db"
+        user = None
+        old = {}
+        with Store.open(path) as store1:
+            user = store1.create_user("A")
+            run = _running(store1, user)
+            fake1 = GatewayFake(store1)
+            manager1 = RuntimeManager(
+                store1, fake1, gateway_required=True, clock=Clock(1000))
+            handle = await manager1.ensure_ready(user.workspace_id, 1)
+            lease = store1.get_worker_lease(user.workspace_id)
+            staged = store1.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager1.owner_id,
+                handle, "a" * 32, 1001, 60)
+            assert staged is not None
+            old.update(owner=manager1.owner_id, generation=staged.generation,
+                       handle=handle, run=run.id)
+
+        with Store.open(path) as store2:
+            fake2 = GatewayFake(store2)
+            manager2 = RuntimeManager(
+                store2, fake2, gateway_required=True, clock=Clock(1200))
+            restored = await manager2.restore_gateway(
+                user.workspace_id, WORKER, 1)
+            assert restored is not None
+            assert restored.container_id == WORKER
+            assert restored.gateway_state == "available"
+            assert fake2.restore_calls == 1
+            assert fake2.ensure_calls == 0, "不得冷启动或替换 worker"
+            lease = store2.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == WORKER
+            assert lease.gateway_state == "available"
+            assert store2.get_run(user, old["run"]).status == "running"
+
+            # 旧 owner 的迟到完成不能覆盖新代次。
+            assert store2.complete_worker_gateway_refresh(
+                user.workspace_id, old["owner"], old["generation"],
+                old["handle"], 1201, 120) is False
+            current = store2.get_worker_lease(user.workspace_id)
+            assert current.generation == lease.generation
+            assert current.owner_id == manager2.owner_id
+    _run(scenario())
+
+
+def test_gateway_only_stopping_is_recovered_before_gateway_restore(tmp_path):
+    """过期 gateway-only stopping 先按原 attempt/scope 收口，再恢复 gateway。"""
+    async def scenario():
+        path = tmp_path / "db"
+        with Store.open(path) as store1:
+            user = store1.create_user("A")
+            run = _running(store1, user)
+            fake1 = GatewayFake(store1)
+            manager1 = RuntimeManager(
+                store1, fake1, gateway_required=True, clock=Clock(1000))
+            handle = await manager1.ensure_ready(user.workspace_id, 1)
+            lease = store1.get_worker_lease(user.workspace_id)
+            attempt = "b" * 32
+            staged = store1.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager1.owner_id,
+                handle, attempt, 1001, 60)
+            assert staged is not None
+            assert store1.begin_worker_abort(
+                user.workspace_id, manager1.owner_id, staged.generation,
+                attempt, "gateway", False, True, 1001) is True
+
+        with Store.open(path) as store2:
+            fake2 = GatewayFake(store2)
+            manager2 = RuntimeManager(
+                store2, fake2, gateway_required=True, clock=Clock(1200))
+            restored = await manager2.restore_gateway(
+                user.workspace_id, WORKER, 1)
+            assert restored is not None
+            assert restored.container_id == WORKER
+            assert fake2.ensure_calls == 0
+            assert len(fake2.abort_calls) == 1
+            abort = fake2.abort_calls[0]
+            assert abort["attempt_id"] == attempt
+            assert abort["scope"] == "gateway"
+            assert abort["gateway"] == GATEWAY
+            assert abort["worker_created"] is False
+            assert abort["gateway_created"] is True
+            assert fake2.restore_calls == 1
+            lease = store2.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+            assert lease.container_id == WORKER
+            assert lease.gateway_state == "available"
+            assert store2.get_run(user, run.id).status == "running"
+    _run(scenario())
+
+
+def test_unexpired_starting_refresh_still_reports_busy(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(1000))
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+            assert store.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                handle, "c" * 32, 1001, 120) is not None
+            with pytest.raises(RuntimeUnavailable) as rejected:
+                await RuntimeManager(
+                    store, fake, gateway_required=True,
+                    clock=Clock(1100)).restore_gateway(
+                        user.workspace_id, WORKER, 1)
+            assert rejected.value.code == "worker_gateway_refresh_in_progress"
+            assert fake.ensure_calls == 1
+    _run(scenario())
+
+
 def test_bound_handle_gateway_only_abort_is_not_worker_gone(tmp_path):
     async def scenario():
         with Store.open(tmp_path / "db") as store:

@@ -682,7 +682,10 @@ class WorkerRelay:
                 current = await self._lookup_existing(
                     workspace_id, container, config_version)
             except RuntimeUnavailable:
-                current = None
+                # 另一个请求/后台对账正在同一 refresh CAS 中；这是暂态，
+                # 必须继续等待其完成，不能当成实例消失立即 503。
+                await asyncio.sleep(0.1)
+                continue
             if current is None:
                 # 租约已不再指向该实例；不要为不存在的 worker 再等。
                 return None
@@ -1011,6 +1014,10 @@ class WorkerRelay:
                 await self._finish_system(
                     workspace_id, run_id, "interrupted")
                 return True
+            if self._gateway_required:
+                # gateway 模式没有成功读到原实例状态，就不能据此发停止、
+                # 撤 token 或结算 Run；临时 503 恢复后由后续对账重试。
+                return False
             if not timed_out:
                 return False
             return await self._confirm_stop(

@@ -1,0 +1,75 @@
+{
+  "date": "2026-10-28",
+  "baseline_commit": "81e9cc18f6ff698fdc16abff7a0418260e0217ee",
+  "scope": [
+    "A4-R1-01",
+    "A4-R1-02",
+    "A4-R1-03",
+    "A4-R1-04",
+    "A4-R1-05",
+    "A4-R1-06"
+  ],
+  "schema_version": 14,
+  "fixes": {
+    "A4-R1-01": "dedicated egress policy volume; egress cannot mount key/control data; Initialize/Start/Stop/Status/Common/README updated; real same-UID material isolation",
+    "A4-R1-02": "gateway-mode reconciler never stops/revokes/settles after failed status read; dispatched timeout test asserts GET only and no POST",
+    "A4-R1-03": "expired starting refresh takeover with owner/generation/attempt/expiry CAS; gateway-only stopping abort/finish before restore; dual Store and late completion tests",
+    "A4-R1-04": "provisioner v2 identity action, sanitized identity client, Start before/after verification, Status required-fact checks and nonzero failure",
+    "A4-R1-05": "schema v14 control_state admission barrier; cross-process admission checks; drain terminal verification; admin resume; Stop/Start barrier handling",
+    "A4-R1-06": "mount-aware fsutil; only 9p/drvfs/virtiofs known unsupported errnos tolerated; native file/dir EIO propagation; staging/message recovery tests"
+  },
+  "tests": {
+    "r1_targeted": "120 passed in 10.66s",
+    "multiuser_and_desktop_static": "1350 passed, 10 skipped, 2 warnings in 156.73s",
+    "g1_gateway": "120 passed, 2 warnings in 2.10s",
+    "real_chain": "1 passed in 76.84s",
+    "real_material_isolation": "1 passed in 4.89s",
+    "filesystem_durability": "6 passed (incl. WSL native directory fd EIO and 9p tolerance)",
+    "desktop_scripts_smoke": "Initialize/Start/Status/Stop passed; status=ok; barrier drain verified; Stop drained=True; resources cleaned",
+    "full_pytest": "2677 passed, 62 failed, 87 skipped (failures in untouched setup/bash encoding and Starlette TestClient/httpx2 environment)"
+  },
+  "fixed_images": {
+    "control": "sha256:588b18691b13966c33875b48597f63787151a6b87d4ed9ae8f390835376be5ee",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc61f4f24"
+  },
+  "real_evidence": {
+    "workspaces": [
+      {
+        "workspace": "a6df82efd476440d908590a0330b5e5b",
+        "worker": "4a22686f678db86d3aab27c41ca3dcea580b09dd58495d9d6d849588640d6e3b",
+        "gateway": "3863663de5d779f0c6649863cd2a1290ee3611fb7751afdb2ac35fb75dc8c95f"
+      },
+      {
+        "workspace": "11ba89aecb8b4b9695fa0b8a451f6fd2",
+        "worker": "592177e51bd039f8c2f851124250925a7c45bd017958e4e930681730eadc258d",
+        "gateway": "4d3c0ee1343bd1d94c52b85f6890c3474bdf75adce9bd2336f2f335c6873e991"
+      }
+    ],
+    "provider_requests": 2,
+    "provider_model": "deepseek-chat",
+    "provider_sentinel_header_ok": true,
+    "cross_workspace_status": 404,
+    "wrong_channel_status": 404,
+    "gateway_restart_same_worker": true,
+    "gateway_replacement": {
+      "old": "3863663de5d779f0c6649863cd2a1290ee3611fb7751afdb2ac35fb75dc8c95f",
+      "new": "8dd0aa6a21428854413a9bca6f2b9c6c780cba54d0201621c50be5f51e3254da",
+      "same_worker": true,
+      "tokens": 1
+    },
+    "broker_tokens_before_after": [
+      1,
+      1
+    ],
+    "no_published_gateway_worker_ports": true
+  },
+  "cleanup": "no A4/R1/smoke containers, networks, volumes or provisioner processes remain; fixed images retained",
+  "not_run": [
+    "ngrok public browser entry",
+    "real DeepSeek Harness",
+    "real provider billing",
+    "full two-user browser closure (A6)",
+    "production XFS/firewall/IPv6 gates"
+  ]
+}
