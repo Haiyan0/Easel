@@ -574,6 +574,7 @@ workspace_key_fingerprints_missing / policy_copy_missing
 docker_engine_unavailable / wsl_docker_engine_unavailable
 docker_engine_mismatch / docker_context_unavailable
 provisioner_gid_mismatch / provisioner_socket_owner_unknown
+desktop_lifecycle_busy / desktop_lifecycle_lock_unavailable
 wsl_repo_missing / wsl_python_dependencies_missing
 provisioner_start_timeout / compose_config_invalid
 provisioner_config_mismatch / provisioner_identity_unavailable
@@ -589,9 +590,15 @@ stopping 实例。无法 drain 或复核失败时返回
 `stop_completion`（barrier ID、项目、expected-identity SHA-256）；失败或
 取消没有该记录。屏障不会在 control 停止后自然失效。
 
+Start/Stop 从读取资源到 drain、down、provisioner 进程操作、完成记录和
+重开全程持有跨进程命名互斥；锁名只由真实 Compose 项目派生，不含 DataRoot，
+同一项目不同 PowerShell 进程和 `-Force` 都不能绕过。等锁超时返回
+`desktop_lifecycle_busy`，不会执行物理动作；异常/取消由 finally 或 OS 释放。
+
 Start 看到屏障时只调用 `admin reopen`：仅当当前 barrier ID、项目、配置
 摘要与完成记录完全匹配，且持久状态无活跃 Run/请求/未收口实例，才原子清除
-并继续；因此正常 Stop→Start 可直接重开，连续多轮成立。失败/取消/旧记录/
+并继续；因此正常 Stop→Start 可直接重开，连续多轮成立。迟到的第二个 Stop
+必须等锁并重新读取当前状态，不能沿用旧 drain 快照；失败/取消/旧记录/
 新 barrier 保持失败关闭，需显式恢复：
 
 ```powershell
@@ -633,7 +640,11 @@ A4 R1 定向回归：
 
 本轮真实证据、红绿与固定镜像见
 [docs/evidence/desktop-a4-r2/report.md](../../docs/evidence/desktop-a4-r2/report.md)。
-R1 的证据保留在
+R2/R1 的证据保留在
+[docs/evidence/desktop-a4-r2/report.md](../../docs/evidence/desktop-a4-r2/report.md)
+与
 [docs/evidence/desktop-a4-r1/report.md](../../docs/evidence/desktop-a4-r1/report.md)。
+R3 并发启停锁证据见
+[docs/evidence/desktop-a4-r3/report.md](../../docs/evidence/desktop-a4-r3/report.md)。
 未运行 ngrok 公网浏览器、真实 DeepSeek Harness、真实供应商计费或 A6 双用户
 浏览器闭环；这些分别留待 A5/A6。

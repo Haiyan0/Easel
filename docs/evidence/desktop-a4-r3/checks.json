@@ -1,0 +1,28 @@
+{
+  "date": "2026-10-28",
+  "baseline_commit": "d5e80a9b87b19a14ddf6f6939396e84b646f321b",
+  "scope": ["A4-R3-01"],
+  "fix": "cross-process Windows named mutex Global\\\\Easel.Desktop.Lifecycle.<ProjectName> held across Start/Stop state reads, drain, compose down, pkill, completion and reopen; bounded wait; Force uses the same lock; finally/abandoned handling",
+  "tests": {
+    "r3_targeted": "31 passed in 14.04s",
+    "multiuser_and_desktop_static": "1365 passed, 10 skipped, 2 warnings in 194.73s",
+    "full_pytest": "2694 passed, 60 failed, 87 skipped (failures in untouched setup/bash encoding and Starlette TestClient/httpx2 environment)",
+    "process_gate": "lock held: no admin drain/compose down/pkill; after release: drain -> down -> pkill -> stop-complete",
+    "start_gate": "lock held: no keygen/compose; after release: keygen/compose/start",
+    "per_project": "different project lock enters while first project is held",
+    "real_two_rounds": "Stop1 stop_completed=stop-f468beb0938546f1adfd25d7581d8f58; Start2 reopened same; Stop2 stop_completed=stop-d30c69c51c3148a18cd3c5fd1410b503"
+  },
+  "fixed_images": {
+    "control": "sha256:1d9c559e97f172381da28dbbec4e1afeb008405cddbea972c0f2baecff7deb16",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "worker_execution": "sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc61f4f24"
+  },
+  "cleanup": "no R3/smoke containers, networks, volumes, WSL sockets or provisioner processes remain; fixed images retained",
+  "not_run": [
+    "ngrok public browser entry",
+    "real DeepSeek Harness",
+    "real provider billing",
+    "full two-user browser closure (A6)",
+    "second real Docker daemon Engine drift"
+  ]
+}

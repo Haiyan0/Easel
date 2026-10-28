@@ -118,7 +118,8 @@ def test_start_diagnoses_missing_dependencies_before_starting():
             "provisioner_identity_mismatch", "admission_barrier_active",
             "public_copy_mismatch", "docker_engine_mismatch",
             "Get-EaselKeyFingerprints", "Get-EaselEngineIdentity",
-            "admin", "reopen"):
+            "admin", "reopen", "Enter-EaselLifecycleLock",
+            "LockTimeoutSeconds"):
         assert marker in text
     _assert_no_authtoken_read(text)
 
@@ -132,6 +133,8 @@ def test_stop_drains_before_stopping_and_status_fails_closed():
     assert "stop_completed" in stop
     assert "stop-complete" in stop
     assert "DataRoot" in stop
+    assert "Enter-EaselLifecycleLock" in stop
+    assert "LockTimeoutSeconds" in stop
     assert "worker_drain_failed" in stop
     assert "'down'" in stop
     assert "provisioner_socket_missing" in stop

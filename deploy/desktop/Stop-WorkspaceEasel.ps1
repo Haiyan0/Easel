@@ -14,6 +14,7 @@ param(
     [string]$Distro = 'Ubuntu-26.04',
     [string]$WslRepo = '/mnt/c/Code/Easel',
     [string]$DataRoot = 'C:\Easel\desktop',
+    [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60,
     [switch]$Force
 )
 
@@ -37,9 +38,12 @@ function Invoke-Wsl {
     }
 }
 
+$lifecycleLock = $null
 try {
     $ProjectName = Resolve-EaselProject -ProjectName $ProjectName
     Assert-EaselDocker
+    $lifecycleLock = Enter-EaselLifecycleLock `
+        -ProjectName $ProjectName -TimeoutSeconds $LockTimeoutSeconds
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
     $network = Get-EaselWorkspaceNetworkName -ProjectName $ProjectName
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
@@ -147,4 +151,7 @@ try {
 catch {
     [Console]::Error.WriteLine("错误：$($_.Exception.Message)")
     exit 1
+}
+finally {
+    Exit-EaselLifecycleLock -Lock $lifecycleLock
 }

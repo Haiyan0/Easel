@@ -51,7 +51,8 @@ param(
     [string]$WorkspaceRoot = 'C:\Easel\workspaces',
     [string]$DataRoot = 'C:\Easel\desktop',
     [int]$ProvisionerGid = 1000,
-    [ValidateRange(1, 600)][int]$TimeoutSeconds = 180
+    [ValidateRange(1, 600)][int]$TimeoutSeconds = 180,
+    [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -171,6 +172,7 @@ function Invoke-ProvisionerIdentityCheck {
         '--expected', '/expected.json')
 }
 
+$lifecycleLock = $null
 try {
     $PublicOrigin = Resolve-EaselOrigin -Origin $PublicOrigin
     $Image = Resolve-EaselImage -Image $Image
@@ -179,6 +181,8 @@ try {
     $ProjectName = Resolve-EaselProject -ProjectName $ProjectName
     $Port = Resolve-EaselPort -Port $Port
     Assert-EaselDocker
+    $lifecycleLock = Enter-EaselLifecycleLock `
+        -ProjectName $ProjectName -TimeoutSeconds $LockTimeoutSeconds
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
     $network = Get-EaselWorkspaceNetworkName -ProjectName $ProjectName
     $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
@@ -453,4 +457,7 @@ try {
 catch {
     [Console]::Error.WriteLine("错误：$($_.Exception.Message)")
     exit 1
+}
+finally {
+    Exit-EaselLifecycleLock -Lock $lifecycleLock
 }

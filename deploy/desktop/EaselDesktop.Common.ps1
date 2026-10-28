@@ -382,6 +382,67 @@ function Assert-EaselPublicCopies {
     }
 }
 
+function Get-EaselLifecycleLockName {
+    param([Parameter(Mandatory)][string]$ProjectName)
+    # 名称只由真实 Compose 项目派生，不包含 DataRoot/相对路径；同一项目
+    # 的不同 PowerShell 进程/不同参数共用同一把跨进程锁。
+    return "Global\Easel.Desktop.Lifecycle.$ProjectName"
+}
+
+function Enter-EaselLifecycleLock {
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 60
+    )
+    $name = Get-EaselLifecycleLockName -ProjectName $ProjectName
+    try {
+        $mutex = [Threading.Mutex]::new($false, $name)
+    }
+    catch {
+        throw 'desktop_lifecycle_lock_unavailable'
+    }
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(
+                [TimeSpan]::FromSeconds($TimeoutSeconds), $false)
+        }
+        catch [Threading.AbandonedMutexException] {
+            # 上一个持锁进程异常退出；所有权已转给本次等待者。
+            $acquired = $true
+        }
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        throw 'desktop_lifecycle_busy'
+    }
+    return [pscustomobject]@{
+        Name = $name
+        TimeoutSeconds = $TimeoutSeconds
+        Mutex = $mutex
+    }
+}
+
+function Exit-EaselLifecycleLock {
+    param([AllowNull()]$Lock)
+    if ($null -eq $Lock -or $null -eq $Lock.Mutex) {
+        return
+    }
+    try {
+        $Lock.Mutex.ReleaseMutex()
+    }
+    catch {
+        # 进程异常退出时 OS 会释放；这里只清理句柄，不掩盖原错误。
+    }
+    finally {
+        try { $Lock.Mutex.Dispose() } catch { }
+    }
+}
+
 function Get-EaselWorkspaceComposePath {
     return (Join-Path $PSScriptRoot 'compose.workspace.yaml')
 }
