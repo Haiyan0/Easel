@@ -1,0 +1,13 @@
+log_dir=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs
+provisioner_log=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs\provisioner.log
+provisioner_error_log=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs\provisioner.err.log
+--- service=control tail=5 ---
+INFO:     192.168.96.1:60316 - "GET /api/sessions/cb12ba45570f4a6abc27bb5e621c37a8/messages HTTP/1.1" 200 OK
+INFO:     192.168.96.1:60316 - "GET /api/sessions/cb12ba45570f4a6abc27bb5e621c37a8/runs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40496 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40510 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40518 - "GET /api/health HTTP/1.1" 200 OK
+--- service=egress tail=5 ---
+--- file=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs\provisioner.log tail=5 ---
+--- file=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs\provisioner.err.log tail=5 ---
+配额已显式关闭：不得用于真实多人部署

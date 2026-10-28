@@ -1,0 +1,4 @@
+started project=easel-a7-dst-09290 origin=https://a7-dst-09290.example port=7872 control=sha256:a5110be8a165d578b8411cce059bec8f2d5be047e63d70d1ea268faa1be9afe3 worker=sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993 gateway=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a network=easel-a7-dst-09290-control provisioner_socket=/tmp/easel-runtime/easel-a7-dst-09290/provisioner.sock
+deployment_file=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\restored\data\logs\deployment.json
+config_sha256=d0b11eda8c055c24b1d2285ed30d7c64a5e18bd6f50756c1df00a13843749715
+frontend_sha256=55cfa8bf96ea9a2a079b6fbf2e6f27d435f04cfe47047182f533c4d0409c4f49

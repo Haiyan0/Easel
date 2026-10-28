@@ -50,6 +50,8 @@ param(
     [string]$WslRepo = '/mnt/c/Code/Easel',
     [string]$WorkspaceRoot = 'C:\Easel\workspaces',
     [string]$DataRoot = 'C:\Easel\desktop',
+    [string]$EgressCaFile = '',
+    [string]$UpgradeFromBackup = '',
     [int]$ProvisionerGid = 1000,
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 180,
     [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60
@@ -213,6 +215,40 @@ try {
         -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress
     $trustedPublic = Assert-EaselPublicCopies -Fingerprints $fingerprints `
         -Policy $policyDigests -PublicDir $publicDir
+    if ($EgressCaFile) {
+        if (-not (Test-Path -LiteralPath $EgressCaFile -PathType Leaf)) {
+            throw 'egress_ca_missing'
+        }
+        $EgressCaFile = (Resolve-Path -LiteralPath $EgressCaFile).Path
+        $caMount = @(
+            '--mount', "type=bind,src=$EgressCaFile,dst=/src/ca.pem,readonly")
+        $caCommand = ('cp /src/ca.pem /keys/egress-ca.pem && ' +
+            'chown 10001:10001 /keys/egress-ca.pem && ' +
+            'chmod 600 /keys/egress-ca.pem')
+    }
+    else {
+        $caMount = @()
+        $caCommand = ('test -s /keys/egress-ca.pem || ' +
+            'cp /etc/ssl/certs/ca-certificates.crt /keys/egress-ca.pem; ' +
+            'chown 10001:10001 /keys/egress-ca.pem && ' +
+            'chmod 600 /keys/egress-ca.pem')
+    }
+    $ensureCa = Invoke-EaselDocker -Arguments (@(
+        'run', '--rm', '--user', '0:0', '--entrypoint', 'sh',
+        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys") +
+        $caMount + @($Image, '-c', $caCommand))
+    if ($ensureCa.ExitCode -ne 0) {
+        throw 'egress_ca_unavailable'
+    }
+    $egressCaSha256 = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--user', '10001:10001', '--entrypoint', 'sha256sum',
+        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
+        $Image, '/keys/egress-ca.pem')
+    $caDigest = (($egressCaSha256.Output -join '') -split '\s+')[0]
+    if ($egressCaSha256.ExitCode -ne 0 -or
+        $caDigest -notmatch '^[0-9a-f]{64}$') {
+        throw 'egress_ca_unavailable'
+    }
     $engineIdentity = Get-EaselEngineIdentity
     $socketIdentity = Get-EaselSocketIdentity
     $configCheck = Invoke-EaselDocker -Arguments @(
@@ -393,6 +429,10 @@ try {
     }
     $up = Invoke-Wsl -Arguments ($composeArgs + @('up', '-d'))
     if ($up.ExitCode -ne 0) {
+        $upText = ($up.Output -join "`n")
+        if ($upText -match 'port is already allocated|address already in use|ports are not available|bind') {
+            throw 'control_port_in_use'
+        }
         throw 'control_start_failed'
     }
 
@@ -443,15 +483,135 @@ try {
             '--project', $ProjectName,
             '--config-sha256', $identityConfigSha256)
         if ($reopen.ExitCode -ne 0) {
-            throw ("admission_barrier_active:" +
-                (($reopen.Output -join ',').Trim()))
+            if (-not $UpgradeFromBackup) {
+                throw ("admission_barrier_active:" +
+                    (($reopen.Output -join ',').Trim()))
+            }
+            # 受控升级：旧 Stop 完成记录绑定旧配置摘要；必须显式提供一份
+            # 通过校验的完整备份，核对旧摘要后才改写成新摘要。
+            $backupPath = [IO.Path]::GetFullPath($UpgradeFromBackup)
+            if (-not (Test-Path -LiteralPath $backupPath -PathType Container)) {
+                throw 'upgrade_backup_missing'
+            }
+            $backupManifest = Assert-EaselBackupManifest `
+                -Backup $backupPath -RequireComplete
+            $backupSha = Get-EaselFileSha256 -Path (
+                Join-Path $backupPath 'manifest.json')
+            $oldConfigSha = [string]$backupManifest.deployment.config_sha256
+            $oldDeploymentFile = Join-Path $logDir 'deployment.json'
+            if (-not (Test-Path -LiteralPath $oldDeploymentFile -PathType Leaf)) {
+                throw 'upgrade_deployment_identity_missing'
+            }
+            try {
+                $oldDeployment = Get-Content -LiteralPath $oldDeploymentFile -Raw |
+                    ConvertFrom-Json
+            }
+            catch {
+                throw 'upgrade_deployment_identity_invalid'
+            }
+            if ([string]$oldDeployment.project -ne $ProjectName -or
+                [string]$oldDeployment.config_sha256 -ne $oldConfigSha -or
+                [string]$oldDeployment.control_image -ne
+                    [string]$backupManifest.deployment.control_image -or
+                [string]$oldDeployment.worker_image -ne
+                    [string]$backupManifest.deployment.worker_image -or
+                [string]$oldDeployment.gateway_image -ne
+                    [string]$backupManifest.deployment.gateway_image) {
+                throw 'upgrade_deployment_mismatch'
+            }
+            $status = Invoke-EaselDocker -Arguments @(
+                'exec', $containerId, 'python', '-m', 'easel', 'admin',
+                'stop-status', '--control-dir', '/srv/easel/control')
+            $statusText = (($status.Output -join '').Trim())
+            if ($status.ExitCode -ne 0 -or
+                -not $statusText.StartsWith('stop_completion=')) {
+                throw 'upgrade_stop_status_unavailable'
+            }
+            try {
+                $stopStatus = $statusText.Substring(16) | ConvertFrom-Json
+            }
+            catch {
+                throw 'upgrade_stop_status_invalid'
+            }
+            if ($null -eq $stopStatus.completion -or
+                [string]$stopStatus.completion.barrierId -ne $barrierId -or
+                [string]$stopStatus.completion.project -ne $ProjectName -or
+                [string]$stopStatus.completion.configSha256 -ne $oldConfigSha) {
+                throw 'upgrade_stop_completion_mismatch'
+            }
+            $upgrade = Invoke-EaselDocker -Arguments @(
+                'exec', $containerId, 'python', '-m', 'easel', 'admin',
+                'upgrade-complete',
+                '--control-dir', '/srv/easel/control',
+                '--barrier-id', $barrierId,
+                '--project', $ProjectName,
+                '--from-config-sha256', $oldConfigSha,
+                '--to-config-sha256', $identityConfigSha256,
+                '--backup-manifest-sha256', $backupSha)
+            if ($upgrade.ExitCode -ne 0) {
+                throw ("upgrade_completion_failed:" +
+                    (($upgrade.Output -join ',').Trim()))
+            }
+            $reopen = Invoke-EaselDocker -Arguments @(
+                'exec', $containerId, 'python', '-m', 'easel', 'admin',
+                'reopen',
+                '--control-dir', '/srv/easel/control',
+                '--barrier-id', $barrierId,
+                '--project', $ProjectName,
+                '--config-sha256', $identityConfigSha256)
+            if ($reopen.ExitCode -ne 0) {
+                throw ("admission_barrier_active:" +
+                    (($reopen.Output -join ',').Trim()))
+            }
+            Write-Output "upgraded_from_backup=$backupPath"
         }
         Write-Output "admission_barrier_reopened=$barrierId"
     }
 
+    $frontendHash = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--network', 'none', '--read-only',
+        '--entrypoint', 'python', $Image, '-c',
+        ("import hashlib;print(hashlib.sha256(open(" +
+         "'/opt/easel/web/frontend/dist/index.html','rb').read()).hexdigest())"))
+    $frontendSha = (($frontendHash.Output -join '').Trim())
+    if ($frontendHash.ExitCode -ne 0 -or
+        $frontendSha -notmatch '^[0-9a-f]{64}$') {
+        throw 'frontend_hash_unavailable'
+    }
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    $sourceCommit = Get-EaselSourceCommit -RepoRoot $repoRoot
+    if (-not $sourceCommit) { $sourceCommit = 'unknown' }
+    $harnessRevision = Get-EaselHarnessRevision -RepoRoot $repoRoot
+    if (-not $harnessRevision) { $harnessRevision = 'unknown' }
+    $deployment = [ordered]@{
+        project = $ProjectName
+        origin = $PublicOrigin
+        port = $Port
+        control_image = $Image
+        worker_image = $WorkerImage
+        gateway_image = $GatewayImage
+        frontend_sha256 = $frontendSha
+        config_sha256 = $identityConfigSha256
+        egress_ca_sha256 = $caDigest
+        engine_id = $engineIdentity.Id
+        engine_context = $engineIdentity.Context
+        source_commit = $sourceCommit
+        harness_revision = $harnessRevision
+        workspace_root = $WorkspaceRoot
+        data_root = $DataRoot
+    }
+    $deploymentFile = Join-Path $logDir 'deployment.json'
+    [IO.File]::WriteAllText(
+        $deploymentFile,
+        ($deployment | ConvertTo-Json -Compress),
+        (New-Object System.Text.UTF8Encoding($false)))
+
     Write-Output ("started project={0} origin={1} port={2} control={3} worker={4} gateway={5} network={6} provisioner_socket={7}" -f `
         $ProjectName, $PublicOrigin, $Port, $Image, $WorkerImage,
         $GatewayImage, $network, $socket)
+    Write-Output "deployment_file=$deploymentFile"
+    Write-Output "config_sha256=$identityConfigSha256"
+    Write-Output "frontend_sha256=$frontendSha"
     exit 0
 }
 catch {

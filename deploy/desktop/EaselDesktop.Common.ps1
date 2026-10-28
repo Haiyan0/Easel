@@ -446,3 +446,92 @@ function Exit-EaselLifecycleLock {
 function Get-EaselWorkspaceComposePath {
     return (Join-Path $PSScriptRoot 'compose.workspace.yaml')
 }
+
+function Set-EaselPrivateAcl {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Directory
+    )
+    # Windows ACL 保护备份/恢复邀请；只授予当前用户、SYSTEM 与管理员。
+    # Linux 侧由 Python 的 0700/0600 负责，本函数只在 Windows 生效。
+    if ($env:OS -ne 'Windows_NT') { return }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw 'private_path_missing'
+    }
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $inheritance = if ($Directory) { '(OI)(CI)F' } else { 'F' }
+    $aclArgs = @(
+        $Path, '/inheritance:r',
+        '/grant:r', "${user}:$inheritance",
+        '/grant:r', "SYSTEM:$inheritance",
+        '/grant:r', "BUILTIN\Administrators:$inheritance"
+    )
+    $result = & icacls.exe @aclArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw 'private_acl_failed'
+    }
+}
+
+function Get-EaselSourceCommit {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    try {
+        $value = & git -C $RepoRoot rev-parse HEAD 2>$null
+    }
+    catch {
+        return ''
+    }
+    if ($LASTEXITCODE -ne 0) { return '' }
+    $text = ("$value").Trim()
+    if ($text -notmatch '^[0-9a-f]{7,64}$') { return '' }
+    return $text
+}
+
+function Get-EaselHarnessRevision {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $path = Join-Path $RepoRoot 'deploy/multiuser/managed/acp-profile.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    try {
+        $profile = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        return [string]$profile.harness.commit
+    }
+    catch {
+        return ''
+    }
+}
+
+function Assert-EaselBackupManifest {
+    param(
+        [Parameter(Mandatory)][string]$Backup,
+        [switch]$RequireComplete
+    )
+    # 只读解析本工具生成的 manifest；不输出任何密钥文件内容。
+    $manifestPath = Join-Path $Backup 'manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw 'backup_manifest_missing'
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw |
+            ConvertFrom-Json
+    }
+    catch {
+        throw 'backup_manifest_invalid'
+    }
+    if ([string]$manifest.format -ne 'easel.control.backup') {
+        throw 'backup_manifest_invalid'
+    }
+    if ([int]$manifest.version -lt 2) {
+        throw 'backup_incompatible'
+    }
+    if ($RequireComplete -and $manifest.complete -ne $true) {
+        throw 'backup_manifest_incomplete'
+    }
+    if ($null -eq $manifest.deployment -or
+        [string]$manifest.deployment.config_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$manifest.deployment.project -eq '') {
+        throw 'backup_manifest_invalid'
+    }
+    if ($manifest.runtime_state.clean_stop -ne $true) {
+        throw 'backup_not_from_clean_stop'
+    }
+    return $manifest
+}

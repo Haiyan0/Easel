@@ -24,10 +24,12 @@ from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
 from easel.control.cli import (cmd_admin_backup, cmd_admin_barrier_status,
                                cmd_admin_bootstrap, cmd_admin_drain,
-                               cmd_admin_invite, cmd_admin_migrate_local,
+                               cmd_admin_invite, cmd_admin_materialize_restore,
+                               cmd_admin_migrate_local, cmd_admin_prepare_restore,
                                cmd_admin_reopen, cmd_admin_restore,
                                cmd_admin_resume, cmd_admin_stop_complete,
-                               cmd_serve_control)
+                               cmd_admin_stop_status, cmd_admin_upgrade_complete,
+                               cmd_admin_verify_backup, cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
 from easel.persona import persona_prefix
@@ -360,7 +362,56 @@ def main(argv: list[str] | None = None) -> int:
                           help="记录到清单的 Harness 修订")
     p_backup.add_argument("--provisioner-socket", default=None,
                           help="有活动 worker 时必须提供，用于先 drain")
+    p_backup.add_argument("--signing-key-file", default=None,
+                          help="Ed25519 签名私钥；与受管配置/策略成组给出")
+    p_backup.add_argument("--managed-agent-config", default=None,
+                          help="受管 Agent 配置 JSON（不得含密钥）")
+    p_backup.add_argument("--egress-policy-file", default=None,
+                          help="管理员出口策略 JSON")
+    p_backup.add_argument("--egress-ca-file", default=None,
+                          help="可选；出口 TLS 校验 CA（公开证书文件）")
+    p_backup.add_argument("--deployment-json", default=None,
+                          help="非秘密部署身份 JSON（镜像/配置摘要/项目）")
+    p_backup.add_argument("--require-clean-stop", action="store_true",
+                          help="只允许备份已完成干净 Stop 的实例")
     p_backup.set_defaults(func=cmd_admin_backup)
+
+    p_verify_backup = admin_sub.add_parser(
+        "verify-backup", help="只读校验完整备份")
+    p_verify_backup.add_argument("--source", required=True)
+    p_verify_backup.set_defaults(func=cmd_admin_verify_backup)
+
+    p_prepare_restore = admin_sub.add_parser(
+        "prepare-restore", help="准备恢复副本并签发一次性管理员恢复邀请")
+    p_prepare_restore.add_argument("--destination", required=True)
+    p_prepare_restore.add_argument(
+        "--invite-ttl-seconds", type=int, default=3600,
+        help="恢复邀请有效期秒数（默认 3600）")
+    p_prepare_restore.set_defaults(func=cmd_admin_prepare_restore)
+
+    p_materialize = admin_sub.add_parser(
+        "materialize-restore", help="把恢复包落到新部署目标目录")
+    p_materialize.add_argument("--source", required=True)
+    p_materialize.add_argument("--control-dir", required=True)
+    p_materialize.add_argument("--keys-dir", required=True)
+    p_materialize.add_argument("--egress-dir", required=True)
+    p_materialize.add_argument("--workspace-root", required=True)
+    p_materialize.set_defaults(func=cmd_admin_materialize_restore)
+
+    p_stop_status = admin_sub.add_parser(
+        "stop-status", help="只读打印 Stop 完成记录")
+    p_stop_status.add_argument("--control-dir", required=True)
+    p_stop_status.set_defaults(func=cmd_admin_stop_status)
+
+    p_upgrade = admin_sub.add_parser(
+        "upgrade-complete", help="受控升级：匹配旧配置后改写 Stop 完成记录")
+    p_upgrade.add_argument("--control-dir", required=True)
+    p_upgrade.add_argument("--barrier-id", required=True)
+    p_upgrade.add_argument("--project", required=True)
+    p_upgrade.add_argument("--from-config-sha256", required=True)
+    p_upgrade.add_argument("--to-config-sha256", required=True)
+    p_upgrade.add_argument("--backup-manifest-sha256", required=True)
+    p_upgrade.set_defaults(func=cmd_admin_upgrade_complete)
 
     p_restore = admin_sub.add_parser(
         "restore", help="把备份恢复到全新目录")

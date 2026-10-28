@@ -1,0 +1,19 @@
+{
+  "old_marker": true,
+  "new_ok": true,
+  "run": "5daf8d092004482aa377d3ac684f4f34",
+  "state": "done",
+  "messages": 4,
+  "completion": {
+    "backupManifestSha256": "605a3ac65cd100e14780a05e6555203b4bd23e2b425631908b4e3bced213a138",
+    "barrierId": "stop-b9c5ddc7c520414fa5fc0031b8129801",
+    "completedAt": 1793210484,
+    "configSha256": "73561e217f3651e0623c65cff4787803848b36cb6dc54393b9cf96f8728d0bb3",
+    "project": "easel-a7-up-09290",
+    "reopenedAt": 1793210526,
+    "upgradedAt": 1793210525,
+    "upgradedFrom": "85cb1b5e105b5a925c3f16f75717f983afedddd6f49278e911ee2e6338ebf321"
+  },
+  "worker_container": "",
+  "worker_image": ""
+}

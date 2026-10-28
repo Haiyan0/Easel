@@ -1,0 +1,28 @@
+network=easel-a7-rb-09290-control state=present
+volume=easel-a7-rb-09290-control state=present
+volume=easel-a7-rb-09290-keys state=present
+volume=easel-a7-rb-09290-egress state=present
+control=running healthy
+control_port=7874 published=True
+control_mounts=checked
+workspace_keys=valid
+workspace_config=valid
+worker_leases=ready:1
+api_health=ok
+admission_barrier=barrier=none
+egress=running healthy
+egress_policy_mount=valid
+provisioner_socket=present
+provisioner_engine=default/4c5b9122-bd30-42bd-af1e-019c5053a914
+provisioner_identity=ok
+version_control_image=sha256:a5110be8a165d578b8411cce059bec8f2d5be047e63d70d1ea268faa1be9afe3
+version_worker_image=sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9
+version_gateway_image=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a
+version_frontend_sha256=55cfa8bf96ea9a2a079b6fbf2e6f27d435f04cfe47047182f533c4d0409c4f49
+version_config_sha256=46aa675443e9694a7ca83dd8732e1349ba1e2647c26f0b3f9d6379eceb3b3779
+version_source_commit=d9c2f5ba960e892f198ebc4a111b7e2ad7e835af
+version_harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317
+version_project=easel-a7-rb-09290
+logs=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\logs
+version_schema=14
+status=ok

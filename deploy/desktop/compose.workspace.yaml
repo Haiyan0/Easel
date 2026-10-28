@@ -52,6 +52,10 @@ services:
       - http://egress:8899
       - --egress-policy
       - /keys/egress-policy.json
+      - --egress-ca-file
+      - /keys/egress-ca.pem
+    environment:
+      SSL_CERT_FILE: /keys/egress-ca.pem
     ports:
       - "127.0.0.1:${EASEL_CONTROL_PORT:-7861}:7861"
     networks:

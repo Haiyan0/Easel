@@ -1,12 +1,31 @@
-# Task A2：Desktop 完整拓扑契约与可行性报告
+# Desktop 完整拓扑：契约、装配与运维入口
 
-状态：**A2 拓扑契约保留；A3 执行 worker、G1 gateway 核心、G2 生命周期接线与
-A4 公开 relay/broker 装配均已实现。真实 DeepSeek Harness、真实供应商与完整
-双用户浏览器闭环仍留 A5/A6。**
+状态：**A7 运维验收完成代码与真实演练；A5/A6 真实 Harness、双用户浏览器
+闭环与 A6-R1 取消清理互斥已通过功能验收。真实 DeepSeek 供应商与 Linux
+生产隔离门槛仍为 not-run。**
 
-基线：`f1c4e5ef98ea756513071367919fe57fac7dbf17`（A1 验收通过）。
-本目录只增加 A2 契约、反例和证据；没有修改认证核心、A1 Compose
-拓扑或现有 provisioner/worker 行为。
+基线：`d9c2f5ba960e892f198ebc4a111b7e2ad7e835af`（A6-R1 终审）。
+A7 入口在本目录新增：
+
+| 入口 | 作用 |
+|---|---|
+| `Initialize-WorkspaceEasel.ps1` | 只创建本项目卷/网络/key/配置；重复执行不换 key |
+| `Start-WorkspaceEasel.ps1` | 固定镜像/卷/网络/key/前端/provisioner 检查后启动；`-UpgradeFromBackup` 受控升级 |
+| `Stop-WorkspaceEasel.ps1` | 屏障 → drain → down → 完成记录 |
+| `Status-WorkspaceEasel.ps1` | 只读诊断 + 镜像/前端/配置/schema/日志版本摘要 |
+| `Logs-WorkspaceEasel.ps1` | control/egress/provisioner 最近日志，不读 key |
+| `Backup-WorkspaceEasel.ps1` | 成功 Stop 后的 v2 完整备份（含签名私钥/配置/CA/workspace） |
+| `Verify-WorkspaceEasel.ps1` | 只读校验备份清单/摘要/DB/派生公钥 |
+| `Restore-WorkspaceEasel.ps1` | 新项目/目录/端口恢复；撤销旧登录/token，签发恢复邀请 |
+
+备份/恢复/升级的完整新手命令与错误码见
+[docs/windows-desktop-operations.zh-CN.md](../../docs/windows-desktop-operations.zh-CN.md#9-完整-desktop-多人已装配的正式路线)，
+Linux 目标门槛与 not-run 清单见
+[docs/linux-docker-operations.zh-CN.md](../../docs/linux-docker-operations.zh-CN.md#13-a7-完整-desktopl-unix-可核查命令与-not-run-清单)。
+A7 证据见 [docs/evidence/desktop-a7/](../../docs/evidence/desktop-a7/report.md)。
+
+> 注意：以下 A2/A4 契约保留为历史设计与验收记录；其中“A5/A6 未做”的
+> 状态描述以本段和 A5/A6/A7 证据为准。不要把历史段落当成当前缺口。
 
 ## 1. 结论先行
 

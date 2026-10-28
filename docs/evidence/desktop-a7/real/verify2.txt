@@ -1,0 +1,14 @@
+verified=/backup
+version=2
+schema_version=14
+files=35
+workspaces=3
+clean_stop=true
+project=easel-a7-src-09290
+config_sha256=f7f0c2ec41cb0b29d5336da149a4321aa45e35fb074558d0eb4925f16772bcfc
+worker_image=sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993
+gateway_image=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a
+control_image=sha256:34b29259b0d7d99253ab16d764db7b5ae1ae32a3b031dece5abd52d341c5afc9
+harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317
+backup_manifest_sha256=d149016ae4a2455dcdef09fd4c391a71ce4f3db98c6b32851d7552928d6d26c4
+verified_backup=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\data\backups\desktop-20261029-015521

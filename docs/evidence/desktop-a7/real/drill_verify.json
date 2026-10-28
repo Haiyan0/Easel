@@ -1,0 +1,45 @@
+{
+  "old_cookie_status": 401,
+  "evil_origin_status": 403,
+  "recovery_admin": true,
+  "a_workspace_same": true,
+  "b_workspace_same": true,
+  "a_history_has_marker": true,
+  "b_history_has_marker": true,
+  "a_does_not_contain_b": true,
+  "cross_session_status": 404,
+  "a_sessions": 1,
+  "b_sessions": 1,
+  "new_run": "44de70c55cda4405aa41e625ee079dbf",
+  "new_run_state": "done",
+  "after_messages": 6,
+  "new_assistant_ok": true,
+  "sentinel": "a7-source-sentinel",
+  "source_sentinel": "a7-source-sentinel",
+  "backup_manifest_sha256": "d149016ae4a2455dcdef09fd4c391a71ce4f3db98c6b32851d7552928d6d26c4",
+  "leases": [
+    [
+      "ready",
+      2
+    ]
+  ],
+  "control_state": [
+    [
+      "restore_info"
+    ],
+    [
+      "stop_completion"
+    ]
+  ],
+  "active_logins": [
+    [
+      9
+    ]
+  ],
+  "active_broker_tokens": [
+    [
+      0
+    ]
+  ],
+  "control_instance": "ee5bc19be53818a331120592a42f06b9ce18f60aad712ad9388ac1748516b68b"
+}

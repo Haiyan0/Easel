@@ -85,6 +85,11 @@ function global:docker {{
         Write-Output ('gateway_public_sha256=' + $env:STUB_TRUSTED_GATEWAY)
         return
     }}
+    if ($joined -match 'hashlib\\.sha256' -or
+        $joined -match 'frontend/dist/index.html') {{
+        Write-Output ('f' * 64)
+        return
+    }}
     if ($joined -match 'sha256sum') {{
         Write-Output ($env:STUB_TRUSTED_POLICY + '  /keys/egress-policy.json')
         Write-Output ($env:STUB_TRUSTED_POLICY + '  /policy/egress-policy.json')

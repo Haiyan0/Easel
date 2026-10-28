@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import uvicorn
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..worker.sessions import (
@@ -47,8 +48,25 @@ from .types import DomainError
 
 CONTROL_DB_NAME = "control.sqlite3"
 BACKUP_FORMAT = "easel.control.backup"
-BACKUP_VERSION = 1
+BACKUP_VERSION = 2
+BACKUP_V2 = 2
 _ACTIVE_LEASE_STATES = ("starting", "ready", "draining", "stopping")
+_BACKUP_DEPLOYMENT_FIELDS = frozenset({
+    "project", "origin", "port", "control_image", "worker_image",
+    "gateway_image", "frontend_sha256", "config_sha256", "engine_id",
+    "engine_context", "source_commit", "harness_revision", "workspace_root",
+    "data_root", "egress_ca_sha256",
+})
+_BACKUP_SECRET_FIELDS = frozenset({
+    "secret", "secrets", "token", "password", "credential", "credentials",
+    "api_key", "apikey", "private_key", "authtoken",
+})
+_BACKUP_EXCLUDED_RUNTIME = (
+    {"path": ".credentials",
+     "reason": "per-deployment worker service tokens must be regenerated"},
+    {"path": ".gateway",
+     "reason": "per-deployment start attempt tombstones are not durable data"},
+)
 
 _SKIP_BACKUP_NAMES = frozenset({".credentials"})
 """只排除秘密材料；.git、node_modules 等持久数据不得从完整备份静默丢弃。"""
@@ -130,6 +148,58 @@ def _load_backup_key(path: Path) -> bytes:
         raise DomainError("invalid_master_key", 400) from None
 
 
+def _private_copy(path: Path) -> tuple[tempfile.TemporaryDirectory, Path]:
+    """把待校验秘密复制到 0600 临时文件，兼容 Windows bind 的宽 POSIX mode。"""
+    directory = tempfile.TemporaryDirectory(prefix="easel-backup-check-")
+    target = Path(directory.name) / path.name
+    try:
+        shutil.copyfile(path, target)
+        if os.name == "posix":
+            target.chmod(0o600)
+    except OSError:
+        directory.cleanup()
+        raise DomainError("backup_integrity_failed", 409) from None
+    return directory, target
+
+
+def _load_backup_master_key(path: Path) -> bytes:
+    directory, target = _private_copy(path)
+    try:
+        return _load_backup_key(target)
+    finally:
+        directory.cleanup()
+
+
+def _load_backup_signing_key(path: Path):
+    directory, target = _private_copy(path)
+    try:
+        return load_signing_key(target)
+    except (OSError, ValueError):
+        raise DomainError("backup_integrity_failed", 409) from None
+    finally:
+        directory.cleanup()
+
+
+def _load_backup_managed(path: Path):
+    directory, target = _private_copy(path)
+    try:
+        return load_managed_agent_config(target)
+    except (OSError, ValueError):
+        raise DomainError("backup_integrity_failed", 409) from None
+    finally:
+        directory.cleanup()
+
+
+def _load_backup_policy(path: Path):
+    directory, target = _private_copy(path)
+    try:
+        return load_policy(target)
+    except (OSError, ValueError):
+        raise DomainError("backup_integrity_failed", 409) from None
+    finally:
+        directory.cleanup()
+
+
 def _key_matches(store: Store, key: bytes) -> None:
     """已有密文必须能用本 key 解开；失败只返回稳定错误码，不回显秘密。"""
     try:
@@ -181,6 +251,152 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_json_object(path: Path, code: str) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        raise DomainError(code, 400) from None
+    if not isinstance(payload, dict):
+        raise DomainError(code, 400)
+    return payload
+
+
+def _reject_secret_fields(value: object, *, prefix: str = "") -> None:
+    """拒绝部署元数据里出现疑似秘密字段；值本身不打印。"""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key).lower().replace("-", "_")
+            if name in _BACKUP_SECRET_FIELDS:
+                raise DomainError("backup_metadata_contains_secret", 400)
+            _reject_secret_fields(item, prefix=f"{prefix}{key}.")
+    elif isinstance(value, list):
+        for item in value:
+            _reject_secret_fields(item, prefix=prefix)
+
+
+def _validate_deployment_metadata(deployment: object) -> dict:
+    """校验并复制非秘密部署身份；不接受未知字段或疑似凭证字段。"""
+    if not isinstance(deployment, dict):
+        raise DomainError("backup_deployment_metadata_invalid", 400)
+    _reject_secret_fields(deployment)
+    unknown = set(deployment) - _BACKUP_DEPLOYMENT_FIELDS
+    if unknown:
+        raise DomainError("backup_deployment_metadata_invalid", 400)
+    required = {
+        "project", "origin", "port", "control_image", "worker_image",
+        "gateway_image", "frontend_sha256", "config_sha256", "engine_id",
+        "engine_context", "source_commit", "harness_revision",
+    }
+    if not required.issubset(deployment):
+        raise DomainError("backup_deployment_metadata_invalid", 400)
+    project = deployment.get("project")
+    origin = deployment.get("origin")
+    port = deployment.get("port")
+    if (not isinstance(project, str) or not project
+            or not isinstance(origin, str) or not origin
+            or type(port) is not int or not 1 <= port <= 65535):
+        raise DomainError("backup_deployment_metadata_invalid", 400)
+    for key in ("control_image", "worker_image", "gateway_image"):
+        value = deployment.get(key)
+        if (not isinstance(value, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None):
+            raise DomainError("backup_deployment_metadata_invalid", 400)
+    for key in ("frontend_sha256", "config_sha256", "egress_ca_sha256"):
+        value = deployment.get(key)
+        if value is None and key == "egress_ca_sha256":
+            continue
+        if (not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None):
+            raise DomainError("backup_deployment_metadata_invalid", 400)
+    if (not isinstance(deployment.get("engine_id"), str)
+            or not deployment["engine_id"]
+            or not isinstance(deployment.get("engine_context"), str)
+            or not deployment["engine_context"]
+            or not isinstance(deployment.get("source_commit"), str)
+            or not deployment["source_commit"]
+            or not isinstance(deployment.get("harness_revision"), str)):
+        raise DomainError("backup_deployment_metadata_invalid", 400)
+    for key in ("workspace_root", "data_root"):
+        value = deployment.get(key)
+        if value is not None and not isinstance(value, str):
+            raise DomainError("backup_deployment_metadata_invalid", 400)
+    return dict(deployment)
+
+
+def _signing_public_derived(
+        private: Ed25519PrivateKey) -> tuple[bytes, bytes]:
+    public = private.public_key()
+    return (
+        public.public_bytes_raw(),
+        public.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo),
+    )
+
+
+def _validate_backup_signing_material(
+        source: Path, manifest: dict) -> None:
+    """校验 v2 备份的签名私钥、派生公钥、受管配置与出口策略。"""
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise DomainError("backup_integrity_failed", 409)
+    signing = source / "snapshot.pem"
+    worker = source / "worker-public.key"
+    gateway = source / "gateway-public.pem"
+    managed = source / "managed-agent.json"
+    policy = source / "egress-policy.json"
+    try:
+        key = _load_backup_signing_key(signing)
+    except DomainError:
+        raise
+    raw, pem = _signing_public_derived(key)
+    try:
+        if (not worker.is_file() or worker.read_bytes() != raw
+                or not gateway.is_file() or gateway.read_bytes() != pem):
+            raise DomainError("backup_integrity_failed", 409)
+    except OSError:
+        raise DomainError("backup_integrity_failed", 409) from None
+    for path in (signing, worker, gateway):
+        if _is_reparse(path) or not path.is_file():
+            raise DomainError("backup_integrity_failed", 409)
+    try:
+        _load_backup_managed(managed)
+        _load_backup_policy(policy)
+    except DomainError:
+        raise
+    for name, expected in (
+            ("signing_key", identity.get("signing_key")),
+            ("worker_public", identity.get("worker_public")),
+            ("gateway_public", identity.get("gateway_public")),
+            ("managed_config", manifest.get("managed_config")),
+            ("egress_policy", manifest.get("egress_policy"))):
+        if not isinstance(expected, dict):
+            raise DomainError("backup_integrity_failed", 409)
+        path = source.joinpath(*_manifest_path(expected.get("path")).parts)
+        if (_is_reparse(path) or not path.is_file()
+                or path.stat().st_size != expected.get("bytes")
+                or _sha256_file(path) != expected.get("sha256")):
+            raise DomainError("backup_integrity_failed", 409)
+    ca = manifest.get("egress_ca")
+    if ca is not None:
+        if not isinstance(ca, dict):
+            raise DomainError("backup_integrity_failed", 409)
+        path = source.joinpath(*_manifest_path(ca.get("path")).parts)
+        if (_is_reparse(path) or not path.is_file()
+                or path.stat().st_size != ca.get("bytes")
+                or _sha256_file(path) != ca.get("sha256")):
+            raise DomainError("backup_integrity_failed", 409)
+
+
+def _clean_stop_view(store: Store) -> tuple[bool, dict | None]:
+    barrier = store.admission_barrier()
+    completion = store.stop_completion()
+    if (barrier is None or completion is None
+            or completion.get("barrierId") != barrier.get("id")):
+        return False, None
+    return True, completion
 
 
 def _copy_file(source: Path, destination: Path) -> dict:
@@ -318,8 +534,18 @@ def _snapshot_metadata(path: Path) -> tuple[list[str], dict[str, int], int]:
 def create_backup(store: Store, destination: Path, *, control_dir: Path,
                   master_key_file: Path, workspace_root: Path | None = None,
                   image_digest: str = "", harness_revision: str = "",
-                  drain: Callable[[], object] | None = None) -> Path:
-    """备份控制 SQLite、master key 与各 workspace 持久区。
+                  drain: Callable[[], object] | None = None,
+                  signing_key_file: Path | None = None,
+                  managed_config_file: Path | None = None,
+                  egress_policy_file: Path | None = None,
+                  egress_ca_file: Path | None = None,
+                  deployment: dict | None = None,
+                  require_clean_stop: bool = False) -> Path:
+    """备份控制 SQLite、master key、签名材料与各 workspace 持久区。
+
+    v2（显式给出签名私钥/受管配置/出口策略时）额外备份 Ed25519 私钥与
+    派生公钥、受管 Agent 配置、出口策略和部署身份；v1 只备份控制库与
+    master key，保持旧格式可恢复但不含完整 Desktop 材料。
 
     worker 仍在活动状态时，调用方必须提供 ``drain``；drain 返回后若租约仍
     未进入终态则失败关闭。所有内容先写同卷临时目录，校验完成后整体 rename，
@@ -351,11 +577,73 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
         destination, control_dir=control_dir, workspace_root=data_root)
     key = _load_backup_key(key_file)
     _key_matches(store, key)
+
+    material_paths = (signing_key_file, managed_config_file,
+                      egress_policy_file, egress_ca_file)
+    full = any(path is not None for path in material_paths)
+    if full:
+        if signing_key_file is None:
+            raise DomainError("backup_signing_key_missing", 409)
+        if managed_config_file is None:
+            raise DomainError("backup_managed_config_missing", 409)
+        if egress_policy_file is None:
+            raise DomainError("backup_egress_policy_missing", 409)
+        if deployment is None:
+            raise DomainError("backup_materials_incomplete", 400)
+    elif require_clean_stop or deployment is not None:
+        raise DomainError("backup_materials_incomplete", 400)
+    if full:
+        clean, completion = _clean_stop_view(store)
+        if require_clean_stop and not clean:
+            raise DomainError("backup_requires_clean_stop", 409)
+        deployment_meta = _validate_deployment_metadata(deployment)
+        signing_path = _absolute_path(
+            signing_key_file, "backup_signing_key_missing")
+        if not signing_path.is_file() or _is_reparse(signing_path):
+            raise DomainError("backup_signing_key_missing", 409)
+        try:
+            signing_key = load_signing_key(signing_path)
+        except (OSError, ValueError):
+            raise DomainError("backup_signing_key_invalid", 409) from None
+        managed_path = _absolute_path(
+            managed_config_file, "backup_managed_config_missing")
+        if not managed_path.is_file() or _is_reparse(managed_path):
+            raise DomainError("backup_managed_config_missing", 409)
+        try:
+            load_managed_agent_config(managed_path)
+        except (OSError, ValueError):
+            raise DomainError("backup_managed_config_invalid", 409) from None
+        policy_path = _absolute_path(
+            egress_policy_file, "backup_egress_policy_missing")
+        if not policy_path.is_file() or _is_reparse(policy_path):
+            raise DomainError("backup_egress_policy_missing", 409)
+        try:
+            load_policy(policy_path)
+        except (OSError, ValueError):
+            raise DomainError("backup_egress_policy_invalid", 409) from None
+        if egress_ca_file is not None:
+            ca_path = _absolute_path(
+                egress_ca_file, "backup_egress_ca_missing")
+            if not ca_path.is_file() or _is_reparse(ca_path):
+                raise DomainError("backup_egress_ca_missing", 409)
+        else:
+            ca_path = None
+    else:
+        signing_path = managed_path = policy_path = ca_path = None
+        signing_key = None
+        completion = None
+        clean = False
+        deployment_meta = None
+
     _drain_before_backup(store, drain)
+    if not store.drain_status(int(time.time()))["settled"]:
+        raise DomainError("worker_drain_incomplete", 503)
 
     staging = _new_staging(
         destination.parent, f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
+        if os.name == "posix":
+            staging.chmod(0o700)
         control_target = staging / "control" / CONTROL_DB_NAME
         backup_control(store, control_target)
         workspace_ids, workspace_versions, config_version = _snapshot_metadata(
@@ -375,6 +663,58 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
             {"path": "master.key", "bytes": len(key),
              "sha256": hashlib.sha256(key).hexdigest()},
         ]
+        identity: dict | None = None
+        if full:
+            raw_public, pem_public = _signing_public_derived(signing_key)
+            try:
+                (staging / "snapshot.pem").write_bytes(
+                    signing_path.read_bytes())
+                (staging / "managed-agent.json").write_bytes(
+                    managed_path.read_bytes())
+                (staging / "egress-policy.json").write_bytes(
+                    policy_path.read_bytes())
+                (staging / "worker-public.key").write_bytes(raw_public)
+                (staging / "gateway-public.pem").write_bytes(pem_public)
+                if os.name == "posix":
+                    for name in ("snapshot.pem", "managed-agent.json",
+                                 "egress-policy.json"):
+                        (staging / name).chmod(0o600)
+                    for name in ("worker-public.key", "gateway-public.pem"):
+                        (staging / name).chmod(0o644)
+            except OSError:
+                raise DomainError("backup_write_failed", 500) from None
+            material_entries: dict[str, dict] = {}
+            for name in ("snapshot.pem", "managed-agent.json",
+                         "egress-policy.json", "worker-public.key",
+                         "gateway-public.pem"):
+                path = staging / name
+                material_entries[name] = {
+                    "path": name,
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256_file(path),
+                }
+            if ca_path is not None:
+                try:
+                    (staging / "egress-ca.pem").write_bytes(
+                        ca_path.read_bytes())
+                    if os.name == "posix":
+                        (staging / "egress-ca.pem").chmod(0o600)
+                except OSError:
+                    raise DomainError("backup_write_failed", 500) from None
+                material_entries["egress-ca.pem"] = {
+                    "path": "egress-ca.pem",
+                    "bytes": (staging / "egress-ca.pem").stat().st_size,
+                    "sha256": _sha256_file(staging / "egress-ca.pem"),
+                }
+            files.extend(material_entries.values())
+            identity = {
+                "master_key": files[1],
+                "signing_key": material_entries["snapshot.pem"],
+                "worker_public": material_entries["worker-public.key"],
+                "gateway_public": material_entries["gateway-public.pem"],
+            }
+            if ca_path is not None:
+                identity["egress_ca"] = material_entries["egress-ca.pem"]
         workspace_entries: dict[str, dict] = {}
         for workspace_id in workspace_ids:
             # 数据库值不直接拼进宿主路径；损坏/伪造 ID 不能逃出备份临时目录
@@ -417,11 +757,15 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
                         prefix=f"workspaces/{workspace_id}/{part}",
                         skip_names=_SKIP_BACKUP_NAMES))
                     entry[part] = True
+                state = data_root / workspace_id / "workspace" / "state"
+                entry["state"] = bool(
+                    entry.get("workspace") and state.is_dir()
+                    and not _is_reparse(state))
             workspace_entries[workspace_id] = entry
 
         manifest = {
             "format": BACKUP_FORMAT,
-            "version": BACKUP_VERSION,
+            "version": BACKUP_V2 if full else 1,
             "created_at": int(time.time()),
             "schema_version": SCHEMA_VERSION,
             "config_version": config_version,
@@ -437,7 +781,39 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
                            "bytes": files[1]["bytes"]},
             "files": sorted(files, key=lambda item: item["path"]),
         }
+        if full:
+            manifest.update({
+                "complete": True,
+                "deployment": deployment_meta,
+                "identity": identity,
+                "managed_config": {
+                    "path": "managed-agent.json",
+                    "sha256": next(item["sha256"] for item in files
+                                   if item["path"] == "managed-agent.json"),
+                    "bytes": next(item["bytes"] for item in files
+                                  if item["path"] == "managed-agent.json"),
+                },
+                "egress_policy": {
+                    "path": "egress-policy.json",
+                    "sha256": next(item["sha256"] for item in files
+                                   if item["path"] == "egress-policy.json"),
+                    "bytes": next(item["bytes"] for item in files
+                                  if item["path"] == "egress-policy.json"),
+                },
+                **({"egress_ca": {
+                    "path": "egress-ca.pem",
+                    "sha256": identity["egress_ca"]["sha256"],
+                    "bytes": identity["egress_ca"]["bytes"],
+                }} if ca_path is not None else {}),
+                "runtime_state": {
+                    "clean_stop": bool(clean),
+                    "stop": dict(completion) if completion else None,
+                    "excluded": list(_BACKUP_EXCLUDED_RUNTIME),
+                },
+            })
         _write_json(staging / "manifest.json", manifest)
+        if os.name == "posix":
+            (staging / "manifest.json").chmod(0o600)
         _replace_directory(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -592,6 +968,54 @@ def _read_manifest(source: Path) -> dict:
         if (entry is None or pointer.get("sha256") != entry.get("sha256")
                 or pointer.get("bytes") != entry.get("bytes")):
             raise DomainError("backup_invalid", 400)
+    if version >= BACKUP_V2:
+        if manifest.get("complete") is not True:
+            raise DomainError("backup_invalid", 400)
+        identity = manifest.get("identity")
+        runtime_state = manifest.get("runtime_state")
+        if not isinstance(identity, dict) or not isinstance(runtime_state, dict):
+            raise DomainError("backup_invalid", 400)
+        required = {
+            "signing_key": "snapshot.pem",
+            "worker_public": "worker-public.key",
+            "gateway_public": "gateway-public.pem",
+        }
+        for key, name in required.items():
+            pointer = identity.get(key)
+            entry = by_path.get(name)
+            if (not isinstance(pointer, dict) or pointer.get("path") != name
+                    or entry is None
+                    or pointer.get("sha256") != entry.get("sha256")
+                    or pointer.get("bytes") != entry.get("bytes")):
+                raise DomainError("backup_invalid", 400)
+        for key, name in (
+                ("managed_config", "managed-agent.json"),
+                ("egress_policy", "egress-policy.json")):
+            pointer = manifest.get(key)
+            entry = by_path.get(name)
+            if (not isinstance(pointer, dict) or pointer.get("path") != name
+                    or entry is None
+                    or pointer.get("sha256") != entry.get("sha256")
+                    or pointer.get("bytes") != entry.get("bytes")):
+                raise DomainError("backup_invalid", 400)
+        if manifest.get("egress_ca") is not None:
+            pointer = manifest.get("egress_ca")
+            entry = by_path.get("egress-ca.pem")
+            if (not isinstance(pointer, dict)
+                    or pointer.get("path") != "egress-ca.pem"
+                    or entry is None
+                    or pointer.get("sha256") != entry.get("sha256")
+                    or pointer.get("bytes") != entry.get("bytes")):
+                raise DomainError("backup_invalid", 400)
+        _validate_deployment_metadata(manifest.get("deployment"))
+        excluded = runtime_state.get("excluded")
+        if (not isinstance(excluded, list)
+                or not all(isinstance(item, dict)
+                           and isinstance(item.get("path"), str)
+                           and isinstance(item.get("reason"), str)
+                           for item in excluded)
+                or type(runtime_state.get("clean_stop")) is not bool):
+            raise DomainError("backup_invalid", 400)
     return manifest
 
 
@@ -700,7 +1124,7 @@ def restore_backup(source: Path, destination: Path, *,
     if not key_path.is_file() or _is_reparse(key_path):
         raise DomainError("backup_master_key_missing", 409)
     expected = _validate_bundle_tree(source, manifest)
-    key = _load_backup_key(key_path)
+    key = _load_backup_master_key(key_path)
 
     staging = _new_staging(
         destination.parent, f".{destination.name}.{uuid.uuid4().hex}.tmp")
@@ -709,11 +1133,169 @@ def restore_backup(source: Path, destination: Path, *,
         _copy_file(source / "manifest.json", staging / "manifest.json")
         _validate_restored_database(
             staging / manifest["control"]["path"], key)
+        if manifest["version"] >= BACKUP_V2:
+            _validate_backup_signing_material(staging, manifest)
         _replace_directory(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return destination
+
+
+def verify_backup(source: Path) -> dict:
+    """只读校验完整备份：清单、文件集合、摘要、schema、密文与派生公钥。
+
+    不写源目录，也不生成新 key；任何缺项、篡改或未来 schema 都失败关闭。
+    """
+    source = _absolute_path(source, "backup_invalid")
+    if not source.is_dir():
+        raise DomainError("backup_invalid", 400)
+    manifest = _read_manifest(source)
+    _validate_bundle_tree(source, manifest)
+    key_path = source / "master.key"
+    if not key_path.is_file() or _is_reparse(key_path):
+        raise DomainError("backup_master_key_missing", 409)
+    key = _load_backup_master_key(key_path)
+    _validate_restored_database(
+        source / manifest["control"]["path"], key)
+    if manifest["version"] >= BACKUP_V2:
+        _validate_backup_signing_material(source, manifest)
+    return {
+        "version": manifest["version"],
+        "schema_version": manifest["schema_version"],
+        "files": len(manifest["files"]),
+        "workspaces": len(manifest["workspaces"]),
+        "clean_stop": bool(manifest.get("runtime_state", {}).get(
+            "clean_stop", False)),
+        "deployment": manifest.get("deployment"),
+        "image": manifest.get("image", ""),
+        "harness_revision": manifest.get("harness_revision", ""),
+    }
+
+
+def prepare_restored_instance(destination: Path, *, now: int | None = None,
+                              invite_ttl_seconds: int = 3600) -> dict:
+    """把已恢复到新目录的 v2 备份准备为可启动实例。
+
+    仅在源已完成干净 Stop 时允许：清屏障、保留带 reopenedAt 的完成记录、
+    撤销旧登录/邀请/Run token、规范化旧 leases，并签发一次性管理员恢复邀请。
+    """
+    destination = _absolute_path(destination, "restore_destination_invalid")
+    manifest = _read_manifest(destination)
+    if manifest["version"] < BACKUP_V2:
+        raise DomainError("backup_incompatible", 409)
+    database = destination / "control" / CONTROL_DB_NAME
+    with Store.open(database) as store:
+        summary = store.prepare_restored_instance(
+            int(time.time()) if now is None else int(now))
+        identity = store.get_identity(summary["admin_user_id"])
+        summary = dict(summary)
+        summary["recovery_invite"] = AuthService(store).create_invite(
+            identity, identity.user_id, invite_ttl_seconds)
+    return summary
+
+
+def _empty_directory(path: Path, code: str) -> Path:
+    path = _absolute_path(path, code)
+    if not path.is_dir() or any(path.iterdir()):
+        raise DomainError("restore_material_target_not_empty", 409)
+    return path
+
+
+def _clear_directory(path: Path) -> None:
+    try:
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def materialize_restore(source: Path, *, control_dir: Path, keys_dir: Path,
+                        egress_dir: Path, workspace_root: Path) -> dict:
+    """把已校验的恢复包落到新部署的 control/keys/egress/workspace 目标。
+
+    目标必须全部为空；失败时只清理本轮新建的目标内容，不触碰源或旧数据。
+    """
+    source = _absolute_path(source, "backup_invalid")
+    control = _empty_directory(control_dir, "restore_target_escape")
+    keys = _empty_directory(keys_dir, "restore_target_escape")
+    egress = _empty_directory(egress_dir, "restore_target_escape")
+    workspaces = _empty_directory(workspace_root, "restore_target_escape")
+    for target in (control, keys, egress, workspaces):
+        if (target == source or target.is_relative_to(source)
+                or source.is_relative_to(target)):
+            raise DomainError("restore_target_escape", 400)
+    manifest = _read_manifest(source)
+    if manifest["version"] < BACKUP_V2:
+        raise DomainError("backup_incompatible", 409)
+    verify_backup(source)
+    key_file = source / "master.key"
+    key = _load_backup_master_key(key_file)
+    copied = 0
+    try:
+        shutil.copyfile(source / "control" / CONTROL_DB_NAME,
+                        control / CONTROL_DB_NAME)
+        if os.name == "posix":
+            (control / CONTROL_DB_NAME).chmod(0o600)
+        copied += 1
+        for name, mode in (
+                ("master.key", 0o600), ("snapshot.pem", 0o600),
+                ("managed-agent.json", 0o600), ("egress-policy.json", 0o600),
+                ("worker-public.key", 0o644), ("gateway-public.pem", 0o644)):
+            target = keys / name
+            shutil.copyfile(source / name, target)
+            if os.name == "posix":
+                target.chmod(mode)
+            copied += 1
+        if (source / "egress-ca.pem").is_file():
+            target = keys / "egress-ca.pem"
+            shutil.copyfile(source / "egress-ca.pem", target)
+            if os.name == "posix":
+                target.chmod(0o600)
+            copied += 1
+        shutil.copyfile(source / "egress-policy.json",
+                        egress / "egress-policy.json")
+        if os.name == "posix":
+            (egress / "egress-policy.json").chmod(0o600)
+        copied += 1
+        for workspace_id, parts in manifest["workspaces"].items():
+            if _WORKSPACE_ID.fullmatch(workspace_id) is None:
+                raise DomainError("backup_workspace_id_invalid", 500)
+            base = source / "workspaces" / workspace_id
+            target_base = workspaces / workspace_id
+            target_base.mkdir(mode=0o700)
+            for part in ("workspace", "home"):
+                if not parts.get(part):
+                    continue
+                source_part = base / part
+                target_part = target_base / part
+                target_part.mkdir(mode=0o700)
+                copied += len(_copy_tree(
+                    source_part, target_part, prefix="",
+                    skip_names=frozenset()))
+        _validate_restored_database(control / CONTROL_DB_NAME, key)
+        _validate_backup_signing_material(source, manifest)
+        for name in ("master.key", "snapshot.pem", "managed-agent.json",
+                     "egress-policy.json", "worker-public.key",
+                     "gateway-public.pem"):
+            if (keys / name).read_bytes() != (source / name).read_bytes():
+                raise DomainError("backup_integrity_failed", 409)
+        if ((source / "egress-ca.pem").is_file()
+                and (keys / "egress-ca.pem").read_bytes()
+                != (source / "egress-ca.pem").read_bytes()):
+            raise DomainError("backup_integrity_failed", 409)
+    except BaseException:
+        for path in (control, keys, egress, workspaces):
+            _clear_directory(path)
+        raise
+    return {
+        "workspaces": len(manifest["workspaces"]),
+        "files": copied,
+        "schema_version": manifest["schema_version"],
+    }
 
 
 @dataclass(frozen=True)
@@ -1289,7 +1871,7 @@ def cmd_admin_invite(args) -> int:
 
 
 def cmd_admin_backup(args) -> int:
-    """备份控制库、key 与 workspace 持久区；活动 worker 必须先 drain。"""
+    """备份控制库、key、签名材料与 workspace 持久区；活动 worker 先 drain。"""
     control_dir = Path(args.control_dir)
     database = _control_db(args.control_dir)
     if not database.is_file():
@@ -1307,6 +1889,15 @@ def cmd_admin_backup(args) -> int:
             # CLI 是同步入口；使用同一线程内的短连接执行 drain 编排。
             asyncio.run(RuntimeManager(store, provisioner).drain_all())
 
+    deployment = None
+    deployment_path = getattr(args, "deployment_json", None)
+    if deployment_path:
+        try:
+            deployment = _read_json_object(
+                Path(deployment_path), "backup_deployment_metadata_invalid")
+        except DomainError as error:
+            return _report(error)
+
     try:
         with Store.open(database) as store:
             result = create_backup(
@@ -1317,10 +1908,120 @@ def cmd_admin_backup(args) -> int:
                                 if args.workspace_root else None),
                 image_digest=args.image_digest,
                 harness_revision=args.harness_revision,
-                drain=drain)
+                drain=drain,
+                signing_key_file=(Path(args.signing_key_file)
+                                  if getattr(args, "signing_key_file", None)
+                                  else None),
+                managed_config_file=(Path(args.managed_agent_config)
+                                     if getattr(args, "managed_agent_config",
+                                                None) else None),
+                egress_policy_file=(Path(args.egress_policy_file)
+                                    if getattr(args, "egress_policy_file",
+                                               None) else None),
+                egress_ca_file=(Path(args.egress_ca_file)
+                                if getattr(args, "egress_ca_file", None)
+                                else None),
+                deployment=deployment,
+                require_clean_stop=bool(
+                    getattr(args, "require_clean_stop", False)))
     except DomainError as error:
         return _report(error)
     print(f"backup={result}")
+    return 0
+
+
+def cmd_admin_verify_backup(args) -> int:
+    """只读校验完整备份；不写源、不生成 key。"""
+    try:
+        summary = verify_backup(Path(args.source))
+    except DomainError as error:
+        return _report(error)
+    print(f"verified={Path(args.source)}")
+    print(f"version={summary['version']}")
+    print(f"schema_version={summary['schema_version']}")
+    print(f"files={summary['files']}")
+    print(f"workspaces={summary['workspaces']}")
+    print(f"clean_stop={str(summary['clean_stop']).lower()}")
+    deployment = summary.get("deployment") or {}
+    for key in ("project", "config_sha256", "worker_image",
+                "gateway_image", "control_image", "harness_revision"):
+        if deployment.get(key):
+            print(f"{key}={deployment[key]}")
+    return 0
+
+
+def cmd_admin_prepare_restore(args) -> int:
+    """准备恢复副本：清运行期身份并签发一次性管理员恢复邀请。"""
+    try:
+        summary = prepare_restored_instance(
+            Path(args.destination),
+            invite_ttl_seconds=int(getattr(args, "invite_ttl_seconds", 3600)))
+    except DomainError as error:
+        return _report(error)
+    print(f"prepared={Path(args.destination)}")
+    print(f"cleared_barrier={summary['cleared_barrier']}")
+    print(f"revoked_logins={summary['revoked_logins']}")
+    print(f"revoked_invites={summary['revoked_invites']}")
+    print(f"revoked_broker_tokens={summary['revoked_broker_tokens']}")
+    # 仅此处输出一次；调用脚本必须写入受限文件，不得进入日志/证据。
+    print(f"recovery_invite={summary['recovery_invite']}")
+    return 0
+
+
+def cmd_admin_materialize_restore(args) -> int:
+    """把已准备恢复包落到新部署目标目录/卷。"""
+    try:
+        summary = materialize_restore(
+            Path(args.source),
+            control_dir=Path(args.control_dir),
+            keys_dir=Path(args.keys_dir),
+            egress_dir=Path(args.egress_dir),
+            workspace_root=Path(args.workspace_root))
+    except DomainError as error:
+        return _report(error)
+    print(f"materialized={Path(args.source)}")
+    print(f"workspaces={summary['workspaces']}")
+    print(f"files={summary['files']}")
+    print(f"schema_version={summary['schema_version']}")
+    return 0
+
+
+def cmd_admin_stop_status(args) -> int:
+    """只读打印 Stop 完成记录，供受控升级比对旧配置摘要。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            barrier = store.admission_barrier()
+            completion = store.stop_completion()
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 诊断失败不得伪报无记录
+        print("错误：stop_status_failed", file=sys.stderr)
+        return 1
+    if barrier is None and completion is None:
+        print("stop_completion=none")
+        return 0
+    print("stop_completion=" + json.dumps(
+        {"barrier": barrier, "completion": completion},
+        sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def cmd_admin_upgrade_complete(args) -> int:
+    """受控升级：仅把匹配旧摘要的完成记录改写为新摘要。"""
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            record = store.upgrade_stop_completion(
+                args.barrier_id, args.project, args.from_config_sha256,
+                args.to_config_sha256, args.backup_manifest_sha256,
+                int(time.time()))
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 升级失败必须保留旧记录
+        print("错误：stop_upgrade_failed", file=sys.stderr)
+        return 1
+    print(f"upgraded={record['barrierId']}")
+    print(f"from_config_sha256={record['upgradedFrom']}")
+    print(f"to_config_sha256={record['configSha256']}")
     return 0
 
 

@@ -442,6 +442,43 @@ try {
         Add-Failure 'provisioner_socket_missing'
     }
 
+    $deploymentFile = Join-Path (Join-Path $DataRoot 'logs') 'deployment.json'
+    if (Test-Path -LiteralPath $deploymentFile -PathType Leaf) {
+        try {
+            $deployment = Get-Content -LiteralPath $deploymentFile -Raw |
+                ConvertFrom-Json
+            Write-Output "version_control_image=$([string]$deployment.control_image)"
+            Write-Output "version_worker_image=$([string]$deployment.worker_image)"
+            Write-Output "version_gateway_image=$([string]$deployment.gateway_image)"
+            Write-Output "version_frontend_sha256=$([string]$deployment.frontend_sha256)"
+            Write-Output "version_config_sha256=$([string]$deployment.config_sha256)"
+            Write-Output "version_source_commit=$([string]$deployment.source_commit)"
+            Write-Output "version_harness_revision=$([string]$deployment.harness_revision)"
+            Write-Output "version_project=$([string]$deployment.project)"
+        }
+        catch {
+            Add-Failure 'deployment_metadata_invalid'
+        }
+    }
+    else {
+        Write-Output 'version_metadata=missing'
+    }
+    Write-Output "logs=$(Join-Path $DataRoot 'logs')"
+    if ($controlId) {
+        $schema = Invoke-EaselDocker -Arguments @(
+            'exec', $controlId, 'python', '-c',
+            ("import sqlite3;print(sqlite3.connect(" +
+             "'/srv/easel/control/control.sqlite3').execute(" +
+             "'PRAGMA user_version').fetchone()[0])"))
+        $schemaText = (($schema.Output -join '').Trim())
+        if ($schema.ExitCode -eq 0 -and $schemaText -match '^[0-9]+$') {
+            Write-Output "version_schema=$schemaText"
+        }
+        else {
+            Add-Failure 'schema_version_unavailable'
+        }
+    }
+
     if ($script:failures.Count -gt 0) {
         Write-Output ("status=failed failures=" + ($script:failures -join ','))
         exit 1

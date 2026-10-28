@@ -1,6 +1,6 @@
 # Easel Windows 本机与 Docker Desktop 使用运维手册
 
-适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`290d94a68b9a4c1e8e3f627b5c96fcbdb8f11f1b`，2026-10-26。
+适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`d9c2f5ba960e892f198ebc4a111b7e2ad7e835af`，2026-10-29。
 
 本文把“Desktop”理解为 **Windows 上的 Docker Desktop**；Easel 当前的操作界面仍是浏览器，不是另一个独立 Windows 安装包。只读这份手册即可先在本机使用；服务器部署见[Linux Docker 手册](linux-docker-operations.zh-CN.md)。
 
@@ -8,17 +8,17 @@
 
 | 路线 | 你会得到什么 | 适合谁 |
 |---|---|---|
-| A：Windows Python 本机运行 | 单人完整工作台，直接使用本机已配置的 DeepSeek Harness/ACP | **你当前优先用这条**，已有 Harness 无需搬迁 |
-| B：Docker Desktop 单人运行 | 独立 Linux 容器、浏览器工作台；默认先配置“仅聊天模式” | 想学习容器、备份和升级的人 |
-| C：Docker Desktop 多用户登录管理面 | ngrok HTTPS、邀请登录、成员与权限、模型设置 | 本机继续验证多用户，见第 9 节 |
-| 完整多人 control/worker | 邀请、成员、配置、服务端历史等代码已验收，但完整生产装配和正式隔离未完成 | 暂不作为小白“一键上线”路线 |
+| A：Windows Python 本机运行 | 单人完整工作台，直接使用本机已配置的 DeepSeek Harness/ACP | **个人本机最省事**，已有 Harness 无需搬迁 |
+| B：Docker Desktop 单人运行 | 独立 Linux 容器、浏览器工作台；默认“仅聊天模式” | 想学习容器、备份和升级的人 |
+| C：Docker Desktop 完整多人 | ngrok HTTPS、邀请登录、成员/权限、模型设置、真实 Harness 聊天、停止、备份/恢复/升级/回滚 | 本机团队验证；见第 9 节 |
+| 正式 Linux 生产发布 | 本机 Desktop 功能已验收只覆盖 Windows 测试宿主；Linux/XFS/firewall/IPv6/Chromium 生产门槛仍未通过 | 暂不作为“生产可发布”依据 |
 
 重要区别：
 
 - `easel web` 是 **local 单人模式**，没有多人邀请登录边界。不能把它直接开放给团队或公网。
-- `easel serve-control` 是 **多人控制面**。仅验证邀请登录、成员管理和模型设置，需要 HTTPS 与 master key；执行聊天任务还需要 provisioner、实际 worker 和任务签名等配套。它不是给 `web` 换一个端口。
-- 当前多人 `/api/outputs` 等工作区业务仍有 503；现有 Docker worker 默认启动 lifecycle 健康服务，不等于已经启动聊天 Web worker。不能靠本文把缺少的产品装配变成可用。
-- Docker Desktop 的测试结果不等于 Linux 多人发布验收；正式检查器仍有固定 `blocked` 证据项。
+- `easel serve-control` 是 **多人控制面**。完整 Desktop 路线 C 已装配 control、gateway、真实 Harness worker、sidecar/broker、权限与停止收尾；不能把“仅聊天”或“仅登录”旧镜像当成完整聊天环境。
+- 路线 C 的聊天必须通过受管 provider/channel；本手册不要求也不允许把真实供应商 Key 写进命令行、日志、截图或 Git。真实 DeepSeek 请求仍是独立 not-run 项。
+- Docker Desktop 的功能/运维结果不等于 Linux 生产发布验收；原发布检查器的固定阻断项仍然存在。
 
 ## 2. 命令怎么读
 
@@ -431,181 +431,336 @@ docker compose -f (Join-Path $OpsRoot 'compose.local.yaml') up -d
 | Key 改了仍报缺少 | 新终端重启 Web，确认只返回布尔值的环境检查；不把 Key 写进 argv |
 | 只有 API 回复但不能执行技能 | 你可能选了“仅聊天模式”，需要可用且已认证的 Agent 底座 |
 | Docker 下载超时 | 检查 Docker Desktop 网络与代理；失败就停，不用不明镜像替换正式配置 |
-| 看到 capability_unavailable/503 | 如果访问的是多人 control，这是未装配能力，不应靠关闭认证或改成 local 冒充修好 |
+| 看到 capability_unavailable/503 | 先确认用的是第 9 节完整 Desktop 镜像/启动命令；仅登录旧编排或未配置受管 provider 会 503。不要靠关闭认证或改 local 冒充修好 |
 
-## 9. Windows 上的多人验证做到哪一步
+## 9. 完整 Desktop 多人：已装配的正式路线
 
-**A1 结论（2026-10-26）**：已交付可独立使用的登录管理面，包含当前源码和当前前端的固定 control 镜像、专用 Compose、PowerShell 初始化/启动/诊断脚本。真实 Docker Desktop + ngrok HTTPS + Chromium 已验证管理员 bootstrap、邀请单次兑换、A/B 独立浏览器 context、权限与 403/404、会话目录隔离、注销/禁用，以及重开同一数据卷后的重新登录。
+本节对应 A2–A7 已装配并实际演练的完整 Desktop 路线：control + 签名 gateway + WSL provisioner + 每 workspace worker/sidecar/broker + 真实 ACP Harness。它是**功能与运维范围**的验收，不是 Linux 生产发布验收。
 
-这不是完整多人聊天环境：未启动执行 worker，聊天/历史请求由 control 明确返回 `503 capability_unavailable`；原 Linux 防火墙/IPv6、XFS 配额、最终 runtime/真实 DSH 等正式发布门槛仍未通过。
+### 9.1 当前事实与边界
 
-### 9.1 边界与前提
+- 聊天、权限允许/拒绝、停止、SSE 回放、control/gateway/worker 重启续接、A/B 隔离、取消清理互斥已由真实 Harness + 受控 provider + 浏览器/API 验证。
+- 上游 provider 在演练中使用受控 TLS fake provider；真实 DeepSeek 请求仍为 **not-run**。不要把本手册的受控 provider 成功写成真实供应商成功。
+- ngrok 公网 HTTPS 证据沿用 A6；本轮 A7 未重做整套公网浏览器矩阵。
+- Linux 目标宿主的 XFS 配额、iptables/nftables、IPv6、Chromium 沙箱等生产门槛仍未验收；Docker Desktop 成功不能替代它们。
+- 所有命令在 PowerShell 执行；每次新终端重新设置本节变量。不要复制开发者 `.env`、HOME、浏览器 profile 或任何真实 Key 到本流程。
 
-- 访问链路：浏览器 → ngrok 公网 HTTPS → Windows `127.0.0.1:7861` → Docker Desktop 的 control 容器。
-- control 容器只以 UID/GID `10001:10001` 运行，只读根文件系统、`cap_drop: ALL`、`no-new-privileges`，只挂 control 数据卷和 master key 卷；不挂 Docker socket、worker 根或开发者目录。
-- 只发布宿主回环 `127.0.0.1:7861`；不暴露 worker、provisioner、broker 或 Docker socket。
-- 需要 Docker Desktop 使用 Linux containers。下面命令在 PowerShell 执行，变量每次新终端重新设置。
-- 不要复用旧 task8 测试镜像；每次都从当前源码构建 control 镜像。
+### 9.2 变量与前置条件
 
 ```powershell
 Set-Location C:\Code\Easel
 $EaselPython = 'C:\Users\hyh\anaconda3\envs\Agent\python.exe'
-$ProjectName = 'easel-login-desktop'
-$ImageTag = 'easel-control:a1'
+$ProjectName = 'easel-desktop-multi'
+$DataRoot = 'C:\Easel\desktop'
+$WorkspaceRoot = 'C:\Easel\workspaces'
+$Port = 7861
+$PublicOrigin = 'https://替换为你的-ngrok-域名'
+$ControlImage = 'sha256:替换为当前源码构建的-control-镜像'
+$WorkerImage = 'sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993'
+$GatewayImage = 'sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a'
 ```
 
-### 9.2 构建并固定 control 镜像
+前置：
 
 ```powershell
+docker version
+docker compose version
+docker info --format '{{.OSType}}'          # 必须是 linux
+wsl --status
+wsl -d Ubuntu-26.04 -- python3 -c "import cryptography"  # provisioner 依赖
+Test-Path .\web\frontend\dist\index.html    # 构建 control 镜像前可为 False，镜像内前端由 Dockerfile 构建
+```
+
+Docker Desktop 使用 Linux containers；WSL 发行版默认 `Ubuntu-26.04`。若不同，后续每个脚本都要显式加 `-Distro`、`-WslRepo`。
+
+### 9.3 构建并固定 control 镜像
+
+```powershell
+$ImageTag = 'easel-control:a7'
 docker build -f .\deploy\desktop\Dockerfile.control -t $ImageTag .
 if ($LASTEXITCODE -ne 0) { throw 'control 镜像构建失败' }
 $ControlImage = (docker image inspect $ImageTag --format '{{.Id}}').Trim()
 $ControlImage
 ```
 
-构建阶段会执行 `npm ci` 与 `npm run build`，最终镜像只复制当前 `easel` 源码、当前前端构建产物、共享模型目录和 keygen；不复制开发者环境文件。后续命令必须使用 `$ControlImage` 的 `sha256:...` ID，不能使用可移动 tag。
-
-### 9.3 初始化专用卷与 master key
+构建期如果 npm/pip 下载慢，可在 Docker Desktop 设置代理，或按本机代理方式传入：
 
 ```powershell
-.\deploy\desktop\Initialize-Easel.ps1 -Image $ControlImage -ProjectName $ProjectName
+docker build --build-arg HTTP_PROXY=http://host.docker.internal:7897 `
+  --build-arg HTTPS_PROXY=http://host.docker.internal:7897 `
+  -f .\deploy\desktop\Dockerfile.control -t $ImageTag .
 ```
 
-预期输出包含 `key=created`（首次）或 `key=exists`（重复运行）。脚本只管理：
+worker/gateway 必须是已验收的固定摘要，不能只写浮动的 tag：
 
-- `$ProjectName-control`：control SQLite 数据卷
-- `$ProjectName-keys`：master key 卷
+```powershell
+docker image inspect $WorkerImage --format '{{.Id}}'
+docker image inspect $GatewayImage --format '{{.Id}}'
+```
 
-重复执行不会覆盖 key、不会删除卷或数据库。卷创建时带 `easel.desktop.project` 与 `easel.desktop.role` 标签；如果同名卷没有本项目标签，初始化会以 `volume_not_owned` 拒绝，root 助手不会 chown 既有开发者卷。root 助手只修改这两个专用卷的目录权限；正式 control 仍以 10001 运行。不要把这两个卷换成开发者已有目录。
+两行输出必须分别等于变量值。worker 镜像缺失时，先按仓库 A5/A6 证据中的构建说明重建，不要用任意新 tag 冒充。
 
-### 9.4 启动 ngrok 与 control
+### 9.4 受管 Agent 配置、出口策略与 CA
 
-在**独立 PowerShell 窗口**启动已有 ngrok 配置；不要关闭其它项目的隧道，也不要读取或打印访问令牌：
+新建两个**不含任何供应商 Key** 的 JSON 文件。`revision` 每次有意变更时递增；`command` 来自锁定的 ACP profile：
+
+```powershell
+$ConfigDir = Join-Path $DataRoot 'config'
+New-Item -ItemType Directory -Force $ConfigDir | Out-Null
+$ManagedConfig = Join-Path $ConfigDir 'managed-agent.json'
+@'
+{
+  "revision": 1,
+  "agent": {
+    "runtime": "acp",
+    "command": ["node", "/opt/dsh/apps/cli/lib/bin.js", "--profile", "acp", "--patch", "/opt/easel/managed/acp.patch.yml"],
+    "sandbox": "workspace-write",
+    "timeout": 300
+  },
+  "broker": {"mode": "workspace-sidecar", "channel": "chat"}
+}
+'@ | Set-Content -LiteralPath $ManagedConfig -Encoding UTF8
+
+$EgressPolicy = Join-Path $ConfigDir 'egress-policy.json'
+@'
+{"approved_hosts": ["你的受控-provider-域名"], "approved_cidrs": []}
+'@ | Set-Content -LiteralPath $EgressPolicy -Encoding UTF8
+```
+
+- `managed-agent.json` 只允许 `revision/agent/broker`；含 `secret/api_key/token/password` 等字段会被拒绝。
+- `egress-policy.json` 只允许 `approved_hosts/approved_cidrs`。
+- 使用企业/私有 CA 时，把 CA PEM 作为 `-EgressCaFile` 传给 Start；省略时使用 control 镜像内的系统 CA bundle。CA 会复制到 key 卷并随 v2 备份保存，不包含私钥。
+
+### 9.5 初始化专用卷、网络与 key
+
+```powershell
+.\deploy\desktop\Initialize-WorkspaceEasel.ps1 `
+  -Image $ControlImage `
+  -ManagedAgentConfig $ManagedConfig `
+  -EgressPolicy $EgressPolicy `
+  -ProjectName $ProjectName `
+  -DataRoot $DataRoot `
+  -WorkspaceRoot $WorkspaceRoot
+```
+
+首次预期包含 `key=created,signing_key=created`；重复执行应为 `key=exists,signing_key=exists`。创建的资源：
+
+- `$ProjectName-control`：control SQLite 卷
+- `$ProjectName-keys`：master.key、Ed25519 私钥、派生公钥、受管配置、出口策略、CA
+- `$ProjectName-egress`：出口策略副本
+- `$ProjectName-control` 网络
+- `$DataRoot\public`：worker/gateway 公钥和策略副本
+- `$WorkspaceRoot`：workspace 持久根
+
+重复初始化不得换 key；卷/网络已有外来标签时以 `volume_not_owned`/`network_not_owned` 拒绝，不会 chown 接管。
+
+### 9.6 启动并接 ngrok HTTPS
+
+先启动 ngrok（独立窗口，不要读取/打印 authtoken）：
 
 ```powershell
 ngrok http http://127.0.0.1:7861 --inspect=false
 ```
 
-复制输出的 HTTPS Forwarding 地址，回到部署终端：
+把输出的 HTTPS Forwarding 地址填入 `$PublicOrigin`，然后：
 
 ```powershell
-$PublicOrigin = 'https://替换为你的实际域名'
-.\deploy\desktop\Start-Easel.ps1 `
-  -PublicOrigin $PublicOrigin -Image $ControlImage -ProjectName $ProjectName
+.\deploy\desktop\Start-WorkspaceEasel.ps1 `
+  -PublicOrigin $PublicOrigin `
+  -Image $ControlImage `
+  -WorkerImage $WorkerImage `
+  -GatewayImage $GatewayImage `
+  -ProjectName $ProjectName `
+  -Port $Port `
+  -DataRoot $DataRoot `
+  -WorkspaceRoot $WorkspaceRoot
 ```
 
-`Start-Easel.ps1` 会在调用 `docker compose up` 之前依次检查：Origin 形状、镜像是否为固定 `sha256`、两个专用卷的实际 Name/项目/角色标签和单对象结构、master key 是否可读、镜像内前端是否存在、Compose 配置是否可展开。卷不存在、外来标签、缺标签、错角色、空/多对象或非法 inspect 都以 `volume_not_owned`/`volume_inspect_invalid`/`volume_inspect_failed` 明确拒绝；Start 不会自动 create 或 chown 接管。任一检查失败都不会启动容器。
+预期输出包含：
 
-首次管理员邀请只在创建时输出一次；在 control 已启动后执行：
+```text
+started project=... origin=... port=... control=sha256:... worker=sha256:... gateway=sha256:...
+deployment_file=...\logs\deployment.json
+config_sha256=<64位>
+frontend_sha256=<64位>
+```
+
+Start 会先核验固定镜像、卷/网络归属、key 指纹、公钥副本、策略副本、前端、WSL 依赖和 provisioner 身份；失败时不会启动替代实例。`config_sha256` 是 stop/reopen 与升级协议的配置身份。
+
+### 9.7 管理员、邀请、登录、聊天、权限与停止
+
+首次管理员（只执行一次）：
 
 ```powershell
-$env:EASEL_CONTROL_IMAGE = $ControlImage
-$env:EASEL_PUBLIC_ORIGIN = $PublicOrigin
-$env:EASEL_DESKTOP_PROJECT = $ProjectName
-$env:EASEL_CONTROL_VOLUME = "$ProjectName-control"
-$env:EASEL_KEY_VOLUME = "$ProjectName-keys"
-$env:EASEL_CONTROL_PORT = '7861'
-docker compose -p $ProjectName -f .\deploy\desktop\compose.login.yaml `
-  exec -T control python -m easel admin bootstrap `
+$ControlContainer = (docker ps -q `
+  --filter "label=com.docker.compose.project=$ProjectName" `
+  --filter 'label=com.docker.compose.service=control').Trim()
+docker exec $ControlContainer python -m easel admin bootstrap `
   --control-dir /srv/easel/control --name Owner
 ```
 
-已有管理员时不要重复 bootstrap。打开 ngrok HTTPS 地址，粘贴邀请登录；管理员在“全体默认 → 成员与邀请”创建用户并签发邀请。普通成员与管理员使用不同浏览器 profile/独立浏览器 context，不能只看同一浏览器的两个标签页。
+输出中的 `invite=` 只出现一次，复制后立即使用；不要写入报告或截图。打开 `$PublicOrigin`，粘贴邀请登录。管理员在“成员与邀请”创建用户并签发邀请；每个用户使用独立浏览器 profile/context，不能只用同一浏览器两个标签页。
 
-### 9.5 只读诊断
+验证聊天/权限/停止：
 
-```powershell
-.\deploy\desktop\Test-Easel.ps1 `
-  -PublicOrigin $PublicOrigin -Image $ControlImage -ProjectName $ProjectName
-curl.exe -fsS -o NUL -w "http=%{http_code} ssl_verify=%{ssl_verify_result}`n" `
-  "$PublicOrigin/api/health"
-```
+1. 管理员发布聊天模型配置（受管 provider/channel；不要填真实 Key 到公开文件）。
+2. 用户新建会话发送消息；预期流式事件、助手回复、历史刷新后仍在。
+3. 需要权限的任务选择允许/拒绝；拒绝后任务不应继续执行。
+4. 点击停止；预期服务端 Run 进入 `cancelled` 或失败终态、临时 token 撤销；随后同会话新消息可继续，不出现“取消清理期间 409 误挡”或重叠执行。
+5. 两个用户互相看不到会话；跨空间读取应为 404/403。
 
-诊断从运行中容器读取实际 `docker inspect`，检查：Compose 项目/service 标签、镜像 ID、UID/GID、只读根、`cap_drop ALL`、`no-new-privileges`、非 privileged、非 host 网络、合并 Entrypoint/Cmd 后的完整 `serve-control` 命令（含实际 `--public-origin`、control/key/前端目录和 7861 端口）、恰好两个 volume 挂载（control 可写/key 只读、实际卷 Name 与项目匹配、拒绝 bind 替代）、无额外挂载、仅 `127.0.0.1:7861` 一个发布端口、健康状态。上述静态契约全部通过后才运行 key helper；helper 固定挂载已验证的预期 `$ProjectName-keys` 卷并显式 `readonly`，不使用运行容器的实际 Name 生成 Docker 操作目标。静态失败时不会运行 helper；inspect 为空/多对象/结构缺失/非法 JSON 均失败。输出只有检查名/状态码，不解析或回显 key、邀请、Cookie、访问令牌或完整 env。
-
-### 9.6 停止、重开与清理
-
-停止本次服务：
+### 9.8 日常 start/stop/status/logs
 
 ```powershell
-docker compose -p $ProjectName -f .\deploy\desktop\compose.login.yaml stop
-# 在 ngrok 窗口按 Ctrl+C
+# 只读诊断：网络/卷/control/端口/挂载/key/lease/health/egress/provisioner/version
+.\deploy\desktop\Status-WorkspaceEasel.ps1 `
+  -ProjectName $ProjectName -DataRoot $DataRoot -Port $Port
+
+# 查看最近日志（control/egress/provisioner；不读取 key）
+.\deploy\desktop\Logs-WorkspaceEasel.ps1 `
+  -ProjectName $ProjectName -DataRoot $DataRoot -Tail 200
+
+# 停止：先建屏障、drain、确认 Run/请求/实例收口，再 down，最后写完成记录
+.\deploy\desktop\Stop-WorkspaceEasel.ps1 `
+  -ProjectName $ProjectName -DataRoot $DataRoot
+
+# 重开：沿用同一 key/数据卷；只有匹配的成功 Stop 记录才自动重开
+.\deploy\desktop\Start-WorkspaceEasel.ps1 `
+  -PublicOrigin $PublicOrigin -Image $ControlImage `
+  -WorkerImage $WorkerImage -GatewayImage $GatewayImage `
+  -ProjectName $ProjectName -Port $Port `
+  -DataRoot $DataRoot -WorkspaceRoot $WorkspaceRoot
 ```
 
-重开（数据卷和 key 保留）：
+`Status` 的 `status=ok` 才表示全部检查通过；`version_*` 是实际镜像/前端/配置/源码/Harness 摘要，`version_schema` 是数据库 schema。`Logs` 只输出日志路径和尾部，不打印 key/邀请/Cookie。
+
+### 9.9 完整备份与只读校验
+
+备份只能在成功 Stop 之后：
 
 ```powershell
-# 重新设置 9.1、9.4 的变量；重新启动 ngrok 并更新 $PublicOrigin
-.\deploy\desktop\Initialize-Easel.ps1 -Image $ControlImage -ProjectName $ProjectName
-.\deploy\desktop\Start-Easel.ps1 `
-  -PublicOrigin $PublicOrigin -Image $ControlImage -ProjectName $ProjectName
+.\deploy\desktop\Backup-WorkspaceEasel.ps1 `
+  -ProjectName $ProjectName `
+  -Image $ControlImage `
+  -DataRoot $DataRoot `
+  -WorkspaceRoot $WorkspaceRoot
+
+$Backup = (Get-ChildItem (Join-Path $DataRoot 'backups') -Directory |
+  Sort-Object LastWriteTime | Select-Object -Last 1).FullName
+.\deploy\desktop\Verify-WorkspaceEasel.ps1 -Backup $Backup -Image $ControlImage
 ```
 
-重复初始化应显示 `key=exists`；不要再次 bootstrap 已有管理员。若 ngrok 地址改变，必须用新地址重新执行 `Start-Easel.ps1`，并从新地址重新登录；旧域名的 `__Host-` Cookie 不会被浏览器带到新域名。免费 ngrok 账户可能只有一个固定静态域名，不能在本机无账户变更的情况下制造第二个公开地址。
+备份包含：control DB 一致快照、master.key、Ed25519 私钥及派生公钥、受管 Agent 配置、出口策略、CA、各 workspace 的 `workspace`（含 `state`）与 `HOME`。明确排除 `.credentials` 与 `.gateway`（每部署重新生成），不备份 socket/PID。
 
-确认只清理本项目测试资源时才执行：
+预期 `version=2`、`clean_stop=true`、`workspaces=<数量>`、`verified_backup=...`。备份目录在 `$DataRoot\backups\<时间戳>`，Windows ACL 只授予当前用户/SYSTEM/Administrators；不要放进 Git 或公开目录。`Verify` 只读，不生成 key、不改备份。
+
+### 9.10 恢复到新目录/新项目
+
+源部署保持停止，目标必须是全新项目/卷/网络/目录/端口：
 
 ```powershell
-docker compose -p $ProjectName -f .\deploy\desktop\compose.login.yaml down --remove-orphans
-docker volume rm "$ProjectName-control" "$ProjectName-keys"
+$RestoredProject = 'easel-desktop-restored'
+$RestoredPort = 7862
+$RestoredOrigin = 'https://替换为恢复实例的-ngrok-域名'
+$RestoredData = 'C:\Easel\desktop-restored'
+$RestoredWorkspaces = 'C:\Easel\workspaces-restored
+'
+
+.\deploy\desktop\Restore-WorkspaceEasel.ps1 `
+  -Backup $Backup `
+  -ProjectName $RestoredProject `
+  -PublicOrigin $RestoredOrigin `
+  -Image $ControlImage `
+  -WorkerImage $WorkerImage `
+  -GatewayImage $GatewayImage `
+  -Port $RestoredPort `
+  -DataRoot $RestoredData `
+  -WorkspaceRoot $RestoredWorkspaces
 ```
 
-不要执行 `down -v`、全局 `docker system prune` 或删除其它项目的卷/容器。删除卷会永久丢失本次登录数据；备份必须同时覆盖 control 数据卷与 master key 卷。
+预期 `restored_project=...`、`restored_schema=...`、`restored_workspaces=...`、`recovery_invite_file=...`。恢复会：
 
-### 9.7 本次真实证据与边界
+- 只读校验备份，拒绝错 key、缺文件、改摘要、未来 schema、非空目标、外来卷/路径逃逸；
+- 创建新卷/网络，把恢复材料落到新目标，不覆盖源；
+- 清除旧屏障/旧 lease 身份、撤销旧登录/未兑换邀请/Run token，签发一次性管理员恢复邀请；
+- 保留 workspace ID、消息和原生会话绑定（容器内 cwd 仍是 `/workspace`）。
 
-2026-10-26 在本机实际执行：
+读取恢复邀请文件后登录管理员，重新给成员签发邀请。旧 Cookie 应 401；新 Origin 不匹配的写请求应 403。恢复副本启动后先验证 A/B 历史、配置解密、sentinel 和同会话新 Harness 消息；确认后先 Stop 恢复副本，才允许源再次 Start。
 
-| 项目 | 实际结果 |
-|---|---|
-| Docker Desktop / Engine | 29.2.1，Linux containers |
-| 浏览器证据 control 镜像 | `sha256:d06578a3b011f6b06e9b3781414aae1757bbe41ffba7e7f3479e3302d4d3b49f` |
-| 最终脚本校验镜像（同源重建） | `sha256:c4a4c7f24462addff841f9b5b360e97654bd4cebaf89c48f113bcc57f8c4e6d1` |
-| R1 脚本校验镜像（同源重建） | `sha256:3df01c1d2072a05c757e2d00bc43a31bcff93d2db5622dd5654ff9f90975e335` |
-| R2 脚本校验镜像（同源重建） | `sha256:0f63a617aa1f95090edbc3073e6447dbfd1c2bc6b15e95f0c7e193e789bc917f` |
-| ngrok | 3.39.11，公网 HTTPS 可达 |
-| Chromium | 151.0.7922.34，headless，独立 browser context |
-| 管理员 HTTPS 登录 | 通过 |
-| 邀请单次兑换 | 重复兑换 401 |
-| A/B 身份与会话目录 | 独立 userId/workspaceId；互不可见 |
-| 跨空间会话读取 | 404 |
-| member 访问管理员 API | 403 |
-| 未装配 worker 的聊天/历史 | 503 `capability_unavailable` |
-| 注销 / 禁用后旧登录 | 401 |
-| 停止后重开同一数据卷 | `key=exists`，管理员 userId 与 A 会话保留 |
-| 旧域名 Cookie 到新 Origin | 401（host-only Cookie 未发送） |
-| 旧 Origin 写请求到新 control | 403 |
-| 新 Origin 重新登录 | 成功，userId 未变 |
-| R1 外来卷直接 Start（真实 Docker） | `volume_not_owned`，无容器、无 Compose up |
-| R1 合法初始化/启动/诊断 | `key=created`，20 项诊断全部通过 |
-| R1 停止后重开 | `key=exists`，再次启动健康，20 项诊断全部通过 |
-| R1 诊断反例（fake Docker） | 错挂载来源、bind 替代、key 可写、Origin/命令/项目/service 错误、额外端口、空/多/非法 inspect 均失败 |
-| R1 红绿 | 旧脚本 44 项中 28 failed、16 passed；当前脚本 44 passed |
-| R2 静态失败时 key helper | 实际外来 key 卷/错挂载/命令/Origin/端口等均在 helper 前拒绝 |
-| R2 合法 readonly helper | 预期 `$ProjectName-keys` 卷、`dst=/keys,readonly`，`key=exists` |
-| R2 红绿 | 旧 Test 脚本 45 项中 10 failed、35 passed；当前 45 passed |
+### 9.11 固定版本升级与失败回滚
 
-截图见 `docs/evidence/desktop-a1/`，均不包含邀请令牌、Cookie、CSRF 或 master key。本次 ngrok 账户使用免费固定静态域名，无法在本机同时建立第二个公开 ngrok 主机；因此“ngrok 公开地址变化”本身标记为 **not-run**。Origin 变更子场景改用 `127.0.0.1:8443` 的真实 TLS 反向代理，并以 Chromium SPKI pin 校验该本地自签证书；它是范围受限的本地证书，不是公开 CA，也不冒充 ngrok 地址变化。核心双身份登录证据仍来自真实 ngrok 公网 HTTPS。
+升级顺序（不能跳过备份）：
 
-### 9.8 回归命令
+1. 记录旧版本：`Status-WorkspaceEasel.ps1` 的 `version_*`。
+2. `Stop-WorkspaceEasel.ps1` 完成 drain/停止。
+3. `Backup-WorkspaceEasel.ps1` + `Verify-WorkspaceEasel.ps1`。
+4. 核验目标镜像存在且摘要匹配；可先用坏镜像演练失败（应 `worker_or_gateway_image_mismatch`，数据/Key 不变、屏障保持）。
+5. 用新镜像启动，并显式提供匹配备份：
 
 ```powershell
-& $EaselPython -m pytest `
-  tests/multiuser/test_desktop_deployment.py `
-  tests/multiuser/test_auth_api.py `
-  tests/multiuser/test_admin_api.py `
-  tests/multiuser/test_config_api.py -q
-
-Push-Location .\web\frontend
-npm run lint
-if ($LASTEXITCODE -ne 0) { throw '前端 lint 失败' }
-npm run build
-if ($LASTEXITCODE -ne 0) { throw '前端构建失败' }
-Pop-Location
+.\deploy\desktop\Start-WorkspaceEasel.ps1 `
+  -PublicOrigin $PublicOrigin `
+  -Image $NewControlImage `
+  -WorkerImage $NewWorkerImage `
+  -GatewayImage $NewGatewayImage `
+  -ProjectName $ProjectName -Port $Port `
+  -DataRoot $DataRoot -WorkspaceRoot $WorkspaceRoot `
+  -UpgradeFromBackup $Backup
 ```
 
-本次实际结果：上述后端 **112 passed**（Desktop 测试 45 passed）；前端 lint/build 通过；`docker compose config --quiet` 通过；完整 `tests/multiuser` 为 **1049 passed、4 skipped**。A1 R2 未改变镜像应用内容/依赖，因此没有重跑真实 HTTPS 双身份浏览器场景；审计单保留已有浏览器证据，并要求复跑合法真实 Test，已完成并记录在 `docs/evidence/desktop-a1/report.md`。
+预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
 
-仍有限制：没有执行 worker、Harness、真实供应商或聊天闭环；`/api/outputs` 等工作区业务继续 503；ngrok 公开地址变化未实测；本地 pinned TLS 只用于子场景；正式 Linux 发布检查器仍因固定证据 blockers 保持 blocked。本文不把本机登录管理面结果冒充正式上线。
+回滚：不要在原卷上强行降 schema。用升级前的匹配备份按 9.10 恢复到新项目/目录，使用旧镜像启动，验证历史和新消息，再停止。
 
-本文外部依据已于 2026-10-26 核对：Docker 官方 [Windows 安装](https://docs.docker.com/desktop/setup/install/windows-install/)、[Compose up 行为](https://docs.docker.com/reference/cli/docker/compose/up/)。Easel 命令以本仓库 CLI 和源码为准。
+没有新 schema 版本时，上述是**流程 + worker 代码版本切换演练**，不能写成 schema 升级成功。旧程序拒绝未来 schema、整套备份恢复边界由 `tests/multiuser/test_operations_a7.py` 的隔离用例覆盖。
+
+### 9.12 数据位置与哪些命令会改数据
+
+| 位置 | 内容 | 是否可丢 |
+|---|---|---|
+| `$ProjectName-control` 卷 | control.sqlite3、登录/邀请/Run 元数据、stop 记录 | 不可丢；靠备份 |
+| `$ProjectName-keys` 卷 | master.key、snapshot.pem、派生公钥、managed-agent.json、egress-policy.json、egress-ca.pem | 不可丢；缺私钥不能“重新生成修复” |
+| `$ProjectName-egress` 卷 | 出口策略副本 | 可重建，但备份保留 |
+| `$WorkspaceRoot\<id>\workspace` | 用户工作区（容器 `/workspace`），含 `state` | 不可丢 |
+| `$WorkspaceRoot\<id>\home` | 用户 HOME（容器 `/home/easel`），含 `.dsh` 原生历史 | 不可丢 |
+| `$WorkspaceRoot\.credentials`、`.gateway` | worker service token、启动 attempt | 运行期材料，不备份；新部署重建 |
+| `$DataRoot\public` | worker/gateway 公钥、策略副本 | 可从 key 卷重建 |
+| `$DataRoot\logs` | provisioner/control 日志、deployment.json | 可丢；deployment.json 用于备份/升级身份 |
+| `$DataRoot\backups` | 完整 v2 备份 | 受 ACL 保护，按保留策略另存 |
+| `$DataRoot\recovery` | 一次性管理员恢复邀请 | 用后删除，不入 Git/证据 |
+
+会修改数据：`Initialize`（创建卷/key/配置）、`Start`（运行期 lease/日志/deployment.json）、`Stop`（屏障/完成记录、停止容器）、`Backup`（只读源、写新备份）、`Restore`（写新目标、撤销恢复副本登录/token）、`Upgrade Start`（核对备份后改写完成记录）。`Verify`、`Status`、`Logs` 只读。
+
+### 9.13 常见错误与处理
+
+| 错误码 | 含义 | 处理 |
+|---|---|---|
+| `volume_not_owned` / `network_not_owned` | 同名资源无本项目标签 | 换项目名或人工确认归属；不要删开发者资源 |
+| `egress_ca_unavailable` | control 镜像内找不到系统 CA 且未提供 CA | 传 `-EgressCaFile` 或换含 CA bundle 的镜像 |
+| `backup_requires_stopped` | 备份时 control 仍在运行 | 先 Stop；不要热备 |
+| `backup_requires_clean_stop` | 无匹配停止完成记录 | 走正式 Stop，不要手工清屏障 |
+| `backup_integrity_failed` | 文件/摘要/派生公钥/DB 校验失败 | 不要恢复；重新取备份或排查篡改 |
+| `restore_target_exists` / `restore_target_not_empty` | 目标卷/目录已有内容 | 换全新项目/目录；不要覆盖 |
+| `restore_target_same_project` | 目标项目等于源项目 | 换新项目名 |
+| `admission_barrier_active` | 旧 Stop 记录与当前配置不匹配 | 用匹配备份走 `-UpgradeFromBackup`；不要无条件 resume |
+| `upgrade_stop_completion_mismatch` | 备份/旧屏障/旧摘要不一致 | 重新 Stop+Backup，或换正确备份 |
+| `upgrade_deployment_identity_missing` / `upgrade_deployment_mismatch` | 缺旧 deployment.json 或备份与旧实例/项目/镜像不一致 | 用当前实例生成的备份与 deployment.json 重试 |
+| `worker_or_gateway_image_mismatch` | worker/gateway 摘要缺失或不匹配 | 核验固定镜像；修复后重试 |
+| `control_port_in_use` | 无既有 control 时回环端口已被其它进程占用 | 停掉占用进程或换 `-Port`；不要杀未知进程 |
+| `control_health_timeout` / `control_unhealthy` | control 未健康 | 看 `Logs` 和 `docker inspect`；不要自动换替代实例 |
+
+### 9.14 两个独立验收维度
+
+**Desktop 功能/运维实际通过（本机 Windows + Docker Desktop）**
+
+- 初始化、两轮 start/stop、Status/Logs/版本摘要、A/B 登录与隔离、真实 Harness 聊天、权限允许/拒绝、停止与续接。
+- v2 完整备份、只读 verify、新目录/新项目恢复、旧 Cookie/邀请/token 撤销、sentinel/历史/配置解密/同会话新消息。
+- 受控版本切换、坏镜像失败、匹配备份升级、旧镜像回滚恢复、源/备份字节不变。
+- 具体镜像、摘要、命令输出和计数见 `docs/evidence/desktop-a7/`。
+
+**production-release 仍未通过（不因本机 Desktop 变绿）**
+
+- 真实 DeepSeek 供应商请求：not-run（无批准受管 channel/凭证；未读取开发者 `.env`/HOME）。
+- Linux 目标宿主/XFS 配额/iptables/nftables/IPv6/Chromium 沙箱：not-run。
+- 错误公钥 UI、运行期缺 broker UI 反例：沿用 A6 未单独执行边界。
+- 原发布检查器固定阻断项保持 blocked；不修改检查器绕过。

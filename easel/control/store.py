@@ -619,6 +619,7 @@ class Store:
 
     _ADMISSION_BARRIER_KEY = "admission_barrier"
     _STOP_COMPLETION_KEY = "stop_completion"
+    _RESTORE_INFO_KEY = "restore_info"
 
     def _admission_barrier_locked(self) -> dict | None:
         row = self._connection.execute(
@@ -771,6 +772,132 @@ class Store:
                 (json.dumps(completion, sort_keys=True, separators=(",", ":")),
                  stamp, self._STOP_COMPLETION_KEY))
             return True
+
+    def upgrade_stop_completion(
+            self, barrier_id: str, project: str, from_config_sha256: str,
+            to_config_sha256: str, backup_manifest_sha256: str,
+            now: int) -> dict:
+        """受控升级：把匹配旧配置摘要的停止完成记录改写为新配置摘要。
+
+        只在备份清单摘要显式给出、旧完成记录与当前屏障/项目/旧摘要完全
+        匹配且持久终态已收口时允许；不直接清屏障，Start 仍需按新摘要
+        走正常 reopen 校验。
+        """
+        barrier_id, project, from_config_sha256 = self._stop_fence(
+            barrier_id, project, from_config_sha256)
+        if (not isinstance(to_config_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", to_config_sha256) is None
+                or to_config_sha256 == from_config_sha256):
+            raise DomainError("invalid_argument", 400)
+        if (not isinstance(backup_manifest_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}",
+                                backup_manifest_sha256) is None):
+            raise DomainError("invalid_argument", 400)
+        stamp = int(now)
+        with self._transaction():
+            barrier = self._admission_barrier_locked()
+            completion = self._stop_completion_locked()
+            if (barrier is None or barrier.get("id") != barrier_id
+                    or completion is None
+                    or completion.get("barrierId") != barrier_id
+                    or completion.get("project") != project
+                    or completion.get("configSha256") != from_config_sha256):
+                raise DomainError("stop_completion_mismatch", 409)
+            if not self.drain_status(stamp)["settled"]:
+                raise DomainError("worker_drain_incomplete", 409)
+            value = dict(completion)
+            value.update({
+                "configSha256": to_config_sha256,
+                "upgradedFrom": from_config_sha256,
+                "upgradedAt": stamp,
+                "backupManifestSha256": backup_manifest_sha256,
+            })
+            self._connection.execute(
+                "UPDATE control_state SET value = ?, updated_at = ?"
+                " WHERE key = ?",
+                (json.dumps(value, sort_keys=True, separators=(",", ":")),
+                 stamp, self._STOP_COMPLETION_KEY))
+            return value
+
+    def prepare_restored_instance(self, now: int) -> dict:
+        """把干净 Stop 的备份准备为可启动副本，保留历史但清运行期身份。
+
+        要求屏障与完成记录匹配、无活跃 Run/请求/租约；然后撤销旧登录、
+        未兑换邀请与 broker token，清空 request lease/worker 句柄，清除
+        接纳屏障并记录来源。旧实例绝不接管、旧 Run 不重放。
+        """
+        stamp = int(now)
+        with self._transaction():
+            barrier = self._admission_barrier_locked()
+            completion = self._stop_completion_locked()
+            if (barrier is None or completion is None
+                    or completion.get("barrierId") != barrier.get("id")):
+                raise DomainError("restore_source_not_stopped", 409)
+            status = self.drain_status(stamp)
+            if not status["settled"]:
+                raise DomainError("restore_source_active", 409)
+            invalid = self._connection.execute(
+                "SELECT COUNT(*) AS total FROM workspaces"
+                " WHERE state NOT IN ('ready', 'stopped')").fetchone()["total"]
+            if invalid:
+                raise DomainError("restore_workspace_state_invalid", 409)
+            admin = self._connection.execute(
+                "SELECT id FROM users WHERE role = 'admin'"
+                " AND disabled_at IS NULL ORDER BY created_at, id LIMIT 1"
+            ).fetchone()
+            if admin is None:
+                raise DomainError("restore_admin_missing", 409)
+            revoked_logins = self._connection.execute(
+                "UPDATE logins SET revoked_at = ? WHERE revoked_at IS NULL",
+                (stamp,)).rowcount
+            revoked_invites = self._connection.execute(
+                "UPDATE invites SET revoked_at = ? WHERE revoked_at IS NULL"
+                " AND redeemed_at IS NULL", (stamp,)).rowcount
+            revoked_tokens = self._connection.execute(
+                "UPDATE broker_tokens SET revoked_at = ?"
+                " WHERE revoked_at IS NULL", (stamp,)).rowcount
+            self._connection.execute("DELETE FROM request_leases")
+            self._connection.execute(
+                "UPDATE worker_leases SET state = 'stopped',"
+                " container_id = '', upstream = '', service_token = '',"
+                " active_requests = 0, gateway_instance_id = '',"
+                " gateway_generation = '', gateway_upstream = '',"
+                " gateway_state = 'disabled', attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
+                " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
+                " lease_expires_at = 0, updated_at = ?", (stamp,))
+            reopened = dict(completion)
+            reopened["reopenedAt"] = stamp
+            reopened["restoredAt"] = stamp
+            self._connection.execute(
+                "UPDATE control_state SET value = ?, updated_at = ?"
+                " WHERE key = ?",
+                (json.dumps(reopened, sort_keys=True, separators=(",", ":")),
+                 stamp, self._STOP_COMPLETION_KEY))
+            self._connection.execute(
+                "DELETE FROM control_state WHERE key = ?",
+                (self._ADMISSION_BARRIER_KEY,))
+            info = {
+                "restoredAt": stamp,
+                "sourceBarrierId": barrier.get("id"),
+                "sourceProject": completion.get("project"),
+                "sourceConfigSha256": completion.get("configSha256"),
+                "sourceCompletedAt": completion.get("completedAt"),
+            }
+            self._connection.execute(
+                "INSERT OR REPLACE INTO control_state (key, value, updated_at)"
+                " VALUES (?, ?, ?)",
+                (self._RESTORE_INFO_KEY,
+                 json.dumps(info, sort_keys=True, separators=(",", ":")),
+                 stamp))
+            return {
+                "revoked_logins": revoked_logins,
+                "revoked_invites": revoked_invites,
+                "revoked_broker_tokens": revoked_tokens,
+                "cleared_barrier": barrier.get("id"),
+                "admin_user_id": admin["id"],
+                "restored_at": stamp,
+            }
 
     def drain_status(self, now: int) -> dict:
         """返回停止能否安全完成所需的全部持久事实。"""

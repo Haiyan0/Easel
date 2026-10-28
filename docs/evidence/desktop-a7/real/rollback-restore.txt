@@ -1,0 +1,5 @@
+restored_project=easel-a7-rb-09290
+restored_schema=14
+restored_workspaces=2
+recovery_invite_file=C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data\recovery\admin-invite.txt
+next=Start-WorkspaceEasel.ps1 -ProjectName easel-a7-rb-09290 -PublicOrigin https://a7-rb-09290.example -Image sha256:a5110be8a165d578b8411cce059bec8f2d5be047e63d70d1ea268faa1be9afe3 -WorkerImage sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9 -GatewayImage sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a -Port 7874 -DataRoot C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\data -WorkspaceRoot C:\Users\hyh\AppData\Local\Temp\easel-a7-src-09290\rollback\workspaces

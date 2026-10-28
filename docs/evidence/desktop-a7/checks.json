@@ -1,0 +1,90 @@
+{
+  "date": "2026-10-29",
+  "baseline_commit": "d9c2f5ba960e892f198ebc4a111b7e2ad7e835af",
+  "scope": ["A7.1", "A7.2", "A7.3", "A7.4", "A7.5"],
+  "images": {
+    "control_a7": "sha256:a5110be8a165d578b8411cce059bec8f2d5be047e63d70d1ea268faa1be9afe3",
+    "control_a7_size_bytes": 60570843,
+    "worker_a6": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+    "worker_a6_size_bytes": 2689778768,
+    "worker_a7": "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993",
+    "worker_a7_size_bytes": 2689779306,
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "source_hash_match": {
+      "easel/control/cli.py": "240ac5cbed1c44ae06a0b98b0913c28f3ddedefd98f255238760e4d9b145df73",
+      "easel/control/store.py": "65e7d5a71799382b6602d642eb62ebb710a0869fb4035e620cbb03d94e9f11f4",
+      "easel/cli.py": "25c54c4ca105e3f3ee892c38b8e613f624dc3d2687e684fa7252452a9b08f464"
+    },
+    "build_download": "local proxy host.docker.internal:7897 during build only"
+  },
+  "tests": {
+    "a7_contract_unit": "19 passed (test_operations_a7.py 12 + test_desktop_operations_a7.py 7)",
+    "a7_focused_regression": "115 passed, 1 skipped (operations + A7 contracts + desktop workspace + start identity + lifecycle lock + release checker + document paths)",
+    "full_multiuser_topology": "1414 passed, 10 skipped, 2 warnings in 166.66s (tests/multiuser + test_desktop_topology.py)",
+    "v1_format_regression": "42 passed, 1 skipped (test_operations.py)",
+    "desktop_scripts": "13 passed (workspace start identity + lifecycle lock)",
+    "integration_real": "1 passed in 257.26s (test_desktop_operations_real.py; source/backup/restore/stop/upgrade/bad-image/rollback, random projects/volumes/ports, cleanup)"
+  },
+  "real_scenarios": {
+    "source_backup": {
+      "project": "easel-a7-src-09290",
+      "port": 7871,
+      "backup": "desktop-20261029-015521",
+      "manifest_sha256": "d149016ae4a2455dcdef09fd4c391a71ce4f3db98c6b32851d7552928d6d26c4",
+      "files": 35,
+      "workspaces": 3,
+      "clean_stop": true,
+      "verify": "version=2 schema_version=14 clean_stop=true"
+    },
+    "restore": {
+      "project": "easel-a7-dst-09290",
+      "port": 7872,
+      "old_cookie_status": 401,
+      "evil_origin_status": 403,
+      "cross_session_status": 404,
+      "a_history_marker": true,
+      "b_history_marker": true,
+      "a_does_not_contain_b": true,
+      "new_run_state": "done",
+      "new_assistant_ok": true,
+      "sentinel": "a7-source-sentinel",
+      "backup_manifest_unchanged": "d149016ae4a2455dcdef09fd4c391a71ce4f3db98c6b32851d7552928d6d26c4",
+      "old_broker_tokens_active": 0
+    },
+    "source_restart_after_restore_stop": {
+      "admission_barrier_reopened": true,
+      "config_sha256": "f7f0c2ec41cb0b29d5336da149a4321aa45e35fb074558d0eb4925f16772bcfc",
+      "new_run_state": "done"
+    },
+    "upgrade": {
+      "project": "easel-a7-up-09290",
+      "port": 7873,
+      "backup_manifest_sha256": "605a3ac65cd100e14780a05e6555203b4bd23e2b425631908b4e3bced213a138",
+      "bad_image": "worker_or_gateway_image_mismatch (barrier retained, data unchanged)",
+      "worker_from": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+      "worker_to": "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993",
+      "upgraded_from": "85cb1b5e105b5a925c3f16f75717f983afedddd6f49278e911ee2e6338ebf321",
+      "config_sha256": "73561e217f3651e0623c65cff4787803848b36cb6dc54393b9cf96f8728d0bb3",
+      "manifest_sha_recorded": "605a3ac65cd100e14780a05e6555203b4bd23e2b425631908b4e3bced213a138",
+      "history_marker": true,
+      "new_assistant_ok": true,
+      "worker_container": "b86bc3970f59afa64aeb95487b053769723be678b0ecaca1c165f87d3625b45b"
+    },
+    "rollback": {
+      "project": "easel-a7-rb-09290",
+      "port": 7874,
+      "worker_image": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+      "history_marker": true,
+      "new_assistant_ok": true,
+      "worker_container": "d1a238be0db94c363b6334f0987edcbaf51e86bc1c06fe2d2defe98ddd2a2407"
+    }
+  },
+  "not_run": [
+    "real DeepSeek provider request (no approved managed channel/credential; did not read developer .env/HOME)",
+    "Linux target XFS quota / iptables/nftables / IPv6 / Chromium sandbox",
+    "ngrok public browser matrix rerun (A6 evidence retained; frontend unchanged)",
+    "wrong-public-key and runtime missing-broker UI negatives (remain as in A6)",
+    "production release checker (fixed blocked items remain)"
+  ],
+  "cleanup": "verified 2026-10-29: no containers/volumes/networks for easel-a7-src/dst/up/rb-09290; fake provider containers removed; WSL provisioner sockets removed; no global prune; developer resources untouched; images retained for review"
+}
