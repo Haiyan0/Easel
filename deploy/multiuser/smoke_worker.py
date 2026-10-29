@@ -282,9 +282,11 @@ def _check_dsh() -> None:
             smoke_harness.SmokeError) as error:
         _fail(f"真实 Harness profile/ACP 门槛失败：{error}")
     print(
-        "DSH_PROFILE_OK commit={} node={} patch_sha256={} model={}".format(
+        "DSH_PROFILE_OK commit={} node={} patch_sha256={} model={}"
+        " models={}".format(
             details["commit"], details["node"],
-            details["patch_sha256"], acp["model"]))
+            details["patch_sha256"], acp["model"],
+            ",".join(acp["models"])))
 
 
 def main(argv: list[str] | None = None) -> int:

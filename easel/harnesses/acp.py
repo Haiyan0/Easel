@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from easel import __version__
 from easel.timeouts import TIMEOUT_HARNESS_CANCEL
@@ -10,6 +11,44 @@ from .base import Descriptor, HarnessError, RunRequest
 from .workspace import harness_instructions
 from .commands import acp_command, base_command
 from .rpc import connection
+
+
+def _model_option_value(model_option: dict, model: str) -> str | None:
+    """按真实 Harness 公布的 select 目录匹配 modelId。
+
+    真实 Harness 的 value 是 ``JSON.stringify([provider, model])``；也兼容
+    其它 Agent 的 flat/raw 值。目录存在但没有匹配项时返回 None，不能把
+    未公布的 model 直接发给 Harness；目录完全未公布时保持旧 raw 行为。
+    """
+    choices: list[dict] = []
+    options = model_option.get("options")
+    if isinstance(options, list):
+        for item in options:
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("options")
+            if isinstance(nested, list):
+                choices.extend(
+                    choice for choice in nested if isinstance(choice, dict))
+            elif isinstance(item.get("value"), str):
+                choices.append(item)
+    if not choices:
+        return model
+    for choice in choices:
+        value = choice.get("value")
+        if not isinstance(value, str):
+            continue
+        if value == model:
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if (isinstance(parsed, list) and len(parsed) == 2
+                and all(isinstance(part, str) for part in parsed)
+                and parsed[1] == model):
+            return value
+    return None
 
 
 class ACPAdapter:
@@ -101,9 +140,17 @@ class ACPAdapter:
                 config_options = result.get("configOptions") or []
                 model_option = next((option for option in config_options if option.get("category") == "model"), None)
                 if model_option:
-                    await rpc.call("session/set_config_option", {
-                        "sessionId": session_id, "configId": model_option["id"], "value": request.model},
-                        stage="model")
+                    value = _model_option_value(model_option, request.model)
+                    if value is None:
+                        # 这是本地目录校验，不是上游结构化拒绝证据；类别
+                        # 保持 unknown，避免违反 Task 1 的证据分类契约。
+                        raise HarnessError(
+                            "请求的模型不在受管 Harness 目录中",
+                            stage="model")
+                    if model_option.get("currentValue") != value:
+                        await rpc.call("session/set_config_option", {
+                            "sessionId": session_id, "configId": model_option["id"],
+                            "value": value}, stage="model")
                 elif result.get("models"):
                     await rpc.call("session/set_model", {"sessionId": session_id, "modelId": request.model},
                                    stage="model")

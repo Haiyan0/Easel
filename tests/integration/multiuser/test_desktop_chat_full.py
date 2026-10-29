@@ -445,6 +445,8 @@ def _write_managed_config(directory: pathlib.Path) -> None:
             "runtime": "acp",
             "command": ["python", "/workspace/broker_acp.py",
                         "--audit", "/workspace/broker-audit.jsonl", "acp"],
+            "models": ["deepseek-chat", "deepseek-flash",
+                       "deepseek-v4-pro"],
             "sandbox": "workspace-write",
             "timeout": 120,
         },

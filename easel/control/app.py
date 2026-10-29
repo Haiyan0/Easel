@@ -230,7 +230,8 @@ def _relay(request: Request):
 
 
 _HARNESS_FIELDS = frozenset({
-    "runtime", "revision", "model", "sandbox", "timeout", "codexAutoApprove"})
+    "runtime", "revision", "model", "models", "sandbox", "timeout",
+    "codexAutoApprove"})
 _HARNESS_RUNTIMES = ("acp", "opencode", "codex")
 _HARNESS_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 
@@ -248,14 +249,24 @@ def _normalize_harness_summary(summary: dict | None) -> dict | None:
     if type(revision) is not int or revision < 0:
         raise ValueError("harness summary revision is invalid")
     result: dict = {"runtime": runtime, "revision": revision,
-                    "model": None, "sandbox": None, "timeout": None,
-                    "codexAutoApprove": None}
+                    "model": None, "models": [], "sandbox": None,
+                    "timeout": None, "codexAutoApprove": None}
     model = summary.get("model")
     if model is not None:
         if (not isinstance(model, str) or not model or len(model) > 256
                 or any(ord(character) < 32 for character in model)):
             raise ValueError("harness summary model is invalid")
         result["model"] = model
+    models = summary.get("models")
+    if models is not None:
+        if (not isinstance(models, list) or len(models) > 64
+                or any(not isinstance(item, str) or not item
+                       or len(item) > 256
+                       or any(ord(character) < 32 for character in item)
+                       for item in models)
+                or len(set(models)) != len(models)):
+            raise ValueError("harness summary models is invalid")
+        result["models"] = list(models)
     sandbox = summary.get("sandbox")
     if sandbox is not None:
         if sandbox not in _HARNESS_SANDBOXES:
@@ -278,8 +289,8 @@ def _harness_view(summary: dict | None) -> dict:
     if summary is None:
         return {
             "locked": True, "configured": False, "runtime": None,
-            "revision": None, "model": None, "sandbox": None,
-            "timeout": None, "codexAutoApprove": None,
+            "revision": None, "model": None, "models": None,
+            "sandbox": None, "timeout": None, "codexAutoApprove": None,
             "unavailableReason": "managed_harness_not_configured",
         }
     return {"locked": True, "configured": True, **summary,

@@ -1,0 +1,11 @@
+# Task 2 增量 control 镜像：复用现有 control 依赖/前端构建，只替换
+# 本轮受影响的 `easel` 代码，避免无缓存重建整个栈。
+FROM easel-control-test:a4
+
+USER root
+RUN chmod -R u+w /opt/easel \
+ && find /opt/easel -name '__pycache__' -type d -prune -exec rm -rf {} + || true
+COPY easel /opt/easel/easel
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+
+USER 10001:10001

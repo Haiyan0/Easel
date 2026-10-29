@@ -1,0 +1,69 @@
+DOCKER_BUILD_EXIT=0
+POWERSHELL_STDERR_WRAPPER_STRIPPED=True
+#1 [internal] load build definition from Dockerfile.worker-delta
+#1 transferring dockerfile: 1.11kB 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-worker-harness:a5
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB 0.0s done
+#3 DONE 0.0s
+
+#4 [ 1/11] FROM docker.io/library/easel-worker-harness:a5@sha256:6830c2b4b2f3424dde6fff492803c05cbe77cc03d4e5921a14e26e
+3a7d738434
+#4 resolve docker.io/library/easel-worker-harness:a5@sha256:6830c2b4b2f3424dde6fff492803c05cbe77cc03d4e5921a14e26e3a7d7
+38434 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 65.20kB 0.3s done
+#5 DONE 0.3s
+
+#6 [ 2/11] RUN chmod -R u+w /opt/easel  && find /opt/easel -name '__pycache__' -type d -prune -exec rm -rf {} + || true
+#6 CACHED
+
+#7 [ 3/11] COPY easel /opt/easel/easel
+#7 DONE 0.1s
+
+#8 [ 4/11] COPY deploy/multiuser/managed /opt/easel/managed
+#8 DONE 0.0s
+
+#9 [ 5/11] COPY deploy/multiuser/smoke_worker.py /opt/easel/deploy/multiuser/smoke_worker.py
+#9 DONE 0.0s
+
+#10 [ 6/11] COPY deploy/multiuser/smoke_harness.py /opt/easel/deploy/multiuser/smoke_harness.py
+#10 DONE 0.0s
+
+#11 [ 7/11] COPY deploy/multiuser/verify_managed_profile.py /opt/easel/deploy/multiuser/verify_managed_profile.py
+#11 DONE 0.0s
+
+#12 [ 8/11] COPY deploy/multiuser/worker_sidecar.py /opt/easel/deploy/multiuser/worker_sidecar.py
+#12 DONE 0.0s
+
+#13 [ 9/11] COPY deploy/multiuser/egress_proxy.py /opt/easel/deploy/multiuser/egress_proxy.py
+#13 DONE 0.0s
+
+#14 [10/11] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#14 DONE 5.6s
+
+#15 [11/11] RUN DSH_COMMIT=687f282e8625c6b8d11ff58211a90524be2e4317       python deploy/multiuser/smoke_worker.py --che
+ck-files --require-dsh
+#15 2.528 DSH_PROFILE_OK commit=687f282e8625c6b8d11ff58211a90524be2e4317 node=24.22.1 patch_sha256=96523f8ad2da5d2789e7
+0814a8a62a12611d1e84642255dac80bf0828978175d model=easel-broker/deepseek-chat models=easel-broker/deepseek-chat,easel-b
+roker/deepseek-flash,easel-broker/deepseek-v4-pro
+#15 2.528 WORKER_SMOKE_OK
+#15 DONE 2.7s
+
+#16 exporting to image
+#16 exporting layers
+#16 exporting layers 6.9s done
+#16 exporting manifest sha256:e5a46a7610287b8841ad592715560ca461a641062c6e3c7dbd43247f8119037d 0.0s done
+#16 exporting config sha256:2b2e068747d0dc321e10680897fad0a0ce186b6d3c80d302a5d77c33c5e19bcd 0.0s done
+#16 exporting attestation manifest sha256:9ecc2dcf95a10e72aecde1063ab746239ca1610fb4328201cb5625f6d66129aa 0.0s done
+#16 exporting manifest list sha256:b8a76e7044dd313cb6747f207e9f72a284e93274c7e070b7df76cd59dfe8c699 0.0s done
+#16 naming to docker.io/library/easel-worker-harness:task2-bcf001a0 done
+#16 unpacking to docker.io/library/easel-worker-harness:task2-bcf001a0
+#16 unpacking to docker.io/library/easel-worker-harness:task2-bcf001a0 1.3s done
+#16 DONE 8.3s

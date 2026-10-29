@@ -1,0 +1,1004 @@
+FFFFFFFFF.....FFFFFFFFFFFF.FFF................F...........               [100%]
+================================== FAILURES ===================================
+______________ test_signed_agent_uses_effective_chat_route_model ______________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_signed_agent_uses_effecti0')
+
+    def test_signed_agent_uses_effective_chat_route_model(tmp_path):
+        """签名 Agent 的 model/allowed_models 必须与 broker 路由快照一致。"""
+        database = tmp_path / "control.sqlite3"
+        with Store.open(database) as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+            conversation = store.create_conversation(member, "模型链路")
+            config = ConfigService(store, MASTER_KEY)
+            publish_chat(config, admin, "deepseek-flash",
+                         ("deepseek-flash", "deepseek-v4-pro"))
+            broker = BrokerService(store, config, clock=lambda: 1000.0)
+            capture = DispatchCapture()
+            key = Ed25519PrivateKey.generate()
+
+            async def scenario() -> dict:
+                relay = make_relay(store, key, capture, broker)
+                try:
+                    return await relay.submit(member, {
+                        "sessionId": conversation.id,
+                        "turnId": "turn-model-1",
+                        "message": "使用管理员模型",
+                    })
+                finally:
+                    await relay._http.aclose()
+
+            result = asyncio.run(scenario())
+            assert result["runId"]
+            assert len(capture.posts) == 1
+            envelope = capture.posts[0]["body"]["envelope"]
+            agent = envelope["agent"]
+>           assert agent["model"] == "deepseek-flash"
+E           KeyError: 'model'
+
+tests\multiuser\test_managed_chat_model.py:156: KeyError
+___________ test_chat_publish_rejects_model_outside_trusted_catalog ___________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_chat_publish_rejects_mode0')
+
+    def test_chat_publish_rejects_model_outside_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:175: TypeError
+_______ test_chat_publish_rejects_allowed_model_outside_trusted_catalog _______
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_chat_publish_rejects_allo0')
+
+    def test_chat_publish_rejects_allowed_model_outside_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:185: TypeError
+_______________ test_chat_publish_rejects_empty_trusted_catalog _______________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_chat_publish_rejects_empt0')
+
+    def test_chat_publish_rejects_empty_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=())
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:196: TypeError
+_________ test_public_settings_filters_chat_models_to_trusted_catalog _________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_public_settings_filters_c0')
+
+    def test_public_settings_filters_chat_models_to_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+>           config = ConfigService(
+                store, MASTER_KEY,
+                model_catalog=("deepseek-flash", "deepseek-v4-pro"))
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:207: TypeError
+_________ test_broker_admission_rejects_route_outside_trusted_catalog _________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_broker_admission_rejects_0')
+
+    def test_broker_admission_rejects_route_outside_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:223: TypeError
+_____________ test_broker_admission_rejects_empty_trusted_catalog _____________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_broker_admission_rejects_1')
+
+    def test_broker_admission_rejects_empty_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:239: TypeError
+___________ test_broker_issue_rejects_route_outside_trusted_catalog ___________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_broker_issue_rejects_rout0')
+
+    def test_broker_issue_rejects_route_outside_trusted_catalog(tmp_path):
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+            conversation = store.create_conversation(member, "模型拒绝")
+>           config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:254: TypeError
+___________ test_managed_agent_config_accepts_bounded_model_catalog ___________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_managed_agent_config_acce0')
+
+    def test_managed_agent_config_accepts_bounded_model_catalog(tmp_path):
+        path = tmp_path / "managed.json"
+        path.write_text(json.dumps({
+            "revision": 2,
+            "agent": {"runtime": "acp", "command": ["managed", "acp"],
+                      "models": list(CATALOG)},
+            "broker": {"mode": "workspace-sidecar", "channel": "chat"},
+        }), encoding="utf-8")
+>       revision, agent, broker = load_managed_agent_config(path)
+
+tests\multiuser\test_managed_chat_model.py:277:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+path = WindowsPath('<pytest-tmp>/pytest-3910/test_managed_agent_config_acce0/managed.json')
+
+    def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
+        """读取受保护的受管 Agent 配置，返回 ``(revision, agent, broker)``。
+
+        只接受固定字段，拒绝任何疑似凭证字段，避免管理员秘密被签进逐 Run
+        快照下发到 worker。``broker`` 只声明目的地与 channel；逐 Run token
+        由正式装配在接纳后调用 BrokerService.issue 签发。
+        """
+        config_path = Path(path)
+        data = config_path.read_bytes()
+        if os.name == "posix" and config_path.stat().st_mode & 0o077:
+            raise ValueError(
+                "managed agent config must not be group/world accessible")
+        try:
+            payload = json.loads(data)
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError("managed agent config must be a JSON object") from None
+        if not isinstance(payload, dict) or set(payload) != _MANAGED_FIELDS:
+            raise ValueError("managed agent config fields are invalid")
+        revision = payload["revision"]
+        if type(revision) is not int or not 0 <= revision <= 2**31 - 1:
+            raise ValueError("managed agent revision must be a non-negative int")
+        agent = payload["agent"]
+        if not isinstance(agent, dict) or not agent:
+            raise ValueError("managed agent must be a non-empty object")
+        if set(agent) - _AGENT_FIELDS:
+>           raise ValueError("managed agent contains unsupported fields")
+E           ValueError: managed agent contains unsupported fields
+
+easel\control\snapshot.py:113: ValueError
+_____________ test_issue_route_and_agent_model_are_fixed_together _____________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_issue_route_and_agent_mod0')
+
+    def test_issue_route_and_agent_model_are_fixed_together(tmp_path):
+        path = tmp_path / "control.sqlite3"
+        with Store.open(path) as setup:
+            admin = setup.create_user("Owner", "admin")
+            member = setup.create_user("Member")
+            conversation = setup.create_conversation(member, "交错发布")
+>           config = ConfigService(setup, MASTER_KEY, model_catalog=CATALOG)
+E           TypeError: ConfigService.__init__() got an unexpected keyword argument 'model_catalog'
+
+tests\multiuser\test_managed_chat_model.py:322: TypeError
+_________________ test_acp_selects_exact_harness_model_value __________________
+
+self = <easel.harnesses.rpc.RPC object at 0x000001E02E237B50>
+method = 'session/set_config_option'
+params = {'sessionId': 'diag-session', 'configId': 'model', 'value': 'deepseek-flash'}
+timeout = 60, stage = 'model'
+
+    async def call(self, method: str, params: dict, timeout=60, *,
+                   stage: str | None = None):
+        self.sequence += 1
+        request_id = self.sequence
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.send({"id": request_id, "method": method, "params": params})
+>           result = await asyncio.wait_for(future, timeout)
+
+easel\harnesses\rpc.py:258:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+fut = <Future finished exception=HarnessError('Agent 协议错误：unknown model option')>
+timeout = 60
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+
+        Coroutine will be wrapped in Task.
+
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+
+        If the wait is cancelled, the task is also cancelled.
+
+        This function is a coroutine.
+        """
+        loop = events.get_running_loop()
+
+        if timeout is None:
+            return await fut
+
+        if timeout <= 0:
+            fut = ensure_future(fut, loop=loop)
+
+            if fut.done():
+                return fut.result()
+
+            await _cancel_and_wait(fut, loop=loop)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise exceptions.TimeoutError() from exc
+
+        waiter = loop.create_future()
+        timeout_handle = loop.call_later(timeout, _release_waiter, waiter)
+        cb = functools.partial(_release_waiter, waiter)
+
+        fut = ensure_future(fut, loop=loop)
+        fut.add_done_callback(cb)
+
+        try:
+            # wait until the future completes or the timeout
+            try:
+                await waiter
+            except exceptions.CancelledError:
+                if fut.done():
+                    return fut.result()
+                else:
+                    fut.remove_done_callback(cb)
+                    # We must ensure that the task is not running
+                    # after wait_for() returns.
+                    # See https://bugs.python.org/issue32751
+                    await _cancel_and_wait(fut, loop=loop)
+                    raise
+
+            if fut.done():
+>               return fut.result()
+E               easel.harnesses.base.HarnessError: Agent 协议错误：unknown model option
+
+<python-env>\lib\asyncio\tasks.py:445: HarnessError
+
+The above exception was the direct cause of the following exception:
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_acp_selects_exact_harness0')
+
+    def test_acp_selects_exact_harness_model_value(tmp_path):
+        events: list[tuple[str, str]] = []
+        request = _adapter_request(tmp_path, "model-catalog", "deepseek-flash")
+
+        async def scenario():
+            await ACPAdapter().run(request, lambda kind, text:
+                                   events.append((kind, text)), _reject,
+                                   lambda identifier: None)
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:410:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+tests\multiuser\test_managed_chat_model.py:406: in scenario
+    await ACPAdapter().run(request, lambda kind, text:
+easel\harnesses\acp.py:104: in run
+    await rpc.call("session/set_config_option", {
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <easel.harnesses.rpc.RPC object at 0x000001E02E237B50>
+method = 'session/set_config_option'
+params = {'sessionId': 'diag-session', 'configId': 'model', 'value': 'deepseek-flash'}
+timeout = 60, stage = 'model'
+
+    async def call(self, method: str, params: dict, timeout=60, *,
+                   stage: str | None = None):
+        self.sequence += 1
+        request_id = self.sequence
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.send({"id": request_id, "method": method, "params": params})
+            result = await asyncio.wait_for(future, timeout)
+            if self.client_error:
+                raise self.client_error
+            return result
+        except asyncio.TimeoutError as error:
+            raise HarnessError(f"Agent 协议请求超时：{method}",
+                               stage=stage or "rpc") from error
+        except HarnessError as error:
+            # 断连/协议错误发生在等待具体调用时，阶段归到该调用；
+            # 已带具体阶段的错误保持原样，不覆盖真实来源。
+            if stage and error.stage in (None, "rpc"):
+>               raise HarnessError(
+                    str(error), stage=stage, category=error.category,
+                    status=error.status) from error
+E               easel.harnesses.base.HarnessError: Agent 协议错误：unknown model option
+
+easel\harnesses\rpc.py:269: HarnessError
+_____________ test_acp_rejects_model_missing_from_harness_catalog _____________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_acp_rejects_model_missing0')
+
+    def test_acp_rejects_model_missing_from_harness_catalog(tmp_path):
+        request = _adapter_request(tmp_path, "model-catalog",
+                                   "deepseek-unknown")
+        with pytest.raises(HarnessError) as caught:
+            asyncio.run(ACPAdapter().run(
+                request, lambda *args: None, _reject, lambda identifier: None))
+        assert getattr(caught.value, "stage", None) == "model"
+>       assert getattr(caught.value, "category", "unknown") in (None, "unknown")
+E       AssertionError: assert 'request_rejected' in (None, 'unknown')
+E        +  where 'request_rejected' = getattr(HarnessError('Agent 协议错误：unknown model option'), 'category', 'unknown')
+E        +    where HarnessError('Agent 协议错误：unknown model option') = <ExceptionInfo HarnessError('Agent 协议错误：unknown model option') tblen=5>.value
+
+tests\multiuser\test_managed_chat_model.py:425: AssertionError
+______________ test_acp_resume_selects_exact_harness_model_value ______________
+
+self = <easel.harnesses.rpc.RPC object at 0x000001E02E3CC640>
+method = 'session/set_config_option'
+params = {'sessionId': 'diag-session', 'configId': 'model', 'value': 'deepseek-flash'}
+timeout = 60, stage = 'model'
+
+    async def call(self, method: str, params: dict, timeout=60, *,
+                   stage: str | None = None):
+        self.sequence += 1
+        request_id = self.sequence
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.send({"id": request_id, "method": method, "params": params})
+>           result = await asyncio.wait_for(future, timeout)
+
+easel\harnesses\rpc.py:258:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+fut = <Future finished exception=HarnessError('Agent 协议错误：unknown model option')>
+timeout = 60
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+
+        Coroutine will be wrapped in Task.
+
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+
+        If the wait is cancelled, the task is also cancelled.
+
+        This function is a coroutine.
+        """
+        loop = events.get_running_loop()
+
+        if timeout is None:
+            return await fut
+
+        if timeout <= 0:
+            fut = ensure_future(fut, loop=loop)
+
+            if fut.done():
+                return fut.result()
+
+            await _cancel_and_wait(fut, loop=loop)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise exceptions.TimeoutError() from exc
+
+        waiter = loop.create_future()
+        timeout_handle = loop.call_later(timeout, _release_waiter, waiter)
+        cb = functools.partial(_release_waiter, waiter)
+
+        fut = ensure_future(fut, loop=loop)
+        fut.add_done_callback(cb)
+
+        try:
+            # wait until the future completes or the timeout
+            try:
+                await waiter
+            except exceptions.CancelledError:
+                if fut.done():
+                    return fut.result()
+                else:
+                    fut.remove_done_callback(cb)
+                    # We must ensure that the task is not running
+                    # after wait_for() returns.
+                    # See https://bugs.python.org/issue32751
+                    await _cancel_and_wait(fut, loop=loop)
+                    raise
+
+            if fut.done():
+>               return fut.result()
+E               easel.harnesses.base.HarnessError: Agent 协议错误：unknown model option
+
+<python-env>\lib\asyncio\tasks.py:445: HarnessError
+
+The above exception was the direct cause of the following exception:
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_acp_resume_selects_exact_0')
+
+    def test_acp_resume_selects_exact_harness_model_value(tmp_path):
+        bound: list[str] = []
+        first = _adapter_request(tmp_path, "model-catalog", "deepseek-flash")
+
+        async def first_run():
+            await ACPAdapter().run(first, lambda *args: None, _reject,
+                                   bound.append)
+
+>       asyncio.run(first_run())
+
+tests\multiuser\test_managed_chat_model.py:440:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+tests\multiuser\test_managed_chat_model.py:437: in first_run
+    await ACPAdapter().run(first, lambda *args: None, _reject,
+easel\harnesses\acp.py:104: in run
+    await rpc.call("session/set_config_option", {
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <easel.harnesses.rpc.RPC object at 0x000001E02E3CC640>
+method = 'session/set_config_option'
+params = {'sessionId': 'diag-session', 'configId': 'model', 'value': 'deepseek-flash'}
+timeout = 60, stage = 'model'
+
+    async def call(self, method: str, params: dict, timeout=60, *,
+                   stage: str | None = None):
+        self.sequence += 1
+        request_id = self.sequence
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.send({"id": request_id, "method": method, "params": params})
+            result = await asyncio.wait_for(future, timeout)
+            if self.client_error:
+                raise self.client_error
+            return result
+        except asyncio.TimeoutError as error:
+            raise HarnessError(f"Agent 协议请求超时：{method}",
+                               stage=stage or "rpc") from error
+        except HarnessError as error:
+            # 断连/协议错误发生在等待具体调用时，阶段归到该调用；
+            # 已带具体阶段的错误保持原样，不覆盖真实来源。
+            if stage and error.stage in (None, "rpc"):
+>               raise HarnessError(
+                    str(error), stage=stage, category=error.category,
+                    status=error.status) from error
+E               easel.harnesses.base.HarnessError: Agent 协议错误：unknown model option
+
+easel\harnesses\rpc.py:269: HarnessError
+__________ test_worker_rejects_invalid_signed_model_metadata[agent0] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si0')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent1] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si1')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent2] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si2')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent3] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si3')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent4] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si4')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent5] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si5')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent6] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si6')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_worker_rejects_invalid_signed_model_metadata[agent7] __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_worker_rejects_invalid_si7')
+agent = {'runtime': 'acp', 'command': ['fixture-acp'], 'sandbox': 'read-only', 'timeout': 60, ...}
+
+    @pytest.mark.parametrize("agent", [
+        _signed_agent(model="deepseek-unknown"),
+        _signed_agent(models=["deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-unknown"]),
+        _signed_agent(allowed_models=["deepseek-chat"]),
+        _signed_agent(models=[]),
+        _signed_agent(models="not-a-list"),
+        _signed_agent(models=["deepseek-chat", "deepseek-chat"]),
+        _signed_agent(allowed_models=["deepseek-flash", 1]),
+    ])
+    def test_worker_rejects_invalid_signed_model_metadata(tmp_path, agent):
+        paths = make_paths(tmp_path)
+        key = Ed25519PrivateKey.generate()
+        executor = NeverExecutor()
+        manager = make_manager(paths, key, executor)
+        envelope = sign(key, run_id="run-bad-model", session_id="conv-bad-model",
+                        message="x", routes={}, agent=agent)
+
+        async def scenario():
+            try:
+                with pytest.raises(DomainError) as error:
+                    await manager.submit(
+                        "run-bad-model", envelope,
+                        request_for("conv-bad-model", "x", envelope))
+                assert error.value.status == 400
+                assert error.value.code == "agent_config_invalid"
+                assert executor.calls == 0, "非法模型元数据不得进入适配器"
+            finally:
+                await manager.aclose()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_managed_chat_model.py:502:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        try:
+>           with pytest.raises(DomainError) as error:
+E           Failed: DID NOT RAISE DomainError
+
+tests\multiuser\test_managed_chat_model.py:492: Failed
+__________ test_manifest_selects_fixed_harness_acp_and_easel_broker ___________
+
+    def test_manifest_selects_fixed_harness_acp_and_easel_broker():
+        data = managed.validate_manifest(
+            _manifest(), expected_commit=managed.HARNESS_COMMIT,
+            patch_root=MANAGED)
+        assert data["manifest"] == "easel.managed-acp-profile/1"
+        assert data["harness"]["commit"] == (
+            "687f282e8625c6b8d11ff58211a90524be2e4317")
+        assert data["harness"]["node"] == "24.22.1"
+        assert data["harness"]["pnpm"] == "11.28.5"
+        assert data["harness"]["bundles"] == [
+            "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-acp-app"]
+        assert data["command"] == [
+            "node", "/opt/dsh/apps/cli/lib/bin.js", "--profile", "acp",
+            "--patch", "/opt/easel/managed/acp.patch.yml"]
+>       assert data["provider"] == {
+            "id": "easel-broker", "api": "openai-completions",
+            "model": "deepseek-chat",
+            "models": ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"]}
+E       AssertionError: assert {'id': 'easel...eepseek-chat'} == {'id': 'easel...seek-v4-pro']}
+E
+E         Omitting 3 identical items, use -vv to show
+E         Right contains 1 more item:
+E         {'models': ['deepseek-chat', 'deepseek-flash', 'deepseek-v4-pro']}
+E         Use -v to get more diff
+
+tests\multiuser\test_managed_profile.py:47: AssertionError
+__________________ test_patch_declares_every_manifest_model ___________________
+
+    def test_patch_declares_every_manifest_model():
+        """Harness 的实际模型目录必须与受管 manifest 的信任目录一致。"""
+        manifest = _manifest()
+        patch = PATCH.read_text(encoding="utf-8")
+>       assert _patch_models(patch) == manifest["provider"]["models"]
+E       KeyError: 'models'
+
+tests\multiuser\test_managed_profile.py:59: KeyError
+_________ test_validator_rejects_patch_not_matching_manifest_catalog __________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_validator_rejects_patch_n0')
+
+    def test_validator_rejects_patch_not_matching_manifest_catalog(tmp_path):
+        manifest = _manifest()
+        (tmp_path / "acp-profile.json").write_text(
+            json.dumps(manifest), encoding="utf-8")
+        patch = PATCH.read_text(encoding="utf-8")
+        (tmp_path / "acp.patch.yml").write_text(
+            patch.replace(
+                "          - id: deepseek-flash\n"
+                "            name: DeepSeek Flash (Easel broker)\n"
+                "            contextWindow: 65536\n"
+                "            maxTokens: 4096\n"
+                "            reasoningEfforts: false\n", ""),
+            encoding="utf-8")
+>       with pytest.raises(managed.ProfileError):
+E       Failed: DID NOT RAISE ProfileError
+
+tests\multiuser\test_managed_profile.py:98: Failed
+_________ test_serve_control_passes_managed_model_catalog_to_services _________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3910/test_serve_control_passes_mana0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001E02E272470>
+
+    def test_serve_control_passes_managed_model_catalog_to_services(
+            tmp_path, monkeypatch):
+        captured = capture_app(tmp_path, monkeypatch)
+        master = write_master_key(tmp_path)
+        signing, _key = write_signing_key(tmp_path)
+        catalog = ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"]
+        agent_config = write_agent_config(tmp_path, {
+            "revision": 4,
+            "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                      "sandbox": "read-only", "timeout": 60,
+                      "models": catalog},
+            "broker": {"mode": "workspace-sidecar", "channel": "chat"},
+        })
+
+        code = main(["serve-control",
+                     "--control-dir", str(tmp_path / "control"),
+                     "--public-origin", ORIGIN,
+                     "--master-key-file", str(master),
+                     "--snapshot-key-file", str(signing),
+                     "--managed-agent-config", str(agent_config),
+                     "--frontend-dir", str(frontend_build(tmp_path))])
+>       assert code == 0
+E       assert 2 == 0
+
+tests\multiuser\test_relay_cli.py:129: AssertionError
+---------------------------- Captured stderr call -----------------------------
+错误：managed_config_invalid
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_managed_chat_model.py::test_signed_agent_uses_effective_chat_route_model
+FAILED tests/multiuser/test_managed_chat_model.py::test_chat_publish_rejects_model_outside_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_chat_publish_rejects_allowed_model_outside_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_chat_publish_rejects_empty_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_public_settings_filters_chat_models_to_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_broker_admission_rejects_route_outside_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_broker_admission_rejects_empty_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_broker_issue_rejects_route_outside_trusted_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_managed_agent_config_accepts_bounded_model_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_issue_route_and_agent_model_are_fixed_together
+FAILED tests/multiuser/test_managed_chat_model.py::test_acp_selects_exact_harness_model_value
+FAILED tests/multiuser/test_managed_chat_model.py::test_acp_rejects_model_missing_from_harness_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_acp_resume_selects_exact_harness_model_value
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent0]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent1]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent2]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent3]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent4]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent5]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent6]
+FAILED tests/multiuser/test_managed_chat_model.py::test_worker_rejects_invalid_signed_model_metadata[agent7]
+FAILED tests/multiuser/test_managed_profile.py::test_manifest_selects_fixed_harness_acp_and_easel_broker
+FAILED tests/multiuser/test_managed_profile.py::test_patch_declares_every_manifest_model
+FAILED tests/multiuser/test_managed_profile.py::test_validator_rejects_patch_not_matching_manifest_catalog
+FAILED tests/multiuser/test_relay_cli.py::test_serve_control_passes_managed_model_catalog_to_services
+25 failed, 33 passed in 3.12s

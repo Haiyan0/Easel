@@ -602,6 +602,14 @@ def _request_headers(headers: Mapping[str, str], *, content_length: str | None =
     return result
 
 
+@dataclass(frozen=True)
+class BrokerIssue:
+    """逐 Run 签发结果：opaque token 与同一事务内固定的有效路由。"""
+
+    token: str = field(repr=False)
+    route: EffectiveRoute
+
+
 class BrokerService:
     """按受管路由签发和校验调用令牌；目标与凭证均由服务端决定。"""
 
@@ -611,11 +619,24 @@ class BrokerService:
                  token_ttl: int = DEFAULT_TOKEN_TTL,
                  lease_ttl: int = DEFAULT_LEASE_TTL,
                  lease_clock: Callable[[], float] | None = None,
-                 db_runner=None):
+                 db_runner=None,
+                 model_catalog: tuple[str, ...] | None = None):
         if not isinstance(store, Store):
             raise TypeError("store must be a Store")
         if not isinstance(config, ConfigService):
             raise TypeError("config must be a ConfigService")
+        if model_catalog is None:
+            model_catalog = config.model_catalog
+        if model_catalog is not None:
+            if (not isinstance(model_catalog, tuple)
+                    or len(model_catalog) > 64
+                    or any(not isinstance(item, str) or not item
+                           or len(item) > 256
+                           or any(ord(character) < 32 for character in item)
+                           for item in model_catalog)
+                    or len(set(model_catalog)) != len(model_catalog)):
+                raise ValueError("model_catalog is invalid")
+        self._model_catalog = model_catalog
         if not callable(clock):
             raise TypeError("clock must be callable")
         if type(token_ttl) is not int or not 1 <= token_ttl <= 86400:
@@ -661,31 +682,51 @@ class BrokerService:
             token_ttl=self._token_ttl,
             lease_ttl=self._lease_ttl,
             lease_clock=self._lease_clock,
-            db_runner=self._db_runner if db_runner is None else db_runner)
+            db_runner=self._db_runner if db_runner is None else db_runner,
+            model_catalog=self._model_catalog)
 
     # ------------------------------------------------------------------
     # 签发与授权
     # ------------------------------------------------------------------
 
+    def _validate_chat_route(self, route: EffectiveRoute) -> None:
+        """chat 路由的默认/允许模型必须全部在锁定 Harness 目录内。"""
+        if route.channel != "chat" or self._model_catalog is None:
+            return
+        if not self._model_catalog:
+            raise DomainError("model_catalog_unavailable", 503)
+        allowed = tuple(route.allowed_models) or (route.model,)
+        if (route.model not in self._model_catalog
+                or any(model not in self._model_catalog
+                       for model in allowed)):
+            raise DomainError("model_not_allowed", 409)
+
     def ensure_issuable(self, actor: Identity, channel: str) -> None:
         """接纳前检查该 channel 是否可签发；不创建 Run、token 或凭证。
 
-        缺受管路由、协议不支持或出口策略拒绝时明确失败，避免先占用
-        容量再发现能力不可用。
+        缺受管路由、协议不支持、chat 模型越界或出口策略拒绝时明确失败，
+        避免先占用容量再发现能力不可用。
         """
         if not isinstance(channel, str) or not channel:
             raise DomainError("invalid_channel", 400)
         route = self._config.resolve(actor, channel)
+        self._validate_chat_route(route)
         adapter_cls = adapter_for_route(route)
         if route.protocol not in adapter_cls.protocols:
             raise DomainError("capability_unavailable", 503)
         self._egress.policy.validate_url(route.base_url, resolve=False)
 
     def issue(self, actor: Identity, run_id: str, channel: str) -> str:
+        """兼容入口：只返回 opaque token；需要路由时用 issue_with_route。"""
+        return self.issue_with_route(actor, run_id, channel).token
+
+    def issue_with_route(self, actor: Identity, run_id: str,
+                         channel: str) -> BrokerIssue:
         """为本人活跃 Run 签发调用令牌；不创建 Run、不下发任何凭证。
 
         路由、凭证与 token 快照在同一个写事务中取得/写入；其他连接的个人
-        覆盖更新或管理员发布必须等待该事务提交，不会混配地址与 Key。
+        覆盖更新或管理员发布必须等待该事务提交，不会混配地址与 Key。返回
+        的 route 与 token 快照来自同一事务，供签名 Agent 固定同一模型。
         """
         if not isinstance(run_id, str) or not run_id:
             raise DomainError("not_found", 404)
@@ -695,11 +736,13 @@ class BrokerService:
         now = int(self._clock())
         token = secrets.token_urlsafe(32)
         snapshot_id = uuid.uuid4().hex
+        selected: dict[str, EffectiveRoute] = {}
 
         def build(workspace_id: str, snapshot_channel: str,
                   managed_row, override_row):
             route, bundle = self._config.snapshot_from_rows(
                 workspace_id, snapshot_channel, managed_row, override_row)
+            self._validate_chat_route(route)
             adapter = adapter_for_route(route)
             if route.protocol not in adapter.protocols:
                 raise DomainError("capability_unavailable", 503)
@@ -718,6 +761,7 @@ class BrokerService:
                 "options": dict(route.options),
                 "allowed_models": list(allowed_models),
             })
+            selected["route"] = route
             return route_json, encrypted, int(route.version)
 
         self._store.create_broker_token_atomic(
@@ -727,7 +771,10 @@ class BrokerService:
             now=now,
             expires_at=now + self._token_ttl,
             build=build)
-        return token
+        route = selected.get("route")
+        if route is None:
+            raise DomainError("configuration_invalid", 500)
+        return BrokerIssue(token, route)
 
     def authorize(self, token: str, workspace_id: str, run_id: str,
                   channel: str) -> EffectiveRoute:

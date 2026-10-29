@@ -1,0 +1,19 @@
+# Task 2 增量 worker 镜像：复用 A5 已构建的固定 Harness/Chromium/依赖层，
+# 只替换本轮受影响的应用代码与 managed profile，并重跑真实 Harness 门槛。
+FROM easel-worker-harness:a5
+
+USER root
+RUN chmod -R u+w /opt/easel \
+ && find /opt/easel -name '__pycache__' -type d -prune -exec rm -rf {} + || true
+COPY easel /opt/easel/easel
+COPY deploy/multiuser/managed /opt/easel/managed
+COPY deploy/multiuser/smoke_worker.py /opt/easel/deploy/multiuser/smoke_worker.py
+COPY deploy/multiuser/smoke_harness.py /opt/easel/deploy/multiuser/smoke_harness.py
+COPY deploy/multiuser/verify_managed_profile.py /opt/easel/deploy/multiuser/verify_managed_profile.py
+COPY deploy/multiuser/worker_sidecar.py /opt/easel/deploy/multiuser/worker_sidecar.py
+COPY deploy/multiuser/egress_proxy.py /opt/easel/deploy/multiuser/egress_proxy.py
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+
+USER 10001:10001
+RUN DSH_COMMIT=687f282e8625c6b8d11ff58211a90524be2e4317 \
+      python deploy/multiuser/smoke_worker.py --check-files --require-dsh

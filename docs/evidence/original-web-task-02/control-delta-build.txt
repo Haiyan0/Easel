@@ -1,0 +1,42 @@
+DOCKER_BUILD_EXIT=0
+POWERSHELL_STDERR_WRAPPER_STRIPPED=True
+#1 [internal] load build definition from Dockerfile.control-delta
+#1 transferring dockerfile: 467B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-control-test:a4
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB 0.0s done
+#3 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/easel-control-test:a4@sha256:1d9c559e97f172381da28dbbec4e1afeb008405cddbea972c0f2baecff
+7deb16
+#4 resolve docker.io/library/easel-control-test:a4@sha256:1d9c559e97f172381da28dbbec4e1afeb008405cddbea972c0f2baecff7de
+b16 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 413.90kB 0.2s done
+#5 DONE 0.2s
+
+#6 [2/4] RUN chmod -R u+w /opt/easel  && find /opt/easel -name '__pycache__' -type d -prune -exec rm -rf {} + || true
+#6 CACHED
+
+#7 [3/4] COPY easel /opt/easel/easel
+#7 DONE 0.0s
+
+#8 [4/4] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#8 DONE 0.5s
+
+#9 exporting to image
+#9 exporting layers 0.1s done
+#9 exporting manifest sha256:c94a4ece126c7b8b2c62df864b8fd796c53b6bb966ecc13195579c8720914512 0.0s done
+#9 exporting config sha256:f151f66fe4e586d457906329301d282b4b84596ab3d73a7ab5e10d4d645489b2 0.0s done
+#9 exporting attestation manifest sha256:339554769497625a3939e294ad4cace23aa8138dcb35d802f8f075e098ffb9e3 0.0s done
+#9 exporting manifest list sha256:b3f2df4d51c24c0dd0b75505e3cf2c0bb5858f559e568d8b9f75a7202e2540a5 0.0s done
+#9 naming to docker.io/library/easel-control-test:task2-bcf001a0
+#9 naming to docker.io/library/easel-control-test:task2-bcf001a0 done
+#9 unpacking to docker.io/library/easel-control-test:task2-bcf001a0 0.1s done
+#9 DONE 0.4s

@@ -2363,6 +2363,7 @@ def cmd_serve_control(args) -> int:
     managed_config_file = getattr(args, "managed_agent_config", None)
     signing_key = None
     managed_agent = None
+    model_catalog = None
     if bool(snapshot_key_file) != bool(managed_config_file):
         print("错误：relay_config_incomplete", file=sys.stderr)
         return 2
@@ -2393,6 +2394,7 @@ def cmd_serve_control(args) -> int:
     harness_summary = None
     if signing_key is not None:
         revision, agent, broker_config = managed_agent
+        model_catalog = tuple(agent.get("models") or ())
         try:
             relay_factory = build_relay_factory(
                 signing_key=signing_key, revision=revision, agent=agent,
@@ -2406,6 +2408,7 @@ def cmd_serve_control(args) -> int:
             "runtime": agent["runtime"],
             "revision": revision,
             "model": agent.get("model"),
+            "models": list(model_catalog),
             "sandbox": agent.get("sandbox"),
             "timeout": agent.get("timeout"),
             "codexAutoApprove": agent.get("codex_auto_approve"),
@@ -2459,11 +2462,13 @@ def cmd_serve_control(args) -> int:
         try:
             # 已有密文与 key 不匹配必须在服务启动前明确失败
             config_service = ConfigService(store, master_key,
-                                           egress_policy=policy)
+                                           egress_policy=policy,
+                                           model_catalog=model_catalog)
         except ValueError:
             print("错误：invalid_master_key", file=sys.stderr)
             return 2
-        broker = BrokerService(store, config_service, egress=egress)
+        broker = BrokerService(store, config_service, egress=egress,
+                               model_catalog=model_catalog)
         app = create_app(store=store, auth=AuthService(store), config=config,
                          config_service=config_service, broker=broker,
                          provisioner=provisioner,

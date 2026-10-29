@@ -373,28 +373,37 @@ class WorkerRelay:
             raise
 
     async def _run_routes(self, actor: Identity, run: RunRecord,
-                          config: PinnedRunConfig) -> Mapping[str, object]:
-        """固定该 Run 的最小 broker 路由。
+                          config: PinnedRunConfig
+                          ) -> tuple[Mapping[str, object], object | None]:
+        """固定该 Run 的最小 broker 路由与同一事务的路由快照。
 
-        正式装配在接纳后调用 ``BrokerService.issue``，token 只绑定本人的
-        workspace/run/channel；签发失败（未配置该 channel 等）明确 503，
-        不以空 routes 接纳一个看似可运行的在线任务。签发与配置快照在同一
-        数据库事务内完成，重试/重启复用原签名包，不会换 token。
+        正式装配在接纳后调用 ``BrokerService.issue_with_route``，token 与
+        有效路由来自同一写事务；返回的路由用于签名 Agent 的模型选择，避免
+        token 固定新版本而 Agent 仍用旧版。测试替身若只实现 ``issue``，
+        仍保持旧的静态 Agent 行为。
         """
         if config.broker is None:
-            return config.routes
+            return config.routes, None
         if self._broker is None:
             raise DomainError("capability_unavailable", 503)
         try:
-            token = await self._db(
-                self._broker.issue, actor, run.id, config.broker.channel)
+            issuer = getattr(self._broker, "issue_with_route", None)
+            if issuer is not None:
+                issued = await self._db(
+                    issuer, actor, run.id, config.broker.channel)
+                token = issued.token
+                route = issued.route
+            else:
+                token = await self._db(
+                    self._broker.issue, actor, run.id, config.broker.channel)
+                route = None
         except DomainError as error:
             if error.status in (400, 404, 503):
                 raise DomainError("capability_unavailable", 503) from None
             raise
-        return {**config.routes,
-                "broker_url": config.broker.url,
-                "broker_token": token}
+        return ({**config.routes,
+                 "broker_url": config.broker.url,
+                 "broker_token": token}, route)
 
     async def _duplicate(self, actor: Identity, run: RunRecord) -> dict:
         state = await self._db(
@@ -404,12 +413,19 @@ class WorkerRelay:
 
     def _sign(self, run: RunRecord, config: PinnedRunConfig,
               request: Mapping[str, object], task_type: str,
-              routes: Mapping[str, object] | None = None) -> str:
+              routes: Mapping[str, object] | None = None,
+              route: object | None = None) -> str:
         digest = run_input_digest(
             conversation_id=run.conversation_id, task_type=task_type,
             message=str(request["message"]),
             attachments=list(request["attachments"]),
             persona=request.get("persona"))
+        agent = dict(config.agent)
+        if route is not None and task_type == "chat":
+            # 有效 chat 路由与 broker token 同一事务；签名 Agent 必须固定
+            # 同一模型与允许目录，不能回退到静态 profile 默认值。
+            agent["model"] = route.model
+            agent["allowed_models"] = list(route.allowed_models)
         envelope = sign_run_snapshot(
             self._signing_key,
             workspace_id=run.workspace_id,
@@ -419,7 +435,7 @@ class WorkerRelay:
             task_type=task_type,
             revision=run.config_version,
             routes=dict(config.routes if routes is None else routes),
-            agent=dict(config.agent),
+            agent=agent,
             expires_at=int(self._clock()) + self._snapshot_ttl,
             nonce=secrets.token_urlsafe(24))
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
@@ -506,12 +522,12 @@ class WorkerRelay:
             return await self._duplicate(actor, run)
 
         try:
-            routes = await self._run_routes(actor, run, config)
+            routes, route = await self._run_routes(actor, run, config)
         except DomainError:
             # 只有准备所有者、且尚未派发时才能补偿；非所有者不会走到这里
             await self._converge(actor, run, "interrupted")
             raise
-        signed = self._sign(run, config, request, task_type, routes)
+        signed = self._sign(run, config, request, task_type, routes, route)
         stored = await self._db(
             self._store.save_run_snapshot, actor, run.id, signed)
         if stored != signed:

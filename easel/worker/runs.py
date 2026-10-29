@@ -253,6 +253,18 @@ def _sandbox(value: object) -> str:
     return str(value)
 
 
+def _model_list(value: object) -> list[str]:
+    """签名快照中的模型目录/允许列表：有界、唯一、无控制字符。"""
+    if (not isinstance(value, list) or not 1 <= len(value) <= 64
+            or any(not isinstance(item, str) or not item
+                   or len(item) > 256
+                   or any(ord(character) < 32 for character in item)
+                   for item in value)
+            or len(set(value)) != len(value)):
+        raise _invalid("agent_config_invalid")
+    return list(value)
+
+
 def _command(value: object, runtime: str) -> tuple[str, ...]:
     if value is None:
         if runtime == "acp":
@@ -1254,6 +1266,19 @@ class RunManager:
         if model is not None and (not isinstance(model, str)
                                   or len(model) > 256):
             raise _invalid("agent_config_invalid")
+        models = agent.get("models")
+        allowed_models = agent.get("allowed_models")
+        if models is not None:
+            models = _model_list(models)
+            if model is not None and model not in models:
+                raise _invalid("agent_config_invalid")
+        if allowed_models is not None:
+            allowed_models = _model_list(allowed_models)
+            if not model or model not in allowed_models:
+                raise _invalid("agent_config_invalid")
+            if models is not None and any(
+                    item not in models for item in allowed_models):
+                raise _invalid("agent_config_invalid")
         sandbox = _sandbox(agent.get("sandbox"))
         timeout = _timeout(agent.get("timeout"))
         auto_approve = agent.get("codex_auto_approve")

@@ -25,6 +25,28 @@ ERROR_MESSAGE = option("error-message", "fixture failure")
 SESSION_ID = "diag-session"
 
 
+MODEL_VALUES = (
+    '["easel-broker","deepseek-chat"]',
+    '["easel-broker","deepseek-flash"]',
+    '["easel-broker","deepseek-v4-pro"]',
+)
+
+
+def model_option():
+    """模拟真实 Harness：select 的 value 是 JSON [provider, model]。"""
+    return {
+        "id": "model", "name": "Model", "category": "model",
+        "type": "select", "currentValue": MODEL_VALUES[0],
+        "options": [{
+            "group": "easel-broker", "name": "Easel broker",
+            "options": [
+                {"value": value, "name": json.loads(value)[1]}
+                for value in MODEL_VALUES
+            ],
+        }],
+    }
+
+
 def record(entry):
     if not AUDIT:
         return
@@ -114,20 +136,34 @@ while True:
         if MODE == "initialize-error":
             fail(message)
             continue
-        reply(message, {"protocolVersion": 1, "agentCapabilities": {}})
+        capabilities = ({"sessionCapabilities": {"resume": {}}}
+                        if MODE == "model-catalog" else {})
+        reply(message, {"protocolVersion": 1,
+                        "agentCapabilities": capabilities})
     elif method in ("session/new", "session/load", "session/resume"):
         if MODE == "session-error":
             fail(message)
             continue
+        config_options = ([model_option()] if MODE == "model-catalog"
+                          else [{"category": "model", "id": "model",
+                                 "type": "select"}])
         reply(message, {
             "sessionId": SESSION_ID,
-            "configOptions": [{"category": "model", "id": "model",
-                               "type": "select"}],
+            "configOptions": config_options,
         })
     elif method == "session/set_config_option":
         if MODE == "model-error":
             fail(message)
             continue
+        if MODE == "model-catalog":
+            value = (message.get("params") or {}).get("value")
+            record({"method": "fixture/set-config", "value": value})
+            if value not in MODEL_VALUES:
+                send({"id": message["id"], "error": {
+                    "code": -32000,
+                    "message": "unknown model option",
+                    "data": {"code": "invalid_request"}}})
+                continue
         reply(message, {})
     elif method == "session/prompt":
         if MODE == "prompt-error":

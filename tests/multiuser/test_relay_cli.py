@@ -105,6 +105,38 @@ def test_serve_control_assembles_relay_only_from_explicit_files(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
+def test_serve_control_passes_managed_model_catalog_to_services(
+        tmp_path, monkeypatch):
+    captured = capture_app(tmp_path, monkeypatch)
+    master = write_master_key(tmp_path)
+    signing, _key = write_signing_key(tmp_path)
+    catalog = ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"]
+    agent_config = write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "sandbox": "read-only", "timeout": 60,
+                  "models": catalog},
+        "broker": {"mode": "workspace-sidecar", "channel": "chat"},
+    })
+
+    code = main(["serve-control",
+                 "--control-dir", str(tmp_path / "control"),
+                 "--public-origin", ORIGIN,
+                 "--master-key-file", str(master),
+                 "--snapshot-key-file", str(signing),
+                 "--managed-agent-config", str(agent_config),
+                 "--frontend-dir", str(frontend_build(tmp_path))])
+    assert code == 0
+    app = captured["app"]
+    with TestClient(app, base_url=ORIGIN):
+        assert app.state.config_service._model_catalog == tuple(catalog)
+        assert app.state.broker._model_catalog == tuple(catalog)
+        relay = app.state.relay
+        config = relay._config_provider(
+            Identity("user-x", "a" * 32, "member"))
+        assert config.agent["models"] == catalog
+
+
 def test_serve_control_without_relay_files_keeps_task_capability_503(
         tmp_path, monkeypatch):
     captured = capture_app(tmp_path, monkeypatch)

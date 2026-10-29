@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 _MANAGED_FIELDS = frozenset({"revision", "agent", "broker"})
 _AGENT_FIELDS = frozenset({
-    "runtime", "command", "model", "sandbox", "timeout",
+    "runtime", "command", "model", "models", "sandbox", "timeout",
     "codex_auto_approve"})
 _LEGACY_BROKER_FIELDS = frozenset({"url", "channel"})
 _SIDECAR_BROKER_FIELDS = frozenset({"mode", "channel"})
@@ -85,6 +85,21 @@ def _command(value: object) -> list[str]:
     return list(value)
 
 
+def _model_catalog(value: object) -> list[str]:
+    """受管 Harness 模型目录：有界、唯一、无控制字符的公开模型 ID。"""
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        raise ValueError("managed agent models must be a non-empty list")
+    normalized: list[str] = []
+    for item in value:
+        if (not isinstance(item, str) or not item or len(item) > 256
+                or any(ord(character) < 32 for character in item)):
+            raise ValueError("managed agent model is invalid")
+        if item in normalized:
+            raise ValueError("managed agent model is duplicated")
+        normalized.append(item)
+    return normalized
+
+
 def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
     """读取受保护的受管 Agent 配置，返回 ``(revision, agent, broker)``。
 
@@ -126,6 +141,13 @@ def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
                 or any(ord(character) < 32 for character in model)):
             raise ValueError("managed agent model is invalid")
         normalized["model"] = model
+    models = None
+    if "models" in agent:
+        models = _model_catalog(agent["models"])
+        normalized["models"] = models
+    if ("model" in normalized and models is not None
+            and normalized["model"] not in models):
+        raise ValueError("managed agent model is not in the catalog")
     if "sandbox" in agent:
         if agent["sandbox"] not in _SANDBOXES:
             raise ValueError("managed agent sandbox is invalid")

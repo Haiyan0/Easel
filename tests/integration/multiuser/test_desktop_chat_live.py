@@ -247,6 +247,7 @@ class Topology:
             "agent": {
                 "runtime": "acp",
                 "command": manifest["command"],
+                "models": manifest["provider"]["models"],
                 "sandbox": "workspace-write",
                 "timeout": 300,
             },
