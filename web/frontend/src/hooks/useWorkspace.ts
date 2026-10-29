@@ -9,7 +9,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AuthContext, IdentityEpoch } from '../lib/auth';
 import { AuthError, identityCacheKey } from '../lib/auth';
-import type { ControlQuestion, ServerSession } from '../lib/control';
+import type {
+  ControlQuestion, ServerSession, SseFrame,
+} from '../lib/control';
 import {
   isActiveRun, isTerminalRun, olderMessageWindow, recoveryAction,
 } from '../lib/control';
@@ -86,7 +88,7 @@ export interface UseWorkspaceResult {
   reconnect(): void;
   answer(
     question: ChatQuestion, answers: Record<string, string[]>,
-  ): Promise<void>;
+  ): Promise<{ ok: boolean; error?: string }>;
 }
 
 function makeTurnId(): string {
@@ -367,8 +369,9 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
         }
       });
     } catch (error) {
-      if (seq !== sessionsSeq.current) return;
+      // 当前身份的 401 必须先结束私人树，不能被分页代次 guard 吞掉。
       if (handleAuthError(error)) return;
+      if (seq !== sessionsSeq.current) return;
       apply(() => {
         setLoading(false);
         setHistoryError(failureNotice(error, '目录读取失败'));
@@ -481,8 +484,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     try {
       latest = await fetchLatestMessages(sessionId);
     } catch (error) {
-      if (!allowed()) return;
       if (handleAuthError(error)) return;
+      if (!allowed()) return;
       const current = runRef.current;
       if (current && current.runId === runId) {
         apply(() => setSessions((items) => items.map((item) => {
@@ -545,48 +548,67 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
       && activeIdRef.current === sessionId
       && runRef.current?.runId === runId
       && sendSeq.current === sendGeneration;
-    const persist = (cursor: number) => {
-      if (cursor > 0 && epochs.isCurrent(epoch)) {
-        writeRecovery(ctx, sessionId, { runId, turnId, eventId: cursor });
+    let cursor = Math.max(0, after);
+    const persist = (next: number) => {
+      if (next > 0 && epochs.isCurrent(epoch)) {
+        writeRecovery(ctx, sessionId, { runId, turnId, eventId: next });
       }
+    };
+    // 所有已消费事件（state/token/thinking/activity/question/error）都推进
+    // 同一个单调游标并持久化；旧连接迟到回调被 owns() 挡住，不回写新连接。
+    const commitFrame = (
+      frame: SseFrame,
+      patch: (current: ClientRun) => Partial<ClientRun>,
+    ): boolean => {
+      if (!owns()) return false;
+      cursor = Math.max(cursor, Math.max(0, frame.id));
+      persist(cursor);
+      const previous = runRef.current;
+      if (previous && previous.runId === runId) {
+        // 同步更新重连快照，避免点击重连时 React effect 尚未刷新 cursor。
+        runRef.current = {
+          ...previous,
+          cursor: Math.max(previous.cursor, cursor),
+          ...patch(previous),
+        };
+      }
+      apply(() => setRun((current) => {
+        if (!current || current.runId !== runId) return current;
+        return {
+          ...current,
+          cursor: Math.max(current.cursor, cursor),
+          ...patch(current),
+        };
+      }));
+      return true;
     };
     try {
       const result = await client.streamRun(runId, after, {
         onState: (state, frame) => {
-          if (!owns()) return;
-          persist(frame.id);
-          apply(() => setRun((current) => current
-            && current.runId === runId
-            ? { ...current, state: state.state, cursor: frame.id }
-            : current));
+          if (!commitFrame(frame, () => ({ state: state.state }))) return;
           if (isTerminalRun(state.state)) {
             void finishRun(sessionId, runId, owns);
           }
         },
         onToken: (text, frame) => {
-          if (!owns()) return;
-          apply(() => setRun((current) => current
-            && current.runId === runId
-            ? { ...current, content: current.content + text,
-              cursor: frame.id } : current));
+          commitFrame(frame, (current) => ({
+            content: current.content + text,
+          }));
         },
-        onThinking: (text) => {
-          if (!owns()) return;
-          apply(() => setRun((current) => current
-            && current.runId === runId
-            ? { ...current, thinking: current.thinking + text } : current));
+        onThinking: (text, frame) => {
+          commitFrame(frame, (current) => ({
+            thinking: current.thinking + text,
+          }));
         },
-        onActivity: (text) => {
-          if (!owns()) return;
-          apply(() => setRun((current) => current
-            && current.runId === runId
-            ? { ...current, activity: text } : current));
+        onActivity: (text, frame) => {
+          commitFrame(frame, () => ({ activity: text }));
         },
-        onErrorText: (text) => {
-          if (owns()) apply(() => setNotice(text));
+        onErrorText: (text, frame) => {
+          if (!commitFrame(frame, () => ({}))) return;
+          apply(() => setNotice(text));
         },
-        onQuestion: (question: ControlQuestion) => {
-          if (!owns()) return;
+        onQuestion: (question: ControlQuestion, frame) => {
+          if (!commitFrame(frame, () => ({}))) return;
           void client.questionStatus(
             runId, [question.id], controller.signal).then((status) => {
             if (!owns()) return;
@@ -604,7 +626,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
               return { ...current,
                 question: controlQuestionView(question) };
             }));
-          }).catch(() => {
+          }).catch((error) => {
+            if (handleAuthError(error)) return;
             if (!owns()) return;
             apply(() => setRun((current) => {
               if (!current || current.runId !== runId) return current;
@@ -644,7 +667,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
       if (connectionSeq.current === connection) setStreamActive(false);
     }
   }, [abortStream, apply, client, ctx, epoch, epochs, finishRun,
-      isSelected, onExpired, refreshLatestMessages]);
+      handleAuthError, isSelected, onExpired, refreshLatestMessages]);
 
   useEffect(() => {
     if (!activeId) {
@@ -693,9 +716,10 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
           clearRecovery(ctx, sessionId);
         }
       } catch (error) {
+        // 401 已使 epoch 失效，不能再被 isSelected/代次 guard 提前吞掉。
+        if (handleAuthError(error)) return;
         if (cancelled || !isSelected(sessionId, seq)
             || generation !== messageSeq.current) return;
-        if (handleAuthError(error)) return;
         apply(() => setHistoryError(
           failureNotice(error, '历史读取失败')));
       }
@@ -805,13 +829,15 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
         writeRecovery(ctx, send.sessionId, recovery);
       }
     } catch (error) {
-      if (!epochs.isCurrent(epoch)) return;
-      if (sendSeq.current !== generation) return;
+      // identityFetchRaw 已使当前 epoch 失效；必须先通知认证边界，
+      // 不能用“epoch 已不是当前”反过来吞掉这次归属明确的 401。
       if (error instanceof AuthError && error.status === 401
           && error.identityInvalidated) {
         onExpired();
         return;
       }
+      if (!epochs.isCurrent(epoch)) return;
+      if (sendSeq.current !== generation) return;
       markLocalFailed(current, failureNotice(error, '发送失败'));
     }
   }, [beginLocalSend, client, connectRun, ctx, epoch, epochs,
@@ -871,29 +897,45 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
 
   const answer = useCallback(async (
     question: ChatQuestion, answers: Record<string, string[]>,
-  ) => {
+  ): Promise<{ ok: boolean; error?: string }> => {
     const current = runRef.current;
     if (!current || !epochs.isCurrent(epoch)
-        || activeIdRef.current !== current.sessionId) return;
+        || activeIdRef.current !== current.sessionId) {
+      return { ok: false, error: '当前问题已失效。' };
+    }
     try {
       await client.answerQuestion(current.runId, question.id, answers,
         requestAbort.current.signal);
       if (!isSelected(current.sessionId)
-          || runRef.current?.runId !== current.runId) return;
+          || runRef.current?.runId !== current.runId) {
+        return { ok: true };
+      }
       apply(() => setRun((value) => value && value.runId === current.runId
         ? { ...value, question: null,
           answered: [...value.answered, question.id] } : value));
+      return { ok: true };
     } catch (error) {
-      if (handleAuthError(error)) return;
+      if (handleAuthError(error)) {
+        return { ok: false, error: '登录已失效，请重新登录。' };
+      }
       if (!isSelected(current.sessionId)
-          || runRef.current?.runId !== current.runId) return;
-      apply(() => {
-        setNotice(error instanceof AuthError && error.status === 409
-          ? '该问题已过期或已回答；请等待服务端最终结果。'
-          : failureNotice(error, '回答提交失败'));
-        setRun((value) => value && value.runId === current.runId
-          ? { ...value, question: null } : value);
-      });
+          || runRef.current?.runId !== current.runId) {
+        return { ok: false, error: '当前问题已切换。' };
+      }
+      if (error instanceof AuthError && error.status === 409) {
+        // 409 是明确的已过期/已回答证据，才允许终结题卡。
+        const message = '该问题已过期或已回答；请等待服务端最终结果。';
+        apply(() => {
+          setNotice(message);
+          setRun((value) => value && value.runId === current.runId
+            ? { ...value, question: null } : value);
+        });
+        return { ok: false, error: message };
+      }
+      // 503/断网/403 等暂时失败：保留题卡和当前选择，允许原地重试。
+      const message = failureNotice(error, '回答提交失败');
+      apply(() => setNotice(message));
+      return { ok: false, error: message };
     }
   }, [apply, client, epoch, epochs, handleAuthError, isSelected]);
 

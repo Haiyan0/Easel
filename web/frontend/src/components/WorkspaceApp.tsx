@@ -94,12 +94,9 @@ export default function WorkspaceApp({
     void workspace.deleteSession(id);
   };
 
-  const answer = async (
+  const answer = (
     question: ChatQuestion, answers: Record<string, string[]>,
-  ) => {
-    await workspace.answer(question, answers);
-    return { ok: true };
-  };
+  ) => workspace.answer(question, answers);
 
   const notice = [workspace.historyError, workspace.notice]
     .filter(Boolean).join('；');

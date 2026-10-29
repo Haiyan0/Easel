@@ -58,9 +58,12 @@ class FakeState:
             "invite-a4": "A", "invite-a5": "A", "invite-a6": "A",
             "invite-a7": "A", "invite-a8": "A", "invite-a9": "A",
             "invite-a10": "A", "invite-a11": "A", "invite-a12": "A",
-            "invite-a13": "A",
+            "invite-a13": "A", "invite-a14": "A", "invite-a15": "A",
+            "invite-a16": "A", "invite-a17": "A", "invite-a18": "A",
+            "invite-a19": "A", "invite-a20": "A", "invite-a21": "A",
+            "invite-a22": "A",
             "invite-b": "B", "invite-b2": "B", "invite-b3": "B",
-            "invite-b4": "B",
+            "invite-b4": "B", "invite-b5": "B",
         }
         self.sessions: dict[str, list[dict]] = {
             "A": [
@@ -95,6 +98,17 @@ class FakeState:
         self.hold_admission = False
         self.admission_waiting = threading.Event()
         self.admission_release = threading.Event()
+        self.fail_next_chat_401 = False
+        self.hold_chat_401 = False
+        self.chat_401_waiting = threading.Event()
+        self.chat_401_release = threading.Event()
+        self.fail_next_question_status_401 = False
+        self.fail_next_answer_503 = False
+        self.fail_next_answer_403 = False
+        self.fail_next_answer_409 = False
+        self.fail_next_runs_401 = False
+        self.stream_afters: list[int] = []
+        self.question_run_ids: list[str] = []
         self.chat_turn_ids: list[tuple[str, str, str]] = []
         self.post_chat_count = 0
         self.stop_count = 0
@@ -137,6 +151,8 @@ class FakeState:
                 "events": [], "next_event": 1, "terminal": False,
                 "state": "accepted", "answered": False, "stopped": False,
                 "asked": False, "release": threading.Event(),
+                "drop_ready": False, "drop_done": False,
+                "resume": threading.Event(),
                 "condition": threading.Condition(self.lock),
             }
             self.runs[run_id] = run
@@ -179,10 +195,57 @@ def finish_run(run: dict, owner: FakeState, state: str,
 
 
 def run_script(run: dict, owner: FakeState) -> None:
-    add_event(run, "state", {"state": "running"})
-    add_event(run, "thinking", "我先分析一下")
-    add_event(run, "activity", "正在生成回答")
     script = run["script"]
+    add_event(run, "state", {"state": "running"})
+    if script == "drop":
+        add_event(run, "thinking", "思考唯一内容")
+        add_event(run, "activity", "活动唯一内容")
+    elif script != "drop_question":
+        add_event(run, "thinking", "我先分析一下")
+        add_event(run, "activity", "正在生成回答")
+    if script == "drop_question":
+        with run["condition"]:
+            run["asked"] = True
+            run["state"] = "awaiting_permission"
+            run["events"].append({
+                "id": run["next_event"], "event": "state",
+                "data": json.dumps({"state": "awaiting_permission"}),
+            })
+            run["next_event"] += 1
+            run["events"].append({
+                "id": run["next_event"], "event": "question",
+                "data": json.dumps(json.dumps({
+                    "id": f"q-{run['id']}",
+                    "questions": [{
+                        "questionId": "permission",
+                        "header": "执行授权",
+                        "question": "允许本次执行吗？",
+                        "options": [
+                            {"label": "允许本次", "value": "qopt_allow"},
+                            {"label": "拒绝", "value": "qopt_deny"},
+                        ],
+                    }],
+                }, ensure_ascii=False)),
+            })
+            run["next_event"] += 1
+            run["drop_ready"] = True
+            run["condition"].notify_all()
+        run["resume"].wait(60)
+        if run["terminal"]:
+            return
+        add_event(run, "token", "问题后回答")
+        finish_run(run, owner, "done", "问题后回答")
+        return
+    if script == "drop":
+        with run["condition"]:
+            run["drop_ready"] = True
+            run["condition"].notify_all()
+        run["resume"].wait(60)
+        if run["terminal"]:
+            return
+        add_event(run, "token", "断线后的回答")
+        finish_run(run, owner, "done", "断线后的回答")
+        return
     if script == "question":
         with run["condition"]:
             if run["terminal"]:
@@ -484,6 +547,10 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 return
             sid = match.group(1)
+            if self.state.fail_next_runs_401:
+                self.state.fail_next_runs_401 = False
+                self._json(401, {"code": "unauthorized"})
+                return
             if self.state.find_session(user, sid) is None:
                 self._json(404, {"code": "not_found"})
                 return
@@ -506,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"code": "run_not_found"})
                 return
             after = int((self._query().get("after") or ["0"])[0])
+            with self.state.lock:
+                self.state.stream_afters.append(after)
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/event-stream; charset=utf-8")
@@ -519,6 +588,10 @@ class Handler(BaseHTTPRequestHandler):
                         pending = [event for event in run["events"]
                                    if event["id"] > after]
                         terminal = run["terminal"]
+                        drop = (run["drop_ready"] and not run["drop_done"]
+                                and not pending)
+                        if drop:
+                            run["drop_done"] = True
                     if pending:
                         for event in pending:
                             frame = (
@@ -530,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                             after = event["id"]
                         continue
-                    if terminal:
+                    if drop or terminal:
                         break
                     with run["condition"]:
                         run["condition"].wait(0.1)
@@ -602,9 +675,23 @@ class Handler(BaseHTTPRequestHandler):
                     or self.state.find_session(user, sid) is None):
                 self._json(400, {"code": "invalid_argument"})
                 return
+            if self.state.hold_chat_401 and "迟到401" in text:
+                self.state.hold_chat_401 = False
+                self.state.chat_401_waiting.set()
+                self.state.chat_401_release.wait(30)
+                self._json(401, {"code": "unauthorized"})
+                return
+            if self.state.fail_next_chat_401:
+                self.state.fail_next_chat_401 = False
+                self._json(401, {"code": "unauthorized"})
+                return
             script = "default"
             if "需要问题" in text:
                 script = "question"
+            elif "断线问题" in text:
+                script = "drop_question"
+            elif "断线思考" in text:
+                script = "drop"
             elif "延迟" in text:
                 script = "held"
             elif "停止" in text:
@@ -661,11 +748,17 @@ class Handler(BaseHTTPRequestHandler):
             user = self._require_user()
             if user is None:
                 return
+            if self.state.fail_next_question_status_401:
+                self.state.fail_next_question_status_401 = False
+                self._json(401, {"code": "unauthorized"})
+                return
             body = self._body()
             run = self.state.runs.get(body.get("runId"))
             if run is None or run["user"] != user:
                 self._json(404, {"code": "run_not_found"})
                 return
+            with self.state.lock:
+                self.state.question_run_ids.append(run["id"])
             questions = {}
             for question_id in body.get("questionIds") or []:
                 if run["answered"]:
@@ -687,6 +780,22 @@ class Handler(BaseHTTPRequestHandler):
             run = self.state.runs.get(body.get("runId"))
             if run is None or run["user"] != user:
                 self._json(404, {"code": "run_not_found"})
+                return
+            with run["condition"]:
+                fail_503 = self.state.fail_next_answer_503
+                fail_403 = self.state.fail_next_answer_403
+                fail_409 = self.state.fail_next_answer_409
+                self.state.fail_next_answer_503 = False
+                self.state.fail_next_answer_403 = False
+                self.state.fail_next_answer_409 = False
+            if fail_503:
+                self._json(503, {"code": "service_unavailable"})
+                return
+            if fail_403:
+                self._json(403, {"code": "forbidden"})
+                return
+            if fail_409:
+                self._json(409, {"code": "question_expired"})
                 return
             with run["condition"]:
                 if run["terminal"] or run["answered"] or not run["asked"]:
@@ -836,6 +945,54 @@ class Server:
 
     def release_admission(self) -> None:
         self.state.admission_release.set()
+
+    def fail_chat_401_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_chat_401 = True
+
+    def hold_chat_401_once(self) -> None:
+        with self.state.lock:
+            self.state.hold_chat_401 = True
+            self.state.chat_401_waiting.clear()
+            self.state.chat_401_release.clear()
+
+    def release_chat_401(self) -> None:
+        self.state.chat_401_release.set()
+
+    def fail_question_status_401_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_question_status_401 = True
+
+    def fail_answer_503_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_answer_503 = True
+
+    def fail_answer_403_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_answer_403 = True
+
+    def fail_answer_409_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_answer_409 = True
+
+    def fail_runs_401_once(self) -> None:
+        with self.state.lock:
+            self.state.fail_next_runs_401 = True
+
+    def abandon_runs(self, user: str, sid: str | None = None) -> None:
+        with self.state.lock:
+            for run in self.state.runs.values():
+                if run["user"] != user:
+                    continue
+                if sid is not None and run["session"] != sid:
+                    continue
+                if run["terminal"]:
+                    continue
+                run["stopped"] = True
+                run["terminal"] = True
+                run["release"].set()
+                run["resume"].set()
+                run["condition"].notify_all()
 
     def seed_sessions(self, user: str, count: int) -> list[str]:
         ids: list[str] = []
@@ -1069,9 +1226,13 @@ async def scenario_cross_identity(browser, server: Server,
     try:
         await login(page, server.origin, "invite-a5")
         await select_session(page, "A 第二会话")
-        await page.locator(".chat-input").fill("A 未发送草稿")
+        with server.state.lock:
+            posts_before = server.state.post_chat_count
         await page.locator(".chat-input").fill("延迟的 A 任务")
         await page.locator(".send-btn").click()
+        await wait_for(
+            lambda: server.state.post_chat_count == posts_before + 1, 10,
+            "cross-identity 未派发新 Run")
         await page.get_by_text("正在生成回答").first.wait_for(timeout=15000)
         await page.locator(".chat-input").fill("A 切换后的草稿")
         await logout(page)
@@ -1085,6 +1246,10 @@ async def scenario_cross_identity(browser, server: Server,
         await page.get_by_role("button", name="进入工作区").click()
         await page.locator(".sidebar").wait_for(timeout=15000)
         await page.get_by_text("B 会话", exact=True).wait_for(timeout=15000)
+        runs = [(run["id"], run["text"], run["state"], run["terminal"])
+                for run in server.state.runs.values()]
+        assert any(run["text"] == "延迟的 A 任务"
+                   for run in server.state.runs.values()), runs
         held = next(run for run in server.state.runs.values()
                     if run["text"] == "延迟的 A 任务")
         held["release"].set()
@@ -1092,7 +1257,6 @@ async def scenario_cross_identity(browser, server: Server,
         body = await page.text_content("body") or ""
         assert "B 私有回答" in body
         assert "A 私有回答" not in body
-        assert "A 未发送草稿" not in body
         assert "A 切换后的草稿" not in body
         assert "延迟的 A 任务" not in body
         assert await page.locator(".question-card").count() == 0
@@ -1484,6 +1648,316 @@ async def scenario_settings_delayed(browser, server: Server,
         await context.close()
 
 
+async def scenario_r1_submit_401(browser, server: Server,
+                                 results: dict, failures: list,
+                                 screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a14")
+        await select_session(page, "A 第二会话")
+        server.fail_chat_401_once()
+        await page.locator(".chat-input").fill("提交401")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("登录已失效", exact=False).first.wait_for(
+            timeout=15000)
+        await page.locator("#invite").wait_for(timeout=15000)
+        assert await page.locator(".sidebar").count() == 0
+        body = await page.text_content("body") or ""
+        assert "发送中" not in body
+        results["r1_submit_401"] = True
+        await page.screenshot(path=str(EVIDENCE / "19-r1-submit-401.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-submit-401: {error!r}")
+    finally:
+        await context.close()
+
+
+async def scenario_r1_question_status_401(browser, server: Server,
+                                          results: dict, failures: list,
+                                          screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a15")
+        await select_session(page, "A 第二会话")
+        server.fail_question_status_401_once()
+        await page.locator(".chat-input").fill("需要问题")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("登录已失效", exact=False).first.wait_for(
+            timeout=15000)
+        await page.locator("#invite").wait_for(timeout=15000)
+        assert await page.locator(".sidebar").count() == 0
+        body = await page.text_content("body") or ""
+        assert "发送中" not in body
+        results["r1_question_status_401"] = True
+        await page.screenshot(path=str(EVIDENCE / "20-r1-question-401.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-question-status-401: {error!r}")
+    finally:
+        server.abandon_runs("A", "s-a2")
+        await context.close()
+
+
+async def scenario_r1_initial_history_401(browser, server: Server,
+                                          results: dict, failures: list,
+                                          screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        server.fail_runs_401_once()
+        await page.goto(server.origin, wait_until="domcontentloaded")
+        await page.fill("#invite", "invite-a16")
+        await page.get_by_role("button", name="进入工作区").click()
+        await page.get_by_text("登录已失效", exact=False).first.wait_for(
+            timeout=15000)
+        await page.locator("#invite").wait_for(timeout=15000)
+        assert await page.locator(".sidebar").count() == 0
+        body = await page.text_content("body") or ""
+        assert "发送中" not in body
+        results["r1_initial_history_401"] = True
+        await page.screenshot(path=str(
+            EVIDENCE / "21-r1-initial-history-401.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-initial-history-401: {error!r}")
+    finally:
+        await context.close()
+
+
+async def scenario_r1_late_401_keeps_b(browser, server: Server,
+                                       results: dict, failures: list,
+                                       screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a17")
+        await select_session(page, "A 第二会话")
+        server.hold_chat_401_once()
+        await page.locator(".chat-input").fill("迟到401")
+        await page.locator(".send-btn").click()
+        await wait_for(
+            lambda: server.state.chat_401_waiting.is_set(), 10,
+            "迟到 401 请求未挂起")
+        await logout(page)
+        await page.fill("#invite", "invite-b5")
+        await page.get_by_role("button", name="进入工作区").click()
+        await page.locator(".sidebar").wait_for(timeout=15000)
+        await page.get_by_text("B 会话", exact=True).wait_for(timeout=15000)
+        server.release_chat_401()
+        await asyncio.sleep(1.0)
+        assert await page.locator("#invite").count() == 0
+        assert await page.locator(".sidebar").count() == 1
+        body = await page.text_content("body") or ""
+        assert "B 私有回答" in body
+        assert "A 私有回答" not in body
+        results["r1_late_401_keeps_b"] = True
+        await page.screenshot(path=str(EVIDENCE / "22-r1-late-401.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-late-401: {error!r}")
+    finally:
+        server.release_chat_401()
+        await context.close()
+
+
+async def scenario_r1_answer_503_retry(browser, server: Server,
+                                       results: dict, failures: list,
+                                       screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a18")
+        await select_session(page, "A 第二会话")
+        await page.locator(".chat-input").fill("需要问题")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("允许本次", exact=True).wait_for(timeout=15000)
+        await page.get_by_role("button", name="允许本次").click()
+        server.fail_answer_503_once()
+        with server.state.lock:
+            posts = server.state.post_chat_count
+        await page.get_by_role("button", name="提交").click()
+        await page.get_by_text("回答提交失败", exact=False).first.wait_for(
+            timeout=15000)
+        assert await page.locator(".question-card").count() == 1, (
+            "503 后题卡被移除")
+        assert await page.locator(
+            ".question-card__option--selected").count() >= 1, (
+            "503 后已选答案丢失")
+        run = server.state.runs[server.state.question_run_ids[-1]]
+        assert run["text"] == "需要问题", run
+        assert run["answered"] is False, run
+        assert server.state.post_chat_count == posts, (
+            server.state.post_chat_count, posts)
+        await page.get_by_role("button", name="提交").click()
+        await wait_for(
+            lambda: run["answered"] is True, 10,
+            f"重试未提交 {run['id']}")
+        await page.wait_for_function(
+            "() => document.querySelectorAll('.question-card').length === 0",
+            timeout=15000)
+        await page.get_by_text("已按你的选择继续。", exact=True).last.wait_for(
+            timeout=15000)
+        assert await page.locator(".question-card").count() == 0, (
+            "成功后题卡未移除")
+        assert server.state.post_chat_count == posts, (
+            server.state.post_chat_count, posts)
+        results["r1_answer_503_retry"] = True
+        await page.screenshot(path=str(EVIDENCE / "23-r1-answer-retry.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-answer-503-retry: {error!r}")
+    finally:
+        server.abandon_runs("A", "s-a2")
+        await context.close()
+
+
+async def scenario_r1_answer_403(browser, server: Server,
+                                 results: dict, failures: list,
+                                 screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a20")
+        await select_session(page, "A 第二会话")
+        await page.locator(".chat-input").fill("需要问题")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("允许本次", exact=True).wait_for(timeout=15000)
+        await page.get_by_role("button", name="允许本次").click()
+        server.fail_answer_403_once()
+        await page.get_by_role("button", name="提交").click()
+        await page.get_by_text("403 权限不足", exact=False).first.wait_for(
+            timeout=15000)
+        assert await page.locator(".question-card").count() == 1
+        assert await page.locator("#invite").count() == 0
+        run = server.state.runs[server.state.question_run_ids[-1]]
+        assert run["answered"] is False
+        await page.get_by_role("button", name="提交").click()
+        await wait_for(lambda: run["answered"] is True, 10, "403 后重试失败")
+        await page.wait_for_function(
+            "() => document.querySelectorAll('.question-card').length === 0",
+            timeout=15000)
+        results["r1_answer_403"] = True
+        await page.screenshot(path=str(EVIDENCE / "25-r1-answer-403.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-answer-403: {error!r}")
+    finally:
+        server.abandon_runs("A", "s-a2")
+        await context.close()
+
+
+async def scenario_r1_answer_409(browser, server: Server,
+                                 results: dict, failures: list,
+                                 screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a21")
+        await select_session(page, "A 第二会话")
+        await page.locator(".chat-input").fill("需要问题")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("允许本次", exact=True).wait_for(timeout=15000)
+        await page.get_by_role("button", name="允许本次").click()
+        server.fail_answer_409_once()
+        await page.get_by_role("button", name="提交").click()
+        await page.get_by_text("已过期或已回答", exact=False).first.wait_for(
+            timeout=15000)
+        await page.wait_for_function(
+            "() => document.querySelectorAll('.question-card').length === 0",
+            timeout=15000)
+        assert await page.locator("#invite").count() == 0
+        results["r1_answer_409"] = True
+        await page.screenshot(path=str(EVIDENCE / "26-r1-answer-409.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-answer-409: {error!r}")
+    finally:
+        server.abandon_runs("A", "s-a2")
+        await context.close()
+
+
+async def scenario_r1_question_cursor(browser, server: Server,
+                                      results: dict, failures: list,
+                                      screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a22")
+        await select_session(page, "A 第二会话")
+        with server.state.lock:
+            afters = len(server.state.stream_afters)
+        await page.locator(".chat-input").fill("断线问题")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("允许本次", exact=True).wait_for(timeout=15000)
+        posts_after_send = server.state.post_chat_count
+        reconnect = page.get_by_role("button", name="重连（只回放）")
+        await reconnect.wait_for(timeout=15000)
+        await reconnect.click()
+        await wait_for(
+            lambda: (len(server.state.stream_afters) > afters
+                     and server.state.stream_afters[-1] == 3), 10,
+            "题卡后重连未从已消费游标继续")
+        run = [run for run in server.state.runs.values()
+               if run["text"] == "断线问题"][-1]
+        run["resume"].set()
+        await page.get_by_text("问题后回答", exact=True).last.wait_for(
+            timeout=15000)
+        assert server.state.post_chat_count == posts_after_send
+        results["r1_question_cursor"] = True
+        await page.screenshot(path=str(
+            EVIDENCE / "27-r1-question-cursor.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-question-cursor: {error!r}")
+    finally:
+        for run in server.state.runs.values():
+            if run["text"] == "断线问题":
+                run["resume"].set()
+        await context.close()
+
+
+async def scenario_r1_thinking_cursor(browser, server: Server,
+                                      results: dict, failures: list,
+                                      screenshots: list) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, "invite-a19")
+        await select_session(page, "A 第二会话")
+        with server.state.lock:
+            posts_before = server.state.post_chat_count
+            afters = len(server.state.stream_afters)
+        await page.locator(".chat-input").fill("断线思考")
+        await page.locator(".send-btn").click()
+        await page.get_by_text("思考唯一内容", exact=True).wait_for(
+            timeout=15000)
+        await page.get_by_text("活动唯一内容", exact=True).wait_for(
+            timeout=15000)
+        posts_after_send = server.state.post_chat_count
+        assert posts_after_send == posts_before + 1
+        reconnect = page.get_by_role("button", name="重连（只回放）")
+        await reconnect.wait_for(timeout=15000)
+        await reconnect.click()
+        await wait_for(
+            lambda: (len(server.state.stream_afters) > afters
+                     and server.state.stream_afters[-1] == 3), 10,
+            "重连未从已消费游标继续")
+        body = await page.text_content("body") or ""
+        assert body.count("思考唯一内容") == 1, body
+        assert body.count("活动唯一内容") == 1, body
+        run = [run for run in server.state.runs.values()
+               if run["text"] == "断线思考"][-1]
+        run["resume"].set()
+        await page.get_by_text("断线后的回答", exact=True).last.wait_for(
+            timeout=15000)
+        assert server.state.post_chat_count == posts_after_send
+        results["r1_thinking_cursor"] = True
+        await page.screenshot(path=str(
+            EVIDENCE / "24-r1-thinking-cursor.png"))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"r1-thinking-cursor: {error!r}")
+    finally:
+        for run in server.state.runs.values():
+            if run["text"] == "断线思考":
+                run["resume"].set()
+        await context.close()
+
+
 async def main() -> int:
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     if not (DIST / "index.html").is_file():
@@ -1502,34 +1976,26 @@ async def main() -> int:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             version = browser.version
-            await scenario_control_layout(
-                browser, control, results, failures, screenshots)
-            await scenario_control_chat(
-                browser, control, results, failures, screenshots)
-            await scenario_question_and_stop(
-                browser, control, results, failures, screenshots)
-            await scenario_refresh_reconnect(
-                browser, control, results, failures, screenshots)
-            await scenario_cross_identity(
-                browser, control, results, failures, screenshots)
-            await scenario_cross_tab(
-                browser, control, results, failures, screenshots)
-            await scenario_delayed_history(
-                browser, control, results, failures, screenshots)
-            await scenario_selection_interleaving(
-                browser, control, results, failures, screenshots)
-            await scenario_admission_ordering(
-                browser, control, results, failures, screenshots)
-            await scenario_identity_unavailable(
-                browser, control, results, failures, screenshots)
-            await scenario_session_crud(
-                browser, control, results, failures, screenshots)
-            await scenario_history_pagination(
-                browser, control, results, failures, screenshots)
-            await scenario_failure_preserves(
-                browser, control, results, failures, screenshots)
-            await scenario_settings_delayed(
-                browser, control, results, failures, screenshots)
+            control_scenarios = [
+                scenario_control_layout, scenario_control_chat,
+                scenario_question_and_stop, scenario_refresh_reconnect,
+                scenario_cross_identity, scenario_cross_tab,
+                scenario_delayed_history, scenario_selection_interleaving,
+                scenario_admission_ordering, scenario_identity_unavailable,
+                scenario_session_crud, scenario_history_pagination,
+                scenario_failure_preserves, scenario_settings_delayed,
+                scenario_r1_submit_401, scenario_r1_question_status_401,
+                scenario_r1_initial_history_401,
+                scenario_r1_late_401_keeps_b,
+                scenario_r1_answer_503_retry, scenario_r1_answer_403,
+                scenario_r1_answer_409, scenario_r1_question_cursor,
+                scenario_r1_thinking_cursor,
+            ]
+            for scenario in control_scenarios:
+                await scenario(
+                    browser, control, results, failures, screenshots)
+                # 每个场景独立收尾：不把上一场景的活跃 Run 带入下一场景。
+                control.abandon_runs("A")
             await scenario_local_mode(
                 browser, local, results, failures, screenshots)
             await browser.close()
@@ -1560,7 +2026,11 @@ async def main() -> int:
         "control_selection_interleaving", "control_admission_ordering",
         "control_identity_unavailable", "control_session_crud",
         "control_history_pagination", "control_failure_preserves_completed",
-        "control_settings_delayed", "local_original_chat",
+        "control_settings_delayed", "r1_submit_401",
+        "r1_question_status_401", "r1_initial_history_401",
+        "r1_late_401_keeps_b", "r1_answer_503_retry",
+        "r1_answer_403", "r1_answer_409", "r1_question_cursor",
+        "r1_thinking_cursor", "local_original_chat",
     }
     return 0 if not failures and expected <= set(results) else 1
 
