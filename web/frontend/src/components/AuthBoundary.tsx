@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import LoginPage from './LoginPage';
+import AuthFrame from './AuthFrame';
 import {
   AuthError, IdentityEpoch, clearIdentityCache, loadIdentity, logout,
 } from '../lib/auth';
@@ -24,16 +25,12 @@ function Centered({ text, children }: {
   text: string; children?: ReactNode;
 }) {
   return (
-    <main style={{
-      minHeight: '100vh', display: 'grid', placeItems: 'center',
-      background: 'var(--bg, #0f1115)', color: 'var(--text, #c8ced9)',
-      padding: '24px', fontFamily: 'system-ui, sans-serif',
-    }}>
-      <div style={{ textAlign: 'center', display: 'grid', gap: '14px' }}>
-        <div>{text}</div>
+    <AuthFrame>
+      <div className="auth-status" role="status">
+        <p className="auth-status-text">{text}</p>
         {children}
       </div>
-    </main>
+    </AuthFrame>
   );
 }
 
@@ -156,7 +153,8 @@ export default function AuthBoundary({ children }: AuthBoundaryProps) {
   if (status === 'error') {
     return (
       <Centered text={fatal || '服务暂不可用'}>
-        <button type="button" onClick={() => void checkIdentity()}>
+        <button type="button" className="btn btn-primary"
+          onClick={() => void checkIdentity()}>
           重试
         </button>
       </Centered>

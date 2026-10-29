@@ -213,13 +213,16 @@ test('invite exchange clears neither token to storage and errors stay typed', as
   );
 });
 
-test('login errors keep 401/429/503/network semantics', () => {
+test('login errors keep 401/403/429/503/network semantics', () => {
   const auth = load(async () => {
     throw new Error('no network');
   });
   const { AuthError } = auth;
   assert.match(auth.loginErrorMessage(new AuthError(401, 'unauthorized')),
     /已使用|已过期/);
+  const forbidden = auth.loginErrorMessage(new AuthError(403, 'forbidden'));
+  assert.match(forbidden, /来源|权限/);
+  assert.doesNotMatch(forbidden, /邀请无效|已使用|已过期/);
   assert.match(auth.loginErrorMessage(new AuthError(429, 'rate_limited')),
     /过多/);
   assert.match(auth.loginErrorMessage(new AuthError(0, 'network_unavailable')),

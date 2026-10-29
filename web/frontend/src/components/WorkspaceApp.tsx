@@ -61,8 +61,8 @@ export default function WorkspaceApp({
 }: WorkspaceAppProps) {
   const [currentPage, setCurrentPage] = useState<Page>('chat');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<'personal' | 'admin'>(
-    'personal');
+  const [settingsTab, setSettingsTab] = useState<
+    'personal' | 'defaults' | 'members'>('personal');
   const workspace = useWorkspace({ ctx, epoch, epochs, onExpired });
   const features = workspaceModeFeatures('control');
   const admin = ctx.role === 'admin';
@@ -102,31 +102,6 @@ export default function WorkspaceApp({
     .filter(Boolean).join('；');
 
   const renderContent = () => {
-    if (settingsOpen) {
-      return (
-        <section className="settings-bridge" aria-label="工作区设置">
-          <div className="settings-bridge-tabs" role="tablist">
-            <button role="tab" aria-selected={settingsTab === 'personal'}
-              className={`settings-bridge-tab ${settingsTab === 'personal'
-                ? 'active' : ''}`}
-              onClick={() => setSettingsTab('personal')}>
-              个人设置
-            </button>
-            {admin && (
-              <button role="tab" aria-selected={settingsTab === 'admin'}
-                className={`settings-bridge-tab ${settingsTab === 'admin'
-                  ? 'active' : ''}`}
-                onClick={() => setSettingsTab('admin')}>
-                全体默认
-              </button>
-            )}
-          </div>
-          {settingsTab === 'admin' && admin
-            ? <AdminSettingsPage ctx={ctx} call={workspace.call} />
-            : <ControlSettingsPage ctx={ctx} call={workspace.call} />}
-        </section>
-      );
-    }
     if (currentPage !== 'chat') {
       return (
         <UnavailablePage page={currentPage}
@@ -167,7 +142,14 @@ export default function WorkspaceApp({
     );
   };
 
+  const settingsContent = admin && settingsTab === 'defaults'
+    ? <AdminSettingsPage ctx={ctx} call={workspace.call} section="defaults" />
+    : admin && settingsTab === 'members'
+      ? <AdminSettingsPage ctx={ctx} call={workspace.call} section="members" />
+      : <ControlSettingsPage ctx={ctx} call={workspace.call} />;
+
   return (
+    <>
     <WorkspaceLayout
       currentPage={currentPage}
       onPageChange={navigate}
@@ -202,5 +184,58 @@ export default function WorkspaceApp({
     >
       {renderContent()}
     </WorkspaceLayout>
+    {settingsOpen && (
+      <div className="settings-overlay"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSettingsOpen(false);
+        }}>
+        <div className="settings-panel" role="dialog" aria-modal="true"
+          aria-label="设置">
+          <div className="settings-head">
+            <div>
+              <h2 className="settings-title">设置</h2>
+              <div className="settings-sub">
+                {admin
+                  ? '个人覆盖 · 全体默认 · 成员与邀请'
+                  : '个人覆盖 · 能力模型'}
+              </div>
+            </div>
+            <div className="settings-actions">
+              <button className="settings-close" title="关闭"
+                onClick={() => setSettingsOpen(false)}>✕</button>
+            </div>
+          </div>
+          <div className="settings-body">
+            <nav className="settings-nav" role="tablist"
+              aria-label="设置分类" aria-orientation="vertical">
+              <button role="tab" aria-selected={settingsTab === 'personal'}
+                className={`snav${settingsTab === 'personal' ? ' active' : ''}`}
+                onClick={() => setSettingsTab('personal')}>
+                个人设置<small>能力模型</small>
+              </button>
+              {admin && (
+                <button role="tab" aria-selected={settingsTab === 'defaults'}
+                  className={`snav${settingsTab === 'defaults' ? ' active' : ''}`}
+                  onClick={() => setSettingsTab('defaults')}>
+                  全体默认<small>主聊天</small>
+                </button>
+              )}
+              {admin && (
+                <button role="tab" aria-selected={settingsTab === 'members'}
+                  className={`snav${settingsTab === 'members' ? ' active' : ''}`}
+                  onClick={() => setSettingsTab('members')}>
+                  成员与邀请<small>账号</small>
+                </button>
+              )}
+            </nav>
+            <div className="settings-main">{settingsContent}</div>
+          </div>
+          <div className="settings-foot">
+            设置作用于当前工作区；个人覆盖不会改变其他成员。
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

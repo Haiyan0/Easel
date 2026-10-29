@@ -96,8 +96,11 @@ export async function loadIdentity(
 /** 登录页错误文案：保留状态语义，不把 503 说成“没有邀请”。 */
 export function loginErrorMessage(error: unknown): string {
   if (error instanceof AuthError) {
-    if (error.status === 401 || error.status === 403) {
+    if (error.status === 401) {
       return '邀请无效、已使用或已过期，请联系管理员重新获取。';
+    }
+    if (error.status === 403) {
+      return '当前来源或账号权限不允许登录。请从管理员提供的地址重新打开，或联系管理员确认账号状态。';
     }
     if (error.status === 429) return '尝试次数过多，请稍后再试。';
     if (error.status === 0) return '网络不可用，请检查连接后重试。';

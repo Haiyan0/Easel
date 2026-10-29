@@ -19,6 +19,7 @@ import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
 import AuthBoundary from './components/AuthBoundary';
+import AuthFrame from './components/AuthFrame';
 import WorkspaceApp from './components/WorkspaceApp';
 import WorkspaceLayout from './components/WorkspaceLayout';
 import { detectRuntimeMode } from './lib/control';
@@ -66,11 +67,8 @@ export default function App() {
     return (
       <ModeNotice text="无法确认服务模式。为保护身份数据，未加载本地缓存。">
         <button
+          className="btn btn-primary"
           onClick={() => window.location.reload()}
-          style={{
-            border: 'none', background: '#8b5cf6', color: 'white',
-            borderRadius: '9px', padding: '9px 14px', cursor: 'pointer',
-          }}
         >重试</button>
       </ModeNotice>
     );
@@ -97,17 +95,12 @@ function ModeNotice({ text, children }: {
   text: string; children?: ReactNode;
 }) {
   return (
-    <main style={{
-      minHeight: '100vh', display: 'grid', placeItems: 'center',
-      background: '#0f1115', color: '#c8ced9', padding: '24px',
-      fontFamily: 'system-ui, sans-serif',
-    }}>
-      <div style={{ maxWidth: '440px', textAlign: 'center',
-        display: 'grid', gap: '14px' }}>
-        <div>{text}</div>
+    <AuthFrame>
+      <div className="auth-status" role="status">
+        <p className="auth-status-text">{text}</p>
         {children}
       </div>
-    </main>
+    </AuthFrame>
   );
 }
 

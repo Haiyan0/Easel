@@ -7,7 +7,7 @@ ChatPage、身份切换、迟到响应、问题卡、停止、刷新重连与 lo
 from __future__ import annotations
 
 import asyncio
-import base64
+import hashlib
 import inspect
 import json
 import mimetypes
@@ -22,9 +22,10 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[2]
 DIST = ROOT / "web" / "frontend" / "dist"
 EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-03" / "browser"
-PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
-    "/x8AAusB9Y9Z0mQAAAAASUVORK5CYII=")
+BRAND = DIST / "static" / "easel-icon-transparent.png"
+BRAND_SHA256 = (
+    "71c260f5a28e82aced0a513186ebdcf43782b068633e3a7ca5f159d3e3606132"
+)
 
 USERS = {
     "A": {
@@ -377,13 +378,6 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path in ("/", "/index.html"):
             file_path = DIST / "index.html"
-        elif path == "/static/easel-icon-transparent.png":
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(PNG)))
-            self.end_headers()
-            self.wfile.write(PNG)
-            return True
         else:
             relative = path.lstrip("/")
             file_path = (DIST / relative).resolve()
@@ -1141,6 +1135,15 @@ async def scenario_control_layout(browser, server: Server,
         await page.get_by_role("button", name="进入工作区").click()
         await page.locator(".sidebar").wait_for(timeout=15000)
         await page.locator(".chat-page").wait_for(timeout=15000)
+        logo = page.locator(".sidebar-logo-icon")
+        assert await logo.evaluate(
+            "(img) => img.complete && img.naturalWidth") == 800, \
+            "Sidebar 未加载真实 800×800 品牌图"
+        brand = await page.request.get(
+            f"{server.origin}/static/easel-icon-transparent.png")
+        assert brand.status == 200
+        assert brand.headers["content-type"].startswith("image/png")
+        assert hashlib.sha256(await brand.body()).hexdigest() == BRAND_SHA256
         body = await page.text_content("body") or ""
         for label in ("工作台", "对话", "技能库", "内容库", "账号", "画像"):
             assert label in body, label
@@ -1675,6 +1678,9 @@ async def scenario_settings_delayed(browser, server: Server,
         await wait_for(
             lambda: server.state.a_settings_waiting.is_set(), 10,
             "A 设置请求未挂起")
+        # 设置现在复用原设置的模态容器；注销前先关闭，侧栏才能操作。
+        await page.locator(".settings-close").click()
+        await page.locator(".settings-overlay").wait_for(state="detached")
         await logout(page)
         await page.fill("#invite", "invite-b4")
         await page.get_by_role("button", name="进入工作区").click()

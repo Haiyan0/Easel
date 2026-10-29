@@ -1208,6 +1208,95 @@ test('admin member management still loads when managed config is unavailable', a
   assert.doesNotMatch(text(tree), /受管默认模型/);
 });
 
+test('admin defaults section guides an unconfigured main chat instead of claiming ready', async () => {
+  const { call } = recorder((path) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      return { invites: [], nextOffset: null };
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call, section: 'defaults' });
+  await settle();
+  let tree = view.render({
+    ctx: ctx({ role: 'admin' }), call, section: 'defaults',
+  });
+  assert.match(text(tree), /主聊天尚未配置/);
+  assert.match(text(tree), /配置主聊天/);
+  assert.doesNotMatch(text(tree), /主聊天已配置/);
+  assert.equal(text(tree).includes('成员与邀请'), false,
+    '全体默认 section 不应同时渲染成员写入区');
+
+  button(tree, '配置主聊天').props.onClick();
+  tree = view.render({
+    ctx: ctx({ role: 'admin' }), call, section: 'defaults',
+  });
+  const chatChannel = nodes(tree, 'button').find((node) =>
+    text(node).trim() === '主聊天');
+  assert.equal(chatChannel.props['aria-pressed'], true);
+});
+
+test('admin defaults section reports a real configured main chat', async () => {
+  const { call } = recorder((path) => {
+    if (path === '/api/admin/managed-config') {
+      return managedSettings({
+        chat: {
+          provider: 'managed-provider',
+          model: 'managed-chat',
+          base_url: 'https://provider.example/v1',
+          protocol: 'openai',
+          options: {},
+          allowed_models: ['managed-chat'],
+          credential_configured: true,
+        },
+      });
+    }
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      return { invites: [], nextOffset: null };
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call, section: 'defaults' });
+  await settle();
+  const tree = view.render({
+    ctx: ctx({ role: 'admin' }), call, section: 'defaults',
+  });
+  assert.match(text(tree), /主聊天已配置/);
+  assert.match(text(tree), /managed-chat/);
+  assert.doesNotMatch(text(tree), /主聊天尚未配置/);
+});
+
+test('admin members section keeps member controls without the default form', async () => {
+  const { call } = recorder((path) => {
+    if (path === '/api/admin/managed-config') return managedSettings();
+    if (path.startsWith('/api/admin/users?')) {
+      return { users: [user()], nextOffset: null };
+    }
+    if (path.startsWith('/api/admin/invites?')) {
+      return { invites: [], nextOffset: null };
+    }
+    throw new Error(`unexpected ${path}`);
+  });
+  const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
+  view.render({ ctx: ctx({ role: 'admin' }), call, section: 'members' });
+  await settle();
+  const tree = view.render({
+    ctx: ctx({ role: 'admin' }), call, section: 'members',
+  });
+  assert.match(text(tree), /成员与邀请/);
+  assert.ok(button(tree, '创建邀请'));
+  assert.equal(button(tree, '保存全体默认'), undefined);
+  assert.doesNotMatch(text(tree), /受管默认模型/);
+});
+
 test('admin page refuses a non-admin even if mounted by mistake', async () => {
   const { call, requests } = recorder(() => managedSettings());
   const view = createView('../../web/frontend/src/components/AdminSettingsPage.tsx');
