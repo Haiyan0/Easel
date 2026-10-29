@@ -325,6 +325,7 @@ export default function ChatPage({
           })}
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (
             <QuestionCards questions={stream!.questions || []}
+              pending={stream!.questionPending === true}
               onDone={(qid) => onQuestionAnswered?.(qid)}
               onAnswer={onAnswerQuestion} />
           )}

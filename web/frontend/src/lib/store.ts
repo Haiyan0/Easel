@@ -31,6 +31,7 @@ export interface StreamState {
   activity: string;
   stillWorking?: string;   // 防呆心跳提示（未卡住）；独立于 activity，不覆盖真实状态
   questions: ChatQuestion[];   // ask_user 问答题卡片（进行中）
+  questionPending?: boolean;   // control：问题事件已消费，状态仍在核对，禁止提交
 }
 
 /** 发布中心草稿：持久化到 localStorage，切页/刷新都不丢。 */

@@ -29,9 +29,12 @@ interface QuestionCardProps {
   onAnswer?: (
     question: ChatQuestion, answers: Record<string, string[]>,
   ) => Promise<AnswerResult>;
+  pending?: boolean;
 }
 
-function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
+function QuestionCard({
+  question, onAnswered, onAnswer, pending = false,
+}: QuestionCardProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<Record<string, string[]>>({});
@@ -74,7 +77,7 @@ function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
   };
 
   const submit = async () => {
-    if (busy || !allAnswered) return;
+    if (busy || pending || !allAnswered) return;
     setBusy(true); setError('');
     const answers = questionAnswersFor(items, selected);
     try {
@@ -93,7 +96,8 @@ function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
   return (
     <div className="message-row assistant">
       <div className="msg-col assistant" style={{ maxWidth: '80%' }}>
-        <div className="question-card">
+        <div className="question-card"
+          data-pending={pending ? 'true' : 'false'}>
           {items.map((it, idx) => {
             const options: { label: string; description?: string }[] = it.options || [];
             const vals = valsOf(it);
@@ -157,7 +161,8 @@ function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
           {/* 单选题：选完点提交；多题：全部选齐后提交（单选/多选同一规则） */}
           {items.length === 1 ? (
             <div className="question-card__actions">
-              <button className="question-card__submit" disabled={busy || !allAnswered}
+              <button className="question-card__submit"
+                disabled={busy || pending || !allAnswered}
                 onClick={() => void submit()}>
                 提交
               </button>
@@ -165,11 +170,15 @@ function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
           ) : (
             allAnswered && !busy && (
               <div className="question-card__actions">
-                <button className="question-card__submit" disabled={busy} onClick={() => void submit()}>
+                <button className="question-card__submit"
+                  disabled={busy || pending} onClick={() => void submit()}>
                   全部已选，提交
                 </button>
               </div>
             )
+          )}
+          {pending && !busy && (
+            <div className="question-card__hint">正在确认问题状态…</div>
           )}
           {busy && <div className="question-card__hint">已提交，Agent 继续处理中…</div>}
           {error && <div className="question-card__hint question-card__error">{error}</div>}
@@ -181,13 +190,14 @@ function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
 
 /** 流式中的 ask_user 问答题列表（一次性卡片，答完即从当前流移除）。 */
 export default function QuestionCards({
-  questions, onDone, onAnswer,
+  questions, onDone, onAnswer, pending = false,
 }: {
   questions: ChatQuestion[];
   onDone?: (questionId: string) => void;
   onAnswer?: (
     question: ChatQuestion, answers: Record<string, string[]>,
   ) => Promise<AnswerResult>;
+  pending?: boolean;
 }) {
   const [answered, setAnswered] = useState<Record<string, boolean>>({});
   const visible = useMemo(
@@ -199,6 +209,7 @@ export default function QuestionCards({
     <>
       {visible.map((q) => (
         <QuestionCard key={q.id} question={q} onAnswer={onAnswer}
+          pending={pending}
           onAnswered={() => {
             setAnswered((a) => ({ ...a, [q.id]: true }));
             onDone?.(q.id);   // 通知 App：此题已答，重放/恢复不再出现

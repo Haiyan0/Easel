@@ -38,6 +38,9 @@ interface ClientRun {
   thinking: string;
   activity: string;
   question: ChatQuestion | null;
+  // true 表示已收到 question 事件但尚未由服务端确认仍为 pending；
+  // 此时题卡只读展示、禁止提交，重连后由新连接继续核对。
+  questionPending: boolean;
   answered: string[];
   cursor: number;
 }
@@ -535,8 +538,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
       ? { ...previous, cursor: Math.max(0, after) }
       : {
         runId, turnId, sessionId, state: 'accepted', content: '',
-        thinking: '', activity: '', question: null, answered: [],
-        cursor: Math.max(0, after),
+        thinking: '', activity: '', question: null, questionPending: false,
+        answered: [], cursor: Math.max(0, after),
       };
     runRef.current = initial;
     setStreamActive(true);
@@ -582,6 +585,52 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
       }));
       return true;
     };
+    // 问题事件可能先于状态查询落地；重连时必须由新连接继续核对，
+    // 不能依赖旧请求一定成功，也不能把未知状态当成已授权。
+    const verifyQuestion = async (question: ChatQuestion) => {
+      try {
+        const status = await client.questionStatus(
+          runId, [question.id], controller.signal);
+        if (!owns()) return;
+        const state = status[question.id]?.status;
+        const explicit = typeof state === 'string' && state !== ''
+          && state !== 'pending';
+        apply(() => setRun((current) => {
+          if (!current || current.runId !== runId) return current;
+          if (current.answered.includes(question.id)) {
+            return current.question?.id === question.id
+              ? { ...current, question: null, questionPending: false }
+              : current;
+          }
+          if (current.question?.id !== question.id) {
+            return explicit
+              ? { ...current, answered: [...current.answered, question.id] }
+              : current;
+          }
+          if (explicit) {
+            return { ...current, question: null, questionPending: false,
+              answered: [...current.answered, question.id] };
+          }
+          if (state === 'pending') {
+            return { ...current, questionPending: false };
+          }
+          return current;
+        }));
+      } catch (error) {
+        if (handleAuthError(error)) return;
+        if (!owns()) return;
+        const current = runRef.current;
+        if (!current || current.runId !== runId
+            || current.question?.id !== question.id
+            || !current.questionPending) return;
+        apply(() => setNotice(
+          '问题状态确认失败；题卡暂不可提交，重连后会继续确认。'));
+      }
+    };
+    // 重连继承待确认 payload，立刻用新连接归属继续核对。
+    if (initial.question && initial.questionPending) {
+      void verifyQuestion(initial.question);
+    }
     try {
       const result = await client.streamRun(runId, after, {
         onState: (state, frame) => {
@@ -608,33 +657,16 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
           apply(() => setNotice(text));
         },
         onQuestion: (question: ControlQuestion, frame) => {
-          if (!commitFrame(frame, () => ({}))) return;
-          void client.questionStatus(
-            runId, [question.id], controller.signal).then((status) => {
-            if (!owns()) return;
-            const state = status[question.id]?.status;
-            if (state && state !== 'pending') {
-              apply(() => setRun((current) => current
-                && current.runId === runId
-                ? { ...current,
-                  answered: [...current.answered, question.id] } : current));
-              return;
-            }
-            apply(() => setRun((current) => {
-              if (!current || current.runId !== runId
-                  || current.answered.includes(question.id)) return current;
-              return { ...current,
-                question: controlQuestionView(question) };
-            }));
-          }).catch((error) => {
-            if (handleAuthError(error)) return;
-            if (!owns()) return;
-            apply(() => setRun((current) => {
-              if (!current || current.runId !== runId) return current;
-              return { ...current,
-                question: controlQuestionView(question) };
-            }));
-          });
+          const view = controlQuestionView(question);
+          // 游标与待确认 payload 必须同步提交：这样即使状态请求未回、
+          // 流已断开并重连，新连接仍能从 runRef/React 状态恢复题卡。
+          if (!commitFrame(frame, (current) => (
+            current.answered.includes(view.id)
+              ? {}
+              : { question: view, questionPending: true }))) return;
+          if (!runRef.current?.answered.includes(view.id)) {
+            void verifyQuestion(view);
+          }
         },
       }, controller.signal);
       if (result.aborted || controller.signal.aborted) return;
@@ -911,7 +943,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
         return { ok: true };
       }
       apply(() => setRun((value) => value && value.runId === current.runId
-        ? { ...value, question: null,
+        ? { ...value, question: null, questionPending: false,
           answered: [...value.answered, question.id] } : value));
       return { ok: true };
     } catch (error) {
@@ -928,7 +960,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
         apply(() => {
           setNotice(message);
           setRun((value) => value && value.runId === current.runId
-            ? { ...value, question: null } : value);
+            ? { ...value, question: null, questionPending: false } : value);
         });
         return { ok: false, error: message };
       }
@@ -999,6 +1031,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     thinking: activeRun.thinking,
     activity: activeRun.activity,
     questions: activeRun.question ? [activeRun.question] : [],
+    questionPending: activeRun.questionPending,
   } : undefined;
   const canReconnect = !!activeRun && !isTerminalRun(activeRun.state)
     && !streamActive;
