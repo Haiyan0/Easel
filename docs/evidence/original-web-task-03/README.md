@@ -1,6 +1,7 @@
 # 原 Web 修复 Task 3 证据：共用认证与会话数据层
 
 > Task 3 R1 三项返工证据见 [R1.md](R1.md)。
+> Task 3 R2 待确认题卡恢复证据见 [R2.md](R2.md)。
 
 日期：2026-10-29（Asia/Shanghai）。
 父基线：`4bb993bb353f23f5eec06442d2f6ce1c6c2e3090`（Task 2 验收）。
