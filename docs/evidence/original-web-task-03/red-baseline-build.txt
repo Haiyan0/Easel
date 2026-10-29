@@ -12,13 +12,13 @@ dist/assets/index-D-Q9WPHd.css   89.90 kB │ gzip:  16.32 kB
 dist/assets/index-C1w31LuT.js   601.63 kB │ gzip: 186.48 kB
 
 ✓ built in 177ms
-node.exe : [plugin builtin:vite-reporter] 
+node.exe : [plugin builtin:vite-reporter]
 At line:1 char:1
 + & "C:\Program Files\nodejs/node.exe" "C:\Users\hyh\AppData\Roaming\np ...
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: ([plugin builtin:vite-reporter] :String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 (!) Some chunks are larger than 500 kB after minification. Consider:
 - Using dynamic import() to code-split the application
 - Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeS

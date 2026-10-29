@@ -121,9 +121,9 @@ test at tests\frontend\personaSession.test.mjs:1:1
 test at tests\frontend\questionCards.test.mjs:54:1
 ✖ control options carry opaque values while showing human labels (0.9768ms)
   AssertionError [ERR_ASSERTION]: The input did not match the regular expression /data-value="qopt_allow"/. Input:
-  
+
   '<div class="message-row assistant"><div class="msg-col assistant" style="max-width:80%"><div class="question-card"><div class="question-card__item"><div class="question-card__chip">授权</div><div class="question-card__title">允许？</div><div class="question-card__options"><button class="question-card__option"><strong>允许本次</strong></button><button class="question-card__option"><strong>拒绝</strong></button><button class="question-card__other">自行输入…</button></div></div><div class="question-card__actions"><button class="question-card__submit" disabled="">提交</button></div></div></div></div>'
-  
+
       at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/questionCards.test.mjs:70:10)
       at Test.runInAsyncScope (node:async_hooks:214:14)
       at Test.run (node:internal/test_runner/test:1106:25)
