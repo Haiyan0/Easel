@@ -1,0 +1,5 @@
+SUBMIT_401={"sidebar_visible": false, "login_visible": true, "pending_visible": false}
+ANSWER_503={"question_cards": 1, "backend_answered": false, "backend_waiting": true}
+THINKING_REPLAY={"before_count": 1, "after_count": 1, "after_values": [0, 2]}
+ISOLATED_ADMISSION={"results": {"control_admission_ordering": true}, "failure_count": 0}
+FIXTURE_CLEANUP=ok

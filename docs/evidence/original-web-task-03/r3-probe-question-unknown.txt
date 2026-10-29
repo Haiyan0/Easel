@@ -1,0 +1,5 @@
+QUESTION_STATUS={"status": null, "cards": 1, "pending": "true", "backend_pending": true}
+QUESTION_STATUS={"status": "unknown", "cards": 1, "pending": "true", "backend_pending": true}
+QUESTION_STATUS={"status": "checking", "cards": 1, "pending": "true", "backend_pending": true}
+QUESTION_STATUS={"status": "pending", "cards": 1, "pending": "false", "backend_pending": true}
+FIXTURE_CLEANUP=ok
