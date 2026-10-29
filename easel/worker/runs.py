@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -54,6 +55,60 @@ SHUTDOWN_GRACE_ENV = "EASEL_WORKER_DRAIN_TIMEOUT"
 DEFAULT_SHUTDOWN_GRACE = 15.0
 MAX_SHUTDOWN_GRACE = 120.0
 _SHUTDOWN_CANCEL_TIMEOUT = 5.0
+
+_LOGGER = logging.getLogger(__name__)
+
+# 用户可见诊断只使用固定词表；不拼接异常 message、stderr、prompt 或路径。
+_STAGE_LABELS = {
+    "cli_start": "启动 Agent 进程",
+    "initialize": "初始化 Agent 协议",
+    "session": "建立或恢复会话",
+    "model": "选择模型",
+    "prompt": "执行本轮对话",
+    "rpc": "Agent 协议通信",
+    "unknown": "未知阶段",
+}
+_CATEGORY_LABELS = {
+    "auth": "上游鉴权失败",
+    "rate_limited": "上游限速",
+    "request_rejected": "上游拒绝请求",
+    "service_unavailable": "上游服务不可用",
+    "unknown": "未知原因（未获得可分类的上游证据）",
+}
+
+
+def _failure_diagnostic(error: BaseException
+                        ) -> tuple[str, str, int | None, str]:
+    """把适配器异常收敛为固定阶段/类别/状态码与可追踪 reason。"""
+    stage = getattr(error, "stage", None)
+    if type(stage) is not str or stage not in _STAGE_LABELS:
+        stage = "unknown"
+    category = getattr(error, "category", None)
+    if type(category) is not str or category not in _CATEGORY_LABELS:
+        category = "unknown"
+    status = getattr(error, "status", None)
+    if type(status) is not int or not 100 <= status <= 599:
+        status = None
+    reason = "agent_failed" if category == "unknown" else \
+        f"harness_{category}"
+    return stage, category, status, reason
+
+
+def _display_run_id(run_id: object) -> str:
+    if (not isinstance(run_id, str) or not run_id or len(run_id) > 128
+            or any(not (character.isalnum()
+                        or character in "-_.:")
+                   for character in run_id)):
+        return "unknown"
+    return run_id
+
+
+def _failure_message(run_id: str, stage: str, category: str,
+                     status: int | None) -> str:
+    evidence = f"状态码：{status}；" if status is not None else ""
+    return (f"Agent 执行失败（阶段：{_STAGE_LABELS[stage]}；"
+            f"类别：{_CATEGORY_LABELS[category]}；{evidence}"
+            f"任务：{_display_run_id(run_id)}）")
 
 
 def shutdown_grace_from_env(environ: Mapping[str, str] | None = None) -> float:
@@ -1358,7 +1413,8 @@ class RunManager:
             self._release(context)
             raise
         except asyncio.TimeoutError:
-            emit("error", "Agent 执行超时，已终止本轮进程")
+            emit("error", "Agent 执行超时，已终止本轮进程"
+                          f"（任务：{_display_run_id(run_id)}）")
             self.registry.finish_if_active(run_id, "failed", "timeout")
             self._release(context)
             return
@@ -1368,9 +1424,15 @@ class RunManager:
                 run_id, "failed", error.code)
             self._release(context)
             return
-        except Exception:  # noqa: BLE001 - 适配器边界统一收敛失败
-            emit("error", "Agent 执行失败，请检查本机 CLI、登录和模型配置")
-            self.registry.finish_if_active(run_id, "failed", "agent_failed")
+        except Exception as error:  # noqa: BLE001 - 适配器边界统一收敛失败
+            stage, category, status, reason = _failure_diagnostic(error)
+            # 运维日志只保留可追踪分类，不写 message/stderr/prompt/路径/命令。
+            _LOGGER.warning(
+                "run failure run_id=%s stage=%s category=%s status=%s"
+                " error_type=%s", _display_run_id(run_id), stage, category,
+                status, type(error).__name__)
+            emit("error", _failure_message(run_id, stage, category, status))
+            self.registry.finish_if_active(run_id, "failed", reason)
             self._release(context)
             return
 

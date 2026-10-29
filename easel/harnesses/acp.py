@@ -55,7 +55,8 @@ class ACPAdapter:
             command = list(acp_command(request.cwd,
                                        managed_command=request.command))
         elif request.workspace_id:
-            raise HarnessError("worker 模式缺少受管 ACP 命令")
+            raise HarnessError("worker 模式缺少受管 ACP 命令",
+                               stage="cli_start")
         else:
             command = list(acp_command(request.cwd))
         async with connection(request, command, notify, respond, acp=True) as rpc:
@@ -63,10 +64,10 @@ class ACPAdapter:
                 rpc.initialized = await rpc.call("initialize", {
                     "protocolVersion": 1, "clientInfo": {"name": "easel", "version": __version__},
                     "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
-                                           "terminal": False}})
+                                           "terminal": False}}, stage="initialize")
             initialized = rpc.initialized
             if initialized.get("protocolVersion") != 1:
-                raise HarnessError("Agent 不支持 ACP v1")
+                raise HarnessError("Agent 不支持 ACP v1", stage="initialize")
             capabilities = initialized.get("agentCapabilities") or {}
             params = {"cwd": str(request.cwd), "mcpServers": []}
             if session_id and rpc.native_id == session_id:
@@ -78,15 +79,21 @@ class ACPAdapter:
                 elif capabilities.get("loadSession"):
                     resume_method = "session/load"
                 else:
-                    raise HarnessError("此 ACP Agent 不支持历史续接；请新建对话")
-                result = await rpc.call(resume_method, {**params, "sessionId": session_id})
+                    raise HarnessError("此 ACP Agent 不支持历史续接；请新建对话",
+                                       stage="session")
+                result = await rpc.call(resume_method,
+                                        {**params, "sessionId": session_id},
+                                        stage="session")
                 if result.get("sessionId", session_id) != session_id:
-                    raise HarnessError("ACP 返回了不同的原生会话 ID，不会替换已有历史")
+                    raise HarnessError("ACP 返回了不同的原生会话 ID，不会替换已有历史",
+                                       stage="session")
             else:
-                result = await rpc.call("session/new", params)
+                result = await rpc.call("session/new", params,
+                                        stage="session")
                 session_id = result.get("sessionId", "")
                 if not session_id:
-                    raise HarnessError("ACP Agent 未返回会话 ID")
+                    raise HarnessError("ACP Agent 未返回会话 ID",
+                                       stage="session")
             bind(session_id)
             rpc.native_id = session_id
             rpc.session_info = result
@@ -95,22 +102,26 @@ class ACPAdapter:
                 model_option = next((option for option in config_options if option.get("category") == "model"), None)
                 if model_option:
                     await rpc.call("session/set_config_option", {
-                        "sessionId": session_id, "configId": model_option["id"], "value": request.model})
+                        "sessionId": session_id, "configId": model_option["id"], "value": request.model},
+                        stage="model")
                 elif result.get("models"):
-                    await rpc.call("session/set_model", {"sessionId": session_id, "modelId": request.model})
+                    await rpc.call("session/set_model", {"sessionId": session_id, "modelId": request.model},
+                                   stage="model")
                 else:
-                    raise HarnessError("此 ACP Agent 未提供模型切换能力，请清空覆盖值使用原生配置")
+                    raise HarnessError("此 ACP Agent 未提供模型切换能力，请清空覆盖值使用原生配置",
+                                       stage="model")
             active = True
             prompt = harness_instructions(request) + "\n\n" + request.prompt
             pending = asyncio.create_task(rpc.call("session/prompt", {
                 "sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]},
-                timeout=request.timeout))
+                timeout=request.timeout, stage="prompt"))
             try:
                 # Keep the original response alive: ACP v1 acknowledges cancel
                 # by resolving session/prompt, not by replying to session/cancel.
                 result = await asyncio.shield(pending)
                 if result.get("stopReason") != "end_turn":
-                    raise HarnessError(f"Agent 本轮未正常完成：{result.get('stopReason', 'unknown')}")
+                    raise HarnessError(f"Agent 本轮未正常完成：{result.get('stopReason', 'unknown')}",
+                                       stage="prompt")
             except asyncio.CancelledError:
                 async def cancel_and_wait():
                     await rpc.send({"method": "session/cancel", "params": {"sessionId": session_id}})
