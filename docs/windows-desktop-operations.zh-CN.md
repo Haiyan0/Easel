@@ -1,6 +1,6 @@
 # Easel Windows 本机与 Docker Desktop 使用运维手册
 
-适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`04b5f23e36879e72fbafa345dc2ed06abd26a5ae`（A7；A7-R1 修订见交付说明），2026-10-29。
+适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`e8376753d63eb681560ae868aa2d1528b2756c85`（A7-R1；A7-R2 修订见交付说明），2026-10-29。
 
 本文把“Desktop”理解为 **Windows 上的 Docker Desktop**；Easel 当前的操作界面仍是浏览器，不是另一个独立 Windows 安装包。只读这份手册即可先在本机使用；服务器部署见[Linux Docker 手册](linux-docker-operations.zh-CN.md)。
 
@@ -654,7 +654,7 @@ $Backup = (Get-ChildItem (Join-Path $DataRoot 'backups') -Directory |
 
 `Backup` 会先读取 `$DataRoot\logs\deployment.json`，要求传入的 `-DataRoot`/`-WorkspaceRoot` 与已启动部署登记值指向同一物理目录；错误空根、重解析点或路径别名在启动备份容器前失败。v2 完整备份必须提供真实 workspace 根；已有 Run 历史的 workspace 缺目录时失败，尚未物化的新 workspace 才允许为空。
 
-预期 `version=2`、`clean_stop=true`、`workspaces=<数量>`、`verified_backup=...`。备份目录在 `$DataRoot\backups\<时间戳>`，Windows ACL 只授予当前用户/SYSTEM/Administrators；不要放进 Git 或公开目录。`Verify` 只读，逐项核对清单中全部文件的大小/SHA-256，不只看 SQLite/签名配置；不生成 key、不改备份。
+预期 `version=2`、`clean_stop=true`、`workspaces=<数量>`、`verified_backup=...`。备份目录在 `$DataRoot\backups\<时间戳>`，Windows ACL 只授予当前用户/SYSTEM/Administrators；不要放进 Git 或公开目录。`Verify` 真正只读：逐项核对清单中全部文件的大小/SHA-256，并在私有数据库副本上检查 SQLite/密文，不创建 `-wal`/`-shm`、不生成 key、不改备份；连续执行两次结果一致。
 
 ### 9.10 恢复到新目录/新项目
 
@@ -683,7 +683,7 @@ $RestoredWorkspaces = 'C:\Easel\workspaces-restored'
 
 - 只读校验备份，拒绝错 key、缺文件、改摘要、未来 schema、非空目标、外来卷/路径逃逸；
 - 创建新卷/网络，把恢复材料落到新目标，不覆盖源；
-- `prepare-restore` 只修改 staging 控制库并更新 staging 清单的来源摘要，**原备份不变**；`materialize-restore` 再核对输入与实际复制字节，失败只清理本次目标；
+- `prepare-restore` 先按原清单校验整个 staging；数据库或 workspace 已被篡改时拒绝，DB/manifest/文件集合均不变。只有合法输入才修改 staging 控制库并更新 staging 清单的来源摘要，**原备份不变**；`materialize-restore` 再核对输入与实际复制字节，失败只清理本次目标；
 - 清除旧屏障/旧 lease 身份、撤销旧登录/未兑换邀请/Run token，签发一次性管理员恢复邀请；
 - 保留 workspace ID、消息和原生会话绑定（容器内 cwd 仍是 `/workspace`）。
 
@@ -710,7 +710,7 @@ $RestoredWorkspaces = 'C:\Easel\workspaces-restored'
   -UpgradeFromBackup $Backup
 ```
 
-预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。在 **compose up 新 control 之前**，`Start` 会先用只读容器执行完整 `verify-backup`，并匹配旧 `deployment.json` 的项目/镜像/配置/根目录；只有 manifest、缺 key/DB、损坏数据或错版本会在新程序打开/迁移正式 DB 之前失败。随后才启动 control、读取 stop 完成记录并执行 `upgrade-complete`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
+预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。在 **compose up 新 control 之前**，`Start` 会通过只读副本读取当前 barrier/Stop 完成记录与 key 指纹，要求备份 `runtime_state.stop` 精确匹配**当前同一轮 Stop**（屏障/项目/旧配置/完成时间）且 key 来源一致；再用只读容器执行完整 `verify-backup`。旧备份、只有 manifest、缺 key/DB、损坏数据或错版本都会在新程序打开/迁移正式 DB 之前失败。随后才启动 control、读取 stop 完成记录并执行 `upgrade-complete`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
 
 回滚：不要在原卷上强行降 schema。用升级前的匹配备份按 9.10 恢复到新项目/目录，使用旧镜像启动，验证历史和新消息，再停止。
 

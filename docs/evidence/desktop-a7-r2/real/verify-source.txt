@@ -1,0 +1,14 @@
+verified=/backup
+version=2
+schema_version=14
+files=35
+workspaces=3
+clean_stop=true
+project=easel-a7-live-49078de2
+config_sha256=84a0d4b2bb9bd4ca43f19beab9264cf1bfca2caa55efa7b1cbdd5e8ef72a3256
+worker_image=sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9
+gateway_image=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a
+control_image=sha256:9fc4e037f82ad16a6d0553ee208cf0b85731ed23d57532da132f628474422009
+harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317
+backup_manifest_sha256=730ce9e19de979721c1e9cfc49de567d8d5eceebcbab4c609bece84c8d0bfd9c
+verified_backup=C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3834\test_real_backup_restore_upgra0\source\data\backups\desktop-20261029-110801

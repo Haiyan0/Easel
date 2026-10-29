@@ -1,0 +1,4 @@
+started project=easel-a7-live-49078de2 origin=https://a7-live-49078de2.example port=7800 control=sha256:9fc4e037f82ad16a6d0553ee208cf0b85731ed23d57532da132f628474422009 worker=sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9 gateway=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a network=easel-a7-live-49078de2-control provisioner_socket=/tmp/easel-runtime/easel-a7-live-49078de2/provisioner.sock
+deployment_file=C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3834\test_real_backup_restore_upgra0\source\data\logs\deployment.json
+config_sha256=84a0d4b2bb9bd4ca43f19beab9264cf1bfca2caa55efa7b1cbdd5e8ef72a3256
+frontend_sha256=55cfa8bf96ea9a2a079b6fbf2e6f27d435f04cfe47047182f533c4d0409c4f49

@@ -586,7 +586,9 @@ function Assert-EaselUpgradeBackup {
         [Parameter(Mandatory)][string]$ProjectName,
         [Parameter(Mandatory)][string]$OldDeploymentFile,
         [Parameter(Mandatory)][string]$Distro,
-        [Parameter(Mandatory)][string]$Image
+        [Parameter(Mandatory)][string]$Image,
+        [string]$ControlVolume = '',
+        [string]$KeyVolume = ''
     )
     # 升级前对真实备份做只读全量校验，并先绑定旧部署身份；调用方必须
     # 在 compose up（新 control 可能打开/迁移正式 DB）之前执行。
@@ -625,6 +627,77 @@ function Assert-EaselUpgradeBackup {
         [string]$manifest.deployment.data_root -ne
             [string]$oldDeployment.data_root) {
         throw 'upgrade_deployment_mismatch'
+    }
+
+    # 备份必须来自“当前正式控制库的同一轮 Stop”；只读副本查询控制库，
+    # 不打开 Store、不执行 schema 迁移、不写正式卷。
+    if (-not $ControlVolume -or -not $KeyVolume) {
+        throw 'upgrade_stop_state_unavailable'
+    }
+    $state = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'run', '--rm',
+        '--network', 'none', '--read-only',
+        '--user', '10001:10001', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges:true',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=32m',
+        '--entrypoint', 'python',
+        '--mount', "type=volume,src=$ControlVolume,dst=/control,readonly",
+        '--mount', "type=volume,src=$KeyVolume,dst=/keys,readonly",
+        $Image, '/opt/easel/deploy/desktop/read_stop_state.py',
+        '--control-dir', '/control', '--keys-dir', '/keys')
+    if ($state.ExitCode -ne 0) {
+        throw ("upgrade_stop_state_unavailable:" +
+            (($state.Output -join ',').Trim()))
+    }
+    $stateLine = $state.Output |
+        Where-Object { "$_" -match '^stop_state=' } |
+        Select-Object -Last 1
+    if (-not $stateLine) {
+        throw 'upgrade_stop_state_invalid'
+    }
+    try {
+        $stopState = $stateLine.Substring(11) | ConvertFrom-Json
+    }
+    catch {
+        throw 'upgrade_stop_state_invalid'
+    }
+    $barrier = $stopState.admission_barrier
+    $completion = $stopState.stop_completion
+    $backupStop = $manifest.runtime_state.stop
+    if ($null -eq $barrier -or $null -eq $completion -or
+        $null -eq $backupStop -or
+        [string]$barrier.id -ne [string]$completion.barrierId -or
+        [string]$backupStop.barrierId -ne [string]$completion.barrierId -or
+        [string]$backupStop.project -ne [string]$completion.project -or
+        [string]$backupStop.configSha256 -ne
+            [string]$completion.configSha256 -or
+        [string]$backupStop.completedAt -ne
+            [string]$completion.completedAt) {
+        throw 'upgrade_stop_commitment_mismatch'
+    }
+    $hashes = @{}
+    foreach ($line in $state.Output) {
+        if ("$line" -match '^(master_key|signing_key|worker_public|gateway_public)_sha256=([0-9a-f]{64})$') {
+            $hashes[$Matches[1]] = $Matches[2]
+        }
+    }
+    $expectedKeys = @(
+        [pscustomobject]@{ Name = 'master_key';
+            Pointer = $manifest.identity.master_key },
+        [pscustomobject]@{ Name = 'signing_key';
+            Pointer = $manifest.identity.signing_key },
+        [pscustomobject]@{ Name = 'worker_public';
+            Pointer = $manifest.identity.worker_public },
+        [pscustomobject]@{ Name = 'gateway_public';
+            Pointer = $manifest.identity.gateway_public }
+    )
+    foreach ($expected in $expectedKeys) {
+        $digest = [string]$expected.Pointer.sha256
+        if (-not $digest) { continue }
+        if (-not $hashes.ContainsKey($expected.Name) -or
+            $hashes[$expected.Name] -ne $digest) {
+            throw 'upgrade_key_source_mismatch'
+        }
     }
 
     $wslBackup = ConvertTo-EaselWslPath -Path $backupPath

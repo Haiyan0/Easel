@@ -217,7 +217,8 @@ try {
         $upgradeBackup = Assert-EaselUpgradeBackup `
             -Backup $UpgradeFromBackup -ProjectName $ProjectName `
             -OldDeploymentFile (Join-Path $logDir 'deployment.json') `
-            -Distro $Distro -Image $Image
+            -Distro $Distro -Image $Image `
+            -ControlVolume $volumes.Control -KeyVolume $volumes.Keys
     }
 
     $fingerprints = Get-EaselKeyFingerprints -Image $Image `

@@ -1186,15 +1186,22 @@ def _verify_materialized_tree(root: Path, expected: dict[str, dict],
 
 
 def _validate_restored_database(path: Path, key: bytes) -> None:
-    """恢复前用新目录中的数据库和 key 复核 schema、完整性与密文。"""
+    """在私有副本上复核 schema、完整性与密文，绝不改变源目录。
+
+    已处于 WAL 模式的数据库用只读 URI 打开时，SQLite 仍可能创建
+    ``-shm``/``-wal`` 辅助文件；备份树校验会把这些文件视为清单外内容。
+    因此先把主库复制到临时目录，再在副本上打开连接；临时目录清理后
+    源树字节与文件集合保持不变。
+    """
     from sqlite3 import Error, Row, connect
 
+    directory, copy = _private_copy(path)
+    connection = None
     try:
-        # 只读 URI：恢复校验不能向待提交目录写 WAL/shm 或改变数据库内容
-        connection = connect(f"{path.as_uri()}?mode=ro", uri=True)
-    except Error:
-        raise DomainError("backup_integrity_failed", 409) from None
-    try:
+        try:
+            connection = connect(f"{copy.as_uri()}?mode=ro", uri=True)
+        except Error:
+            raise DomainError("backup_integrity_failed", 409) from None
         connection.row_factory = Row
         check = connection.execute("PRAGMA integrity_check").fetchone()
         if check is None or check[0] != "ok":
@@ -1202,7 +1209,7 @@ def _validate_restored_database(path: Path, key: bytes) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
             raise DomainError("backup_incompatible", 409)
-        store = Store(connection, path)
+        store = Store(connection, copy)
         try:
             ConfigService(store, key)
         except ValueError:
@@ -1212,7 +1219,9 @@ def _validate_restored_database(path: Path, key: bytes) -> None:
     except (Error, OSError):
         raise DomainError("backup_integrity_failed", 409) from None
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
+        directory.cleanup()
 
 
 def restore_backup(source: Path, destination: Path, *,
@@ -1310,6 +1319,9 @@ def prepare_restored_instance(destination: Path, *, now: int | None = None,
     manifest = _read_manifest(destination)
     if manifest["version"] < BACKUP_V2:
         raise DomainError("backup_incompatible", 409)
+    # 准备转换会修改控制库并登记新摘要；只有当前 staging 仍完整匹配
+    # 原清单时才允许转换，不能用重算摘要掩盖 restore 后的未知损坏。
+    verify_backup(destination)
     database = destination / "control" / CONTROL_DB_NAME
     with Store.open(database) as store:
         summary = store.prepare_restored_instance(

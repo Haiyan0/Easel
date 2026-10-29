@@ -1,0 +1,5 @@
+restored_project=easel-a7-restore-49078de2
+restored_schema=14
+restored_workspaces=3
+recovery_invite_file=C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3834\test_real_backup_restore_upgra0\restore\data\recovery\admin-invite.txt
+next=Start-WorkspaceEasel.ps1 -ProjectName easel-a7-restore-49078de2 -PublicOrigin https://a7-restore-49078de2.example -Image sha256:9fc4e037f82ad16a6d0553ee208cf0b85731ed23d57532da132f628474422009 -WorkerImage sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9 -GatewayImage sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a -Port 7801 -DataRoot C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3834\test_real_backup_restore_upgra0\restore\data -WorkspaceRoot C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3834\test_real_backup_restore_upgra0\restore\workspaces

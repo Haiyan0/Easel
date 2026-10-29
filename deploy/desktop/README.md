@@ -1,11 +1,11 @@
 # Desktop 完整拓扑：契约、装配与运维入口
 
-状态：**A7 运维验收完成代码与真实演练，A7-R1 四项完整性/源根/升级前置/
-初始化失败关闭返工已实现；A5/A6 真实 Harness、双用户浏览器闭环与 A6-R1
-取消清理互斥已通过功能验收。真实 DeepSeek 供应商与 Linux 生产隔离门槛
-仍为 not-run。**
+状态：**A7 运维验收完成代码与真实演练，A7-R1 四项与 A7-R2 三项准备/
+只读校验/当前 Stop 绑定返工已实现；A5/A6 真实 Harness、双用户浏览器闭环
+与 A6-R1 取消清理互斥已通过功能验收。真实 DeepSeek 供应商与 Linux 生产
+隔离门槛仍为 not-run。**
 
-基线：`04b5f23e36879e72fbafa345dc2ed06abd26a5ae`（A7）。
+基线：`e8376753d63eb681560ae868aa2d1528b2756c85`（A7-R1）。
 A7 入口在本目录新增：
 
 | 入口 | 作用 |
@@ -16,7 +16,7 @@ A7 入口在本目录新增：
 | `Status-WorkspaceEasel.ps1` | 只读诊断 + 镜像/前端/配置/schema/日志版本摘要 |
 | `Logs-WorkspaceEasel.ps1` | control/egress/provisioner 最近日志，不读 key |
 | `Backup-WorkspaceEasel.ps1` | 成功 Stop 后的 v2 完整备份；源根必须匹配 deployment.json 登记值 |
-| `Verify-WorkspaceEasel.ps1` | 只读校验清单全部文件大小/SHA、DB/派生公钥 |
+| `Verify-WorkspaceEasel.ps1` | 只读校验清单全部文件大小/SHA、DB/派生公钥；私有 DB 副本不产生 WAL/SHM |
 | `Restore-WorkspaceEasel.ps1` | 新项目/目录/端口恢复；撤销旧登录/token，签发恢复邀请 |
 
 备份/恢复/升级的完整新手命令与错误码见
@@ -25,7 +25,9 @@ Linux 目标门槛与 not-run 清单见
 [docs/linux-docker-operations.zh-CN.md](../../docs/linux-docker-operations.zh-CN.md#13-a7-完整-desktopl-unix-可核查命令与-not-run-清单)。
 A7 证据见 [docs/evidence/desktop-a7/](../../docs/evidence/desktop-a7/report.md)；
 A7-R1 四项返工证据见
-[docs/evidence/desktop-a7-r1/](../../docs/evidence/desktop-a7-r1/report.md)。
+[docs/evidence/desktop-a7-r1/](../../docs/evidence/desktop-a7-r1/report.md)；
+A7-R2 三项返工证据见
+[docs/evidence/desktop-a7-r2/](../../docs/evidence/desktop-a7-r2/report.md)。
 
 > 注意：以下 A2/A4 契约保留为历史设计与验收记录；其中“A5/A6 未做”的
 > 状态描述以本段和 A5/A6/A7 证据为准。不要把历史段落当成当前缺口。

@@ -365,7 +365,8 @@ def test_prepare_restored_instance_refuses_active_run(tmp_path):
     _backup(seeded, destination)
     restored = tmp_path / "restored"
     restore_backup(destination, restored)
-    with sqlite3.connect(restored / "control" / "control.sqlite3") as connection:
+    database = restored / "control" / "control.sqlite3"
+    with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO runs (workspace_id, id, conversation_id,"
             " client_request_id, input_digest, status, config_version,"
@@ -374,6 +375,18 @@ def test_prepare_restored_instance_refuses_active_run(tmp_path):
              seeded["conversation"].id, "active-request", "d" * 64,
              int(time.time())))
         connection.commit()
+    # 模拟一个“清单与当前 staging 一致”的输入，专门验证 prepare 的
+    # active-run 失败关闭，而不是先被摘要校验挡住。
+    manifest_path = restored / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = next(item for item in manifest["files"]
+                 if item["path"] == "control/control.sqlite3")
+    entry["bytes"] = database.stat().st_size
+    entry["sha256"] = _sha256(database)
+    manifest["control"]["bytes"] = entry["bytes"]
+    manifest["control"]["sha256"] = entry["sha256"]
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True),
+                             encoding="utf-8")
     with pytest.raises(DomainError) as active:
         prepare_restored_instance(restored, now=int(time.time()))
     _assert_error(active, "restore_source_active", 409)

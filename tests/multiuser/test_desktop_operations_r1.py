@@ -33,6 +33,12 @@ WORKER = "sha256:" + "b" * 64
 GATEWAY = "sha256:" + "c" * 64
 PROJECT = "easel-a7-r1-test"
 ORIGIN = "https://a7-r1.ngrok-free.app"
+STOP = {
+    "barrierId": "stop-test",
+    "project": PROJECT,
+    "configSha256": "e" * 64,
+    "completedAt": 1,
+}
 
 pytestmark = pytest.mark.skipif(
     POWERSHELL is None or os.name != "nt",
@@ -230,7 +236,23 @@ class FakeWsl {
         File.AppendAllText(Path.Combine(state, "calls.log"),
                            string.Join("\u001f", args) + "\n");
         string joined = string.Join(" ", args);
+        if (joined.Contains("read_stop_state.py")) {
+            var stopState = Environment.GetEnvironmentVariable("FAKE_STOP_STATE");
+            if (!string.IsNullOrEmpty(stopState)) {
+                Console.WriteLine("stop_state=" + stopState);
+            }
+            var hashes = Environment.GetEnvironmentVariable("FAKE_KEY_HASHES");
+            if (!string.IsNullOrEmpty(hashes)) {
+                Console.WriteLine(hashes.Replace("\\n", "\n"));
+            }
+            return 0;
+        }
         if (joined.Contains("verify-backup")) {
+            if (Environment.GetEnvironmentVariable("FAKE_VERIFY_EXIT") == "0") {
+                Console.WriteLine("version=2");
+                Console.WriteLine("clean_stop=true");
+                return 0;
+            }
             Console.Error.WriteLine("错误：backup_integrity_failed");
             return 1;
         }
@@ -284,6 +306,10 @@ def _base_env(tmp_path: Path) -> dict[str, str]:
     env["FAKE_PROJECT"] = PROJECT
     env["EASEL_KEYGEN_PATH"] = str(KEYGEN)
     env["EASEL_INIT_STATE_PATH"] = str(INIT_STATE)
+    env["FAKE_STOP_STATE"] = json.dumps({
+        "admission_barrier": {"id": STOP["barrierId"], "project": PROJECT},
+        "stop_completion": STOP,
+    })
     env["OS"] = "Other"  # 跳过 Windows ACL 辅助，测试只关心控制流
     return env
 
@@ -404,7 +430,8 @@ def _manifest() -> dict:
             "workspace_root": str(Path("__WORKSPACE__")),
             "data_root": str(Path("__DATA__")),
         },
-        "runtime_state": {"clean_stop": True, "stop": {}, "excluded": []},
+        "runtime_state": {"clean_stop": True, "stop": dict(STOP),
+                          "excluded": []},
         "files": [],
     }
 
@@ -484,6 +511,44 @@ def _seed_control_database(env: dict[str, str]) -> tuple[Path, bytes, bytes]:
     sentinel = control / "sentinel.txt"
     sentinel.write_text("existing-control", encoding="utf-8")
     return control, (control / "control.sqlite3").read_bytes(), sentinel.read_bytes()
+
+
+def test_start_rejects_backup_from_previous_stop_before_compose_up(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(tmp_path, env)
+    old_stop = dict(STOP)
+    old_stop["barrierId"] = "old-stop"
+    old_stop["completedAt"] = 0
+    new_stop = dict(STOP)
+    new_stop["barrierId"] = "new-stop"
+    new_stop["completedAt"] = 2
+    env["FAKE_STOP_STATE"] = json.dumps({
+        "admission_barrier": {"id": "new-stop", "project": PROJECT},
+        "stop_completion": new_stop,
+    })
+    backup = tmp_path / "old-upgrade-backup"
+    backup.mkdir()
+    manifest = _manifest()
+    manifest["deployment"]["workspace_root"] = str(workspace_root)
+    manifest["deployment"]["data_root"] = str(data_root)
+    manifest["runtime_state"]["stop"] = old_stop
+    (backup / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    result = _run_ps(
+        START, "-PublicOrigin", ORIGIN, "-Image", IMAGE,
+        "-WorkerImage", WORKER, "-GatewayImage", GATEWAY,
+        "-ProjectName", PROJECT, "-Port", "7861",
+        "-DataRoot", str(data_root), "-WorkspaceRoot", str(workspace_root),
+        "-UpgradeFromBackup", str(backup), env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "upgrade_stop_commitment_mismatch" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+    calls = (tmp_path / "wsl-state" / "calls.log").read_text("utf-8")
+    assert "read_stop_state.py" in calls
+    assert "verify-backup" not in calls
 
 
 def test_initialize_rejects_existing_database_without_master_key(tmp_path):

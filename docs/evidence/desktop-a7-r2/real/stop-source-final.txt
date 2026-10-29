@@ -1,0 +1,4 @@
+admission_barrier=stop-1c9f31f4f6a947d0aa6e62f99ef18e97
+drain_verified=settled
+stop_completed=stop-1c9f31f4f6a947d0aa6e62f99ef18e97
+stopped project=easel-a7-live-49078de2 drained=True network=easel-a7-live-49078de2-control
