@@ -1,0 +1,255 @@
+✔ a failed old avatar does not prevent a newly verified avatar from rendering (17.8288ms)
+✔ manual account verification updates the card and identity from the same result (20.4765ms)
+✔ failed account verification preserves the last verified nickname and avatar (10.1796ms)
+✔ handleLogin serializes polling and never overwrites terminal success (7.6744ms)
+✔ handleLogin surfaces persistent polling failures instead of spinning forever (3.4347ms)
+✔ handleLogin opens the login modal before its start request resolves (1.1196ms)
+✔ handleLogin keeps a closed modal closed when its start response arrives (0.9216ms)
+✔ handleLogin shows startup failures inside the open modal (1.2249ms)
+✔ handleLogin discards polling responses from a previous login (1.7101ms)
+✔ handleMpLogin serializes polling and never overwrites terminal success (8.7715ms)
+✔ handleMpLogin surfaces persistent polling failures instead of spinning forever (8.6251ms)
+✔ handleMpLogin opens the login modal before its start request resolves (6.6502ms)
+✔ handleMpLogin keeps a closed modal closed when its start response arrives (1.174ms)
+✔ handleMpLogin shows startup failures inside the open modal (1.4383ms)
+✔ handleMpLogin discards polling responses from a previous login (0.9773ms)
+✔ repeated clicks share one fetch and refresh is possible afterwards (6.8022ms)
+✔ a completed request does not persist another platforms loading state (1.6436ms)
+✔ failed fetch displays the server reason and can retry (1.4173ms)
+✔ analytics requests have platform-specific bounded deadlines (56.6474ms)
+✔ local media types are recognized without converting text reports or external links (2.3199ms)
+✔ artifact filenames decode Unicode and preserve download query arguments (0.2225ms)
+✔ content-library preview links also join the gallery, including old saved conversations (0.2452ms)
+✔ referenced output ZIP files resolve safely without accepting unrelated archive URLs (0.3695ms)
+✔ gallery merges archive members in order while removing differently encoded duplicate images (0.2986ms)
+✔ invalid encoded or traversing artifact paths never render (0.1865ms)
+✔ responsive fit preserves proportions, fits both bounds and never enlarges artwork (0.3654ms)
+✔ multiple artifact arrows and keyboard controls wrap around without losing the files (83.7397ms)
+✖ published brand asset is byte-identical to the original Easel image (1.2416ms)
+✔ index, sidebar and chat hero keep the packaged brand path (0.6312ms)
+✔ question parser handles chunked live SSE (24.5228ms)
+✔ question parser handles chunked replayed SSE (2.0101ms)
+✔ settings defer environment probes and wait for the actual runtime before loading models (1.9267ms)
+✔ sidebar keeps its settings button unwrapped beside a truncated status (1.5534ms)
+✔ changing harness is local until save and retains its model override (7.3214ms)
+✔ Codex permanent approval defaults off, saves explicitly and stays exclusive to Codex (2.4328ms)
+✔ environment-locked harness cannot be changed or saved (1.4409ms)
+✔ settings can retry a failed read without saving or silently changing the engine (1.9088ms)
+✔ uninstalled native harness cannot be saved and does not show Codex sandbox for ACP (1.8566ms)
+✔ engine options retain missing harnesses with configuration previews and installation hints (2.6122ms)
+✔ failed harness save shows error without switching the active runtime (1.891ms)
+✔ harness form reuses settings input styling and managed connection hints (1.6917ms)
+✔ chat-only is the initial default with an accessible explanation beside the engine (1.4719ms)
+✔ chat-only can be saved without any agent CLI and preserves the active engine until save (1.5154ms)
+✔ OpenClaw selection previews its API configuration without changing the active engine (1.3537ms)
+✔ codex loads native models only on request and saves a dropdown selection (1.9568ms)
+✔ opencode loads native models only on request and saves a dropdown selection (1.6882ms)
+✔ native model listing failure preserves the saved model and allows manual input (1.5509ms)
+✔ absolute Markdown report links retain their label and open the content preview (1.6596ms)
+✔ images and angle-wrapped paths with spaces resolve through media or content routes (0.4269ms)
+✔ external URLs, commands, converted links and traversal targets remain unchanged (0.4446ms)
+✔ Windows paths and encoded file names resolve without corrupting their destination (0.193ms)
+✔ multiple previewable Markdown output links resolve as media for gallery detection (0.4321ms)
+✔ starting zhihu requests a fresh QR runner (1.8164ms)
+✔ starting xiaohongshu requests a fresh QR runner (0.6975ms)
+✔ starting weixin-channels requests a fresh QR runner (0.6465ms)
+✔ old identity cannot commit after switch, including same-user relogin (3.7737ms)
+✔ write requests add in-memory CSRF and same-origin credentials (1.2782ms)
+✔ a stale epoch 401 cannot invalidate the newly logged-in identity (14.9569ms)
+✔ 403 and 503 keep explicit status, never fall back to local (7.9066ms)
+✔ identity cache keys are scoped by user, workspace and name (1.2025ms)
+✔ loadIdentity distinguishes anonymous, unavailable and valid (4.3373ms)
+✔ invite exchange clears neither token to storage and errors stay typed (2.2658ms)
+✖ login errors keep 401/403/429/503/network semantics (1.832ms)
+✔ raw identity fetch exposes 202 while preserving CSRF and 401 ownership (1.188ms)
+✔ identity cache clearing removes only the captured identity keys (1.2625ms)
+✔ logout uses the captured CSRF and reports remote failure (1.0619ms)
+✔ runtime mode fails closed on unknown or unavailable startup info (1.9272ms)
+✔ 202 admission is parsed; other statuses and malformed bodies fail (0.9432ms)
+✔ SSE frames split across chunks and CRLF are parsed without loss (0.5453ms)
+✔ question payloads support double JSON encoding and opaque values (0.3732ms)
+✔ recovery only streams active runs and never re-submits prompts (0.2985ms)
+✔ session, run and message pages validate shape and pagination (0.4453ms)
+✔ local session history still reads, continues and deletes in isolation (39.6915ms)
+✔ older message windows exactly cover the unloaded interval (0.3161ms)
+✔ terminal states are explicit and do not depend on a done event name (0.2304ms)
+✔ parsers keep provenance fields and reject malformed payloads (2.3012ms)
+✔ route builders send raw snake_case protocol and omit an empty secret (1.4127ms)
+✔ form conversion never reads a secret back from public settings (0.5583ms)
+✔ personal settings load provenance and save an empty key without secret (49.5259ms)
+✔ personal complete route sends a newly typed key and never stores it (22.5525ms)
+✔ a stale A settings response cannot fill the B form (26.1317ms)
+✔ managed-model form edits only personal raw values and keeps following (17.6866ms)
+✔ explicit managed model is preserved even when equal to the default (11.5316ms)
+✔ multi-field provider sends a typed bundle and never reads secrets back (10.9424ms)
+✔ multi-field credentials reject partial input and allow all blank reuse (14.3473ms)
+✔ admin member and invite pages can load later rows (22.5884ms)
+✔ stale invite load-more cannot override a create refresh or cursor (15.4467ms)
+✔ stale invite load-more cannot override a revoke refresh (12.9946ms)
+✔ stale invite failure and finally cannot disturb a newer page request (14.7471ms)
+✔ full reload invalidates an in-flight invite page and its loading state (11.5611ms)
+✔ member never renders admin write controls or calls admin APIs (16.0051ms)
+✔ admin default conflict keeps the form and warns without overwriting (12.5524ms)
+✔ admin member and invite actions use exact protocol without leaking tokens (13.3166ms)
+✔ admin member management still loads when managed config is unavailable (9.7617ms)
+✖ admin defaults section guides an unconfigured main chat instead of claiming ready (10.2045ms)
+✖ admin defaults section reports a real configured main chat (10.2068ms)
+✖ admin members section keeps member controls without the default form (15.0234ms)
+✔ admin page refuses a non-admin even if mounted by mistake (9.0343ms)
+✔ control disables local personas and attachments while local keeps them (2.4204ms)
+✔ changing persona on a populated conversation preserves its identity and history (1.0725ms)
+✔ an empty conversation adopts its persona without creating another conversation (0.8472ms)
+✔ switching to general mode creates an unbound conversation and keeps the old one (0.4785ms)
+✔ without an active conversation, persona selection safely creates one (0.6088ms)
+✔ PublishPage only marks itself dead from the unmount cleanup (2.7909ms)
+✔ default policy keeps the existing automatic page and exposes both paths (5.2589ms)
+✔ switching to manual and back only changes the visible workflow (1.7075ms)
+✔ administrator manual-only policy disables automatic publishing (1.5768ms)
+✔ inconsistent policies never expose the automatic page (2.2076ms)
+✔ policy lookup failures show retry instead of silently permitting submissions (1.5149ms)
+✔ policy lookup completing after unmount does not update the page (1.2986ms)
+✔ approval cards preserve long multiline commands and both permission choices (5.9537ms)
+✔ control options carry opaque values while showing human labels (1.0586ms)
+✔ approval card grids can shrink and wrap commands without clipping their content (0.9146ms)
+✔ loading without the obsolete reset marker preserves existing conversation history and recovery (2.1423ms)
+✔ local history tolerates shared workspace view fields without identity storage (1.0031ms)
+✔ legacy conversation history migrates rather than being deleted on first load (0.8222ms)
+✔ Escape is captured by the dropdown, not the surrounding settings dialog (1.9333ms)
+✔ custom reasoning declaration and dialect reach the save payload (30.1503ms)
+✔ disabled reasoning and native Anthropic do not send a compatible dialect (7.7464ms)
+✔ existing undeclared models and direct API rows omit the reasoning declaration (8.0756ms)
+✔ new custom rows default to reasoning disabled and the OpenAI dialect (3.4378ms)
+✔ streamChat: POST 5xx 后 jobs 404 终结并报错（不再无限重试） (71.2869ms)
+✔ streamChat: 提供 onRecoveryUnavailable 时仍走回调（恢复语义不变） (75.5391ms)
+✔ legacy and previously incorrect account identity caches are ignored (2.9791ms)
+✔ a verification started before login cannot overwrite the new login cache (3.6449ms)
+✔ invalidating login cache discards a previously running background verification (1.3719ms)
+✔ fresh verification still updates and caches the actual account result (2.9961ms)
+✔ incomplete account identity is refreshed after one minute instead of ten (1.0138ms)
+✔ session and message pages use identity-scoped paginated control APIs (2.9917ms)
+✔ create, rename, archive and delete send CSRF and exact JSON bodies (2.019ms)
+✔ 202 admission keeps turnId idempotency and 409/503 stay typed (1.7394ms)
+✔ 401 invalidates only the captured identity epoch (2.2357ms)
+✔ SSE stream reports cursor, token, thinking, activity and terminal state (1.8508ms)
+✔ reconnect asks only for the cursor tail and 404 is explicit (1.4063ms)
+✔ question status and answer use runId plus opaque option values (2.2466ms)
+✔ server views keep original ChatPage types and control capabilities (1.1159ms)
+ℹ tests 136
+ℹ suites 0
+ℹ pass 131
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 964.5386
+
+✖ failing tests:
+
+test at tests\frontend\brandAssets.test.mjs:25:1
+✖ published brand asset is byte-identical to the original Easel image (1.2416ms)
+  Error: ENOENT: no such file or directory, open 'C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\frontend\public\static\easel-icon-transparent.png'
+      at Object.openSync (node:fs:559:18)
+      at readFileSync (node:fs:443:35)
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/brandAssets.test.mjs:27:21)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.start (node:internal/test_runner/test:1003:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:358:17) {
+    errno: -4058,
+    code: 'ENOENT',
+    syscall: 'open',
+    path: 'C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\web\\frontend\\public\\static\\easel-icon-transparent.png'
+  }
+
+test at tests\frontend\multiuserAuth.test.mjs:216:1
+✖ login errors keep 401/403/429/503/network semantics (1.832ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /来源|权限/. Input:
+
+  '邀请无效、已使用或已过期，请联系管理员重新获取。'
+
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserAuth.test.mjs:224:10)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '邀请无效、已使用或已过期，请联系管理员重新获取。',
+    expected: /来源|权限/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at tests\frontend\multiuserSettings.test.mjs:1211:1
+✖ admin defaults section guides an unconfigured main chat instead of claiming ready (10.2045ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /主聊天尚未配置/. Input:
+
+  '全体默认这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。受管默认模型 · 版本 语音图像视频音乐主聊天openai-compatible/tts-default · 凭证已配置供应商模型API 地址协议API Key非敏感参数（JSON）允许的模型（逗号分隔）留空 Key 仅在已有该通道、同供应商/地址/协议时复用原受管凭证； 新增通道或更换作用域必须显式输入。保存全体默认重新读取成员与邀请创建成员成员一成员禁用 成员一撤销登录 成员一选择成员成员一创建邀请'
+
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserSettings.test.mjs:1228:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '全体默认这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。受管默认模型 · 版本 语音图像视频音乐主聊天openai-compatible/tts-default · 凭证已配置供应商模型API 地址协议API Key非敏感参数（JSON）允许的模型（逗号分隔）留空 Key 仅在已有该通道、同供应商/地址/协议时复用原受管凭证； 新增通道或更换作用域必须显式输入。保存全体默认重新读取成员与邀请创建成员成员一成员禁用 成员一撤销登录 成员一选择成员成员一创建邀请',
+    expected: /主聊天尚未配置/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at tests\frontend\multiuserSettings.test.mjs:1243:1
+✖ admin defaults section reports a real configured main chat (10.2068ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /主聊天已配置/. Input:
+
+  '全体默认这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。受管默认模型 · 版本 语音图像视频音乐主聊天openai-compatible/tts-default · 凭证已配置供应商模型API 地址协议API Key非敏感参数（JSON）允许的模型（逗号分隔）留空 Key 仅在已有该通道、同供应商/地址/协议时复用原受管凭证； 新增通道或更换作用域必须显式输入。保存全体默认重新读取成员与邀请创建成员成员一成员禁用 成员一撤销登录 成员一选择成员成员一创建邀请'
+
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserSettings.test.mjs:1272:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '全体默认这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。受管默认模型 · 版本 语音图像视频音乐主聊天openai-compatible/tts-default · 凭证已配置供应商模型API 地址协议API Key非敏感参数（JSON）允许的模型（逗号分隔）留空 Key 仅在已有该通道、同供应商/地址/协议时复用原受管凭证； 新增通道或更换作用域必须显式输入。保存全体默认重新读取成员与邀请创建成员成员一成员禁用 成员一撤销登录 成员一选择成员成员一创建邀请',
+    expected: /主聊天已配置/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at tests\frontend\multiuserSettings.test.mjs:1277:1
+✖ admin members section keeps member controls without the default form (15.0234ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+
+  + {
+  +   children: [
+  +     '保存全体默认'
+  +   ],
+  +   props: {
+  +     disabled: false,
+  +     onClick: [Function: onClick],
+  +     style: {
+  +       background: '#1b1f28',
+  +       border: '1px solid #333a47',
+  +       borderColor: '#8b5cf6',
+  +       borderRadius: '9px',
+  +       color: '#e7e9ee',
+  +       cursor: 'pointer',
+  +       fontSize: '13px',
+  +       padding: '8px 10px'
+  +     }
+  +   },
+  +   type: 'button'
+  + }
+  - undefined
+
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserSettings.test.mjs:1296:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [Object],
+    expected: undefined,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
