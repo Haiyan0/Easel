@@ -143,7 +143,8 @@ def _seed(tmp_path: Path):
 
 
 def _backup(seeded, destination: Path, *, deployment=None,
-            require_clean_stop: bool = False, **overrides):
+            require_clean_stop: bool = False, workspace_root=...,
+            **overrides):
     params = {
         "signing_key_file": seeded["signing"],
         "managed_config_file": seeded["managed"],
@@ -157,7 +158,8 @@ def _backup(seeded, destination: Path, *, deployment=None,
             store, destination,
             control_dir=seeded["control"],
             master_key_file=seeded["master"],
-            workspace_root=seeded["workspace_root"],
+            workspace_root=(seeded["workspace_root"]
+                            if workspace_root is ... else workspace_root),
             image_digest=params["deployment"]["worker_image"],
             harness_revision=params["deployment"]["harness_revision"],
             **{key: value for key, value in params.items()
@@ -414,6 +416,185 @@ def test_materialize_restore_populates_deployment_targets(tmp_path):
             restored, control_dir=control, keys_dir=keys,
             egress_dir=egress, workspace_root=workspace)
     _assert_error(occupied, "restore_material_target_not_empty", 409)
+
+
+def test_full_backup_requires_a_real_workspace_root(tmp_path):
+    seeded = _seed(tmp_path)
+    with pytest.raises(DomainError) as missing:
+        _backup(seeded, tmp_path / "backup-no-root", workspace_root=None)
+    _assert_error(missing, "backup_workspace_root_missing", 409)
+    assert not (tmp_path / "backup-no-root").exists()
+
+
+def test_full_backup_rejects_registered_root_mismatch(tmp_path):
+    seeded = _seed(tmp_path)
+    other = tmp_path / "other-workspaces"
+    other.mkdir()
+    deployment = _deployment()
+    deployment["workspace_root"] = str(other)
+    with pytest.raises(DomainError) as mismatch:
+        _backup(seeded, tmp_path / "backup-root-mismatch",
+                deployment=deployment)
+    _assert_error(mismatch, "backup_workspace_root_mismatch", 409)
+    assert not (tmp_path / "backup-root-mismatch").exists()
+
+
+def test_full_backup_rejects_missing_materialized_workspace(tmp_path):
+    seeded = _seed(tmp_path)
+    with sqlite3.connect(seeded["control"] / "control.sqlite3") as db:
+        db.execute(
+            "INSERT INTO runs (workspace_id, id, conversation_id,"
+            " client_request_id, input_digest, status, config_version,"
+            " created_at, finished_at) VALUES (?, ?, ?, ?, ?, 'done', 0, ?, ?)",
+            (seeded["member"].workspace_id, "e" * 32,
+             seeded["conversation"].id, "a7-r1-run", "d" * 64,
+             int(time.time()), int(time.time())))
+        db.commit()
+    import shutil
+    shutil.rmtree(seeded["workspace_root"] / seeded["member"].workspace_id)
+    with pytest.raises(DomainError) as missing:
+        _backup(seeded, tmp_path / "backup-missing-workspace")
+    _assert_error(missing, "backup_workspace_missing", 409)
+    assert not (tmp_path / "backup-missing-workspace").exists()
+
+
+def test_full_backup_allows_new_workspace_without_materialized_files(tmp_path):
+    seeded = _seed(tmp_path)
+    with Store.open(seeded["control"] / "control.sqlite3") as store:
+        store.create_user("A7 Not Materialized")
+    destination = tmp_path / "backup-new-workspace"
+    _backup(seeded, destination)
+    manifest = json.loads((destination / "manifest.json").read_text("utf-8"))
+    assert all(
+        parts[part] is False
+        for workspace_id, parts in manifest["workspaces"].items()
+        if workspace_id != seeded["member"].workspace_id
+        for part in ("workspace", "home", "state")
+    )
+
+
+def _prepared_staging(seeded, tmp_path: Path) -> Path:
+    _stop(seeded)
+    backup = tmp_path / "backup-prepared"
+    _backup(seeded, backup)
+    restored = tmp_path / "restored-prepared"
+    restore_backup(backup, restored)
+    prepare_restored_instance(restored, now=int(time.time()))
+    return restored
+
+
+def _empty_targets(tmp_path: Path):
+    control = tmp_path / "materialize-control"
+    keys = tmp_path / "materialize-keys"
+    egress = tmp_path / "materialize-egress"
+    workspace = tmp_path / "materialize-workspaces"
+    for path in (control, keys, egress, workspace):
+        path.mkdir()
+    return control, keys, egress, workspace
+
+
+@pytest.mark.parametrize("tamper", [
+    "same_size_workspace",
+    "home_content",
+    "missing_file",
+    "extra_file",
+    "valid_sqlite_row",
+])
+def test_verify_backup_checks_every_manifest_file(tmp_path, tamper):
+    seeded = _seed(tmp_path)
+    destination = tmp_path / "backup-tamper"
+    _backup(seeded, destination)
+    workspace = seeded["member"].workspace_id
+    if tamper == "same_size_workspace":
+        path = destination / "workspaces" / workspace / "workspace" / "sentinel.txt"
+        original = path.read_bytes()
+        path.write_bytes(original[:-1] + b"X")
+    elif tamper == "home_content":
+        path = destination / "workspaces" / workspace / "home" / ".dsh" / "session.json"
+        original = path.read_bytes()
+        path.write_bytes(original[:-1] + b"X")
+    elif tamper == "missing_file":
+        (destination / "workspaces" / workspace / "workspace" /
+         "sentinel.txt").unlink()
+    elif tamper == "extra_file":
+        (destination / "workspaces" / workspace / "workspace" /
+         "extra.txt").write_bytes(b"extra")
+    else:
+        with sqlite3.connect(destination / "control" / "control.sqlite3") as db:
+            db.execute("UPDATE users SET display_name = 'changed' WHERE id = ?",
+                       (seeded["member"].user_id,))
+            db.commit()
+    with pytest.raises(DomainError) as tampered:
+        verify_backup(destination)
+    _assert_error(tampered, "backup_integrity_failed", 409)
+
+
+def test_prepare_updates_staging_manifest_but_not_source_backup(tmp_path):
+    seeded = _seed(tmp_path)
+    _stop(seeded)
+    backup = tmp_path / "backup-prepare-manifest"
+    _backup(seeded, backup)
+    source_manifest = (backup / "manifest.json").read_bytes()
+    restored = tmp_path / "restored-prepare-manifest"
+    restore_backup(backup, restored)
+    prepare_restored_instance(restored, now=int(time.time()))
+
+    assert (backup / "manifest.json").read_bytes() == source_manifest
+    manifest = json.loads((restored / "manifest.json").read_text("utf-8"))
+    assert manifest["prepared"]["source_manifest_sha256"] == hashlib.sha256(
+        source_manifest).hexdigest()
+    assert manifest["control"]["sha256"] == _sha256(
+        restored / "control" / "control.sqlite3")
+    assert verify_backup(restored)["version"] == 2
+
+    path = (restored / "workspaces" / seeded["member"].workspace_id /
+            "workspace" / "sentinel.txt")
+    original = path.read_bytes()
+    path.write_bytes(original[:-1] + b"X")
+    with pytest.raises(DomainError) as tampered:
+        verify_backup(restored)
+    _assert_error(tampered, "backup_integrity_failed", 409)
+
+
+def test_materialize_restore_rejects_tampered_prepared_workspace(tmp_path):
+    seeded = _seed(tmp_path)
+    restored = _prepared_staging(seeded, tmp_path)
+    path = (restored / "workspaces" / seeded["member"].workspace_id /
+            "workspace" / "sentinel.txt")
+    original = path.read_bytes()
+    path.write_bytes(original[:-1] + b"X")
+    control, keys, egress, workspace = _empty_targets(tmp_path)
+    with pytest.raises(DomainError) as tampered:
+        materialize_restore(
+            restored, control_dir=control, keys_dir=keys,
+            egress_dir=egress, workspace_root=workspace)
+    _assert_error(tampered, "backup_integrity_failed", 409)
+    for target in (control, keys, egress, workspace):
+        assert not any(target.iterdir())
+
+
+def test_materialize_restore_verifies_copied_bytes(tmp_path, monkeypatch):
+    seeded = _seed(tmp_path)
+    restored = _prepared_staging(seeded, tmp_path)
+    original_copy = control_cli._copy_file
+
+    def corrupt_copy(source, destination):
+        copied = original_copy(source, destination)
+        if destination.name == "sentinel.txt":
+            destination.write_bytes(b"corrupt")
+            copied["bytes"] = destination.stat().st_size
+            copied["sha256"] = _sha256(destination)
+        return copied
+
+    monkeypatch.setattr(control_cli, "_copy_file", corrupt_copy)
+    control, keys, egress, workspace = _empty_targets(tmp_path)
+    with pytest.raises(DomainError) as corrupted:
+        materialize_restore(
+            restored, control_dir=control, keys_dir=keys,
+            egress_dir=egress, workspace_root=workspace)
+    _assert_error(corrupted, "backup_integrity_failed", 409)
+    for target in (control, keys, egress, workspace):
+        assert not any(target.iterdir())
 
 
 def test_upgrade_stop_completion_requires_matching_backup_and_old_digest(tmp_path):

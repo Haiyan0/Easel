@@ -25,7 +25,7 @@ DEPLOY = ROOT / "deploy" / "desktop"
 WSL_DISTRO = "Ubuntu-26.04"
 CONTROL_IMAGE = os.environ.get(
     "EASEL_A7_CONTROL_IMAGE",
-    "sha256:a5110be8a165d578b8411cce059bec8f2d5be047e63d70d1ea268faa1be9afe3")
+    "sha256:6d12e0783526084283931da194575809750f8e4a0c50cb24d8d49cdea6fd4842")
 WORKER_OLD = os.environ.get(
     "EASEL_A7_WORKER_OLD",
     "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9")

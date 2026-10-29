@@ -175,6 +175,7 @@ function Invoke-ProvisionerIdentityCheck {
 }
 
 $lifecycleLock = $null
+$upgradeBackup = $null
 try {
     $PublicOrigin = Resolve-EaselOrigin -Origin $PublicOrigin
     $Image = Resolve-EaselImage -Image $Image
@@ -189,6 +190,7 @@ try {
     $network = Get-EaselWorkspaceNetworkName -ProjectName $ProjectName
     $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
     $DataRoot = [IO.Path]::GetFullPath($DataRoot)
+    $logDir = Join-Path $DataRoot 'logs'
     $publicDir = Join-Path $DataRoot 'public'
     $compose = Get-EaselWorkspaceComposePath
     if (-not (Test-Path -LiteralPath $compose -PathType Leaf)) {
@@ -207,6 +209,15 @@ try {
             (($inspect.Output -join '').Trim()) -ne $pin) {
             throw 'worker_or_gateway_image_mismatch'
         }
+    }
+
+    if ($UpgradeFromBackup) {
+        # 全量校验与旧部署身份绑定必须在任何 compose up 之前完成；
+        # 只有 manifest 的空备份、缺 key/DB 或错项目在这里就失败。
+        $upgradeBackup = Assert-EaselUpgradeBackup `
+            -Backup $UpgradeFromBackup -ProjectName $ProjectName `
+            -OldDeploymentFile (Join-Path $logDir 'deployment.json') `
+            -Distro $Distro -Image $Image
     }
 
     $fingerprints = Get-EaselKeyFingerprints -Image $Image `
@@ -305,7 +316,6 @@ try {
         socketMode = '660'
         allowedUid = 10001
     }
-    $logDir = Join-Path $DataRoot 'logs'
     $null = New-Item -ItemType Directory -Path $logDir -Force
     $identityExpectedPath = Join-Path $logDir 'provisioner-expected.json'
     [IO.File]::WriteAllText(
@@ -487,38 +497,14 @@ try {
                 throw ("admission_barrier_active:" +
                     (($reopen.Output -join ',').Trim()))
             }
-            # 受控升级：旧 Stop 完成记录绑定旧配置摘要；必须显式提供一份
-            # 通过校验的完整备份，核对旧摘要后才改写成新摘要。
-            $backupPath = [IO.Path]::GetFullPath($UpgradeFromBackup)
-            if (-not (Test-Path -LiteralPath $backupPath -PathType Container)) {
+            # 受控升级：备份已在 compose up 之前完成只读全量校验和旧部署
+            # 身份绑定；这里只核对正式 DB 中的 Stop 完成记录。
+            if ($null -eq $upgradeBackup) {
                 throw 'upgrade_backup_missing'
             }
-            $backupManifest = Assert-EaselBackupManifest `
-                -Backup $backupPath -RequireComplete
-            $backupSha = Get-EaselFileSha256 -Path (
-                Join-Path $backupPath 'manifest.json')
-            $oldConfigSha = [string]$backupManifest.deployment.config_sha256
-            $oldDeploymentFile = Join-Path $logDir 'deployment.json'
-            if (-not (Test-Path -LiteralPath $oldDeploymentFile -PathType Leaf)) {
-                throw 'upgrade_deployment_identity_missing'
-            }
-            try {
-                $oldDeployment = Get-Content -LiteralPath $oldDeploymentFile -Raw |
-                    ConvertFrom-Json
-            }
-            catch {
-                throw 'upgrade_deployment_identity_invalid'
-            }
-            if ([string]$oldDeployment.project -ne $ProjectName -or
-                [string]$oldDeployment.config_sha256 -ne $oldConfigSha -or
-                [string]$oldDeployment.control_image -ne
-                    [string]$backupManifest.deployment.control_image -or
-                [string]$oldDeployment.worker_image -ne
-                    [string]$backupManifest.deployment.worker_image -or
-                [string]$oldDeployment.gateway_image -ne
-                    [string]$backupManifest.deployment.gateway_image) {
-                throw 'upgrade_deployment_mismatch'
-            }
+            $backupPath = $upgradeBackup.Path
+            $backupSha = $upgradeBackup.Sha256
+            $oldConfigSha = $upgradeBackup.OldConfigSha256
             $status = Invoke-EaselDocker -Arguments @(
                 'exec', $containerId, 'python', '-m', 'easel', 'admin',
                 'stop-status', '--control-dir', '/srv/easel/control')

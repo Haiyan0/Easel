@@ -499,6 +499,50 @@ function Get-EaselHarnessRevision {
     }
 }
 
+function Get-EaselCanonicalRoot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$MissingCode
+    )
+    # 备份源根只接受真实目录；拒绝重解析点（junction/符号链接）和别名，
+    # 防止把另一个空目录当成已登记部署根。
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not [IO.Path]::IsPathRooted($Path)) {
+        throw $MissingCode
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        throw $MissingCode
+    }
+    $item = Get-Item -LiteralPath $full -Force
+    $current = $item
+    while ($null -ne $current) {
+        if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'backup_source_reparse'
+        }
+        $current = $current.Parent
+    }
+    return $item.FullName.TrimEnd('\')
+}
+
+function Assert-EaselRegisteredRoot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Registered,
+        [Parameter(Mandatory)][string]$MissingCode,
+        [Parameter(Mandatory)][string]$MismatchCode
+    )
+    # 用户传入根必须与 deployment.json 的登记值指向同一物理目录；
+    # 比较发生在任何备份容器启动之前。
+    $actual = Get-EaselCanonicalRoot -Path $Path -MissingCode $MissingCode
+    $expected = Get-EaselCanonicalRoot -Path $Registered -MissingCode $MissingCode
+    if (-not [string]::Equals($actual, $expected,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw $MismatchCode
+    }
+    return $actual
+}
+
 function Assert-EaselBackupManifest {
     param(
         [Parameter(Mandatory)][string]$Backup,
@@ -534,4 +578,78 @@ function Assert-EaselBackupManifest {
         throw 'backup_not_from_clean_stop'
     }
     return $manifest
+}
+
+function Assert-EaselUpgradeBackup {
+    param(
+        [Parameter(Mandatory)][string]$Backup,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$OldDeploymentFile,
+        [Parameter(Mandatory)][string]$Distro,
+        [Parameter(Mandatory)][string]$Image
+    )
+    # 升级前对真实备份做只读全量校验，并先绑定旧部署身份；调用方必须
+    # 在 compose up（新 control 可能打开/迁移正式 DB）之前执行。
+    $backupPath = [IO.Path]::GetFullPath($Backup)
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Container)) {
+        throw 'upgrade_backup_missing'
+    }
+    $manifest = Assert-EaselBackupManifest `
+        -Backup $backupPath -RequireComplete
+    $backupSha = Get-EaselFileSha256 -Path (
+        Join-Path $backupPath 'manifest.json')
+    if (-not (Test-Path -LiteralPath $OldDeploymentFile -PathType Leaf)) {
+        throw 'upgrade_deployment_identity_missing'
+    }
+    try {
+        $oldDeployment = Get-Content -LiteralPath $OldDeploymentFile -Raw |
+            ConvertFrom-Json
+    }
+    catch {
+        throw 'upgrade_deployment_identity_invalid'
+    }
+    if ([string]$manifest.deployment.project -ne $ProjectName -or
+        [string]$oldDeployment.project -ne $ProjectName -or
+        [string]$oldDeployment.config_sha256 -ne
+            [string]$manifest.deployment.config_sha256 -or
+        [string]$oldDeployment.control_image -ne
+            [string]$manifest.deployment.control_image -or
+        [string]$oldDeployment.worker_image -ne
+            [string]$manifest.deployment.worker_image -or
+        [string]$oldDeployment.gateway_image -ne
+            [string]$manifest.deployment.gateway_image) {
+        throw 'upgrade_deployment_mismatch'
+    }
+    if ([string]$manifest.deployment.workspace_root -ne
+            [string]$oldDeployment.workspace_root -or
+        [string]$manifest.deployment.data_root -ne
+            [string]$oldDeployment.data_root) {
+        throw 'upgrade_deployment_mismatch'
+    }
+
+    $wslBackup = ConvertTo-EaselWslPath -Path $backupPath
+    $verify = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'docker', 'run', '--rm',
+        '--network', 'none', '--read-only',
+        '--user', '10001:10001', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges:true',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=32m',
+        '--mount', "type=bind,src=$wslBackup,dst=/backup,readonly",
+        $Image, 'python', '-m', 'easel', 'admin', 'verify-backup',
+        '--source', '/backup')
+    if ($verify.ExitCode -ne 0) {
+        throw ("upgrade_backup_verify_failed:" +
+            (($verify.Output -join ',').Trim()))
+    }
+    $text = ($verify.Output -join "`n")
+    if ($text -notmatch '(?m)^version=2\s*$' -or
+        $text -notmatch '(?m)^clean_stop=true\s*$') {
+        throw 'upgrade_backup_verify_failed'
+    }
+    return [pscustomobject]@{
+        Path = $backupPath
+        Sha256 = $backupSha
+        Manifest = $manifest
+        OldConfigSha256 = [string]$oldDeployment.config_sha256
+    }
 }

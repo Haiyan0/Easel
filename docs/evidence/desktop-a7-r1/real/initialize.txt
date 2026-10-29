@@ -1,0 +1,1 @@
+initialized project=easel-a7-live-b729adf1 control_volume=easel-a7-live-b729adf1-control key_volume=easel-a7-live-b729adf1-keys egress_volume=easel-a7-live-b729adf1-egress network=easel-a7-live-b729adf1-control key=created,signing_key=created

@@ -582,6 +582,29 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
                       egress_policy_file, egress_ca_file)
     full = any(path is not None for path in material_paths)
     if full:
+        if data_root is None:
+            raise DomainError("backup_workspace_root_missing", 409)
+        # 同一宿主命名空间内，部署登记根必须与实参一致；容器内登记的
+        # Windows 宿主路径通常不存在，此时由 PowerShell 入口负责绑定。
+        for field, actual in (("workspace_root", data_root),):
+            registered = (deployment.get(field)
+                          if isinstance(deployment, dict) else None)
+            if isinstance(registered, str) and registered:
+                try:
+                    registered_path = Path(registered).resolve()
+                except (OSError, RuntimeError):
+                    raise DomainError(
+                        "backup_workspace_root_mismatch", 409) from None
+                if registered_path.is_dir():
+                    try:
+                        actual_path = actual.resolve()
+                    except (OSError, RuntimeError):
+                        raise DomainError(
+                            "backup_workspace_root_mismatch", 409) from None
+                    if (os.path.normcase(str(registered_path))
+                            != os.path.normcase(str(actual_path))):
+                        raise DomainError(
+                            "backup_workspace_root_mismatch", 409)
         if signing_key_file is None:
             raise DomainError("backup_signing_key_missing", 409)
         if managed_config_file is None:
@@ -749,6 +772,11 @@ def create_backup(store: Store, destination: Path, *, control_dir: Path,
                         raise DomainError(
                             "backup_workspace_path_escape", 409)
                     if not source.is_dir():
+                        if full and store.workspace_has_history(workspace_id):
+                            # 已有 Run 历史说明该 workspace 曾物化；根缺失
+                            # 不是“新空间”，不能静默备成 complete 空目录。
+                            raise DomainError(
+                                "backup_workspace_missing", 409)
                         entry[part] = False
                         continue
                     files.extend(_copy_tree(
@@ -1016,6 +1044,22 @@ def _read_manifest(source: Path) -> dict:
                            for item in excluded)
                 or type(runtime_state.get("clean_stop")) is not bool):
             raise DomainError("backup_invalid", 400)
+        prepared = manifest.get("prepared")
+        if prepared is not None:
+            if (not isinstance(prepared, dict)
+                    or not isinstance(prepared.get("source_manifest_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}",
+                                    prepared["source_manifest_sha256"]) is None
+                    or type(prepared.get("restored_at")) is not int
+                    or not isinstance(prepared.get("cleared_barrier"), str)
+                    or not isinstance(prepared.get("admin_user_id"), str)
+                    or not isinstance(prepared.get("control"), dict)
+                    or prepared["control"].get("path") != control_path
+                    or prepared["control"].get("sha256")
+                    != control.get("sha256")
+                    or prepared["control"].get("bytes")
+                    != control.get("bytes")):
+                raise DomainError("backup_invalid", 400)
     return manifest
 
 
@@ -1044,6 +1088,24 @@ def _validate_bundle_tree(source: Path, manifest: dict) -> dict[str, dict]:
     return expected
 
 
+def _verify_bundle_digests(source: Path,
+                           expected: dict[str, dict]) -> None:
+    """逐项核对清单文件的大小与 SHA-256；只读，不跟随链接。"""
+    for shown, entry in expected.items():
+        relative = _manifest_path(shown)
+        path = source.joinpath(*relative.parts)
+        try:
+            if _is_reparse(path) or not path.is_file():
+                raise DomainError("backup_integrity_failed", 409)
+            if (path.stat().st_size != entry["bytes"]
+                    or _sha256_file(path) != entry["sha256"]):
+                raise DomainError("backup_integrity_failed", 409)
+        except DomainError:
+            raise
+        except OSError:
+            raise DomainError("backup_integrity_failed", 409) from None
+
+
 def _verify_and_copy(source: Path, staging: Path,
                      expected: dict[str, dict]) -> None:
     for shown, entry in expected.items():
@@ -1063,6 +1125,64 @@ def _verify_and_copy(source: Path, staging: Path,
         if (copied["sha256"] != entry["sha256"]
                 or copied["bytes"] != entry["bytes"]):
             raise DomainError("backup_integrity_failed", 409)
+
+
+def _copy_verified_file(source: Path, destination: Path,
+                        entry: dict) -> None:
+    """复制清单文件并同时校验源与目标实际字节，不能只信一次复制成功。"""
+    try:
+        if _is_reparse(source) or not source.is_file():
+            raise DomainError("backup_integrity_failed", 409)
+        if (source.stat().st_size != entry["bytes"]
+                or _sha256_file(source) != entry["sha256"]):
+            raise DomainError("backup_integrity_failed", 409)
+    except DomainError:
+        raise
+    except OSError:
+        raise DomainError("backup_integrity_failed", 409) from None
+    _copy_file(source, destination)
+    try:
+        if (destination.stat().st_size != entry["bytes"]
+                or _sha256_file(destination) != entry["sha256"]):
+            raise DomainError("backup_integrity_failed", 409)
+    except DomainError:
+        raise
+    except OSError:
+        raise DomainError("backup_integrity_failed", 409) from None
+
+
+def _verify_materialized_tree(root: Path, expected: dict[str, dict],
+                              prefix: str) -> None:
+    """核对目标树文件集合、大小与摘要；拒绝额外文件或链接。"""
+    wanted = {
+        shown[len(prefix):]: entry
+        for shown, entry in expected.items() if shown.startswith(prefix)
+    }
+    actual: set[str] = set()
+    for directory, names, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in names + files:
+            path = base / name
+            if _is_reparse(path):
+                raise DomainError("backup_integrity_failed", 409)
+        for name in files:
+            path = base / name
+            try:
+                actual.add(path.relative_to(root).as_posix())
+            except ValueError:
+                raise DomainError("backup_integrity_failed", 409) from None
+    if actual != set(wanted):
+        raise DomainError("backup_integrity_failed", 409)
+    for shown, entry in wanted.items():
+        path = root.joinpath(*PurePosixPath(shown).parts)
+        try:
+            if (path.stat().st_size != entry["bytes"]
+                    or _sha256_file(path) != entry["sha256"]):
+                raise DomainError("backup_integrity_failed", 409)
+        except DomainError:
+            raise
+        except OSError:
+            raise DomainError("backup_integrity_failed", 409) from None
 
 
 def _validate_restored_database(path: Path, key: bytes) -> None:
@@ -1151,7 +1271,8 @@ def verify_backup(source: Path) -> dict:
     if not source.is_dir():
         raise DomainError("backup_invalid", 400)
     manifest = _read_manifest(source)
-    _validate_bundle_tree(source, manifest)
+    expected = _validate_bundle_tree(source, manifest)
+    _verify_bundle_digests(source, expected)
     key_path = source / "master.key"
     if not key_path.is_file() or _is_reparse(key_path):
         raise DomainError("backup_master_key_missing", 409)
@@ -1181,6 +1302,11 @@ def prepare_restored_instance(destination: Path, *, now: int | None = None,
     撤销旧登录/邀请/Run token、规范化旧 leases，并签发一次性管理员恢复邀请。
     """
     destination = _absolute_path(destination, "restore_destination_invalid")
+    manifest_path = destination / "manifest.json"
+    try:
+        source_manifest = manifest_path.read_bytes()
+    except OSError:
+        raise DomainError("backup_invalid", 400) from None
     manifest = _read_manifest(destination)
     if manifest["version"] < BACKUP_V2:
         raise DomainError("backup_incompatible", 409)
@@ -1192,6 +1318,31 @@ def prepare_restored_instance(destination: Path, *, now: int | None = None,
         summary = dict(summary)
         summary["recovery_invite"] = AuthService(store).create_invite(
             identity, identity.user_id, invite_ttl_seconds)
+
+    # 准备步骤会合法修改 staging 控制库；只更新 staging 清单及其来源摘要，
+    # 原备份 manifest 保持不变。后续 materialize 仍按新清单逐项校验。
+    entry = next((item for item in manifest["files"]
+                  if item["path"] == manifest["control"]["path"]), None)
+    if entry is None:
+        raise DomainError("backup_integrity_failed", 409)
+    try:
+        size = database.stat().st_size
+        digest = _sha256_file(database)
+    except OSError:
+        raise DomainError("backup_integrity_failed", 409) from None
+    manifest["control"] = {
+        "path": manifest["control"]["path"], "sha256": digest, "bytes": size}
+    entry["sha256"] = digest
+    entry["bytes"] = size
+    manifest["prepared"] = {
+        "source_manifest_sha256": hashlib.sha256(source_manifest).hexdigest(),
+        "control": {"path": manifest["control"]["path"], "sha256": digest,
+                    "bytes": size},
+        "restored_at": int(summary["restored_at"]),
+        "cleared_barrier": summary["cleared_barrier"],
+        "admin_user_id": summary["admin_user_id"],
+    }
+    _write_json(manifest_path, manifest)
     return summary
 
 
@@ -1232,12 +1383,15 @@ def materialize_restore(source: Path, *, control_dir: Path, keys_dir: Path,
     if manifest["version"] < BACKUP_V2:
         raise DomainError("backup_incompatible", 409)
     verify_backup(source)
+    expected = {entry["path"]: entry for entry in manifest["files"]}
     key_file = source / "master.key"
     key = _load_backup_master_key(key_file)
     copied = 0
     try:
-        shutil.copyfile(source / "control" / CONTROL_DB_NAME,
-                        control / CONTROL_DB_NAME)
+        control_entry = expected[f"control/{CONTROL_DB_NAME}"]
+        _copy_verified_file(
+            source / "control" / CONTROL_DB_NAME,
+            control / CONTROL_DB_NAME, control_entry)
         if os.name == "posix":
             (control / CONTROL_DB_NAME).chmod(0o600)
         copied += 1
@@ -1246,18 +1400,20 @@ def materialize_restore(source: Path, *, control_dir: Path, keys_dir: Path,
                 ("managed-agent.json", 0o600), ("egress-policy.json", 0o600),
                 ("worker-public.key", 0o644), ("gateway-public.pem", 0o644)):
             target = keys / name
-            shutil.copyfile(source / name, target)
+            _copy_verified_file(source / name, target, expected[name])
             if os.name == "posix":
                 target.chmod(mode)
             copied += 1
-        if (source / "egress-ca.pem").is_file():
+        ca_entry = expected.get("egress-ca.pem")
+        if ca_entry is not None:
             target = keys / "egress-ca.pem"
-            shutil.copyfile(source / "egress-ca.pem", target)
+            _copy_verified_file(source / "egress-ca.pem", target, ca_entry)
             if os.name == "posix":
                 target.chmod(0o600)
             copied += 1
-        shutil.copyfile(source / "egress-policy.json",
-                        egress / "egress-policy.json")
+        _copy_verified_file(
+            source / "egress-policy.json", egress / "egress-policy.json",
+            expected["egress-policy.json"])
         if os.name == "posix":
             (egress / "egress-policy.json").chmod(0o600)
         copied += 1
@@ -1276,17 +1432,9 @@ def materialize_restore(source: Path, *, control_dir: Path, keys_dir: Path,
                 copied += len(_copy_tree(
                     source_part, target_part, prefix="",
                     skip_names=frozenset()))
+        _verify_materialized_tree(workspaces, expected, "workspaces/")
         _validate_restored_database(control / CONTROL_DB_NAME, key)
         _validate_backup_signing_material(source, manifest)
-        for name in ("master.key", "snapshot.pem", "managed-agent.json",
-                     "egress-policy.json", "worker-public.key",
-                     "gateway-public.pem"):
-            if (keys / name).read_bytes() != (source / name).read_bytes():
-                raise DomainError("backup_integrity_failed", 409)
-        if ((source / "egress-ca.pem").is_file()
-                and (keys / "egress-ca.pem").read_bytes()
-                != (source / "egress-ca.pem").read_bytes()):
-            raise DomainError("backup_integrity_failed", 409)
     except BaseException:
         for path in (control, keys, egress, workspaces):
             _clear_directory(path)

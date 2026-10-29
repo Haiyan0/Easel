@@ -1,6 +1,6 @@
 # Easel Windows 本机与 Docker Desktop 使用运维手册
 
-适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`d9c2f5ba960e892f198ebc4a111b7e2ad7e835af`，2026-10-29。
+适合读者：会运行 Python，但不熟悉 Docker、服务器和运维的开发者。核对基线：`04b5f23e36879e72fbafa345dc2ed06abd26a5ae`（A7；A7-R1 修订见交付说明），2026-10-29。
 
 本文把“Desktop”理解为 **Windows 上的 Docker Desktop**；Easel 当前的操作界面仍是浏览器，不是另一个独立 Windows 安装包。只读这份手册即可先在本机使用；服务器部署见[Linux Docker 手册](linux-docker-operations.zh-CN.md)。
 
@@ -652,7 +652,9 @@ $Backup = (Get-ChildItem (Join-Path $DataRoot 'backups') -Directory |
 
 备份包含：control DB 一致快照、master.key、Ed25519 私钥及派生公钥、受管 Agent 配置、出口策略、CA、各 workspace 的 `workspace`（含 `state`）与 `HOME`。明确排除 `.credentials` 与 `.gateway`（每部署重新生成），不备份 socket/PID。
 
-预期 `version=2`、`clean_stop=true`、`workspaces=<数量>`、`verified_backup=...`。备份目录在 `$DataRoot\backups\<时间戳>`，Windows ACL 只授予当前用户/SYSTEM/Administrators；不要放进 Git 或公开目录。`Verify` 只读，不生成 key、不改备份。
+`Backup` 会先读取 `$DataRoot\logs\deployment.json`，要求传入的 `-DataRoot`/`-WorkspaceRoot` 与已启动部署登记值指向同一物理目录；错误空根、重解析点或路径别名在启动备份容器前失败。v2 完整备份必须提供真实 workspace 根；已有 Run 历史的 workspace 缺目录时失败，尚未物化的新 workspace 才允许为空。
+
+预期 `version=2`、`clean_stop=true`、`workspaces=<数量>`、`verified_backup=...`。备份目录在 `$DataRoot\backups\<时间戳>`，Windows ACL 只授予当前用户/SYSTEM/Administrators；不要放进 Git 或公开目录。`Verify` 只读，逐项核对清单中全部文件的大小/SHA-256，不只看 SQLite/签名配置；不生成 key、不改备份。
 
 ### 9.10 恢复到新目录/新项目
 
@@ -663,8 +665,7 @@ $RestoredProject = 'easel-desktop-restored'
 $RestoredPort = 7862
 $RestoredOrigin = 'https://替换为恢复实例的-ngrok-域名'
 $RestoredData = 'C:\Easel\desktop-restored'
-$RestoredWorkspaces = 'C:\Easel\workspaces-restored
-'
+$RestoredWorkspaces = 'C:\Easel\workspaces-restored'
 
 .\deploy\desktop\Restore-WorkspaceEasel.ps1 `
   -Backup $Backup `
@@ -682,6 +683,7 @@ $RestoredWorkspaces = 'C:\Easel\workspaces-restored
 
 - 只读校验备份，拒绝错 key、缺文件、改摘要、未来 schema、非空目标、外来卷/路径逃逸；
 - 创建新卷/网络，把恢复材料落到新目标，不覆盖源；
+- `prepare-restore` 只修改 staging 控制库并更新 staging 清单的来源摘要，**原备份不变**；`materialize-restore` 再核对输入与实际复制字节，失败只清理本次目标；
 - 清除旧屏障/旧 lease 身份、撤销旧登录/未兑换邀请/Run token，签发一次性管理员恢复邀请；
 - 保留 workspace ID、消息和原生会话绑定（容器内 cwd 仍是 `/workspace`）。
 
@@ -708,7 +710,7 @@ $RestoredWorkspaces = 'C:\Easel\workspaces-restored
   -UpgradeFromBackup $Backup
 ```
 
-预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
+预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。在 **compose up 新 control 之前**，`Start` 会先用只读容器执行完整 `verify-backup`，并匹配旧 `deployment.json` 的项目/镜像/配置/根目录；只有 manifest、缺 key/DB、损坏数据或错版本会在新程序打开/迁移正式 DB 之前失败。随后才启动 control、读取 stop 完成记录并执行 `upgrade-complete`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
 
 回滚：不要在原卷上强行降 schema。用升级前的匹配备份按 9.10 恢复到新项目/目录，使用旧镜像启动，验证历史和新消息，再停止。
 
@@ -720,6 +722,7 @@ $RestoredWorkspaces = 'C:\Easel\workspaces-restored
 |---|---|---|
 | `$ProjectName-control` 卷 | control.sqlite3、登录/邀请/Run 元数据、stop 记录 | 不可丢；靠备份 |
 | `$ProjectName-keys` 卷 | master.key、snapshot.pem、派生公钥、managed-agent.json、egress-policy.json、egress-ca.pem | 不可丢；缺私钥不能“重新生成修复” |
+| 初始化状态 | `Initialize` 先只读探测 control DB 与 key 卷；已有 DB/身份缺 master/signing 时拒绝且不生成新 key，仅全新空部署创建初始材料 | 不要删除 key 后重跑 Initialize 试图“修复” |
 | `$ProjectName-egress` 卷 | 出口策略副本 | 可重建，但备份保留 |
 | `$WorkspaceRoot\<id>\workspace` | 用户工作区（容器 `/workspace`），含 `state` | 不可丢 |
 | `$WorkspaceRoot\<id>\home` | 用户 HOME（容器 `/home/easel`），含 `.dsh` 原生历史 | 不可丢 |

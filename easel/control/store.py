@@ -927,6 +927,22 @@ class Store:
         return [row[0] for row in self._connection.execute(
             "SELECT id FROM workspaces ORDER BY id").fetchall()]
 
+    def workspace_has_history(self, workspace_id: str) -> bool:
+        """该 workspace 是否已有 Run 或 worker lease 历史。
+
+        备份缺根时用于区分“从未物化的新空间”和“曾启动过但数据根丢失”。
+        """
+        workspace_id = _text(workspace_id)
+        run = self._connection.execute(
+            "SELECT 1 FROM runs WHERE workspace_id = ? LIMIT 1",
+            (workspace_id,)).fetchone()
+        if run is not None:
+            return True
+        lease = self._connection.execute(
+            "SELECT 1 FROM worker_leases WHERE workspace_id = ?"
+            " AND started_at > 0 LIMIT 1", (workspace_id,)).fetchone()
+        return lease is not None
+
     def workspace_config_versions(self) -> dict[str, int]:
         """返回各 workspace 当前配置版本，写进备份清单便于恢复核对。"""
         return {

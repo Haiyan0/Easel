@@ -1,0 +1,6 @@
+upgraded_from_backup=C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3819\test_real_backup_restore_upgra0\source\data\backups\desktop-20261029-103051
+admission_barrier_reopened=stop-e8a221196efe49809364ad6a51de928e
+started project=easel-a7-live-b729adf1 origin=https://a7-live-b729adf1.example port=7800 control=sha256:6d12e0783526084283931da194575809750f8e4a0c50cb24d8d49cdea6fd4842 worker=sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993 gateway=sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a network=easel-a7-live-b729adf1-control provisioner_socket=/tmp/easel-runtime/easel-a7-live-b729adf1/provisioner.sock
+deployment_file=C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3819\test_real_backup_restore_upgra0\source\data\logs\deployment.json
+config_sha256=89cc1916aa60f621b7ce2c5caae54ade45375fa1f9b8919375df4c4621520a51
+frontend_sha256=55cfa8bf96ea9a2a079b6fbf2e6f27d435f04cfe47047182f533c4d0409c4f49

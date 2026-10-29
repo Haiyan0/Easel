@@ -58,9 +58,6 @@ try {
         -NetworkName $network
     $DataRoot = [IO.Path]::GetFullPath($DataRoot)
     $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
-    if (-not (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
-        throw 'backup_workspace_root_missing'
-    }
     $deploymentFile = Join-Path (Join-Path $DataRoot 'logs') 'deployment.json'
     if (-not (Test-Path -LiteralPath $deploymentFile -PathType Leaf)) {
         throw 'deployment_metadata_missing'
@@ -70,6 +67,24 @@ try {
     if ([string]$deployment.project -ne $ProjectName) {
         throw 'deployment_project_mismatch'
     }
+    if ([string]::IsNullOrWhiteSpace([string]$deployment.workspace_root)) {
+        throw 'backup_workspace_root_missing'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$deployment.data_root)) {
+        throw 'backup_data_root_missing'
+    }
+    # 源根只能来自已启动部署登记值；用户参数必须指向同一物理目录。
+    # 这不依赖容器或卷内容，错误空根在启动任何备份容器前失败。
+    $WorkspaceRoot = Assert-EaselRegisteredRoot `
+        -Path $WorkspaceRoot `
+        -Registered ([string]$deployment.workspace_root) `
+        -MissingCode 'backup_workspace_root_missing' `
+        -MismatchCode 'backup_workspace_root_mismatch'
+    $DataRoot = Assert-EaselRegisteredRoot `
+        -Path $DataRoot `
+        -Registered ([string]$deployment.data_root) `
+        -MissingCode 'backup_data_root_missing' `
+        -MismatchCode 'backup_data_root_mismatch'
     if (-not $Image) {
         $Image = [string]$deployment.control_image
     }

@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-29",
+  "baseline_commit": "04b5f23e36879e72fbafa345dc2ed06abd26a5ae",
+  "scope": ["A7-R1-01", "A7-R1-02", "A7-R1-03", "A7-R1-04"],
+  "tests": {
+    "a7_unit_and_r1_contract": "38 passed (test_operations_a7.py + test_desktop_operations_a7.py + test_desktop_operations_r1.py)",
+    "focused_regression": "147 passed, 1 skipped (operations + A7 contracts + R1 script + desktop deployment/workspace + start identity + lifecycle lock)",
+    "full_multiuser_and_topology": "1433 passed, 10 skipped, 2 warnings in 186.58s",
+    "real_integration": "1 passed in 258.93s (test_desktop_operations_real.py; source/backup/verify/restore/upgrade/bad-image/rollback, random resources, cleanup)",
+    "baseline_script_red": "5 failed, 2 passed on 04b5f23 baseline worktree (correct negative cases rejected; positive idempotent/fresh cases passed)"
+  },
+  "images": {
+    "control_r1": "sha256:6d12e0783526084283931da194575809750f8e4a0c50cb24d8d49cdea6fd4842",
+    "control_r1_size_bytes": 60572259,
+    "worker_old": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+    "worker_new": "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993",
+    "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a",
+    "source_hash_match": {
+      "easel/control/cli.py": "711e22a188cc5f1ec78e4ad8d4f19446356bfb00334a870a0c89ca20529dc2db",
+      "easel/control/store.py": "60c1549110821c9b722039069586a0e34c327ce205f65272ca0ee3a8db762cdc",
+      "easel/cli.py": "25c54c4ca105e3f3ee892c38b8e613f624dc3d2687e684fa7252452a9b08f464",
+      "deploy/desktop/initialize_state.py": "546ab7601a875b20f10de0e3656737b5d78c66ab1937d7f8902305825d247311"
+    },
+    "build_download": "local proxy host.docker.internal:7897 during build only"
+  },
+  "real_scenarios": {
+    "source": {
+      "project": "easel-a7-live-b729adf1",
+      "port": 7800,
+      "config_sha256": "ecead3bdec3ec7eb667ac44127ea2bad709acd81d6b97a759e69cf034e552163",
+      "stop_barrier": "stop-e8a221196efe49809364ad6a51de928e"
+    },
+    "backup": {
+      "name": "desktop-20261029-103051",
+      "manifest_sha256": "f98e25689dd2f874745b5f9faac8091bc99bdaf399d642d3dc0ca3955963c3be",
+      "files": 35,
+      "workspaces": 3,
+      "clean_stop": true
+    },
+    "restore": {
+      "project": "easel-a7-restore-b729adf1",
+      "port": 7801,
+      "old_cookie_status": 401,
+      "evil_origin_status": 403,
+      "a_history_preserved": true,
+      "b_history_preserved": true,
+      "cross_session_isolated": true,
+      "sentinel_preserved": true,
+      "new_harness_message_done": true,
+      "backup_manifest_unchanged": true,
+      "restored_stop_barrier": "stop-71717700ba5a4ff08fcef168fce0b777"
+    },
+    "upgrade": {
+      "bad_image": "worker_or_gateway_image_mismatch (compose up not reached for incomplete backup; valid-image bad worker rejected before start)",
+      "worker_from": "sha256:984bfac19412c0c6251e93568508fc9c078970727e4a9b515d5cb455a82128e9",
+      "worker_to": "sha256:e48eb63b6155b6fc14c37a2525d138e7419f7a8024f46a58d209c40d3a5bd993",
+      "upgraded_from_backup": true,
+      "config_sha256": "89cc1916aa60f621b7ce2c5caae54ade45375fa1f9b8919375df4c4621520a51",
+      "history_preserved": true,
+      "new_message_done": true,
+      "final_stop_barrier": "stop-f37cde3ac6ca44769f0f6377d496df66"
+    }
+  },
+  "not_run": [
+    "real DeepSeek provider request (no approved managed channel/credential; did not read developer .env/HOME)",
+    "Linux target XFS quota / iptables/nftables / IPv6 / Chromium sandbox",
+    "ngrok public browser matrix rerun (A6 evidence retained; frontend unchanged)",
+    "wrong-public-key and runtime missing-broker UI negatives (remain as in A6)",
+    "production release checker (fixed blocked items remain)"
+  ],
+  "cleanup": "verified 2026-10-29 after real run: no containers/volumes/networks for easel-a7-live-b729adf1 or easel-a7-restore-b729adf1; no provisioner sockets; no global prune; developer resources untouched; control image retained for review"
+}

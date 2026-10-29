@@ -133,6 +133,45 @@ try {
     Assert-EaselNetworkContract -ProjectName $ProjectName `
         -NetworkName $network
 
+    # 先只读探测既有 control DB/身份材料。已有部署缺 master/signing 时
+    # 必须在 chown/keygen 之前失败，绝不用新 key 顶替丢失的私钥。
+    $probe = Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--network', 'none', '--read-only',
+        '--user', '10001:10001', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges:true',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+        '--entrypoint', 'python',
+        '--mount', "type=volume,src=$($volumes.Control),dst=/data,readonly",
+        '--mount', "type=volume,src=$($volumes.Keys),dst=/keys,readonly",
+        $Image, '/opt/easel/deploy/desktop/initialize_state.py',
+        '--control', '/data', '--keys', '/keys')
+    if ($probe.ExitCode -ne 0) {
+        throw 'identity_probe_failed'
+    }
+    $probeState = @{}
+    foreach ($line in $probe.Output) {
+        if ("$line" -match '^(database|control_any|master|signing|keys_any)=(.+)$') {
+            $probeState[$Matches[1]] = $Matches[2]
+        }
+    }
+    foreach ($name in @('database', 'control_any', 'master', 'signing',
+                        'keys_any')) {
+        if (-not $probeState.ContainsKey($name)) {
+            throw 'identity_probe_invalid'
+        }
+    }
+    $existing = (
+        $probeState['database'] -eq 'present' -or
+        $probeState['control_any'] -eq 'yes' -or
+        $probeState['master'] -eq 'present' -or
+        $probeState['signing'] -eq 'present' -or
+        $probeState['keys_any'] -eq 'yes')
+    if ($existing -and (
+            $probeState['master'] -ne 'present' -or
+            $probeState['signing'] -ne 'present')) {
+        throw 'existing_identity_incomplete'
+    }
+
     $chown = Invoke-EaselDocker -Arguments @(
         'run', '--rm', '--user', '0:0', '--entrypoint', 'sh',
         '--mount', "type=volume,src=$($volumes.Control),dst=/data",

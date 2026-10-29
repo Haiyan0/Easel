@@ -1,6 +1,6 @@
 # Easel Linux Docker 部署、使用、升级与恢复手册
 
-适合读者：能运行 Python，但第一次维护 Linux/Docker 服务的开发者。核对基线：`d9c2f5ba960e892f198ebc4a111b7e2ad7e835af`，2026-10-29。Windows 操作见[Windows 手册](windows-desktop-operations.zh-CN.md)。
+适合读者：能运行 Python，但第一次维护 Linux/Docker 服务的开发者。核对基线：`04b5f23e36879e72fbafa345dc2ed06abd26a5ae`（A7；A7-R1 修订见交付说明），2026-10-29。Windows 操作见[Windows 手册](windows-desktop-operations.zh-CN.md)。
 
 ## 1. 本文提供哪两种部署
 
@@ -760,6 +760,8 @@ sudo docker run --rm --network none --user 0:0 \
     --require-clean-stop
 ```
 
+完整模式必须提供真实 `--workspace-root`；缺根不会产出 `complete=true`。已有 Run 历史的 workspace 缺目录会失败，尚未物化的新 workspace 才允许为空。Windows 脚本还会把该根绑定到 `deployment.json` 的登记值；Linux 手工命令必须使用同一已登记根，不能用另一个空目录替代。
+
 只读校验：
 
 ```bash
@@ -769,6 +771,8 @@ sudo docker run --rm --network none --read-only --user 10001:10001 \
   --mount "type=bind,src=$DATA_ROOT/backups/$BACKUP_NAME,dst=/backup,readonly" \
   "$CONTROL_IMAGE" python -m easel admin verify-backup --source /backup
 ```
+
+`verify-backup` 逐项核对清单全部文件的大小与 SHA-256（含 workspace/HOME 和有效 SQLite 内容），不只看结构/签名配置；缺文件、多文件或同大小内容篡改都失败。
 
 ### 13.4 恢复/升级（命令存在，但 Linux 端到端未执行）
 
@@ -794,7 +798,11 @@ python -m easel admin materialize-restore --source /data/restore-staging \
   --workspace-root /data/workspaces
 ```
 
-恢复后必须用新的 provider/provisioner/worker/gateway 启动，验证 A/B 历史、sentinel、同会话新 Harness 消息；旧 Cookie 应 401，新 Origin 不匹配写请求应 403。升级必须先 Stop+Backup，再启动新镜像；`admin stop-status`、`admin upgrade-complete`、`admin reopen` 的受控顺序与 Windows `Start -UpgradeFromBackup` 等价。**本轮没有 Linux 目标机，以上恢复/升级/回滚未在 Linux 执行，不得写成 passed。**
+`prepare-restore` 会合法修改 staging 控制库并更新 staging 清单的来源摘要；原备份必须保持不变。`materialize-restore` 会重新核对输入及实际复制字节，失败只清理本次新建的目标，不提交部分恢复。
+
+恢复到新部署后，初始化同样要先探测既有 control DB/key；已有 DB/身份缺 master/signing 时拒绝且不生成新 key，仅全新空部署创建初始材料。
+
+恢复后必须用新的 provider/provisioner/worker/gateway 启动，验证 A/B 历史、sentinel、同会话新 Harness 消息；旧 Cookie 应 401，新 Origin 不匹配写请求应 403。升级必须先 Stop+Backup；Windows `Start -UpgradeFromBackup` 会在 compose up 前完成只读全量校验和旧部署身份匹配，Linux 手工命令必须保持同一顺序：`verify-backup` → 启动新镜像 → `admin stop-status` → `admin upgrade-complete` → `admin reopen`，不得先启动新 control 再查备份。**本轮没有 Linux 目标机，以上恢复/升级/回滚未在 Linux 执行，不得写成 passed。**
 
 ### 13.5 Linux not-run 清单（生产阻断保持）
 
