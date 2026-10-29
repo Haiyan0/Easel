@@ -21,6 +21,7 @@ from pathlib import Path
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi.testclient import TestClient
 
 from easel.control.auth import AuthService
 from easel.control.broker import BrokerService
@@ -32,6 +33,7 @@ from easel.control.store import Store
 from easel.control.types import DomainError, WorkerHandle
 from easel.harnesses.acp import ACPAdapter
 from easel.harnesses.base import HarnessError, RunRequest
+from tests.multiuser import test_relay_cli as relay_cli
 from tests.multiuser.test_runs import (
     NeverExecutor,
     RecordingExecutor,
@@ -522,3 +524,138 @@ def test_worker_consumes_signed_model_metadata_inside_catalog(tmp_path):
             await manager.aclose()
 
     asyncio.run(scenario())
+
+
+MANAGED_PROFILE = (Path(__file__).resolve().parents[2]
+                   / "deploy" / "multiuser" / "managed" / "acp-profile.json")
+
+
+def _serve_args(tmp_path, agent_config) -> list[str]:
+    return [
+        "serve-control",
+        "--control-dir", str(tmp_path / "control"),
+        "--public-origin", relay_cli.ORIGIN,
+        "--master-key-file", str(relay_cli.write_master_key(tmp_path)),
+        "--snapshot-key-file", str(relay_cli.write_signing_key(tmp_path)[0]),
+        "--managed-agent-config", str(agent_config),
+        "--frontend-dir", str(relay_cli.frontend_build(tmp_path)),
+    ]
+
+
+def test_load_managed_profile_models_reads_repo_manifest():
+    from easel.control.snapshot import load_managed_profile_models
+
+    assert load_managed_profile_models(MANAGED_PROFILE) == CATALOG
+
+
+def test_load_managed_profile_models_rejects_missing_or_mismatched(tmp_path):
+    from easel.control.snapshot import load_managed_profile_models
+
+    with pytest.raises((OSError, ValueError)):
+        load_managed_profile_models(tmp_path / "missing.json")
+
+    original = json.loads(MANAGED_PROFILE.read_text(encoding="utf-8"))
+    wrong_schema = {**original, "manifest": "easel.managed-acp-profile/2"}
+    path = tmp_path / "wrong-schema.json"
+    path.write_text(json.dumps(wrong_schema), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_managed_profile_models(path)
+
+    mismatch = json.loads(json.dumps(original))
+    mismatch["harness"]["commit"] = "1" * 40
+    path = tmp_path / "wrong-commit.json"
+    path.write_text(json.dumps(mismatch), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_managed_profile_models(path, expected_commit="2" * 40)
+
+
+def test_serve_control_rejects_model_outside_image_catalog(
+        tmp_path, monkeypatch, capsys):
+    captured = relay_cli.capture_app(tmp_path, monkeypatch)
+    agent_config = relay_cli.write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "models": ["not-in-worker-image-catalog"]},
+        "broker": {"url": "https://control.internal", "channel": "chat"},
+    })
+    code = relay_cli.main(_serve_args(tmp_path, agent_config))
+    assert code != 0
+    assert "managed_config_invalid" in capsys.readouterr().err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
+def test_serve_control_uses_image_catalog_when_models_absent(
+        tmp_path, monkeypatch):
+    captured = relay_cli.capture_app(tmp_path, monkeypatch)
+    agent_config = relay_cli.write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "sandbox": "read-only"},
+        "broker": {"url": "https://control.internal", "channel": "chat"},
+    })
+    code = relay_cli.main(_serve_args(tmp_path, agent_config))
+    assert code == 0
+    app = captured["app"]
+    with TestClient(app, base_url=relay_cli.ORIGIN):
+        assert app.state.config_service._model_catalog == CATALOG
+
+
+def test_serve_control_rejects_missing_managed_profile(
+        tmp_path, monkeypatch, capsys):
+    captured = relay_cli.capture_app(tmp_path, monkeypatch)
+    agent_config = relay_cli.write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "sandbox": "read-only"},
+        "broker": {"url": "https://control.internal", "channel": "chat"},
+    })
+    monkeypatch.setenv("EASEL_MANAGED_PROFILE",
+                       str(tmp_path / "missing-profile.json"))
+    code = relay_cli.main(_serve_args(tmp_path, agent_config))
+    assert code != 0
+    assert "managed_profile_invalid" in capsys.readouterr().err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
+def test_serve_control_rejects_managed_profile_version_mismatch(
+        tmp_path, monkeypatch, capsys):
+    captured = relay_cli.capture_app(tmp_path, monkeypatch)
+    original = json.loads(MANAGED_PROFILE.read_text(encoding="utf-8"))
+    expected = original["harness"]["commit"]
+    mismatch = json.loads(json.dumps(original))
+    mismatch["harness"]["commit"] = "1" * 40
+    profile = tmp_path / "acp-profile.json"
+    profile.write_text(json.dumps(mismatch), encoding="utf-8")
+    agent_config = relay_cli.write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "sandbox": "read-only"},
+        "broker": {"url": "https://control.internal", "channel": "chat"},
+    })
+    monkeypatch.setenv("EASEL_MANAGED_PROFILE", str(profile))
+    monkeypatch.setenv("EASEL_EXPECTED_HARNESS_COMMIT", expected)
+    code = relay_cli.main(_serve_args(tmp_path, agent_config))
+    assert code != 0
+    assert "managed_profile_invalid" in capsys.readouterr().err
+    assert captured == {}
+    assert not (tmp_path / "control").exists()
+
+
+def test_serve_control_narrows_image_catalog(tmp_path, monkeypatch):
+    captured = relay_cli.capture_app(tmp_path, monkeypatch)
+    agent_config = relay_cli.write_agent_config(tmp_path, {
+        "revision": 4,
+        "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                  "models": ["deepseek-flash"]},
+        "broker": {"url": "https://control.internal", "channel": "chat"},
+    })
+    code = relay_cli.main(_serve_args(tmp_path, agent_config))
+    assert code == 0
+    app = captured["app"]
+    with TestClient(app, base_url=relay_cli.ORIGIN):
+        assert app.state.config_service._model_catalog == (
+            "deepseek-flash",)
+        assert "deepseek-chat" not in \
+            app.state.config_service._model_catalog

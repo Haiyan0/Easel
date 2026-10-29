@@ -1,0 +1,2 @@
+DSH_PROFILE_OK commit=687f282e8625c6b8d11ff58211a90524be2e4317 node=24.22.1 patch_sha256=96523f8ad2da5d2789e70814a8a62a12611d1e84642255dac80bf0828978175d model=easel-broker/deepseek-chat models=easel-broker/deepseek-chat,easel-broker/deepseek-flash,easel-broker/deepseek-v4-pro
+WORKER_SMOKE_OK

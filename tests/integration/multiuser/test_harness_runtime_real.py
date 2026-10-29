@@ -334,6 +334,8 @@ def test_real_harness_broker_resume_and_failure_semantics(
             "--master-key-file", "/keys/master.key",
             "--snapshot-key-file", "/keys/snapshot.pem",
             "--managed-agent-config", "/keys/managed-agent.json",
+            "--expected-harness-commit",
+            _manifest()["harness"]["commit"],
             "--frontend-dir", "/opt/easel/web/frontend/dist",
             "--host", "0.0.0.0", "--port", "7861",
             "--provisioner-socket", "/run/easel/provisioner.sock",

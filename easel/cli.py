@@ -296,6 +296,12 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--managed-agent-config", default=None,
                          help="受保护的受管 Agent JSON（revision/agent）；不从用户目录推断")
     p_serve.add_argument(
+        "--managed-profile", default=None,
+        help="受管 ACP manifest（默认控制镜像内 /opt/easel/managed/acp-profile.json）")
+    p_serve.add_argument(
+        "--expected-harness-commit", default=None,
+        help="可选：目标 worker 镜像的 Harness commit；与 manifest 不符时失败")
+    p_serve.add_argument(
         "--frontend-dir",
         default=str(PROJECT_ROOT / "web" / "frontend" / "dist"),
         help="固定前端构建目录（含 index.html）；缺失时明确失败")

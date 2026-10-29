@@ -18,6 +18,7 @@
 - `easel/control/app.py`
 - `easel/harnesses/acp.py`
 - `easel/worker/runs.py`
+- `easel/cli.py`（R1：受管 profile / expected commit 参数）
 
 受管 profile / 构建门槛：
 
@@ -26,6 +27,7 @@
 - `deploy/multiuser/verify_managed_profile.py`
 - `deploy/multiuser/smoke_harness.py`
 - `deploy/multiuser/smoke_worker.py`
+- `deploy/desktop/Dockerfile.control`（R1：控制镜像内置受管 manifest）
 
 测试：
 
@@ -55,6 +57,15 @@
 - `green-tcp-related.txt`
 - `real-flash-topology.txt`
 - `real-flash-permission-stop.txt`
+- `control-delta-build-r1.txt`
+- `worker-delta-build-r1.txt`
+- `worker-image-smoke-r1.txt`
+- `image-source-hashes-r1.txt`
+- `red-task2-r1-binding.txt`
+- `green-task2-r1-targeted.txt`
+- `green-task1-r1.txt`
+- `real-flash-topology-r1.txt`
+- `real-flash-permission-stop-r1.txt`
 
 ## 2. 单一来源与版本固定
 
@@ -65,24 +76,32 @@
    `verify_managed_profile.validate_manifest` 强制完全一致；目录为
    `deepseek-chat`、`deepseek-flash`、`deepseek-v4-pro`。默认模型仍为
    `deepseek-chat`，但每个 Run 的签名 Agent 会用有效路由模型覆盖它。
-2. **运行时信任目录**：`managed-agent.json` 的 `agent.models` 是部署方
-   提供的受信目录；`load_managed_agent_config` 校验其类型/长度/唯一性，
-   `cmd_serve_control` 将其传给 `ConfigService` 与 `BrokerService`。
-   缺失或空目录时，chat 发布/接纳在启动 Run 前明确失败（503
-   `model_catalog_unavailable`）。
-3. **管理员 chat 路由**：`ConfigService.publish` 保存时拒绝默认模型或
-   `allowed_models` 不在信任目录内的路由（409 `model_not_allowed`）；
+2. **镜像信任目录（R1 起为基线）**：控制镜像内
+   `/opt/easel/managed/acp-profile.json` 与 worker 镜像使用同一份受管
+   manifest；`load_managed_profile_models` 校验 schema、Harness commit、
+   provider id/api、默认模型和 `provider.models`。`cmd_serve_control`
+   在打开控制库前读取该目录；`--expected-harness-commit` /
+   `EASEL_EXPECTED_HARNESS_COMMIT` 可绑定目标 worker 镜像 commit，不符即
+   失败。
+3. **运行时目录只能收窄**：`managed-agent.json` 的 `agent.models` 可选；
+   若提供，必须是镜像目录的子集。越界模型在服务启动前以
+   `managed_config_invalid` 拒绝；manifest 缺失/schema/version 不匹配以
+   `managed_profile_invalid` 拒绝；不打开控制库、不创建 Run/token。
+   未提供时直接使用镜像目录。`ConfigService` 与 `BrokerService` 只接收
+   校验后的有效目录。
+4. **管理员 chat 路由**：`ConfigService.publish` 保存时拒绝默认模型或
+   `allowed_models` 不在有效目录内的路由（409 `model_not_allowed`）；
    `public_settings` 只公开交集。
-4. **接纳时固定**：`BrokerService.issue_with_route` 在写 broker token
+5. **接纳时固定**：`BrokerService.issue_with_route` 在写 broker token
    快照的同一事务中返回 `EffectiveRoute`；`WorkerRelay._sign` 对该 chat
    Run 写入 `agent.model = route.model` 与
    `agent.allowed_models = route.allowed_models`。broker token 的
    route_json 与签名 Agent 来自同一路由版本，不会出现 token 新版本而
    Agent 仍用旧版。
-5. **worker 复核**：`RunManager._prepare` 校验签名 Agent 的
+6. **worker 复核**：`RunManager._prepare` 校验签名 Agent 的
    `models`/`allowed_models`/`model` 关系，越界或格式错误在适配器启动前
    以 `agent_config_invalid` 拒绝。
-6. **ACP 选择**：真实 Harness 的 `session/new` 模型选项值是
+7. **ACP 选择**：真实 Harness 的 `session/new` 模型选项值是
    `JSON.stringify([provider, model])`；`ACPAdapter` 从真实选项目录中
    按 model 匹配精确 value，再调用 `session/set_config_option`。目录存在
    但无匹配时本地拒绝，不会把臆造值发给 Harness；旧 Agent 未公布目录时
@@ -92,26 +111,26 @@
 Run。`test_issue_route_and_agent_model_are_fixed_together` 用双连接交错
 证明发布与接纳只能得到整份旧版或新版。
 
-### 部署前置
+### 部署前置（R1 更新）
 
-新 control 的 `managed-agent.json` 必须加入：
+R1 后不再要求部署方手工保持 `agent.models` 与镜像目录一致。控制镜像
+已包含受管 manifest；`managed-agent.json` 的 `agent.models` 可选，仅用于
+收窄：
 
-```json
-"agent": {
-  "runtime": "acp",
-  "command": ["node", "/opt/dsh/apps/cli/lib/bin.js",
-              "--profile", "acp",
-              "--patch", "/opt/easel/managed/acp.patch.yml"],
-  "models": ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"],
-  "sandbox": "workspace-write",
-  "timeout": 300
-}
-```
+- 不写：有效目录 = 镜像 manifest 的 `provider.models`
+  （`deepseek-chat`、`deepseek-flash`、`deepseek-v4-pro`）。
+- 写子集：有效目录 = 该子集；写镜像外模型 → 启动前
+  `managed_config_invalid`，不打开控制库。
+- manifest 缺失、schema/provider 不合法或 commit 与
+  `--expected-harness-commit`/`EASEL_EXPECTED_HARNESS_COMMIT` 不符 →
+  启动前 `managed_profile_invalid`。
+- 控制镜像与 worker 镜像由同一源码构建；worker 构建期
+  `verify_managed_profile` 校验 manifest/patch 一致；真实拓扑测试通过
+  `--expected-harness-commit` 绑定目标 Harness commit。
 
-用户当前实例未更新该文件；本轮未部署、未重启、未替换镜像。部署时必须
-让该目录与 `acp-profile.json`/`acp.patch.yml` 的 `provider.models` 一致
-（真实 Harness 构建冒烟会校验镜像目录；集成测试 helper 直接读取
-manifest 生成 managed 配置）。运维手册同步留到 Task 6。
+用户当前实例未更新/未重启；新 control 镜像无需修改现有
+`managed-agent.json` 即可从镜像 manifest 取得基线目录；若现有文件已写
+`models`，必须收窄在镜像目录内。运维手册同步留到 Task 6。
 
 ## 3. 红绿结果
 
@@ -256,3 +275,76 @@ A6_2_PASS {"allow_requests": 2, "deny_requests": 2, "hang_state": "cancelled", "
 - 增量镜像与一次性 smoke 容器使用 `--rm`/本轮标签；用户镜像未替换。
 - 证据中的路径已脱敏（如出现临时目录会替换为占位符）；无真实 Key/
   Cookie/邀请/prompt 写入证据。
+
+## 7. R1 返工（T2-R1-01 / P2）：运行时目录绑定目标镜像
+
+- R1 父 tip：`68789d3a36c96b3d087774e5aafc7cd33c18e2f5`
+- 修改：`easel/control/snapshot.py`（`load_managed_profile_models`）、
+  `easel/control/cli.py`（manifest 路径/有效目录装配）、`easel/cli.py`
+  （`--managed-profile`、`--expected-harness-commit`）、
+  `deploy/desktop/Dockerfile.control`（控制镜像内置受管 manifest）、
+  测试与证据。Task 2 已通过的 token/签名同事务固定、ACP 映射和 Task 1
+  诊断未改。
+
+### 绑定规则
+
+1. 可信基线目录来自控制镜像内 `/opt/easel/managed/acp-profile.json`
+   （与 worker 镜像同一源码/受管 manifest）；校验 schema、Harness
+   commit、provider id/api、默认模型与 `provider.models`。
+2. 可选 `--expected-harness-commit` 或 `EASEL_EXPECTED_HARNESS_COMMIT`
+   绑定目标 worker 镜像 commit；不符即失败。
+3. `managed-agent.json` 的 `agent.models` 可选，只能收窄：
+   - 镜像外模型 → 服务启动前 `managed_config_invalid`；
+   - manifest 缺失/schema/版本不匹配 → `managed_profile_invalid`；
+   - 未写 models → 使用镜像目录；写子集 → 有效目录为该子集。
+4. 校验发生在 `Store.connect`/`uvicorn.run` 之前：失败不打开/改动控制库，
+   不创建 Run/token/prompt。
+
+### 红绿
+
+- 红（父代码 + 最终测试）：
+  `pytest tests/multiuser/test_managed_chat_model.py -q` →
+  **6 failed, 28 passed**，见 `red-task2-r1-binding.txt`。
+  失败覆盖：镜像外模型仍可启动、未写 models 得到空目录、缺失 manifest
+  仍启动、版本不匹配仍启动、loader 不存在。
+- 绿：
+  - 新测 + profile/relay/config/proxy/broker/provider/worker/runs/
+    diagnostics：**179 passed**，见 `green-task2-r1-targeted.txt`。
+  - Task 1 四文件：**156 passed, 4 skipped**，见 `green-task1-r1.txt`。
+  - `git diff --check`：无输出，exit 0。
+
+### R1 镜像与真实链路
+
+增量镜像（复用 A5 固定 Harness/依赖层；worker 也重建以保持镜像内
+`easel` 源码一致）：
+
+- control：`easel-control-test:task2-r1-68789d3`
+  manifest list `sha256:2acb2485b07dbc65732c0c9996d987922a9d98dbe4fc9a14312217011b46e745`
+- worker：`easel-worker-harness:task2-r1-68789d3`
+  manifest list `sha256:c44c786aa4ef70734ca878fdd9e5ca90c390acf907fc4598b42b042a62c80195`
+- gateway 未改：`sha256:c0a35aaa...`
+
+证据：
+
+- `control-delta-build-r1.txt` / `worker-delta-build-r1.txt`
+- `worker-image-smoke-r1.txt`：`DSH_PROFILE_OK ... models=...` +
+  `WORKER_SMOKE_OK`
+- `image-source-hashes-r1.txt`：14 个 worker 文件 + 10 个 control 文件
+  （含控制镜像内 manifest）逐项 SHA-256，**0 mismatches**
+- `real-flash-topology-r1.txt`：真实拓扑 1 passed；受控 provider 9 个
+  chat 请求全部 `deepseek-flash`，假 Authorization，resume/A-B/权限/
+  401/429/500/drop 通过
+- `real-flash-permission-stop-r1.txt`：A6 `A6_2_PASS`，权限允许/拒绝、
+  停止后继续、注销与令牌撤销通过
+
+真实测试的控制命令已显式传 `--expected-harness-commit`（取工作区
+manifest commit），控制镜像启动时验证镜像内 manifest 与目标版本一致。
+
+### 边界与清理
+
+- 用户运行实例未更新、未重启、未替换镜像；用户容器 ID 与基线一致。
+- 测试容器/网络/卷已按本轮标签清理；未全局 prune，未删除历史
+  `easel-ws-*` 网络。
+- 旧 Run 幂等/恢复仍使用已持久化快照；R1 只改变新控制进程的目录来源
+  校验，未改 Run 状态机、token 事务或 ACP 映射。
+- 真实 DeepSeek/用户真实聊天/原 Web/UI/Task 3+ 仍未运行或验收。

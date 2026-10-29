@@ -1,0 +1,4 @@
+A6_IMAGES {"control": "sha256:2acb2485b07dbc65732c0c9996d987922a9d98dbe4fc9a14312217011b46e745", "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a", "worker": "sha256:c44c786aa4ef70734ca878fdd9e5ca90c390acf907fc4598b42b042a62c80195"}
+A6_2_PASS {"allow_requests": 2, "deny_requests": 2, "hang_state": "cancelled", "logout_close_seconds": 0.03, "retry_runs": 1, "screenshots": ["04-permission.png"], "slow_events": 4}
+.
+1 passed, 1 deselected in 83.66s (0:01:23)

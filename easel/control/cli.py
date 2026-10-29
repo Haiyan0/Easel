@@ -41,12 +41,34 @@ from .runtime import RuntimeManager, UnixProvisionerClient
 from .snapshot import (
     WORKSPACE_SIDECAR_MODE,
     load_managed_agent_config,
+    load_managed_profile_models,
     load_signing_key,
 )
 from .store import SCHEMA_VERSION, Store
 from .types import DomainError
 
 CONTROL_DB_NAME = "control.sqlite3"
+_MANAGED_PROFILE_INSTALLED = Path("/opt/easel/managed/acp-profile.json")
+_MANAGED_PROFILE_REPO = (Path(__file__).resolve().parents[2]
+                         / "deploy" / "multiuser" / "managed"
+                         / "acp-profile.json")
+
+
+def _managed_profile_path(explicit: object) -> Path:
+    """受管 manifest 只来自显式文件、部署 env 或镜像/源码固定位置。"""
+    if explicit:
+        if not isinstance(explicit, (str, Path)):
+            raise ValueError("managed profile path is invalid")
+        return Path(explicit)
+    env = os.environ.get("EASEL_MANAGED_PROFILE")
+    if env:
+        return Path(env)
+    for candidate in (_MANAGED_PROFILE_INSTALLED, _MANAGED_PROFILE_REPO):
+        if candidate.is_file():
+            return candidate
+    raise OSError("managed profile is missing")
+
+
 BACKUP_FORMAT = "easel.control.backup"
 BACKUP_VERSION = 2
 BACKUP_V2 = 2
@@ -2394,7 +2416,24 @@ def cmd_serve_control(args) -> int:
     harness_summary = None
     if signing_key is not None:
         revision, agent, broker_config = managed_agent
-        model_catalog = tuple(agent.get("models") or ())
+        try:
+            profile_path = _managed_profile_path(
+                getattr(args, "managed_profile", None))
+            expected_commit = (
+                getattr(args, "expected_harness_commit", None)
+                or os.environ.get("EASEL_EXPECTED_HARNESS_COMMIT"))
+            image_models = load_managed_profile_models(
+                profile_path, expected_commit=expected_commit)
+        except (OSError, ValueError):
+            print("错误：managed_profile_invalid", file=sys.stderr)
+            return 2
+        configured_models = tuple(agent.get("models") or ())
+        if configured_models and any(
+                model not in image_models for model in configured_models):
+            # 运行时配置只能收窄镜像可信目录，不能自报镜像不支持的模型。
+            print("错误：managed_config_invalid", file=sys.stderr)
+            return 2
+        model_catalog = configured_models or image_models
         try:
             relay_factory = build_relay_factory(
                 signing_key=signing_key, revision=revision, agent=agent,
