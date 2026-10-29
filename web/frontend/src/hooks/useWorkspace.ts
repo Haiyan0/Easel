@@ -29,6 +29,12 @@ interface Recovery {
   eventId: number;
 }
 
+// questionStatus 中协议明确的终态；unknown/checking 等其它值一律按未知处理，
+// 保留待确认题卡并继续禁用提交。
+const TERMINAL_QUESTION_STATUSES = new Set([
+  'answered', 'resolved', 'expired', 'not_found',
+]);
+
 interface ClientRun {
   runId: string;
   turnId: string;
@@ -593,8 +599,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
           runId, [question.id], controller.signal);
         if (!owns()) return;
         const state = status[question.id]?.status;
-        const explicit = typeof state === 'string' && state !== ''
-          && state !== 'pending';
+        const explicit = typeof state === 'string'
+          && TERMINAL_QUESTION_STATUSES.has(state);
         apply(() => setRun((current) => {
           if (!current || current.runId !== runId) return current;
           if (current.answered.includes(question.id)) {

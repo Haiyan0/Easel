@@ -62,7 +62,7 @@ class FakeState:
             "invite-a16": "A", "invite-a17": "A", "invite-a18": "A",
             "invite-a19": "A", "invite-a20": "A", "invite-a21": "A",
             "invite-a22": "A", "invite-a23": "A", "invite-a24": "A",
-            "invite-a25": "A",
+            "invite-a25": "A", "invite-a26": "A", "invite-a27": "A",
             "invite-b": "B", "invite-b2": "B", "invite-b3": "B",
             "invite-b4": "B", "invite-b5": "B",
         }
@@ -2152,6 +2152,81 @@ async def scenario_r2_question_resolved_on_reconnect(
         "30-r2-question-resolved.png")
 
 
+async def _r3_unknown_status(
+    browser, server: Server, results: dict, failures: list,
+    invite: str, status: str, key: str, filename: str,
+) -> None:
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await login(page, server.origin, invite)
+        await select_session(page, "A 第二会话")
+        with server.state.lock:
+            calls = len(server.state.question_run_ids)
+        server.force_question_status_once(status)
+        await send_text(page, "需要问题")
+        await wait_for(
+            lambda: len(server.state.question_run_ids) > calls, 10,
+            f"{status} 状态查询未发生")
+        await asyncio.sleep(0.5)
+        cards = await page.locator(".question-card").count()
+        assert cards == 1, (
+            f"{status} 状态清除了待确认题卡 cards={cards}")
+        assert await page.locator(
+            '.question-card[data-pending="true"]').count() == 1
+        await page.get_by_role("button", name="允许本次").click()
+        assert await page.get_by_role("button", name="提交").is_disabled(), (
+            f"{status} 状态未知时提交按钮未禁用")
+        run = server.state.runs[server.state.question_run_ids[-1]]
+        assert run["text"] == "需要问题", run
+        assert run["asked"] and not run["terminal"], run
+        with server.state.lock:
+            posts_after_send = server.state.post_chat_count
+        # 后续明确 pending 应恢复可提交。
+        server.force_question_status_once("pending")
+        await page.reload(wait_until="domcontentloaded")
+        await page.locator(".sidebar").wait_for(timeout=15000)
+        await select_session(page, "A 第二会话")
+        await page.locator(
+            '.question-card[data-pending="false"]').wait_for(timeout=15000)
+        await page.get_by_role("button", name="允许本次").click()
+        assert not await page.get_by_role("button", name="提交").is_disabled()
+        await page.get_by_role("button", name="提交").click()
+        await wait_for(lambda: run["answered"] is True, 10,
+                       f"{status} 后明确 pending 无法回答")
+        await page.wait_for_function(
+            "() => document.querySelectorAll('.question-card').length === 0",
+            timeout=15000)
+        await page.get_by_text("已按你的选择继续。", exact=True).last.wait_for(
+            timeout=15000)
+        assert server.state.post_chat_count == posts_after_send
+        results[key] = True
+        await page.screenshot(path=str(EVIDENCE / filename))
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{key}: {error!r}")
+    finally:
+        server.abandon_runs("A", "s-a2")
+        await context.close()
+
+
+async def scenario_r3_question_unknown_status(
+    browser, server: Server, results: dict, failures: list,
+    screenshots: list,
+) -> None:
+    await _r3_unknown_status(
+        browser, server, results, failures, "invite-a26", "unknown",
+        "r3_question_unknown_status", "31-r3-question-unknown.png")
+
+
+async def scenario_r3_question_checking_status(
+    browser, server: Server, results: dict, failures: list,
+    screenshots: list,
+) -> None:
+    await _r3_unknown_status(
+        browser, server, results, failures, "invite-a27", "checking",
+        "r3_question_checking_status", "32-r3-question-checking.png")
+
+
 async def main() -> int:
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     if not (DIST / "index.html").is_file():
@@ -2187,6 +2262,8 @@ async def main() -> int:
                 scenario_r2_pending_question_reconnect,
                 scenario_r2_question_expired_on_reconnect,
                 scenario_r2_question_resolved_on_reconnect,
+                scenario_r3_question_unknown_status,
+                scenario_r3_question_checking_status,
             ]
             for scenario in control_scenarios:
                 await scenario(
@@ -2229,7 +2306,9 @@ async def main() -> int:
         "r1_answer_403", "r1_answer_409", "r1_question_cursor",
         "r1_thinking_cursor", "r2_pending_question_reconnect",
         "r2_question_expired_on_reconnect",
-        "r2_question_resolved_on_reconnect", "local_original_chat",
+        "r2_question_resolved_on_reconnect",
+        "r3_question_unknown_status",
+        "r3_question_checking_status", "local_original_chat",
     }
     return 0 if not failures and expected <= set(results) else 1
 
