@@ -20,6 +20,7 @@ AUDIT = option("audit", "")
 STDERR_BYTES = int(option("stderr-bytes", "0") or 0)
 STATUS = option("status", "")
 ERROR_CODE = option("error-code", "")
+ERROR_DATA = option("error-data", "")
 ERROR_MESSAGE = option("error-message", "fixture failure")
 SESSION_ID = "diag-session"
 
@@ -52,6 +53,11 @@ def reply(message, result):
 def fail(message):
     error = {"code": -32000, "message": ERROR_MESSAGE}
     data = {}
+    if ERROR_DATA:
+        # 原样注入结构化证据，包括非法 status 字符串；fixture 不做 int 转换。
+        parsed = json.loads(ERROR_DATA)
+        if isinstance(parsed, dict):
+            data = parsed
     if STATUS:
         data["status"] = int(STATUS)
     if ERROR_CODE:
@@ -97,6 +103,13 @@ if MODE == "hang-stderr":
 while True:
     message = receive()
     method = message.get("method")
+    if method == "probe-error":
+        # 可选诊断字段解析的专用帧；后续 probe-ok 必须仍能被 reader 消费。
+        fail(message)
+        continue
+    if method == "probe-ok":
+        reply(message, {"ok": True})
+        continue
     if method == "initialize":
         if MODE == "initialize-error":
             fail(message)

@@ -28,6 +28,10 @@
 - `green-targeted.txt`
 - `green-related-harness.txt`
 - `green-related-tcp.txt`
+- `red-r1-status-parser.txt`
+- `green-r1-status-parser.txt`
+- `green-targeted-r1.txt`
+- `probe-status-r1.txt`
 
 ## 2. 红绿命令与实际结果
 
@@ -216,3 +220,51 @@ run failure run_id=<id> stage=<stage> category=<category> status=<status|None> e
 - 四个生产文件 `ruff check` 仍只报告基线已有规则（`BLE001`、`SIM102`、
   `I001`、`UP035` 等），本任务新增代码未引入新的 ruff 告警。
 - `git diff --check` 无输出。
+
+## 11. R1 返工（T1-R1-01 / P2）：无效 status 不得退出 reader
+
+- 父提交：`9f95e5dfea96312550eecd3101ed61f7188ab68b`
+- 修改范围：`easel/harnesses/rpc.py` 的 `_status_value` 与
+  `classify_error_evidence`；`tests/multiuser/test_run_diagnostics.py`；
+  `tests/fixtures/harness_diagnostics.py`；本证据目录。`base.py`/
+  `acp.py`/`runs.py` 本轮未改。
+
+修复要点：
+
+- status 字符串先限长（≤3 字符）、`isascii()`、`isdigit()`，最后才
+  `int()`；Unicode 数字（如 `²`）、4301 位数字、空串、带空格等无效字段
+  直接忽略，不再抛出诊断解析异常。
+- 某个 status 字段无效或未映射时，继续检查后续 status 字段以及已知
+  `code`/`error`；只有全部没有可分类证据才回 unknown。
+- 不在 `_read` 外层捕获后退出 reader；同一 reader 继续消费后续正常帧。
+
+红绿结果：
+
+- 红（`9f95e5d` 的 `rpc.py` + 最终测试内容）：**7 failed, 19 passed**，
+  见 `red-r1-status-parser.txt`。失败均为 `status="²"`、4301 位数字、
+  无效 status 掩盖 code/后续 status 字段导致 reader 退出。
+- 绿（修复后）：新测 **26 passed**，见 `green-r1-status-parser.txt`；
+  执行单指定四文件 **156 passed, 4 skipped**，见
+  `green-targeted-r1.txt`。
+- 主审只读探针（未修改）复跑：基线与实施目录均能继续读取第二帧
+  `{"ok": true}`；实施目录对 `"429"`、`"²"`、4301 位数字都得到
+  `category=rate_limited`，输出 `NO_RUNTIME_RESOURCES_TOUCHED=True`，
+  见 `probe-status-r1.txt`。
+- `git diff --check` 无输出。
+
+回归覆盖（均为真实假 ACP 子进程 + `RPC._read`）：
+
+- Unicode digit `²` + 已知 `code=rate_limited` → `rate_limited`
+- 4301 位数字 + 已知 code → `rate_limited`
+- 合法 `"429"` → `rate_limited`、status 429
+- 仅 `status="²"` 无其他证据 → unknown、无 status
+- 无效 status + 后续 `statusCode=503` → `service_unavailable`、503
+- 无效 status + 已知 `error=invalid_request` → `request_rejected`
+- bool status + 已知 code → 使用 code 分类
+- `status=418` + 已知 code → code 分类、保留 status 418
+- `status=418` + 后续 `statusCode=429` → `rate_limited`、429
+- 每个用例在错误帧后继续调用 `probe-ok`，断言返回 `{"ok": true}` 且
+  `rpc.reader` 未结束；证明后续正常响应仍被消费。
+
+本轮未触碰用户容器、卷、socket、Key 或邀请；未运行真实 Harness/模型/
+Docker；未修改主审文件。

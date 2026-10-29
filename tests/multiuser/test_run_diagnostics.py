@@ -46,7 +46,8 @@ STDERR_TOTAL = 65536
 
 
 def _command(tmp_path, mode, *, audit_name=None, status=None,
-             error_code=None, error_message=None, stderr_bytes=0):
+             error_code=None, error_message=None, error_data=None,
+             stderr_bytes=0):
     audit = tmp_path / (audit_name or f"audit-{mode}.jsonl")
     command = [sys.executable, str(FIXTURE), "--mode", mode,
                "--audit", str(audit)]
@@ -56,6 +57,9 @@ def _command(tmp_path, mode, *, audit_name=None, status=None,
         command += ["--error-code", error_code]
     if error_message is not None:
         command += ["--error-message", error_message]
+    if error_data is not None:
+        command += ["--error-data",
+                    json.dumps(error_data, ensure_ascii=False)]
     if stderr_bytes:
         command += ["--stderr-bytes", str(stderr_bytes)]
     return command
@@ -187,6 +191,60 @@ def test_rpc_malformed_frame_reports_rpc_stage(tmp_path):
     error = asyncio.run(scenario())
     assert getattr(error, "stage", None) == "rpc"
     assert getattr(error, "category", "unknown") in (None, "unknown")
+
+
+@pytest.mark.parametrize(
+    ("error_data", "category", "status"),
+    [
+        # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+        ({"status": "²", "code": "rate_limited"},
+         "rate_limited", None),
+        # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+        ({"status": "9" * 4301, "code": "rate_limited"},
+         "rate_limited", None),
+        # 合法 ASCII 状态字符串仍正常分类。
+        ({"status": "429"}, "rate_limited", 429),
+        # 完全没有可用结构化证据时才回 unknown。
+        ({"status": "²"}, None, None),
+        # 无效 status 不得掩盖后续可用的 status 字段。
+        ({"status": "²", "statusCode": 503},
+         "service_unavailable", 503),
+        # 无效 status 不得掩盖已知 code/error。
+        ({"status": "²", "error": "invalid_request"},
+         "request_rejected", None),
+        # bool 不是有效状态码；已知 code 仍生效。
+        ({"status": True, "code": "invalid_token"}, "auth", None),
+        # 可解析但未映射的状态码保留；code 证据仍继续检查。
+        ({"status": 418, "code": "rate_limited"},
+         "rate_limited", 418),
+        # 未映射 status 不得掩盖后续可用的 status 字段。
+        ({"status": 418, "statusCode": 429},
+         "rate_limited", 429),
+    ],
+)
+def test_invalid_diagnostic_status_never_kills_reader(
+        tmp_path, error_data, category, status):
+    """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+            assert getattr(error, "category", None) == category
+            assert getattr(error, "status", None) == status
+            assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+            assert await rpc.call("probe-ok", {}, timeout=10) == {
+                "ok": True}
+            assert not rpc.reader.done()
+        assert rpc.stderr.done()
+
+    asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------

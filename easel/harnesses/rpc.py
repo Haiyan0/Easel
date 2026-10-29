@@ -45,7 +45,10 @@ _EVIDENCE_CODE_CATEGORIES = {
 def _status_value(value: object) -> int | None:
     if type(value) is int:
         status = value
-    elif isinstance(value, str) and value.isdigit():
+    elif (type(value) is str and len(value) <= 3
+          and value.isascii() and value.isdigit()):
+        # 先限长再做 ASCII 十进制校验，最后才 int()；任意长度/Unicode 数字
+        # 以及超长字符串都不能抛到 reader。
         status = int(value)
     else:
         return None
@@ -73,18 +76,22 @@ def classify_error_evidence(error: object) -> tuple[str | None, int | None]:
         return None, None
     status = None
     for field in _EVIDENCE_STATUS_FIELDS:
-        status = _status_value(data.get(field))
-        if status is not None:
-            break
-    if status is not None:
-        return _category_for_status(status), status
+        candidate = _status_value(data.get(field))
+        if candidate is None:
+            continue
+        if status is None:
+            status = candidate
+        category = _category_for_status(candidate)
+        if category is not None:
+            return category, candidate
+    # 状态码无效/未映射时继续检查已知 code/error；都无效才回 unknown。
     for field in ("code", "error"):
         value = data.get(field)
-        if isinstance(value, str):
+        if type(value) is str:
             category = _EVIDENCE_CODE_CATEGORIES.get(value.lower())
             if category is not None:
-                return category, None
-    return None, None
+                return category, status
+    return None, status
 
 
 async def close_sessions(session_key: str | None = None,

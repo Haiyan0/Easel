@@ -1,0 +1,9 @@
+﻿SOURCE=baseline
+ascii429=[{"error": "Agent 协议错误：fixture error", "category": null}, {"result": {"ok": true}}]
+unicode_digit=[{"error": "Agent 协议错误：fixture error", "category": null}, {"result": {"ok": true}}]
+long_digits=[{"error": "Agent 协议错误：fixture error", "category": null}, {"result": {"ok": true}}]
+SOURCE=implementation
+ascii429=[{"error": "Agent 协议错误：fixture error", "category": "rate_limited"}, {"result": {"ok": true}}]
+unicode_digit=[{"error": "Agent 协议错误：fixture error", "category": "rate_limited"}, {"result": {"ok": true}}]
+long_digits=[{"error": "Agent 协议错误：fixture error", "category": "rate_limited"}, {"result": {"ok": true}}]
+NO_RUNTIME_RESOURCES_TOUCHED=True
