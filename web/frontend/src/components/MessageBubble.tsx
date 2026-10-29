@@ -19,6 +19,7 @@ interface MessageBubbleProps {
   activity?: string;
   stillWorking?: string;   // 防呆心跳提示（未卡住）；仅流式时的独立提示，不替代思考/活动
   actions?: BubbleActions;
+  mediaEnabled?: boolean;  // control 暂未接通产物/媒体宿主路径时只渲染文本
 }
 
 function ActionBar({ actions }: { actions: BubbleActions }) {
@@ -40,17 +41,22 @@ function ActionBar({ actions }: { actions: BubbleActions }) {
   );
 }
 
-export default function MessageBubble({ message, isStreaming, thinking, activity, stillWorking, actions }: MessageBubbleProps) {
+export default function MessageBubble({ message, isStreaming, thinking, activity, stillWorking, actions, mediaEnabled = true }: MessageBubbleProps) {
   const rendered = useMemo(() => {
     if (message.role === 'user') return { html: '', artifacts: [], archives: [] };
     // 助手正文里裸露的产物路径先转成前端可用链接（文件直开、图片内联、目录跳内容库）。
     // 流式中不转换：路径/围栏代码块可能被 SSE token 从中间切开（扩展名没收全会被
     // 误判成目录、未闭合的 ``` 会误伤命令示例里的 outputs/），转换只在流式结束后
     // 对完整正文做一次，避免闪烁成错误链接再跳变。
-    const body = isStreaming ? message.content : linkifyOutputs(message.content);
-    const html = externalizeMediaLinks(renderMarkdown(body));
-    return isStreaming ? { html, artifacts: [], archives: [] } : extractArtifacts(html);
-  }, [message.content, message.role, isStreaming]);
+    // control 暂未接通的媒体/产物路径也不生成宿主 URL，避免调用 local 接口。
+    const body = isStreaming || !mediaEnabled
+      ? message.content : linkifyOutputs(message.content);
+    const html = mediaEnabled
+      ? externalizeMediaLinks(renderMarkdown(body))
+      : renderMarkdown(body);
+    return isStreaming || !mediaEnabled
+      ? { html, artifacts: [], archives: [] } : extractArtifacts(html);
+  }, [message.content, message.role, isStreaming, mediaEnabled]);
 
   // ---- 用户消息 ----
   if (message.role === 'user') {
@@ -61,6 +67,14 @@ export default function MessageBubble({ message, isStreaming, thinking, activity
       <div className="message-row user">
         <div className="msg-col user">
           <div className="message-bubble user">{message.content}</div>
+          {message.pending && (
+            <div className="msg-pending" role="status">发送中…</div>
+          )}
+          {message.failed && (
+            <div className="msg-pending msg-failed" role="status">
+              发送失败，可重试同一请求
+            </div>
+          )}
           {actions && <ActionBar actions={actions} />}
         </div>
       </div>

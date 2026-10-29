@@ -335,7 +335,11 @@ export function deleteOutput(path: string): Promise<{ ok: boolean; deleted: stri
 export interface UploadedFile { id: string; name: string; path: string; }
 
 /** OpenClaw ask_user 问答题（SSE question 事件 payload）。 */
-export interface ChatQuestionOption { label: string; description?: string; }
+export interface ChatQuestionOption {
+  label: string;
+  description?: string;
+  value?: string;      // control 的 opaque 选项值；local 无此字段时回退 label
+}
 export interface ChatQuestionItem {
   questionId: string;
   header?: string;

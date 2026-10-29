@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { ReactNode } from 'react';
-import Sidebar from './components/Sidebar';
 import type { Page } from './components/Sidebar';
 import ChatPage from './components/ChatPage';
 import SkillPage from './components/SkillPage';
@@ -13,14 +12,15 @@ import CalendarPage from './components/CalendarPage';
 import IdeasPage from './components/IdeasPage';
 import PublishPage from './components/PublishingPage';
 import BreakdownPage from './components/BreakdownPage';
-import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
 import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
-import ControlApp from './components/ControlApp';
+import AuthBoundary from './components/AuthBoundary';
+import WorkspaceApp from './components/WorkspaceApp';
+import WorkspaceLayout from './components/WorkspaceLayout';
 import { detectRuntimeMode } from './lib/control';
 import {
   loadSessions,
@@ -75,7 +75,22 @@ export default function App() {
       </ModeNotice>
     );
   }
-  return mode === 'control' ? <ControlApp /> : <LocalApp />;
+  if (mode === 'control') {
+    return (
+      <AuthBoundary>
+        {(session) => (
+          <WorkspaceApp key={session.epoch}
+            ctx={session.ctx}
+            epoch={session.epoch}
+            epochs={session.epochs}
+            onExpired={session.onExpired}
+            onLogout={session.onLogout}
+          />
+        )}
+      </AuthBoundary>
+    );
+  }
+  return <LocalApp />;
 }
 
 function ModeNotice({ text, children }: {
@@ -840,8 +855,8 @@ export function LocalApp() {
   }, [activeSessionId]);
 
   return (
-    <div className="app-layout">
-      <Sidebar
+    <>
+      <WorkspaceLayout
         currentPage={currentPage}
         onPageChange={setCurrentPage}
         personas={personas}
@@ -859,15 +874,10 @@ export function LocalApp() {
         apiDirect={apiDirect}
         agentRuntime={agentRuntime}
         onOpenSettings={() => setSettingsOpen(true)}
-      />
-      <main className="main-content">
-        {(['trends', 'ideas', 'calendar', 'publish', 'breakdown'] as Page[]).includes(currentPage) && (
-          <SubNav current={currentPage} onNavigate={setCurrentPage} />
-        )}
-        <div className="page-host">
-          {renderPage()}
-        </div>
-      </main>
+        mode="local"
+      >
+        {renderPage()}
+      </WorkspaceLayout>
 
       {/* 首次使用：推荐配置画像 */}
       {showRecommend && (
@@ -909,6 +919,6 @@ export function LocalApp() {
           }}
         />
       )}
-    </div>
+    </>
   );
 }

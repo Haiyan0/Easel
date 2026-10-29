@@ -1505,3 +1505,76 @@ textarea.field { resize: vertical; min-height: 90px; }
   .profile-head { flex-wrap: wrap; }
   .profile-summary { padding: 18px; }
 }
+
+/* ---- 原 Web 共用认证/会话层（Task 3，最小桥接样式） ---- */
+.sidebar-identity {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.sidebar-identity-name {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.sidebar-logout {
+  border: 1px solid var(--border); background: none;
+  color: var(--text-secondary); cursor: pointer;
+  border-radius: 7px; padding: 3px 8px; font-size: 12px;
+}
+.sidebar-logout:hover { color: var(--text); border-color: var(--accent-start); }
+
+.chat-banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 9px 12px; margin-bottom: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-radius: var(--radius);
+  color: var(--text-secondary); font-size: 13px;
+}
+.chat-banner-text { flex: 1; min-width: 0; }
+.chat-banner-action {
+  border: 1px solid var(--border); background: none;
+  color: var(--text); cursor: pointer;
+  border-radius: 7px; padding: 4px 9px; font-size: 12px;
+}
+.chat-banner-action:hover { border-color: var(--accent-start); }
+.chat-older {
+  align-self: center; margin: 4px auto 10px;
+  border: 1px solid var(--border); background: none;
+  color: var(--text-secondary); cursor: pointer;
+  border-radius: 7px; padding: 5px 10px; font-size: 12px;
+}
+.msg-pending {
+  margin-top: 4px; font-size: 11px; color: var(--text-tertiary);
+}
+.msg-failed { color: var(--red); }
+
+.unavailable-page {
+  max-width: 640px; margin: 0 auto; padding: 56px 24px;
+  display: grid; gap: 14px; align-content: start;
+  color: var(--text-secondary);
+}
+.unavailable-page h2 {
+  margin: 0; color: var(--text); font-size: 22px;
+  font-family: 'Manrope', 'Noto Sans SC', sans-serif;
+}
+.unavailable-page p { margin: 0; line-height: 1.7; font-size: 14px; }
+
+.settings-bridge { min-height: 100%; }
+.settings-bridge-tabs {
+  display: flex; gap: 8px; padding: 16px 24px 0;
+  border-bottom: 1px solid var(--border);
+}
+.settings-bridge-tab {
+  border: 1px solid transparent; background: none;
+  color: var(--text-secondary); cursor: pointer;
+  padding: 8px 12px; border-radius: 8px 8px 0 0; font-size: 13px;
+}
+.settings-bridge-tab.active {
+  color: var(--text); border-color: var(--border);
+  border-bottom-color: var(--bg-elev); background: var(--bg-elev);
+}

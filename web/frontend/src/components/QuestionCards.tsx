@@ -1,6 +1,10 @@
 import { useMemo, useState } from 'react';
-import type { ChatQuestion, ChatQuestionItem } from '../lib/api';
+import type {
+  ChatQuestion, ChatQuestionItem, ChatQuestionOption,
+} from '../lib/api';
 import { answerQuestion } from '../lib/api';
+import { optionSubmitValue } from '../lib/control';
+import { questionAnswersFor } from '../lib/questions';
 
 /**
  * ask_user 问答题卡片。
@@ -14,7 +18,20 @@ import { answerQuestion } from '../lib/api';
  * （gateway 对 multiSelect=false 的多值直接报 "does not allow multiple answers"，
  * 前端只按数据渲染，不绕过校验）。
  */
-function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnswered: () => void }) {
+interface AnswerResult {
+  ok: boolean;
+  error?: string;
+}
+
+interface QuestionCardProps {
+  question: ChatQuestion;
+  onAnswered: () => void;
+  onAnswer?: (
+    question: ChatQuestion, answers: Record<string, string[]>,
+  ) => Promise<AnswerResult>;
+}
+
+function QuestionCard({ question, onAnswered, onAnswer }: QuestionCardProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<Record<string, string[]>>({});
@@ -26,12 +43,14 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
   const valsOf = (it: ChatQuestionItem): string[] => selected[it.questionId] || [];
   const allAnswered = items.length > 0 && items.every((it) => valsOf(it).length > 0);
 
-  const pick = (it: ChatQuestionItem, label: string) => {
+  const pick = (it: ChatQuestionItem, option: ChatQuestionOption) => {
+    const value = optionSubmitValue(option);
     setSelected((s) => {
       const cur = s[it.questionId] || [];
       const next = it.multiSelect
-        ? (cur.includes(label) ? cur.filter((v) => v !== label) : [...cur, label])
-        : [label];
+        ? (cur.includes(value)
+          ? cur.filter((v) => v !== value) : [...cur, value])
+        : [value];
       return { ...s, [it.questionId]: next };
     });
   };
@@ -57,10 +76,11 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
   const submit = async () => {
     if (busy || !allAnswered) return;
     setBusy(true); setError('');
-    const answers: Record<string, string[]> = {};
-    for (const it of items) answers[it.questionId] = valsOf(it);
+    const answers = questionAnswersFor(items, selected);
     try {
-      const res = await answerQuestion({ questionId: question.id, answers });
+      const res = onAnswer
+        ? await onAnswer(question, answers)
+        : await answerQuestion({ questionId: question.id, answers });
       if (!res.ok) setError(res.error || '提交失败');
       else onAnswered();
     } catch (e) {
@@ -88,15 +108,19 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
                   {it.multiSelect && <span className="question-card__multi">可多选</span>}
                 </div>
                 <div className="question-card__options">
-                  {options.map((opt) => (
-                    <button key={opt.label}
-                      className={`question-card__option${vals.includes(opt.label) ? ' question-card__option--selected' : ''}`}
-                      disabled={busy}
-                      onClick={() => pick(it, opt.label)}>
-                      <strong>{opt.label}</strong>
-                      {opt.description && <span>{opt.description}</span>}
-                    </button>
-                  ))}
+                  {options.map((opt) => {
+                    const value = optionSubmitValue(opt);
+                    return (
+                      <button key={opt.label}
+                        data-value={value}
+                        className={`question-card__option${vals.includes(value) ? ' question-card__option--selected' : ''}`}
+                        disabled={busy}
+                        onClick={() => pick(it, opt)}>
+                        <strong>{opt.label}</strong>
+                        {opt.description && <span>{opt.description}</span>}
+                      </button>
+                    );
+                  })}
                   {cvals.map((v) => (
                     <button key={`custom-${v}`}
                       className="question-card__option question-card__option--selected"
@@ -156,7 +180,15 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
 }
 
 /** 流式中的 ask_user 问答题列表（一次性卡片，答完即从当前流移除）。 */
-export default function QuestionCards({ questions, onDone }: { questions: ChatQuestion[]; onDone?: (questionId: string) => void }) {
+export default function QuestionCards({
+  questions, onDone, onAnswer,
+}: {
+  questions: ChatQuestion[];
+  onDone?: (questionId: string) => void;
+  onAnswer?: (
+    question: ChatQuestion, answers: Record<string, string[]>,
+  ) => Promise<AnswerResult>;
+}) {
   const [answered, setAnswered] = useState<Record<string, boolean>>({});
   const visible = useMemo(
     () => questions.filter((q) => !answered[q.id]),
@@ -166,10 +198,11 @@ export default function QuestionCards({ questions, onDone }: { questions: ChatQu
   return (
     <>
       {visible.map((q) => (
-        <QuestionCard key={q.id} question={q} onAnswered={() => {
-          setAnswered((a) => ({ ...a, [q.id]: true }));
-          onDone?.(q.id);   // 通知 App：此题已答，重放/恢复不再出现
-        }} />
+        <QuestionCard key={q.id} question={q} onAnswer={onAnswer}
+          onAnswered={() => {
+            setAnswered((a) => ({ ...a, [q.id]: true }));
+            onDone?.(q.id);   // 通知 App：此题已答，重放/恢复不再出现
+          }} />
       ))}
     </>
   );

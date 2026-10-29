@@ -7,6 +7,9 @@ export interface ChatMessage {
   attachments?: UploadedFile[]; // 结构化附件引用；仅用于请求/重试，不在消息气泡展示
   thinking?: string;   // 模型思考过程（隐思考），流式结束后持久保留
   activity?: string;   // 工具/执行活动步骤（换行分隔），持久保留
+  pending?: boolean;   // control 待确认发送：服务端快照确认前临时展示
+  failed?: boolean;    // control 发送失败：保留文本供同一 turnId 重试
+  turnId?: string;     // control 幂等请求键；重试复用同一值
 }
 
 export interface ChatSession {
@@ -18,6 +21,7 @@ export interface ChatSession {
   sessionKey?: string;  // OpenClaw 的 session key，用于后端删除
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
+  remote?: boolean;     // control 服务端会话：即使消息未加载也显示在侧栏
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */

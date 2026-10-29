@@ -37,6 +37,37 @@ function setup(sessions, activeSessionId) {
   return { state, changePersona };
 }
 
+const workspaceSource = readFileSync(
+  new URL('../../web/frontend/src/lib/workspaceClient.ts', import.meta.url), 'utf8');
+const { outputText: workspaceText } = ts.transpileModule(workspaceSource, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+});
+function loadWorkspace() {
+  const module = { exports: {} };
+  runInNewContext(workspaceText, {
+    exports: module.exports,
+    require: (name) => {
+      if (name === './auth' || name === './control') return {};
+      throw new Error(`unexpected require ${name}`);
+    },
+  });
+  return module.exports;
+}
+
+test('control disables local personas and attachments while local keeps them', () => {
+  const workspace = loadWorkspace();
+  const control = workspace.workspaceModeFeatures('control');
+  assert.equal(control.personas, false);
+  assert.equal(control.attachments, false);
+  assert.equal(control.retry, false);
+  assert.equal(control.localSettings, false);
+  const local = workspace.workspaceModeFeatures('local');
+  assert.equal(local.personas, true);
+  assert.equal(local.attachments, true);
+  assert.equal(local.retry, true);
+  assert.equal(local.localSettings, true);
+});
+
 test('changing persona on a populated conversation preserves its identity and history', () => {
   const original = { id: 'original', persona: '旧画像', messages: [{ role: 'user', content: '历史' }] };
   const { state, changePersona } = setup([original], original.id);
