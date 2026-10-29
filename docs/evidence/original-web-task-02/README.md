@@ -189,10 +189,10 @@ $env:EASEL_RUN_CONTAINER_TESTS='1'
 $env:EASEL_TASK2_CONTROL_IMAGE='easel-control-test:task2-bcf001a0'
 $env:EASEL_TASK2_WORKER_IMAGE='easel-worker-harness:task2-bcf001a0'
 $env:EASEL_TASK2_MODEL='deepseek-flash'
-& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest tests/integration/multiuser/test_managed_chat_model.py -q -s
+& 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -m pytest tests/integration/multiuser/test_managed_chat_model.py -q -s -k real_harness
 ```
 
-实际结果：**1 passed**（77.51s）。`real-flash-topology.txt` 记录：
+实际结果：**1 passed, 1 deselected**（77.51s）。`real-flash-topology.txt` 记录：
 
 ```text
 A5_REAL_PASS {... "provider_requests": 9, "token_rows": [revoked...], "worker_a": ..., "worker_b": ...}
