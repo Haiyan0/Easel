@@ -334,14 +334,27 @@ test('control skill/profile tasks use identity admission and poll the admitted r
           sessionId: 'session-1', skill: 'demo' };
       }
       if (path === '/api/skill/status/demo') {
-        return { state: 'done', response: '上次结果', runId: 'run-0' };
+        return { state: 'done', response: '上次结果', runId: 'run-0',
+          question: { id: 'q-1', questions: [{
+            questionId: 'permission', question: '允许？',
+            options: [{ label: '允许', value: 'allow' }],
+          }] }, questionPending: false };
       }
       if (path === '/api/profile/build') {
         return { created: true, name: '画像', async: true,
-          status: 'running', runId: 'run-2', sessionId: 'session-2' };
+          status: 'running', runId: 'run-2', sessionId: 'session-2',
+          question: { id: 'q-2', questions: [{
+            questionId: 'write', question: '写入？' }] },
+          questionPending: true };
+      }
+      if (path === '/api/chat/question/status') {
+        return { questions: { 'q-1': { status: 'pending' } } };
       }
       if (path.startsWith('/api/profile/build/status/')) {
-        return { state: 'done', log: '完成' };
+        return { state: 'done', log: '完成',
+          question: { id: 'q-3', questions: [{
+            questionId: 'stop', question: '继续？' }] },
+          questionPending: false };
       }
       throw new Error(`unexpected ${path}`);
     },
@@ -364,12 +377,22 @@ test('control skill/profile tasks use identity admission and poll the admitted r
   assert.ok(body.turnId);
   assert.equal(polls[0].sessionId, 'session-1');
   assert.equal(polls[0].runId, 'run-1');
-  assert.equal((await control.skillStatus('demo')).response, '上次结果');
+  const skillStatus = await control.skillStatus('demo');
+  assert.equal(skillStatus.response, '上次结果');
+  assert.equal(skillStatus.question.id, 'q-1');
+  assert.equal(skillStatus.question.questions[0].options[0].value, 'allow');
+  const questionStatus = await control.taskQuestionStatus(
+    'run-0', ['q-1']);
+  assert.equal(questionStatus['q-1'].status, 'pending');
 
   const profile = await control.buildProfile('画像', { direction: '方向' });
   assert.equal(profile.created, true);
   assert.equal(profile.runId, 'run-2');
+  assert.equal(profile.question.id, 'q-2');
+  assert.equal(profile.questionPending, true);
   const profileCall = calls.find((item) => item.path === '/api/profile/build');
   assert.equal(JSON.parse(profileCall.init.body).form.direction, '方向');
-  assert.equal((await control.profileBuildStatus('画像')).state, 'done');
+  const profileStatus = await control.profileBuildStatus('画像');
+  assert.equal(profileStatus.state, 'done');
+  assert.equal(profileStatus.question.id, 'q-3');
 });

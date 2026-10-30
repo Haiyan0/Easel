@@ -51,6 +51,8 @@ _ALLOWED_TASK_FIELDS = frozenset(
     {"sessionId", "turnId", "message", "attachments", "persona"})
 _MAX_IDENTIFIER = 256
 _MAX_PERSONA = 200
+# 这些已启用任务实际走 chat broker 通道；签发路由也必须覆盖其 Agent 快照。
+BROKER_MODEL_TASK_TYPES = frozenset(("chat", "skill", "profile"))
 # 这些错误表示 gateway/worker 暂时不可用，不能作为“实例已消失”的结算依据。
 _GATEWAY_TRANSIENT = frozenset({
     "worker_not_ready", "worker_wiring_mismatch",
@@ -421,9 +423,10 @@ class WorkerRelay:
             attachments=list(request["attachments"]),
             persona=request.get("persona"))
         agent = dict(config.agent)
-        if route is not None and task_type == "chat":
-            # 有效 chat 路由与 broker token 同一事务；签名 Agent 必须固定
-            # 同一模型与允许目录，不能回退到静态 profile 默认值。
+        if route is not None and task_type in BROKER_MODEL_TASK_TYPES:
+            # 实际经 chat 通道执行的受管任务共用同一份有效路由；签名
+            # Agent 必须固定同一模型与允许目录，不能回退到静态默认值。
+            # 只扩到本阶段已启用的类型，账号/发布等后续能力不借此放行。
             agent["model"] = route.model
             agent["allowed_models"] = list(route.allowed_models)
         envelope = sign_run_snapshot(

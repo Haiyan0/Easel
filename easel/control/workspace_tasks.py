@@ -6,6 +6,8 @@ Agent、不读写用户文件、不另建任务账本。
 """
 from __future__ import annotations
 
+import asyncio
+
 from .store import Store
 from .types import DomainError, Identity
 
@@ -15,6 +17,14 @@ _MAX_PERSONA = 200
 _MAX_TURN = 256
 _MAX_PAYLOAD = 256 * 1024
 _SKILL_CHARS = frozenset("/\\:\x00\r\n")
+_PROFILE_ENHANCEMENT = (
+    "请执行 /skill-profile-builder 完善已存在的画像「{name}」。"
+    "用户已通过表单提供以下信息，我已按此写好 profiles/{name}/ 的基线六维文件。"
+    "请：①尽力抓取用户给的社媒链接分析已发内容/风格/受众"
+    "（抓不到就降级，标注[待补充]，勿臆造）"
+    "②据分析结果润色/补全各维度文件 ③给出一句话完成度摘要。"
+    "表单信息如下：\n\n{summary}"
+)
 
 
 def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
@@ -38,13 +48,40 @@ def canonical_skill_name(value: object) -> str:
 
 
 def _run_state(state: object) -> str:
-    if state in ("reserved", "running", "accepted", "awaiting_permission"):
+    if state == "awaiting_permission":
+        return "awaiting_permission"
+    if state in ("reserved", "running", "accepted"):
         return "running"
     if state in ("done",):
         return "done"
     if state in ("failed", "interrupted", "cancelled"):
         return "failed"
     return "unknown"
+
+
+def _question_payload(page: object) -> dict | None:
+    """从 worker 事件页取最后一条 question 事件，不把事件当指令执行。"""
+    if not isinstance(page, dict):
+        return None
+    events = page.get("events")
+    if not isinstance(events, list):
+        return None
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("event") != "question":
+            continue
+        data = event.get("data")
+        if isinstance(data, str):
+            try:
+                import json
+                data = json.loads(data)
+            except (TypeError, ValueError):
+                continue
+        if (isinstance(data, dict) and isinstance(data.get("id"), str)
+                and data["id"]
+                and isinstance(data.get("questions"), list)
+                and data["questions"]):
+            return data
+    return None
 
 
 class WorkspaceTasks:
@@ -55,6 +92,9 @@ class WorkspaceTasks:
         self._relay = relay
         self._workspace_api = workspace_api
         self._db_runner = db_runner
+        # 准备期资源声明只在 control 事件循环内使用：基线写入后、Run 接纳
+        # 前，编辑/删除必须立即看到 busy，不能等待或漏过这个短窗口。
+        self._profile_claims: set[tuple[str, str]] = set()
 
     async def _db(self, function, *args, **kwargs):
         if self._db_runner is None:
@@ -94,14 +134,59 @@ class WorkspaceTasks:
             self._store.latest_run_for_conversation,
             actor, conversation_id)
 
-    async def _refresh_run(self, actor: Identity, run) -> None:
+    async def _refresh_run(self, actor: Identity, run) -> dict:
         """读取 worker 事件页，让控制库的 Run 状态跟到最新终态。"""
         if self._relay is None:
-            return
+            return {}
         try:
-            await self._relay.events(actor, run.id, after=0)
+            page = await self._relay.events(actor, run.id, after=0)
+        except DomainError as error:
+            # 临时不可用必须交给上层表现为 503，让前端保留题卡并禁用提交；
+            # 明确的 404/权限错误不回显无关缓存。
+            if error.status == 503:
+                raise
+            return {}
+        return page if isinstance(page, dict) else {}
+
+    async def _open_question(self, actor: Identity, run_id: str,
+                             page: object) -> tuple[dict | None, bool]:
+        """返回当前题卡及“状态尚未确认”标记。
+
+        worker 已持久化 question 事件后，问答状态查询仍可能暂时失败；
+        此时保留题卡但禁止提交（``questionPending=True``），不能把未知
+        状态误当成已授权，也不能丢掉题卡。明确终态才移除。
+        """
+        question = _question_payload(page)
+        if question is None:
+            return None, False
+        status = getattr(self._relay, "question_status", None)
+        if not callable(status):
+            return question, True
+        try:
+            result = await status(actor, {
+                "runId": run_id, "questionIds": [question["id"]]})
         except DomainError:
-            pass
+            return question, True
+        questions = result.get("questions") if isinstance(result, dict) else None
+        item = questions.get(question["id"]) if isinstance(questions, dict) else None
+        state = item.get("status") if isinstance(item, dict) else None
+        if state == "pending":
+            return question, False
+        if state in ("answered", "resolved", "expired", "not_found"):
+            return None, False
+        # unknown/checking/缺失都保持待确认，不猜测可提交。
+        return question, True
+
+    def claim_profile(self, actor: Identity, name: str) -> bool:
+        """非阻塞声明准备期资源；同一 workspace/画像只能有一个准备者。"""
+        key = (actor.workspace_id, name)
+        if key in self._profile_claims:
+            return False
+        self._profile_claims.add(key)
+        return True
+
+    def release_profile(self, actor: Identity, name: str) -> None:
+        self._profile_claims.discard((actor.workspace_id, name))
 
     async def _result_text(self, actor: Identity, conversation_id: str,
                            run_id: str) -> str:
@@ -180,9 +265,11 @@ class WorkspaceTasks:
         run = await self._latest_run(actor, conversation.id)
         if run is None:
             return {"state": "unknown", "response": ""}
-        await self._refresh_run(actor, run)
+        page = await self._refresh_run(actor, run)
         run = await self._latest_run(actor, conversation.id) or run
-        state = _run_state(run.status)
+        state = _run_state(page.get("state") or run.status)
+        question, question_pending = await self._open_question(
+            actor, run.id, page)
         response = ""
         if state == "done":
             response = await self._result_text(
@@ -192,6 +279,9 @@ class WorkspaceTasks:
             "runId": run.id,
             "sessionId": conversation.id,
             "response": response,
+            **({"question": question,
+                "questionPending": question_pending}
+               if question is not None else {}),
         }
 
     async def profile_active(self, actor: Identity, name: object) -> bool:
@@ -240,63 +330,107 @@ class WorkspaceTasks:
         if turn_id is not None:
             turn_id = _text(turn_id, _MAX_TURN)
 
-        prepared = await self._worker_json(
-            actor, "/api/profile/baseline",
-            {"name": name, "form": form, "reuse": True})
-        created = prepared.get("created") is True
-        instruction = prepared.get("instruction")
-        if not isinstance(instruction, str) or not instruction:
-            raise DomainError("upstream_invalid", 502)
-
-        conversation = await self._db(
-            self._store.get_task_conversation, actor, f"profile:{name}")
-        if not created:
-            if conversation is None:
-                raise DomainError("profile_exists", 409)
-            latest = await self._latest_run(actor, conversation.id)
-            if latest is not None:
-                if (turn_id is None
-                        or latest.client_request_id != turn_id):
-                    raise DomainError("profile_exists", 409)
-            conversation = await self._task_conversation(
-                actor, f"profile:{name}", f"画像增强：{name}")
-        else:
-            conversation = await self._task_conversation(
-                actor, f"profile:{name}", f"画像增强：{name}")
-
+        if not self.claim_profile(actor, name):
+            raise DomainError("profile_busy", 409)
         try:
-            admission = await self._require_relay().submit_task(
-                actor, "profile", {
-                    "sessionId": conversation.id,
-                    "turnId": turn_id,
-                    "message": instruction,
-                    "persona": None,
-                    "attachments": [],
-                })
-        except DomainError as error:
+            if await self.profile_active(actor, name):
+                raise DomainError("profile_busy", 409)
+            prepared = await self._worker_json(
+                actor, "/api/profile/baseline",
+                {"name": name, "form": form, "reuse": True})
+            created = prepared.get("created") is True
+            instruction = prepared.get("instruction")
+            if not isinstance(instruction, str) or not instruction:
+                raise DomainError("upstream_invalid", 502)
+            # 基线接口只返回表单摘要；真正的执行动作与本人目标由 control
+            # 固定拼装，浏览器不能借此指定任意路径或命令。
+            message = _PROFILE_ENHANCEMENT.format(
+                name=name, summary=instruction)
+
+            conversation = await self._db(
+                self._store.get_task_conversation, actor, f"profile:{name}")
             if not created:
-                raise
-            # 基线是确定性写入，已经可用；增强接纳失败必须与基线成功区分。
-            return {
-                "created": True,
+                if conversation is None:
+                    raise DomainError("profile_exists", 409)
+                latest = await self._latest_run(actor, conversation.id)
+                if latest is not None:
+                    if (turn_id is None
+                            or latest.client_request_id != turn_id):
+                        raise DomainError("profile_exists", 409)
+                conversation = await self._task_conversation(
+                    actor, f"profile:{name}", f"画像增强：{name}")
+            else:
+                conversation = await self._task_conversation(
+                    actor, f"profile:{name}", f"画像增强：{name}")
+
+            try:
+                admission = await self._require_relay().submit_task(
+                    actor, "profile", {
+                        "sessionId": conversation.id,
+                        "turnId": turn_id,
+                        "message": message,
+                        "persona": None,
+                        "attachments": [],
+                    })
+            except DomainError as error:
+                if not created:
+                    raise
+                # 基线是确定性写入，已经可用；增强接纳失败必须与基线成功区分。
+                return {
+                    "created": True,
+                    "name": name,
+                    "async": False,
+                    "status": "failed",
+                    "sessionId": conversation.id,
+                    "detail": error.code,
+                    "enhancement": {
+                        "state": "failed", "detail": error.code,
+                    },
+                }
+            result = {
+                "created": created,
                 "name": name,
-                "async": False,
-                "status": "failed",
+                "async": True,
+                "status": "running",
+                "runId": admission.get("runId"),
                 "sessionId": conversation.id,
-                "detail": error.code,
-                "enhancement": {
-                    "state": "failed", "detail": error.code,
-                },
+                "enhancement": {"state": "running"},
             }
-        return {
-            "created": created,
-            "name": name,
-            "async": True,
-            "status": "running",
-            "runId": admission.get("runId"),
-            "sessionId": conversation.id,
-            "enhancement": {"state": "running"},
-        }
+            run_id = admission.get("runId")
+            if isinstance(run_id, str) and run_id:
+                question, question_pending = await self._wait_question(
+                    actor, run_id)
+                if question is not None:
+                    # 立即把刚出现的题卡交给向导，避免用户只看到空等待态。
+                    result.update({
+                        "question": question,
+                        "questionPending": question_pending,
+                    })
+            return result
+        finally:
+            self.release_profile(actor, name)
+
+    async def _wait_question(self, actor: Identity, run_id: str
+                             ) -> tuple[dict | None, bool]:
+        """在接纳后的短暂窗口内取首题；不改变 Run 的归属或执行。"""
+        relay = self._relay
+        events = getattr(relay, "events", None)
+        if relay is None or not callable(events):
+            return None, False
+        for _ in range(10):
+            try:
+                page = await events(actor, run_id, after=0)
+            except DomainError:
+                await asyncio.sleep(0.02)
+                continue
+            question, pending = await self._open_question(actor, run_id, page)
+            if question is not None:
+                return question, pending
+            if isinstance(page, dict) and page.get("state") in (
+                    "done", "failed", "interrupted", "cancelled"):
+                return None, False
+            await asyncio.sleep(0.02)
+        return None, False
 
     async def profile_status(self, actor: Identity, name: object) -> dict:
         if (not isinstance(name, str) or not name or name != name.strip()
@@ -312,11 +446,18 @@ class WorkspaceTasks:
         run = await self._latest_run(actor, conversation.id)
         if run is None:
             return {"state": "unknown", "log": ""}
-        await self._refresh_run(actor, run)
+        page = await self._refresh_run(actor, run)
         run = await self._latest_run(actor, conversation.id) or run
-        state = _run_state(run.status)
+        state = _run_state(page.get("state") or run.status)
+        question, question_pending = await self._open_question(
+            actor, run.id, page)
         log = ""
         if state == "done":
             log = await self._result_text(actor, conversation.id, run.id)
-        return {"state": state, "log": log, "runId": run.id,
-                "sessionId": conversation.id}
+        return {
+            "state": state, "log": log, "runId": run.id,
+            "sessionId": conversation.id,
+            **({"question": question,
+                "questionPending": question_pending}
+               if question is not None else {}),
+        }

@@ -543,6 +543,12 @@ def main() -> int:
                 "/api/profile/build/status/容器新画像",
                 headers=headers).text
             assert "CONTAINER-PROFILE-RESULT" in profile_text, profile_text
+            profile_memory = run([
+                "docker", "exec", worker_name, "cat",
+                "/workspace/profiles/容器新画像/memory.md",
+            ]).stdout
+            assert "CONTAINER-EXECUTOR-ENHANCED" in profile_memory, (
+                profile_memory)
 
             unknown_skill = client.post(
                 "/api/skill",
@@ -611,6 +617,7 @@ def main() -> int:
 WORKER_LAUNCHER = r'''
 import asyncio
 import os
+import re
 
 import uvicorn
 from web import app as worker
@@ -619,8 +626,18 @@ from easel.worker.runs import RunManager
 from easel.worker.sessions import WorkspaceSessionStore
 
 async def executor(request, context, bind, emit, ask):
-    text = ("CONTAINER-SKILL-RESULT" if context.task_type == "skill"
-            else "CONTAINER-PROFILE-RESULT")
+    if context.task_type == "profile":
+        match = re.search(r"画像「([^」]+)」", request.prompt)
+        if (match is None or "/skill-profile-builder" not in request.prompt
+                or f"profiles/{match.group(1)}/" not in request.prompt):
+            raise RuntimeError("container profile instruction missing")
+        target = worker._RUNTIME_PATHS.workspace_root / "profiles" / match.group(1)
+        (target / "memory.md").write_text(
+            (target / "memory.md").read_text(encoding="utf-8")
+            + "\n\nCONTAINER-EXECUTOR-ENHANCED\n", encoding="utf-8")
+        text = "CONTAINER-PROFILE-RESULT"
+    else:
+        text = "CONTAINER-SKILL-RESULT"
     emit("token", text)
     return text
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import ipaddress
+import re
 import shutil
 import socket
 import sys
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c1" / "browser"
+EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c1" / "R1" / "browser"
 SCREENSHOTS: list[Path] = []
 
 
@@ -197,9 +198,51 @@ class Server:
             if context.task_type == "skill" and self.delay_skill:
                 await asyncio.sleep(self.delay_skill)
             if context.task_type == "skill":
+                if "ASK-SKILL" in request.prompt:
+                    answers = await ask([{
+                        "questionId": "permission",
+                        "header": "技能授权",
+                        "question": "允许执行这个技能？",
+                        "options": ["允许", "拒绝"],
+                    }])
+                    if answers.get("permission") == ["拒绝"]:
+                        emit("token", "SKILL-DENIED")
+                        return "SKILL-DENIED"
+                    emit("token", "SKILL-ANSWERED")
+                    return "SKILL-ANSWERED"
                 emit("token", "SKILL-RESULT：受控技能结果")
                 return "SKILL-RESULT：受控技能结果"
             if context.task_type == "profile":
+                match = re.search(r"画像「([^」]+)」", request.prompt)
+                if (match is None or "/skill-profile-builder" not in request.prompt
+                        or f"profiles/{match.group(1)}/" not in request.prompt):
+                    raise RuntimeError("profile instruction/target missing")
+                target = self.workspace_root / "profiles" / match.group(1)
+                if not target.is_dir():
+                    raise RuntimeError("profile target missing")
+                (target / "memory.md").write_text(
+                    (target / "memory.md").read_text(encoding="utf-8")
+                    + "\n\nEXECUTOR-ENHANCED：按真实任务指令更新\n",
+                    encoding="utf-8")
+                if "ASK-PROFILE" in request.prompt:
+                    first = await ask([{
+                        "questionId": "analysis",
+                        "header": "画像授权",
+                        "question": "允许分析这个画像？",
+                        "options": ["允许", "拒绝"],
+                    }])
+                    if first.get("analysis") == ["拒绝"]:
+                        emit("token", "PROFILE-DENIED")
+                        return "PROFILE-DENIED"
+                    second = await ask([{
+                        "questionId": "write",
+                        "header": "写入授权",
+                        "question": "允许写入画像文件？",
+                        "options": ["允许", "拒绝"],
+                    }])
+                    if second.get("write") == ["拒绝"]:
+                        emit("token", "PROFILE-WRITE-DENIED")
+                        return "PROFILE-WRITE-DENIED"
                 emit("token", "PROFILE-RESULT：受控画像增强")
                 return "PROFILE-RESULT：受控画像增强"
             return "CHAT-RESULT"
@@ -404,8 +447,22 @@ async def scenario_profile_wizard(browser, results, failures):
         target = SERVER.workspace_root / "profiles" / "浏览器新画像"
         assert target.is_dir()
         assert len(list(target.glob("*.md"))) == 6
+        await wait_for(
+            lambda: (target / "memory.md").is_file()
+            and "EXECUTOR-ENHANCED" in (target / "memory.md").read_text(
+                encoding="utf-8"), 20000,
+            "受控执行器没有按完整画像任务指令更新本人画像文件")
         assert any(task == "profile" and "做受控测试内容" in prompt
                    for task, prompt in SERVER.executions), SERVER.executions
+        # 原 ProfilePage 必须读回执行器更新的文件，而不是只显示表单摘要。
+        await page.reload(wait_until="domcontentloaded")
+        await page.locator(".sidebar").wait_for(timeout=20000)
+        await page.get_by_role("button", name="画像").click()
+        card = page.locator(".profile-summary").filter(
+            has_text="浏览器新画像")
+        await card.get_by_role("button", name="查看 / 编辑").click()
+        await page.get_by_text("EXECUTOR-ENHANCED", exact=False).wait_for(
+            timeout=20000)
         await screenshot(page, "03-profile-created.png")
         results["profile_wizard"] = True
     except Exception as error:  # noqa: BLE001
@@ -417,6 +474,76 @@ async def scenario_profile_wizard(browser, results, failures):
         failures.append(
             f"profile-wizard: {error!r} body={body!r} "
             f"responses={responses[-30:]!r} console={console[-10:]!r}")
+    finally:
+        await context.close()
+
+
+async def scenario_skill_question(browser, results, failures):
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    try:
+        await login(page)
+        await page.get_by_role("button", name="技能库").click()
+        await page.locator(".skill-card-rawname").filter(
+            has_text="copywriting").first.click()
+        await page.locator(".drawer").wait_for(timeout=20000)
+        await page.locator(".drawer textarea").fill("ASK-SKILL 需要授权")
+        await page.get_by_role("button", name="执行").click()
+        card = page.locator(".question-card")
+        await card.wait_for(timeout=30000)
+        assert "允许执行这个技能" in (await card.text_content() or "")
+        await screenshot(page, "07-skill-question.png")
+        await card.locator(".question-card__option").filter(
+            has_text="允许").click()
+        await card.locator(".question-card__submit").click()
+        await page.get_by_text("SKILL-ANSWERED", exact=False).wait_for(
+            timeout=30000)
+        await screenshot(page, "08-skill-question-answered.png")
+        results["skill_question"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"skill-question: {error!r}")
+    finally:
+        await context.close()
+
+
+async def scenario_profile_question_stop(browser, results, failures):
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    try:
+        await login(page)
+        await page.get_by_role("button", name="画像").click()
+        await page.get_by_role("button", name="新建画像").first.click()
+        modal = page.locator(".modal").filter(has_text="配置账号画像")
+        await modal.wait_for(timeout=10000)
+        await modal.locator("input").first.fill("问题增强画像")
+        await modal.get_by_role("button", name="下一步").click()
+        await modal.get_by_role("button", name="下一步").click()
+        await modal.locator("input").nth(0).fill("ASK-PROFILE 方向")
+        await modal.get_by_role("button", name="下一步").click()
+        await modal.get_by_role("button", name="生成画像").click()
+        card = page.locator(".question-card")
+        await card.wait_for(timeout=30000)
+        assert "允许分析这个画像" in (await card.text_content() or "")
+        await screenshot(page, "09-profile-question.png")
+        await card.locator(".question-card__option").filter(
+            has_text="允许").click()
+        await card.locator(".question-card__submit").click()
+        await page.get_by_text("允许写入画像文件", exact=False).wait_for(
+            timeout=30000)
+        await screenshot(page, "10-profile-question-second.png")
+        await page.get_by_role("button", name="停止", exact=True).click()
+        await page.get_by_role(
+            "heading", name="问题增强画像", exact=True).wait_for(
+                timeout=30000)
+        target = SERVER.workspace_root / "profiles" / "问题增强画像"
+        assert target.is_dir()
+        assert len(list(target.glob("*.md"))) == 6
+        await screenshot(page, "11-profile-question-stopped.png")
+        results["profile_question_stop"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"profile-question-stop: {error!r}")
     finally:
         await context.close()
 
@@ -495,6 +622,8 @@ async def main() -> int:
             print("BROWSER_VERSION", browser.version)
             await scenario_skill_run(browser, results, failures)
             await scenario_profile_wizard(browser, results, failures)
+            await scenario_skill_question(browser, results, failures)
+            await scenario_profile_question_stop(browser, results, failures)
             await scenario_skill_stop(browser, results, failures)
             await scenario_dark_mobile(browser, results, failures)
             await browser.close()

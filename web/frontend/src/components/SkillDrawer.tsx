@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { saveEnv } from '../lib/api';
-import type { SkillDetail } from '../lib/api';
+import type { ChatQuestion, SkillDetail } from '../lib/api';
+import QuestionCards from './QuestionCards';
 import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { workspaceErrorMessage } from '../lib/workspaceData';
 import { renderMarkdown } from '../lib/sanitize';
@@ -29,6 +30,8 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
   const [running, setRunning] = useState(false);
   const [runErr, setRunErr] = useState('');
   const [activeRunId, setActiveRunId] = useState('');
+  const [question, setQuestion] = useState<ChatQuestion | null>(null);
+  const [questionPending, setQuestionPending] = useState(false);
   const reqSeq = useRef(0);
   const runRequest = useRef<AbortController | null>(null);
   const pendingTurn = useRef<{ input: string; id: string } | null>(null);
@@ -60,10 +63,34 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
           detail.name, controller.signal);
         if (!alive) return;
         if (status.response) setResult(status.response);
-        if (status.state === 'running') {
+        setQuestion(status.question || null);
+        let questionPending = status.questionPending === true;
+        if (status.question && status.runId) {
+          try {
+            const states = await data.taskQuestionStatus(
+              status.runId, [status.question.id], controller.signal);
+            const state = states[status.question.id]?.status;
+            if (state === 'pending') questionPending = false;
+            else if (state === 'answered' || state === 'resolved'
+                || state === 'expired' || state === 'not_found') {
+              setQuestion(null);
+              questionPending = false;
+            } else {
+              questionPending = true;
+            }
+          } catch {
+            // 未知状态保留题卡但禁用提交；重连/下一次轮询继续确认。
+            questionPending = true;
+          }
+        }
+        if (!alive) return;
+        setQuestionPending(questionPending);
+        if (status.state === 'running'
+            || status.state === 'awaiting_permission') {
           setRunning(true);
           if (status.runId) setActiveRunId(status.runId);
-          timer = window.setTimeout(check, 3000);
+          timer = window.setTimeout(check, status.state === 'awaiting_permission'
+            ? 1500 : 3000);
         } else {
           setRunning(false);
           if (status.state === 'failed') {
@@ -72,7 +99,8 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
         }
       } catch (error) {
         if (!alive || controller.signal.aborted) return;
-        // 状态查询失败不覆盖当前编辑/结果；仅在无任务时提示。
+        // 状态查询失败不覆盖当前编辑/结果；题卡仍保留但禁止提交。
+        setQuestionPending(true);
         setRunErr((current) => current || workspaceErrorMessage(
           error, '技能任务状态读取失败'));
       }
@@ -83,7 +111,7 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [data, detail?.name]);
+  }, [data, detail?.name, activeRunId]);
 
   useEffect(() => () => runRequest.current?.abort(), []);
 
@@ -156,6 +184,21 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
     } catch (error) {
       setRunErr(workspaceErrorMessage(error, '停止任务失败'));
     }
+  };
+
+  const handleAnswer = async (
+    current: ChatQuestion, answers: Record<string, string[]>,
+  ) => {
+    if (!activeRunId) {
+      return { ok: false, error: '任务尚未接纳，无法回答问题。' };
+    }
+    const result = await data.answerTaskQuestion(
+      activeRunId, current.id, answers);
+    if (result.ok) {
+      setQuestion(null);
+      setQuestionPending(false);
+    }
+    return result;
   };
 
   const blocked = detail?.needsApi && !detail.apiConfigured;
@@ -305,6 +348,16 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
               )}
             </div>
             {runErr && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{runErr}</div>}
+            {question && (
+              <div style={{ marginTop: 12 }}>
+                <QuestionCards
+                  questions={[question]}
+                  pending={questionPending}
+                  onDone={() => setQuestion(null)}
+                  onAnswer={handleAnswer}
+                />
+              </div>
+            )}
             {resultHtml && (
               <div className="skill-result" dangerouslySetInnerHTML={{ __html: resultHtml }} />
             )}

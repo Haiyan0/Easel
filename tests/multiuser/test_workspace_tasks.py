@@ -202,7 +202,10 @@ def test_profile_build_writes_baseline_and_submits_enhancement_run(tmp_path):
             assert payload["status"] == "running"
             assert payload["sessionId"]
             assert relay.calls[-1][1] == "profile"
-            assert relay.calls[-1][2]["message"] == "PROFILE-PROMPT"
+            message = relay.calls[-1][2]["message"]
+            assert "/skill-profile-builder" in message
+            assert "profiles/新画像/" in message
+            assert message.endswith("PROFILE-PROMPT")
             assert relay.calls[-1][2]["turnId"] == "turn-profile"
             assert workspace.calls[-1][2] == "/api/profile/baseline"
 

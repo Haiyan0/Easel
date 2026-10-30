@@ -165,11 +165,17 @@ export interface ProfileBuildResponse {
   sessionId?: string;
   detail?: string;
   enhancement?: { state: string; detail?: string };
+  question?: ChatQuestion;
+  questionPending?: boolean;
 }
 
 export interface ProfileBuildStatus {
-  state: 'running' | 'done' | 'failed' | 'unknown';
+  state: 'running' | 'awaiting_permission' | 'done' | 'failed' | 'unknown';
   log: string;
+  runId?: string;
+  sessionId?: string;
+  question?: ChatQuestion;
+  questionPending?: boolean;
 }
 
 export function fetchStatus(): Promise<StatusResponse> {

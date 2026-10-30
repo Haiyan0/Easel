@@ -3,6 +3,7 @@
  * 调用 Task 5A 已接通的工作区路由。组件不感知 Cookie、路径或服务地址。
  */
 import type {
+  ChatQuestion, ChatQuestionItem, ChatQuestionOption,
   Idea, IdeaInput, OutputContent, OutputNode, PersonaFile, PersonaItem,
   ProfileBuildResponse, ProfileBuildStatus, ScheduleContext, ScheduleInput,
   ScheduleItem, SkillDetail, SkillItem, SkillResponse, TrendGroup,
@@ -100,7 +101,10 @@ export interface WorkspaceData {
   stopTask(runId: string, signal?: AbortSignal): Promise<void>;
   skillStatus(
     name: string, signal?: AbortSignal,
-  ): Promise<{ state: string; response?: string; runId?: string }>;
+  ): Promise<{
+    state: string; response?: string; runId?: string;
+    question?: ChatQuestion; questionPending?: boolean;
+  }>;
   buildProfile(
     name: string, form: Record<string, unknown>, signal?: AbortSignal,
     turnId?: string,
@@ -108,6 +112,13 @@ export interface WorkspaceData {
   profileBuildStatus(
     name: string, signal?: AbortSignal,
   ): Promise<ProfileBuildStatus>;
+  taskQuestionStatus(
+    runId: string, questionIds: string[], signal?: AbortSignal,
+  ): Promise<Record<string, { status: string }>>;
+  answerTaskQuestion(
+    runId: string, questionId: string,
+    answers: Record<string, string[]>, signal?: AbortSignal,
+  ): Promise<{ ok: boolean; error?: string }>;
   personasEnabled: boolean;
   outputsEnabled: boolean;
   workbenchEnabled: boolean;
@@ -490,6 +501,56 @@ function profileBuild(value: unknown): ProfileBuildResponse {
     ...(row.enhancement && typeof row.enhancement === 'object'
       ? { enhancement: row.enhancement as { state: string; detail?: string } }
       : {}),
+    ...taskStatusFields(row),
+  };
+}
+
+function taskQuestion(value: unknown): ChatQuestion {
+  const row = needObject(value, '任务问题响应无效');
+  if (typeof row.id !== 'string' || !row.id) {
+    throw new Error('任务问题响应无效');
+  }
+  const items: ChatQuestionItem[] = needArray(
+    row.questions, '任务问题响应无效').map((item, index) => {
+    const question = needObject(item, '任务问题响应无效');
+    if (typeof question.question !== 'string') {
+      throw new Error('任务问题响应无效');
+    }
+    const result: ChatQuestionItem = {
+      questionId: typeof question.questionId === 'string'
+        ? question.questionId : String(index),
+      question: question.question,
+    };
+    if (typeof question.header === 'string') result.header = question.header;
+    if (question.multiSelect === true) result.multiSelect = true;
+    if (question.options !== undefined) {
+      result.options = needArray(question.options, '任务问题响应无效').map(
+        (option) => {
+          const value = needObject(option, '任务问题响应无效');
+          if (typeof value.label !== 'string') {
+            throw new Error('任务问题响应无效');
+          }
+          const parsed: ChatQuestionOption = { label: value.label };
+          if (typeof value.value === 'string') parsed.value = value.value;
+          if (typeof value.description === 'string') {
+            parsed.description = value.description;
+          }
+          return parsed;
+        });
+    }
+    return result;
+  });
+  if (items.length === 0) throw new Error('任务问题响应无效');
+  return { id: row.id, questions: items };
+}
+
+function taskStatusFields(row: Record<string, unknown>): {
+  question?: ChatQuestion; questionPending?: boolean;
+} {
+  if (row.question === undefined) return {};
+  return {
+    question: taskQuestion(row.question),
+    questionPending: row.questionPending === true,
   };
 }
 
@@ -498,7 +559,12 @@ function profileStatus(value: unknown): ProfileBuildStatus {
   if (typeof row.state !== 'string' || typeof row.log !== 'string') {
     throw new Error('画像增强状态响应无效');
   }
-  return { state: row.state as ProfileBuildStatus['state'], log: row.log };
+  return {
+    state: row.state as ProfileBuildStatus['state'], log: row.log,
+    ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+    ...(typeof row.sessionId === 'string' ? { sessionId: row.sessionId } : {}),
+    ...taskStatusFields(row),
+  };
 }
 
 function makeTaskId(): string {
@@ -695,6 +761,7 @@ export function createControlWorkspaceData(
         state: row.state,
         ...(typeof row.response === 'string' ? { response: row.response } : {}),
         ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+        ...taskStatusFields(row),
       };
     },
     async buildProfile(name, form, signal, turnId) {
@@ -708,6 +775,40 @@ export function createControlWorkspaceData(
     async profileBuildStatus(name, signal) {
       return profileStatus(await call<unknown>(
         `/api/profile/build/status/${encodeURIComponent(name)}`, { signal }));
+    },
+    async taskQuestionStatus(runId, questionIds, signal) {
+      const row = needObject(await call<unknown>(
+        '/api/chat/question/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId, questionIds }),
+          signal,
+        }), '任务问题状态响应无效');
+      const result: Record<string, { status: string }> = {};
+      const questions = needObject(row.questions, '任务问题状态响应无效');
+      for (const [id, value] of Object.entries(questions)) {
+        const item = needObject(value, '任务问题状态响应无效');
+        if (typeof item.status === 'string') {
+          result[id] = { status: item.status };
+        }
+      }
+      return result;
+    },
+    async answerTaskQuestion(runId, questionId, answers, signal) {
+      try {
+        const row = needObject(await call<unknown>(
+          '/api/chat/question/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runId, questionId, answers }),
+            signal,
+          }), '任务问题回答响应无效');
+        return row.ok === true
+          ? { ok: true }
+          : { ok: false, error: '问题回答失败，请重试。' };
+      } catch (error) {
+        return { ok: false, error: workspaceErrorMessage(error, '回答失败') };
+      }
     },
     personasEnabled: true,
     outputsEnabled: true,
@@ -774,6 +875,9 @@ export const localWorkspaceData: WorkspaceData = {
   skillStatus: async () => ({ state: 'unknown' }),
   buildProfile: localBuildProfile,
   profileBuildStatus: localProfileBuildStatus,
+  taskQuestionStatus: async () => ({}),
+  answerTaskQuestion: async () => ({
+    ok: false, error: '当前模式不支持任务问题回答。' }),
   personasEnabled: true,
   outputsEnabled: true,
   workbenchEnabled: true,

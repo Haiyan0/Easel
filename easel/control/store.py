@@ -3225,7 +3225,8 @@ def _conversation_record(row: sqlite3.Row) -> ConversationRecord:
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
     return RunRecord(row["id"], row["workspace_id"], row["conversation_id"],
-                     row["status"], row["config_version"])
+                     row["status"], row["config_version"],
+                     row["client_request_id"])
 
 
 def _restrict_directory(directory: Path) -> None:

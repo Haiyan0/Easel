@@ -941,30 +941,43 @@ def create_app(*, store: Store, auth: AuthService,
         from .workspace_api import canonical_persona_name
 
         encoded = canonical_persona_name(name)
-        if await request.app.state.workspace_tasks.profile_active(
-                _identity(request), name):
+        identity = _identity(request)
+        tasks = request.app.state.workspace_tasks
+        # 声明与检查在同一事件循环步骤内完成；基线准备期也覆盖。
+        if not tasks.claim_profile(identity, name):
             raise DomainError("profile_busy", 409)
-        raw = await _workspace_body(request, maximum=2 * 1024 * 1024)
         try:
-            payload = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
-            raise DomainError("invalid_request", 400) from None
-        if not isinstance(payload, dict):
-            raise DomainError("invalid_request", 400)
-        return await _forward_workspace_json(
-            request, "PUT", f"/api/persona/{encoded}/file",
-            payload=payload)
+            if await tasks.profile_active(identity, name):
+                raise DomainError("profile_busy", 409)
+            raw = await _workspace_body(request, maximum=2 * 1024 * 1024)
+            try:
+                payload = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise DomainError("invalid_request", 400) from None
+            if not isinstance(payload, dict):
+                raise DomainError("invalid_request", 400)
+            return await _forward_workspace_json(
+                request, "PUT", f"/api/persona/{encoded}/file",
+                payload=payload)
+        finally:
+            tasks.release_profile(identity, name)
 
     @app.delete("/api/persona/{name}")
     async def workspace_persona_delete(request: Request, name: str):
         from .workspace_api import canonical_persona_name
 
         encoded = canonical_persona_name(name)
-        if await request.app.state.workspace_tasks.profile_active(
-                _identity(request), name):
+        identity = _identity(request)
+        tasks = request.app.state.workspace_tasks
+        if not tasks.claim_profile(identity, name):
             raise DomainError("profile_busy", 409)
-        return await _forward_workspace_json(
-            request, "DELETE", f"/api/persona/{encoded}")
+        try:
+            if await tasks.profile_active(identity, name):
+                raise DomainError("profile_busy", 409)
+            return await _forward_workspace_json(
+                request, "DELETE", f"/api/persona/{encoded}")
+        finally:
+            tasks.release_profile(identity, name)
 
     @app.get("/api/outputs")
     async def workspace_outputs(request: Request):
