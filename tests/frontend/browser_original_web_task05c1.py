@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c1" / "R1" / "browser"
+EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c1" / "R2" / "browser"
 SCREENSHOTS: list[Path] = []
 
 
@@ -548,6 +548,66 @@ async def scenario_profile_question_stop(browser, results, failures):
         await context.close()
 
 
+async def scenario_skill_status_recovery(browser, results, failures):
+    """一次技能状态 503 后继续轮询，恢复题卡并完成回答。"""
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    before = len(SERVER.executions)
+    try:
+        await login(page)
+        await page.get_by_role("button", name="技能库").click()
+        await page.locator(".skill-card-rawname").filter(
+            has_text="copywriting").first.click()
+        await page.locator(".drawer").wait_for(timeout=20000)
+        await page.locator(".drawer textarea").fill("ASK-SKILL 状态恢复")
+        await page.get_by_role("button", name="执行").click()
+        card = page.locator(".question-card[data-pending=\"false\"]")
+        await card.wait_for(timeout=30000)
+        await card.locator(".question-card__option").filter(
+            has_text="允许").click()
+        assert not await page.get_by_role(
+            "button", name="提交", exact=True).is_disabled()
+        calls: list[str] = []
+        injected = False
+
+        async def once_503(route):
+            nonlocal injected
+            calls.append(route.request.url)
+            if not injected:
+                injected = True
+                await route.fulfill(
+                    status=503, content_type="application/json",
+                    body='{"code":"temporary_status_unavailable"}')
+            else:
+                await route.continue_()
+
+        await page.route("**/api/skill/status/copywriting", once_503)
+        await page.get_by_text("工作区服务暂不可用（503）", exact=False).wait_for(
+            timeout=12000)
+        await page.locator(".question-card[data-pending=\"true\"]").wait_for(
+            timeout=5000)
+        await page.wait_for_timeout(4200)
+        assert len(calls) >= 2, calls
+        assert injected
+        await page.locator(".question-card[data-pending=\"false\"]").wait_for(
+            timeout=10000)
+        assert not await page.get_by_role(
+            "button", name="提交", exact=True).is_disabled()
+        await page.locator(".question-card__option").filter(
+            has_text="允许").click()
+        await page.get_by_role("button", name="提交", exact=True).click()
+        await page.get_by_text("SKILL-ANSWERED", exact=False).wait_for(
+            timeout=30000)
+        assert len(SERVER.executions) == before + 1, SERVER.executions
+        await screenshot(page, "12-skill-status-recovered.png")
+        results["skill_status_recovery"] = True
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"skill-status-recovery: {error!r}")
+    finally:
+        await context.close()
+
+
 async def scenario_skill_stop(browser, results, failures):
     context = await browser.new_context(
         viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
@@ -623,6 +683,7 @@ async def main() -> int:
             await scenario_skill_run(browser, results, failures)
             await scenario_profile_wizard(browser, results, failures)
             await scenario_skill_question(browser, results, failures)
+            await scenario_skill_status_recovery(browser, results, failures)
             await scenario_profile_question_stop(browser, results, failures)
             await scenario_skill_stop(browser, results, failures)
             await scenario_dark_mobile(browser, results, failures)

@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { saveEnv } from '../lib/api';
+import { AuthError } from '../lib/auth';
 import type { ChatQuestion, SkillDetail } from '../lib/api';
 import QuestionCards from './QuestionCards';
 import { useWorkspaceData } from '../lib/workspaceDataContext';
@@ -99,10 +100,14 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
         }
       } catch (error) {
         if (!alive || controller.signal.aborted) return;
-        // 状态查询失败不覆盖当前编辑/结果；题卡仍保留但禁止提交。
+        // 401 已由身份层卸载，不能在旧组件上继续轮询。
+        if (error instanceof AuthError && error.status === 401) return;
+        // 临时 503/断网保留原题卡、Run 标识和待确认状态，但必须安排
+        // 下一轮恢复查询；成功确认 pending 后才重新允许提交。
         setQuestionPending(true);
         setRunErr((current) => current || workspaceErrorMessage(
           error, '技能任务状态读取失败'));
+        timer = window.setTimeout(check, 1500);
       }
     };
     void check();
