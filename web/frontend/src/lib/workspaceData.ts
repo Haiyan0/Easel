@@ -4,7 +4,9 @@
  */
 import type {
   Idea, IdeaInput, OutputContent, OutputNode, PersonaFile, PersonaItem,
-  ScheduleContext, ScheduleInput, ScheduleItem, TrendGroup, UploadedFile,
+  ProfileBuildResponse, ProfileBuildStatus, ScheduleContext, ScheduleInput,
+  ScheduleItem, SkillDetail, SkillItem, SkillResponse, TrendGroup,
+  UploadedFile,
 } from './api';
 import {
   adoptOversize as localAdoptOversize,
@@ -15,7 +17,11 @@ import {
   deletePersona as localDeletePersona,
   deleteSchedule as localDeleteSchedule,
   fetchArtifactArchive as localFetchArtifactArchive,
+  buildProfile as localBuildProfile,
+  executeSkill as localExecuteSkill,
   fetchIdeas as localFetchIdeas,
+  fetchSkillDetail as localFetchSkillDetail,
+  fetchSkills as localFetchSkills,
   fetchOutputContent as localFetchOutputContent,
   fetchOutputs as localFetchOutputs,
   fetchPersonaFiles as localFetchPersonaFiles,
@@ -25,6 +31,7 @@ import {
   fetchStatus as localFetchStatus,
   fetchTrends as localFetchTrends,
   mediaUrl as localMediaUrl,
+  profileBuildStatus as localProfileBuildStatus,
   savePersonaFile as localSavePersonaFile,
   updateIdea as localUpdateIdea,
   updateSchedule as localUpdateSchedule,
@@ -83,10 +90,30 @@ export interface WorkspaceData {
     id: string, item: IdeaInput, signal?: AbortSignal,
   ): Promise<Idea>;
   deleteIdea(id: string, signal?: AbortSignal): Promise<{ ok: boolean }>;
+  fetchSkills(signal?: AbortSignal): Promise<SkillItem[]>;
+  fetchSkillDetail(name: string, signal?: AbortSignal): Promise<SkillDetail>;
+  executeSkill(
+    skill: string, input: string, persona?: string,
+    signal?: AbortSignal, turnId?: string,
+    onAdmission?: (runId: string, sessionId: string) => void,
+  ): Promise<SkillResponse>;
+  stopTask(runId: string, signal?: AbortSignal): Promise<void>;
+  skillStatus(
+    name: string, signal?: AbortSignal,
+  ): Promise<{ state: string; response?: string; runId?: string }>;
+  buildProfile(
+    name: string, form: Record<string, unknown>, signal?: AbortSignal,
+    turnId?: string,
+  ): Promise<ProfileBuildResponse>;
+  profileBuildStatus(
+    name: string, signal?: AbortSignal,
+  ): Promise<ProfileBuildStatus>;
   personasEnabled: boolean;
   outputsEnabled: boolean;
   workbenchEnabled: boolean;
   accountsEnabled: boolean;
+  skillsEnabled: boolean;
+  skillEnvEnabled: boolean;
   attachmentsEnabled: boolean;
   personaBuildEnabled: boolean;
   wechatFetchEnabled: boolean;
@@ -407,9 +434,82 @@ export function oversizeUploadMessage(maxMb: number, mode: OversizeMode): string
 export interface ControlWorkspaceOptions {
   call<T>(path: string, init?: RequestInit): Promise<T>;
   fetchText(url: string, signal?: AbortSignal): Promise<string>;
+  runTask?(
+    sessionId: string, runId: string, signal?: AbortSignal,
+  ): Promise<{ state: string; response?: string }>;
 }
 
 /** control 适配器：所有调用都带身份 epoch/CSRF，错误保留 HTTP 语义。 */
+function skillList(value: unknown): SkillItem[] {
+  return needArray(value, '技能列表响应无效').map((item) => {
+    const row = needObject(item, '技能列表响应无效');
+    if (typeof row.name !== 'string' || !row.name
+        || typeof row.description !== 'string'
+        || typeof row.layer !== 'string'
+        || typeof row.needsApi !== 'boolean'
+        || typeof row.apiConfigured !== 'boolean') {
+      throw new Error('技能列表响应无效');
+    }
+    return {
+      name: row.name, description: row.description, layer: row.layer,
+      needsApi: row.needsApi, apiConfigured: row.apiConfigured,
+    };
+  });
+}
+
+function skillDetail(value: unknown): SkillDetail {
+  const row = needObject(value, '技能详情响应无效');
+  if (typeof row.name !== 'string' || typeof row.layer !== 'string'
+      || typeof row.description !== 'string' || typeof row.body !== 'string'
+      || typeof row.needsApi !== 'boolean'
+      || typeof row.apiConfigured !== 'boolean') {
+    throw new Error('技能详情响应无效');
+  }
+  return {
+    name: row.name, layer: row.layer, description: row.description,
+    body: row.body, needsApi: row.needsApi,
+    apiConfigured: row.apiConfigured,
+    apiSpec: row.apiSpec && typeof row.apiSpec === 'object'
+      ? row.apiSpec as SkillDetail['apiSpec'] : null,
+  };
+}
+
+function profileBuild(value: unknown): ProfileBuildResponse {
+  const row = needObject(value, '画像构建响应无效');
+  if (typeof row.created !== 'boolean' || typeof row.name !== 'string') {
+    throw new Error('画像构建响应无效');
+  }
+  return {
+    created: row.created, name: row.name,
+    ...(typeof row.async === 'boolean' ? { async: row.async } : {}),
+    ...(typeof row.status === 'string' ? { status: row.status } : {}),
+    ...(typeof row.log === 'string' ? { log: row.log } : {}),
+    ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+    ...(typeof row.sessionId === 'string' ? { sessionId: row.sessionId } : {}),
+    ...(typeof row.detail === 'string' ? { detail: row.detail } : {}),
+    ...(row.enhancement && typeof row.enhancement === 'object'
+      ? { enhancement: row.enhancement as { state: string; detail?: string } }
+      : {}),
+  };
+}
+
+function profileStatus(value: unknown): ProfileBuildStatus {
+  const row = needObject(value, '画像增强状态响应无效');
+  if (typeof row.state !== 'string' || typeof row.log !== 'string') {
+    throw new Error('画像增强状态响应无效');
+  }
+  return { state: row.state as ProfileBuildStatus['state'], log: row.log };
+}
+
+function makeTaskId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function createControlWorkspaceData(
   options: ControlWorkspaceOptions,
 ): WorkspaceData {
@@ -545,12 +645,78 @@ export function createControlWorkspaceData(
         { method: 'DELETE', signal }), '选题响应无效');
       return { ok: row.ok === true };
     },
+    async fetchSkills(signal) {
+      return skillList(await call<unknown>('/api/skills', { signal }));
+    },
+    async fetchSkillDetail(name, signal) {
+      return skillDetail(await call<unknown>(
+        `/api/skill/${encodeURIComponent(name)}`, { signal }));
+    },
+    async executeSkill(skill, input, persona, signal, turnId, onAdmission) {
+      const admission = await call<unknown>('/api/skill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          skill, input, turnId: turnId || makeTaskId(),
+          ...(persona ? { persona } : {}),
+        }),
+        signal,
+      });
+      const row = needObject(admission, '技能执行接纳响应无效');
+      if (typeof row.runId !== 'string' || typeof row.sessionId !== 'string'
+          || !row.runId || !row.sessionId) {
+        throw new Error('技能执行接纳响应无效');
+      }
+      if (!options.runTask) throw new Error('任务执行未装配');
+      onAdmission?.(row.runId, row.sessionId);
+      const result = await options.runTask(
+        row.sessionId, row.runId, signal);
+      if (result.state !== 'done') {
+        throw new Error(`任务${result.state}`);
+      }
+      return { response: result.response || '' };
+    },
+    async stopTask(runId, signal) {
+      await call<unknown>('/api/chat/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId }),
+        signal,
+      });
+    },
+    async skillStatus(name, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/skill/status/${encodeURIComponent(name)}`, { signal }),
+      '技能任务状态响应无效');
+      if (typeof row.state !== 'string') {
+        throw new Error('技能任务状态响应无效');
+      }
+      return {
+        state: row.state,
+        ...(typeof row.response === 'string' ? { response: row.response } : {}),
+        ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+      };
+    },
+    async buildProfile(name, form, signal, turnId) {
+      return profileBuild(await call<unknown>('/api/profile/build', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, form, turnId: turnId || makeTaskId() }),
+        signal,
+      }));
+    },
+    async profileBuildStatus(name, signal) {
+      return profileStatus(await call<unknown>(
+        `/api/profile/build/status/${encodeURIComponent(name)}`, { signal }));
+    },
     personasEnabled: true,
     outputsEnabled: true,
     workbenchEnabled: true,
     accountsEnabled: false,
+    skillsEnabled: true,
+    skillEnvEnabled: false,
     attachmentsEnabled: true,
-    personaBuildEnabled: false,
+    personaBuildEnabled: true,
     wechatFetchEnabled: false,
     localSettingsEnabled: false,
     oversizeMode: 'reject',
@@ -601,10 +767,19 @@ export const localWorkspaceData: WorkspaceData = {
   createIdea: localCreateIdea,
   updateIdea: localUpdateIdea,
   deleteIdea: localDeleteIdea,
+  fetchSkills: localFetchSkills,
+  fetchSkillDetail: localFetchSkillDetail,
+  executeSkill: localExecuteSkill,
+  stopTask: async () => { throw new Error('当前模式不支持停止任务'); },
+  skillStatus: async () => ({ state: 'unknown' }),
+  buildProfile: localBuildProfile,
+  profileBuildStatus: localProfileBuildStatus,
   personasEnabled: true,
   outputsEnabled: true,
   workbenchEnabled: true,
   accountsEnabled: true,
+  skillsEnabled: true,
+  skillEnvEnabled: true,
   attachmentsEnabled: true,
   personaBuildEnabled: true,
   wechatFetchEnabled: true,

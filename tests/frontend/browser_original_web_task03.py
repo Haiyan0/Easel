@@ -1156,10 +1156,10 @@ async def scenario_control_layout(browser, server: Server,
         results["control_original_layout"] = True
         await page.screenshot(path=str(EVIDENCE / "01-control-layout.png"))
 
-        await page.get_by_role("button", name="技能库").click()
+        await page.get_by_role("button", name="账号").click()
         await page.get_by_text("暂未接通").first.wait_for(timeout=10000)
         paths = server.request_paths()
-        assert not any(path.startswith("/api/skills") for path in paths), paths
+        assert not any(path.startswith("/api/accounts") for path in paths), paths
         results["control_unavailable_menu"] = True
         await page.screenshot(path=str(
             EVIDENCE / "02-control-unavailable.png"))

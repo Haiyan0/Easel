@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
-import { buildProfile, profileBuildStatus } from '../lib/api';
+import { useState, useEffect, useRef } from 'react';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 
 const PLATFORMS = ['小红书', '抖音', 'B站', '视频号', '公众号', '微博', '知乎'];
 const TONES = ['专业严谨', '轻松幽默', '亲切日常', '犀利吐槽', '治愈温暖', '干货实用'];
@@ -31,14 +32,19 @@ const EMPTY: FormState = {
 const STEPS = ['基础信息', '社媒链接', '运营意图', '偏好与红线'];
 
 export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizardProps) {
+  const data = useWorkspaceData();
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [submitting, setSubmitting] = useState(false);
   const [phase, setPhase] = useState<'form' | 'enhancing'>('form');
   const [error, setError] = useState('');
+  const [enhanceNotice, setEnhanceNotice] = useState('');
+  const submitId = useRef('');
 
-  const set = <K extends keyof FormState>(k: K, v: FormState[K]) =>
+  const set = <K extends keyof FormState>(k: K, v: FormState[K]) => {
+    submitId.current = '';
     setForm((f) => ({ ...f, [k]: v }));
+  };
 
   const togglePlatform = (p: string) =>
     setForm((f) => ({
@@ -57,17 +63,26 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
     setSubmitting(true);
     setError('');
     try {
-      // 后端异步：立即返回（基线已写、画像可用），不再长阻塞被代理超时掐断
-      const res = await buildProfile(form.name.trim(), form as unknown as Record<string, unknown>);
+      if (!submitId.current) {
+        submitId.current = `profile:${Date.now().toString(36)}:`
+          + Math.random().toString(36).slice(2, 10);
+      }
+      // 基线先确定性写入；增强再由 control 的 Run 账本接纳。
+      const res = await data.buildProfile(
+        form.name.trim(), form as unknown as Record<string, unknown>,
+        undefined, submitId.current);
       if (res.created) {
         setSubmitting(false);
+        setEnhanceNotice(res.status === 'failed'
+          ? '画像基线已创建；AI 增强暂不可用，可直接使用或稍后重试。'
+          : '');
         setPhase('enhancing'); // 进入后台增强等待（可跳过）
       } else {
         setError('画像创建失败，请重试');
         setSubmitting(false);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '创建失败');
+      setError(workspaceErrorMessage(e, '创建失败'));
       setSubmitting(false);
     }
   };
@@ -79,7 +94,7 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
     const name = form.name.trim();
     const tick = async () => {
       try {
-        const st = await profileBuildStatus(name);
+        const st = await data.profileBuildStatus(name);
         if (!alive) return;
         if (st.state === 'done' || st.state === 'failed' || st.state === 'unknown') {
           onCreated(name);
@@ -92,7 +107,7 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
     };
     const t = setTimeout(tick, 4000);
     return () => { alive = false; clearTimeout(t); };
-  }, [phase]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [data, phase]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const box: React.CSSProperties = {
     width: '100%', padding: '10px 12px', marginTop: 6, borderRadius: 'var(--radius)',
@@ -134,9 +149,11 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
         ) : phase === 'enhancing' ? (
           <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-secondary)' }}>
             <div className="spinner" style={{ margin: '0 auto 16px' }} />
-            <div style={{ color: 'var(--text)', fontSize: 15, marginBottom: 6 }}>画像已创建 ✓　AI 正在后台增强…</div>
+            <div style={{ color: 'var(--text)', fontSize: 15, marginBottom: 6 }}>
+              {enhanceNotice ? '画像基线已创建 ✓' : '画像已创建 ✓　AI 正在后台增强…'}
+            </div>
             <span style={{ fontSize: 12 }}>
-              正在尝试抓取社媒链接并完善各维度，可能需要 1-2 分钟。<br />
+              {enhanceNotice || '正在尝试抓取社媒链接并完善各维度，可能需要 1-2 分钟。'}<br />
               也可以现在就进去用，增强会在后台继续。
             </span>
             <div style={{ marginTop: 20 }}>

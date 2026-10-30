@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -74,6 +74,10 @@ _IMPLEMENTED_EXACT = frozenset({
     # Task 5A：基础工作区（status/画像/内容/媒体/上传）
     ("GET", "/api/status"),
     ("GET", "/api/personas"),
+    # Task 5C1：技能目录与受管任务入口
+    ("GET", "/api/skills"),
+    ("POST", "/api/skill"),
+    ("POST", "/api/profile/build"),
     ("GET", "/api/outputs"),
     ("GET", "/api/artifacts/archive"),
     ("GET", "/api/upload/limits"),
@@ -100,6 +104,9 @@ _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/persona/[^/]+$")),
     ("GET", re.compile(r"^/api/persona/[^/]+/files$")),
     ("PUT", re.compile(r"^/api/persona/[^/]+/file$")),
+    ("GET", re.compile(r"^/api/skill/[^/]+$")),
+    ("GET", re.compile(r"^/api/skill/status/[^/]+$")),
+    ("GET", re.compile(r"^/api/profile/build/status/[^/]+$")),
     ("GET", re.compile(r"^/api/output/.+$")),
     ("DELETE", re.compile(r"^/api/output/.+$")),
     ("GET", re.compile(r"^/api/media/.+$")),
@@ -826,6 +833,11 @@ def create_app(*, store: Store, auth: AuthService,
                     http_client, control_db_runner)
             else:
                 app.state.workspace_api = None
+            from .workspace_tasks import WorkspaceTasks
+            app.state.workspace_tasks = WorkspaceTasks(
+                app.state.control_store, app.state.sessions,
+                app.state.relay, app.state.workspace_api,
+                control_db_runner)
             # 后台对账与 SSE/登录解耦：应用启动即恢复扫描，退出时先停止
             # 循环再关闭它使用的 HTTP 连接池。
             app.state.reconciler = None
@@ -929,6 +941,9 @@ def create_app(*, store: Store, auth: AuthService,
         from .workspace_api import canonical_persona_name
 
         encoded = canonical_persona_name(name)
+        if await request.app.state.workspace_tasks.profile_active(
+                _identity(request), name):
+            raise DomainError("profile_busy", 409)
         raw = await _workspace_body(request, maximum=2 * 1024 * 1024)
         try:
             payload = json.loads(raw)
@@ -945,6 +960,9 @@ def create_app(*, store: Store, auth: AuthService,
         from .workspace_api import canonical_persona_name
 
         encoded = canonical_persona_name(name)
+        if await request.app.state.workspace_tasks.profile_active(
+                _identity(request), name):
+            raise DomainError("profile_busy", 409)
         return await _forward_workspace_json(
             request, "DELETE", f"/api/persona/{encoded}")
 
@@ -1104,6 +1122,55 @@ def create_app(*, store: Store, auth: AuthService,
         record_id = canonical_workbench_id(iid)
         return await _forward_workspace_json(
             request, "DELETE", f"/api/ideas/{record_id}")
+
+    # ------------------------------------------------------------------
+    # Task 5C1：技能目录/执行与画像基线/增强
+    # ------------------------------------------------------------------
+
+    @app.get("/api/skills")
+    async def workspace_skills(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/skills")
+
+    @app.get("/api/skill/status/{name}")
+    async def workspace_skill_status(request: Request, name: str):
+        service = request.app.state.workspace_tasks
+        return _no_store_json(
+            await service.skill_status(_identity(request), name))
+
+    @app.get("/api/skill/{name}")
+    async def workspace_skill_detail(request: Request, name: str):
+        from .workspace_tasks import canonical_skill_name
+
+        encoded = quote(canonical_skill_name(name), safe="-._~")
+        return await _forward_workspace_json(
+            request, "GET", f"/api/skill/{encoded}")
+
+    @app.post("/api/skill")
+    async def workspace_skill_run(request: Request):
+        service = request.app.state.workspace_tasks
+        payload = await _read_json_body(
+            request, limit=64 * 1024 + 65536)
+        result = await service.submit_skill(
+            _identity(request), payload)
+        return JSONResponse(result, status_code=202,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/profile/build")
+    async def workspace_profile_build(request: Request):
+        service = request.app.state.workspace_tasks
+        payload = await _read_json_body(
+            request, limit=256 * 1024 + 65536)
+        result = await service.build_profile(
+            _identity(request), payload)
+        return JSONResponse(result, status_code=200,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/profile/build/status/{name}")
+    async def workspace_profile_status(request: Request, name: str):
+        service = request.app.state.workspace_tasks
+        return _no_store_json(
+            await service.profile_status(_identity(request), name))
 
     @app.post("/api/auth/exchange")
     async def exchange(request: Request):

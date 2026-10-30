@@ -161,6 +161,15 @@ _WS_SIMPLE: dict[tuple[str, ...], _Route] = {
     ("api", "ideas"): _Route(
         "ws_ideas", frozenset({"GET", "POST"}), "/api/ideas", False,
         frozenset()),
+    ("api", "skills"): _Route(
+        "ws_skills", frozenset({"GET"}), "/api/skills", False,
+        frozenset()),
+    ("api", "skill", "prepare"): _Route(
+        "ws_skill_prepare", frozenset({"POST"}), "/api/skill/prepare",
+        False, frozenset()),
+    ("api", "profile", "baseline"): _Route(
+        "ws_profile_baseline", frozenset({"POST"}),
+        "/api/profile/baseline", False, frozenset()),
 }
 
 
@@ -490,6 +499,10 @@ def _workspace_route(parts: list[str],
             else "ws_idea_item"
         return _Route(name, frozenset({"PUT", "DELETE"}),
                       f"/api/{parts[1]}/{record}", False, frozenset())
+    if len(parts) == 3 and parts[1] == "skill":
+        name = _workspace_segment(parts[2], persona=False)
+        return _Route("ws_skill", frozenset({"GET"}),
+                      f"/api/skill/{name}", False, frozenset())
     if len(parts) >= 3 and parts[1] in ("output", "media"):
         path = _workspace_output_path(parts[2:])
         if parts[1] == "output":

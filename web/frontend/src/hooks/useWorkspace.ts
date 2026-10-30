@@ -87,6 +87,9 @@ export interface UseWorkspaceResult {
   failedTurnId: string | null;
   call<T>(path: string, init?: RequestInit): Promise<T>;
   fetchText(path: string, init?: RequestInit): Promise<string>;
+  runTask(
+    sessionId: string, runId: string, signal?: AbortSignal,
+  ): Promise<{ state: string; response?: string }>;
   selectSession(id: string): void;
   newChat(): Promise<void>;
   renameSession(id: string, title: string): Promise<void>;
@@ -266,6 +269,49 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
       }
       throw error;
     }
+  }, [client, onExpired]);
+
+  const runTask = useCallback(async (
+    sessionId: string, runId: string, signal?: AbortSignal,
+  ): Promise<{ state: string; response?: string }> => {
+    const effective = signal || requestAbort.current.signal;
+    let state = 'running';
+    const chunks: string[] = [];
+    try {
+      const streamed = await client.streamRun(runId, 0, {
+        onState: (value) => { state = value.state; },
+        onToken: (text) => { chunks.push(text); },
+      }, effective);
+      if (streamed.aborted) throw new AuthError(0, 'aborted');
+      if (!isTerminalRun(state) && !streamed.terminal) {
+        throw new AuthError(0, 'task_timeout');
+      }
+    } catch (error) {
+      if (error instanceof AuthError && error.status === 401
+          && error.identityInvalidated) {
+        onExpired();
+      }
+      throw error;
+    }
+    let response = '';
+    try {
+      const messages = await client.loadMessages(
+        sessionId, 0, 500, effective);
+      response = messages.messages
+        .filter((message) => message.role === 'assistant'
+          && (message as { runId?: unknown }).runId === runId)
+        .map((message) => message.content)
+        .join('\n');
+    } catch (error) {
+      // 结果消息读取失败不能用空字符串冒充成功；保留流式 token。
+      if (error instanceof AuthError && error.status === 401
+          && error.identityInvalidated) {
+        onExpired();
+        throw error;
+      }
+      response = chunks.join('');
+    }
+    return { state, response };
   }, [client, onExpired]);
 
   const abortStream = useCallback(() => {
@@ -1087,6 +1133,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     failedTurnId,
     call,
     fetchText,
+    runTask,
     selectSession: chooseSession,
     newChat,
     renameSession,

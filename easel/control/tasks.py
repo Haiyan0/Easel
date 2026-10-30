@@ -74,14 +74,14 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         task_type="skill",
         label="SKILL 执行",
         kind=LONG,
-        implemented=False,
+        implemented=True,
         routes=(TaskRoute("POST", r"/api/skill"),),
     ),
     TaskEntry(
         task_type="profile",
         label="画像增强",
         kind=LONG,
-        implemented=False,
+        implemented=True,
         routes=(TaskRoute("POST", r"/api/profile/build"),),
     ),
     TaskEntry(

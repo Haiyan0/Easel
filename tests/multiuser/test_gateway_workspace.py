@@ -132,6 +132,12 @@ ROUTES = [
     ("POST", "/api/ideas", None, b'{"title":"x"}', None),
     ("PUT", f"/api/ideas/{RECORD_ID}", None, b'{"title":"x"}', None),
     ("DELETE", f"/api/ideas/{RECORD_ID}", None, b"", None),
+    ("GET", "/api/skills", None, b"", None),
+    ("GET", "/api/skill/demo", None, b"", None),
+    ("POST", "/api/skill/prepare", None,
+     b'{"skill":"demo","input":"x"}', None),
+    ("POST", "/api/profile/baseline", None,
+     b'{"name":"p","form":{}}', None),
 ]
 
 
@@ -245,7 +251,6 @@ def test_media_304_is_not_treated_as_redirect():
     ("GET", "/api/persona/%2F/files", 400),
     ("GET", "/api/artifacts/archive?path=", 400),
     ("GET", "/api/artifacts/archive?path=%2e%2e%2fx", 400),
-    ("GET", "/api/skills", 404),
     ("GET", "/api/accounts", 404),
     ("POST", "/api/outputs", 405),
     ("POST", "/api/status", 405),

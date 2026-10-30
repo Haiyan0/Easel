@@ -161,6 +161,10 @@ export interface ProfileBuildResponse {
   async?: boolean;
   status?: string;
   log?: string;
+  runId?: string;
+  sessionId?: string;
+  detail?: string;
+  enhancement?: { state: string; detail?: string };
 }
 
 export interface ProfileBuildStatus {

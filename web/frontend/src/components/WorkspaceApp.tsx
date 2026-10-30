@@ -4,6 +4,8 @@ import ControlSettingsPage from './ControlSettingsPage';
 import AdminSettingsPage from './AdminSettingsPage';
 import DashboardPage from './DashboardPage';
 import TrendsPage from './TrendsPage';
+import SkillPage from './SkillPage';
+import OnboardingWizard from './OnboardingWizard';
 import IdeasPage from './IdeasPage';
 import CalendarPage from './CalendarPage';
 import OutputsPage from './OutputsPage';
@@ -80,15 +82,20 @@ export default function WorkspaceApp({
   const [workspaceReady, setWorkspaceReady] = useState(false);
   const [outputsJump, setOutputsJump] = useState('');
   const [draftPrompt, setDraftPrompt] = useState('');
+  const [profileWizardOpen, setProfileWizardOpen] = useState(false);
+  const [profileRefresh, setProfileRefresh] = useState(0);
   const workspace = useWorkspace({ ctx, epoch, epochs, onExpired });
   const features = workspaceModeFeatures('control');
   const admin = ctx.role === 'admin';
   const workspaceCall = workspace.call;
   const workspaceFetchText = workspace.fetchText;
+  const workspaceRunTask = workspace.runTask;
   const data = useMemo(() => createControlWorkspaceData({
     call: workspaceCall,
     fetchText: (url, signal) => workspaceFetchText(url, { signal }),
-  }), [workspaceCall, workspaceFetchText]);
+    runTask: (sessionId, runId, signal) =>
+      workspaceRunTask(sessionId, runId, signal),
+  }), [workspaceCall, workspaceFetchText, workspaceRunTask]);
 
   useEffect(() => {
     const onHash = () => {
@@ -228,6 +235,9 @@ export default function WorkspaceApp({
     if (currentPage === 'calendar') {
       return <CalendarPage />;
     }
+    if (currentPage === 'skills') {
+      return <SkillPage persona={selectedPersona} />;
+    }
     if (currentPage === 'outputs') {
       return (
         <OutputsPage jumpPath={outputsJump}
@@ -237,11 +247,10 @@ export default function WorkspaceApp({
     if (currentPage === 'profile') {
       return (
         <ProfilePage
+          key={`${epoch}:${profileRefresh}`}
           persona={selectedPersona}
           onUsePersona={changePersona}
-          onNewProfile={() => {
-            /* 画像新建/AI 构建属于 5C；页面以禁用按钮与说明表达 */
-          }}
+          onNewProfile={() => setProfileWizardOpen(true)}
           onDeleted={personaDeleted}
         />
       );
@@ -387,6 +396,20 @@ export default function WorkspaceApp({
           </div>
         </div>
       </div>
+    )}
+    {profileWizardOpen && (
+      <OnboardingWizard
+        onClose={() => setProfileWizardOpen(false)}
+        onCreated={(name) => {
+          setProfileWizardOpen(false);
+          setCurrentPage('profile');
+          setProfileRefresh((value) => value + 1);
+          void data.fetchPersonas().then((list) => {
+            setPersonas(list);
+            setSelectedPersona(name);
+          }).catch(() => { /* 画像列表随后可重试 */ });
+        }}
+      />
     )}
     </WorkspaceDataProvider>
   );

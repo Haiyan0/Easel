@@ -409,8 +409,8 @@ async def scenario_profile_and_attachment(browser, results, failures):
         await page.locator(".section-title", has_text="我的画像").wait_for(
             timeout=10000)
         new_profile = page.get_by_role("button", name="新建画像")
-        assert await new_profile.is_disabled()
-        assert "后续版本接入" in (await page.text_content("body") or "")
+        assert not await new_profile.is_disabled()
+        assert "后续版本接入" not in (await page.text_content("body") or "")
         assert "抓取公众号数据" not in (await page.text_content("body") or "")
 
         await page.get_by_role("button", name="对话", exact=True).click()

@@ -4557,6 +4557,35 @@ class SkillRequest(BaseModel):
     persona: str | None = None
 
 
+class SkillPrepareRequest(BaseModel):
+    skill: str
+    input: str
+    persona: str | None = None
+
+
+@app.post("/api/skill/prepare")
+async def api_skill_prepare(req: SkillPrepareRequest):
+    """只校验技能并返回受管 prompt；执行由 control 的 Run 账本接纳。"""
+    if not req.input.strip():
+        raise HTTPException(400, "技能输入不能为空")
+    if len(req.input.encode("utf-8")) > 64 * 1024:
+        raise HTTPException(413, "技能输入过大")
+    skill_full = find_skill(req.skill)
+    if skill_full is None:
+        raise HTTPException(404, f"SKILL '{req.skill}' 不存在")
+    message = (f"{_persona_prefix(req.persona)}请执行 /{skill_full}，"
+               f"内容如下：\n\n{req.input}")
+    needs_api = skill_full in SKILL_API_REQUIREMENTS
+    env = _read_env()
+    return {
+        "skill": skill_full,
+        "prompt": message,
+        "needsApi": needs_api,
+        "apiConfigured": _skill_api_configured(skill_full, env)
+        if needs_api else True,
+    }
+
+
 @app.post("/api/skill")
 async def api_skill(req: SkillRequest):
     if _direct_api_enabled():
@@ -5746,6 +5775,89 @@ async def api_profile_build(req: ProfileBuildRequest):
     threading.Thread(target=_enhance, daemon=True).start()
     # 基线已写、画像立即可用；增强在后台，前端轮询状态
     return {'created': pd.is_dir(), 'name': name, 'async': True, 'status': 'running'}
+
+
+class ProfileBaselineRequest(BaseModel):
+    name: str
+    form: dict = {}
+    reuse: bool = False
+
+
+def _profile_target(name: str) -> Path:
+    """验证画像名并返回 profiles 根内候选路径；现有链接一律拒绝。"""
+    if (not valid_persona_name(name) or len(name) > 200
+            or name != name.strip()):
+        raise HTTPException(400, "画像名非法")
+    root = PROFILES_DIR
+    if not _real_directory(root.parent):
+        raise HTTPException(500, "画像存储不可用")
+    if not _real_directory(root):
+        try:
+            root.mkdir()
+        except OSError:
+            raise HTTPException(500, "画像存储不可用") from None
+        if not _real_directory(root):
+            raise HTTPException(500, "画像存储不可用")
+    target = root / name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target
+    except OSError:
+        raise HTTPException(500, "画像存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if target.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "画像存储不可用")
+    return target
+
+
+@app.post("/api/profile/baseline")
+async def api_profile_baseline(req: ProfileBaselineRequest):
+    """确定性写入画像六维基线；不启动后台线程，AI 增强由 control Run 接纳。"""
+    name = req.name.strip()
+    form = req.form or {}
+    if not isinstance(form, dict):
+        raise HTTPException(400, "画像表单非法")
+    try:
+        encoded = json.dumps(form, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "画像表单非法") from None
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        raise HTTPException(413, "画像表单过大")
+    target = _profile_target(name)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not target.is_dir() or safe_profile_dir(name) is None:
+            if target.is_dir():
+                raise HTTPException(500, "画像存储不可用")
+            raise HTTPException(409, f'画像「{name}」已存在，请换一个名字')
+        if not req.reuse:
+            raise HTTPException(409, f'画像「{name}」已存在，请换一个名字')
+        return {
+            "created": False, "name": name,
+            "instruction": _form_to_instruction(name, form),
+        }
+    try:
+        target.mkdir()
+    except FileExistsError:
+        raise HTTPException(409, f'画像「{name}」已存在，请换一个名字') from None
+    except OSError:
+        raise HTTPException(500, "画像存储不可用") from None
+    try:
+        if safe_profile_dir(name) is None:
+            raise HTTPException(500, "画像存储不可用")
+        _write_baseline_profile(name, form)
+    except BaseException:
+        import shutil as _shutil
+        _shutil.rmtree(target, ignore_errors=True)
+        raise
+    return {
+        "created": True, "name": name,
+        "instruction": _form_to_instruction(name, form),
+    }
 
 
 def _profile_status_file(name: str) -> Path:

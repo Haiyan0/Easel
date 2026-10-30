@@ -916,21 +916,13 @@ def test_control_upload_forwards_bounded_multipart_and_requires_csrf(tmp_path):
 def test_remaining_groups_stay_explicitly_unavailable(tmp_path):
     fake = FakeWorkspace()
     with control_api(tmp_path, fake) as (client, store, auth, admin, member):
-        body = login(client, auth, admin, member)
-        csrf = body["csrfToken"]
+        login(client, auth, admin, member)
         for method, path in [
-            ("GET", "/api/skills"),
             ("GET", "/api/accounts"),
         ]:
             response = client.request(method, path)
             assert response.status_code == 503, (method, path)
             assert response.json()["code"] == "capability_unavailable"
-        build = client.post(
-            "/api/profile/build", json={"name": "x", "form": {}},
-            headers={"Origin": ORIGIN, "X-CSRF-Token": csrf})
-        assert build.status_code == 503
-        assert not any(len(call) > 2 and call[2] == "/api/profile/build"
-                       for call in fake.calls)
 
 
 def _workbench_response(path: str, method: str, payload=None):

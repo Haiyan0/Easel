@@ -44,6 +44,14 @@ const api = {
     status: item.status || 'pending', created: 1 }),
   updateIdea: async (id, item) => ({ id, ...item }),
   deleteIdea: async () => ({ ok: true }),
+  fetchSkills: async () => [],
+  fetchSkillDetail: async () => ({
+    name: 'demo', layer: 'general', description: '', body: '',
+    needsApi: false, apiConfigured: true, apiSpec: null,
+  }),
+  executeSkill: async () => ({ response: 'ok' }),
+  buildProfile: async (name) => ({ created: true, name }),
+  profileBuildStatus: async () => ({ state: 'done', log: '' }),
 };
 
 const module = { exports: {} };
@@ -76,7 +84,9 @@ test('control workspace data exposes only implemented basic capabilities', () =>
     call: async () => [],
     fetchText: async () => '',
   });
-  assert.equal(control.personaBuildEnabled, false);
+  assert.equal(control.personaBuildEnabled, true);
+  assert.equal(control.skillsEnabled, true);
+  assert.equal(control.skillEnvEnabled, false);
   assert.equal(control.wechatFetchEnabled, false);
   assert.equal(control.attachmentsEnabled, true);
   assert.equal(control.oversizeMode, 'reject');
@@ -91,6 +101,8 @@ test('control workspace data exposes only implemented basic capabilities', () =>
   assert.equal(local.wechatFetchEnabled, true);
   assert.equal(local.workbenchEnabled, true);
   assert.equal(local.accountsEnabled, true);
+  assert.equal(local.skillsEnabled, true);
+  assert.equal(local.skillEnvEnabled, true);
   assert.equal(local.oversizeMode, 'adopt');
   assert.equal(local.localSettingsEnabled, true);
 });
@@ -297,4 +309,67 @@ test('control workbench methods use identity call with exact paths and bodies', 
   await control.deleteSchedule('b1b2c3d4e5f6');
   call = calls.at(-1);
   assert.equal(call.init.method, 'DELETE');
+});
+
+test('control skill/profile tasks use identity admission and poll the admitted run', async () => {
+  const calls = [];
+  const polls = [];
+  const control = data.createControlWorkspaceData({
+    call: async (path, init) => {
+      calls.push({ path, init });
+      if (path === '/api/skills') {
+        return [{
+          name: 'demo', description: '说明', layer: 'general',
+          needsApi: false, apiConfigured: true,
+        }];
+      }
+      if (path === '/api/skill/demo') {
+        return {
+          name: 'demo', layer: 'general', description: '说明', body: '正文',
+          needsApi: false, apiConfigured: true, apiSpec: null,
+        };
+      }
+      if (path === '/api/skill') {
+        return { runId: 'run-1', state: 'running',
+          sessionId: 'session-1', skill: 'demo' };
+      }
+      if (path === '/api/skill/status/demo') {
+        return { state: 'done', response: '上次结果', runId: 'run-0' };
+      }
+      if (path === '/api/profile/build') {
+        return { created: true, name: '画像', async: true,
+          status: 'running', runId: 'run-2', sessionId: 'session-2' };
+      }
+      if (path.startsWith('/api/profile/build/status/')) {
+        return { state: 'done', log: '完成' };
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    fetchText: async () => '',
+    runTask: async (sessionId, runId, signal) => {
+      polls.push({ sessionId, runId, signal });
+      return { state: 'done', response: '技能结果' };
+    },
+  });
+  assert.equal((await control.fetchSkills())[0].name, 'demo');
+  assert.equal((await control.fetchSkillDetail('demo')).body, '正文');
+  assert.equal((await control.executeSkill('demo', '输入', '画像')).response,
+    '技能结果');
+  const admission = calls.find((item) => item.path === '/api/skill');
+  assert.equal(admission.init.method, 'POST');
+  const body = JSON.parse(admission.init.body);
+  assert.equal(body.skill, 'demo');
+  assert.equal(body.input, '输入');
+  assert.equal(body.persona, '画像');
+  assert.ok(body.turnId);
+  assert.equal(polls[0].sessionId, 'session-1');
+  assert.equal(polls[0].runId, 'run-1');
+  assert.equal((await control.skillStatus('demo')).response, '上次结果');
+
+  const profile = await control.buildProfile('画像', { direction: '方向' });
+  assert.equal(profile.created, true);
+  assert.equal(profile.runId, 'run-2');
+  const profileCall = calls.find((item) => item.path === '/api/profile/build');
+  assert.equal(JSON.parse(profileCall.init.body).form.direction, '方向');
+  assert.equal((await control.profileBuildStatus('画像')).state, 'done');
 });
