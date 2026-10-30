@@ -1,10 +1,10 @@
-﻿python.exe : Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+python.exe : Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
 At line:1 char:302
 + ... tch {} } }; & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -W ignor ...
 +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (Exception in ca...tion_lost(None):String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
 Traceback (most recent call last):
   File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run

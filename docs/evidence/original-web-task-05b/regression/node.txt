@@ -1,4 +1,4 @@
-﻿✔ a failed old avatar does not prevent a newly verified avatar from rendering (21.8924ms)
+✔ a failed old avatar does not prevent a newly verified avatar from rendering (21.8924ms)
 ✔ manual account verification updates the card and identity from the same result (59.8806ms)
 ✔ failed account verification preserves the last verified nickname and avatar (8.218ms)
 ✔ handleLogin serializes polling and never overwrites terminal success (3.6074ms)

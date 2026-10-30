@@ -1,10 +1,10 @@
-﻿docker.exe : #0 building with "desktop-linux" instance using docker driver
+docker.exe : #0 building with "desktop-linux" instance using docker driver
 At line:1 char:913
 + ... STEXITCODE; & docker build @proxyArgs -f deploy/desktop/Dockerfile.ga ...
 +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 
 #1 [internal] load build definition from Dockerfile.gateway
 #1 transferring dockerfile: 1.60kB 0.0s done

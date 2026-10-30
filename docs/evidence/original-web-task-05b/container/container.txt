@@ -1,4 +1,4 @@
-﻿CONTAINER_IMAGES {'control': 'easel-control:task5b-20261030', 'gateway': 'easel-gateway:task5b-20261030', 'worker': 'easel-worker-execution:task5b-20261030'}
+CONTAINER_IMAGES {'control': 'easel-control:task5b-20261030', 'gateway': 'easel-gateway:task5b-20261030', 'worker': 'easel-worker-execution:task5b-20261030'}
 CONTAINER_CHECK {'status': True, 'personas': True, 'outputs': True, 'text': True, 'media_head_range': True, 'media_404_typed': True, 'upload': True, 'persona_write': True, 'delete': True, 'anonymous_401': True, 'ideas_crud': True, 'schedule_crud': True, 'schedule_context': True, 'restart_persistence': True, 'trends_public': 'not-run'}
 TASK5B_CONTAINER_OK True
 CLEANUP_ERRORS []
