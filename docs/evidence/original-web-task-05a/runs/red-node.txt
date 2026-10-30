@@ -1,0 +1,11 @@
+实现前运行：
+node --test tests/frontend/workspaceData.test.mjs
+
+结果：
+tests 1
+pass 0
+fail 1
+Error: ENOENT: no such file or directory,
+open 'web/frontend/src/lib/workspaceData.ts'
+
+说明：control 工作区数据适配器尚不存在；红测无法加载。
