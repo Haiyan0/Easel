@@ -54,11 +54,11 @@ function loadWorkspace() {
   return module.exports;
 }
 
-test('control disables local personas and attachments while local keeps them', () => {
+test('control enables synced personas/attachments without local settings', () => {
   const workspace = loadWorkspace();
   const control = workspace.workspaceModeFeatures('control');
-  assert.equal(control.personas, false);
-  assert.equal(control.attachments, false);
+  assert.equal(control.personas, true);
+  assert.equal(control.attachments, true);
   assert.equal(control.retry, false);
   assert.equal(control.localSettings, false);
   const local = workspace.workspaceModeFeatures('local');

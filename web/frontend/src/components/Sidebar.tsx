@@ -34,6 +34,7 @@ interface SidebarProps {
   identityLabel?: string;
   onLogout?: () => void;
   personasEnabled?: boolean;
+  personaCreateEnabled?: boolean;
   showEmptySessions?: boolean;
   statusText?: string;
   statusOnline?: boolean;
@@ -73,6 +74,7 @@ export default function Sidebar({
   identityLabel,
   onLogout,
   personasEnabled = true,
+  personaCreateEnabled = true,
   showEmptySessions = false,
   statusText,
   statusOnline,
@@ -149,7 +151,7 @@ export default function Sidebar({
           <h1>Easel</h1>
           <ThemeToggle />
         </div>
-        {personasEnabled ? (
+        {personasEnabled && (
           <select
             className="persona-select"
             value={selectedPersona}
@@ -163,9 +165,10 @@ export default function Sidebar({
             {personas.map((p) => (
               <option key={p.name} value={p.name}>{p.name}</option>
             ))}
-            <option value="__new__">+ 新建画像…</option>
+            {personaCreateEnabled && <option value="__new__">+ 新建画像…</option>}
           </select>
-        ) : (
+        )}
+        {(mode === 'control' || !personasEnabled) && (
           <div className={`sidebar-identity sidebar-identity-${mode}`}
             title={identityLabel || '已登录'}>
             <span className="sidebar-identity-name">

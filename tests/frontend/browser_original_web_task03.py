@@ -1150,8 +1150,9 @@ async def scenario_control_layout(browser, server: Server,
         assert "A 会话" in body
         assert "A 私有问题" in body
         assert "A 私有回答" in body
-        assert not any(path.startswith("/api/upload/limits")
-                       for path in server.request_paths())
+        # Task 5A 已接通基础附件上传；对话页会读取真实上传上限。
+        assert any(path.startswith("/api/upload/limits")
+                   for path in server.request_paths())
         results["control_original_layout"] = True
         await page.screenshot(path=str(EVIDENCE / "01-control-layout.png"))
 

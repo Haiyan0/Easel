@@ -132,6 +132,7 @@ body {
   background-position: right 10px center;
 }
 .persona-select:focus { border-color: var(--accent-start); }
+.persona-select + .sidebar-identity { margin-top: 8px; }
 
 .sidebar-nav { padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
 
@@ -1177,6 +1178,14 @@ textarea.field { resize: vertical; min-height: 90px; }
 /* 对话页素材上传：拖拽高亮 + 附件芯片 + 素材按钮 */
 .composer-drag { border-color: var(--accent-start); box-shadow: var(--glow); background: var(--accent-soft); }
 .composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.composer-notice {
+  margin-bottom: 8px; padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 32%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px; line-height: 1.5;
+}
 .attach-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 220px; padding: 3px 6px 3px 8px;
   font-size: 12px; color: var(--text-secondary); background: var(--surface-hover);
   border: 1px solid var(--border); border-radius: 7px; }

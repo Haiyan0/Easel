@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
-import { fetchPersonas, fetchPersonaFiles, savePersonaFile, deletePersona, fetchAccountAnalytics } from '../lib/api';
+import { fetchAccountAnalytics } from '../lib/api';
 import type { PersonaItem, PersonaFile, AccountAnalytics } from '../lib/api';
+import { workspaceErrorMessage } from '../lib/workspaceData';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconProfile, IconPlus } from './icons';
 
@@ -67,6 +69,7 @@ const DIM_META: Record<string, { label: string; icon: string }> = {
 };
 
 export default function ProfilePage(props: ProfilePageProps) {
+  const data = useWorkspaceData();
   const [viewedPersona, setViewedPersona] = useState(props.persona);
   const [personas, setPersonas] = useState<PersonaItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -78,13 +81,15 @@ export default function ProfilePage(props: ProfilePageProps) {
     let ignore = false;
     setLoading(true);
     setError('');
-    fetchPersonas().then((list) => {
+    data.fetchPersonas().then((list) => {
       if (!ignore) setPersonas(list);
-    }).catch(() => {
-      if (!ignore) setError('加载画像列表失败，请重试。');
+    }).catch((error: unknown) => {
+      if (!ignore) {
+        setError(workspaceErrorMessage(error, '加载画像列表失败，请重试。'));
+      }
     }).finally(() => { if (!ignore) setLoading(false); });
     return () => { ignore = true; };
-  }, [revision]);
+  }, [data, revision]);
 
   if (viewedPersona) {
     return <ProfileDetail key={viewedPersona} {...props} persona={viewedPersona}
@@ -105,8 +110,18 @@ export default function ProfilePage(props: ProfilePageProps) {
           <h1 className="page-title">用户画像 <span className="profile-title-en">Profile</span></h1>
           <p className="page-subtitle">管理你的定位、风格与受众，为每一种创作找到合适的身份。</p>
         </div>
-        <button className="btn btn-primary" onClick={props.onNewProfile}><IconPlus size={15} /> 新建画像</button>
+        <button className="btn btn-primary" onClick={props.onNewProfile}
+          disabled={!data.personaBuildEnabled}
+          title={data.personaBuildEnabled ? '' : '画像新建与 AI 构建将在后续版本接入'}>
+          <IconPlus size={15} /> 新建画像
+        </button>
       </div>
+      {!data.personaBuildEnabled ? (
+        <div className="profile-mode-note" role="status">
+          <IconProfile size={18} />
+          <span>画像新建与 AI 构建将在后续版本接入；当前可查看、编辑和删除已有画像。</span>
+        </div>
+      ) : null}
       <div className="profile-mode-note">
         <IconProfile size={18} />
         <span>{props.persona ? `当前对话使用「${props.persona}」` : '当前对话为通用模式'}<small>查看和编辑画像不会切换对话身份。</small></span>
@@ -117,7 +132,11 @@ export default function ProfilePage(props: ProfilePageProps) {
           <div className="profile-avatar"><IconProfile size={28} /></div>
           <h3>创建你的第一个画像</h3>
           <p>记录账号定位、内容风格和偏好，让每次创作都更贴合你。</p>
-          <button className="btn btn-primary" onClick={props.onNewProfile}><IconPlus size={15} /> 新建画像</button>
+          <button className="btn btn-primary" onClick={props.onNewProfile}
+            disabled={!data.personaBuildEnabled}
+            title={data.personaBuildEnabled ? '' : '画像新建与 AI 构建将在后续版本接入'}>
+            <IconPlus size={15} /> 新建画像
+          </button>
         </div> : <>
           <div className="section-title">我的画像 · {personas.length}</div>
           <div className="profile-grid">
@@ -143,6 +162,7 @@ function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: Prof
   onBack: () => void;
   inUse: boolean;
 }) {
+  const data = useWorkspaceData();
   const [files, setFiles] = useState<PersonaFile[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
@@ -159,27 +179,29 @@ function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: Prof
     setLoading(true);
     setError('');
     setEditing(false);
-    fetchPersonaFiles(persona)
+    data.fetchPersonaFiles(persona)
       .then((d) => {
         if (ignore) return;
         setFiles(d.files);
         setDrafts(Object.fromEntries(d.files.map((f) => [f.filename, f.content])));
       })
-      .catch(() => { if (!ignore) setError('加载画像失败'); })
+      .catch((error: unknown) => {
+        if (!ignore) setError(workspaceErrorMessage(error, '加载画像失败'));
+      })
       .finally(() => { if (!ignore) setLoading(false); });
     return () => { ignore = true; };
-  }, [persona]);
+  }, [data, persona]);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 2500); };
 
   const handleSave = async (filename: string) => {
     setSavingFile(filename);
     try {
-      await savePersonaFile(persona, filename, drafts[filename] ?? '');
+      await data.savePersonaFile(persona, filename, drafts[filename] ?? '');
       setFiles((prev) => prev.map((f) => f.filename === filename ? { ...f, content: drafts[filename] ?? '' } : f));
       showToast(`已保存 ${DIM_META[filename]?.label || filename} ✓`);
     } catch (e) {
-      showToast(e instanceof Error ? e.message : '保存失败');
+      showToast(workspaceErrorMessage(e, '保存失败'));
     } finally {
       setSavingFile('');
     }
@@ -197,7 +219,7 @@ function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: Prof
       }
       const base = files.find((f) => f.filename === filename)?.content ?? '';
       const merged = mergeWechatBlock(base, buildWechatBlock(a));
-      await savePersonaFile(persona, filename, merged);
+      await data.savePersonaFile(persona, filename, merged);
       // 同步更新 files（视图）与 drafts（若正在编辑也一致），无需手动保存
       setFiles((prev) => prev.map((f) => f.filename === filename ? { ...f, content: merged } : f));
       setDrafts((p) => ({ ...p, [filename]: merged }));
@@ -213,11 +235,11 @@ function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: Prof
     if (!window.confirm(`确定删除画像「${persona}」吗？\n此操作不可恢复，将删除该画像的全部六维文件。`)) return;
     setDeleting(true);
     try {
-      await deletePersona(persona);
+      await data.deletePersona(persona);
       onDeleted(persona);
       showToast(`已删除画像「${persona}」`);
     } catch (e) {
-      showToast(e instanceof Error ? e.message : '删除失败');
+      showToast(workspaceErrorMessage(e, '删除失败'));
     } finally {
       setDeleting(false);
     }
@@ -264,12 +286,17 @@ function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: Prof
               <div className="profile-dim-head">
                 <div className="profile-dim-title">{meta.icon} {meta.label}</div>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  {f.filename === 'platforms.md' && (
+                  {f.filename === 'platforms.md' && data.wechatFetchEnabled && (
                     <button className="btn btn-sm" disabled={fetchingWx}
                       title="用已登录的公众号后台会话抓取粉丝/内容数据，写入本栏（与数据中心同源）"
                       onClick={() => handleFetchWechat(f.filename)}>
                       {fetchingWx ? '抓取中…' : '📊 抓取公众号数据'}
                     </button>
+                  )}
+                  {f.filename === 'platforms.md' && !data.wechatFetchEnabled && (
+                    <span style={{ fontSize: 12, color: 'var(--text-tertiary)', alignSelf: 'center' }}>
+                      公众号数据抓取将在后续版本接入
+                    </span>
                   )}
                   {editing && (
                     <button className="btn btn-sm btn-primary" disabled={!dirty || savingFile === f.filename}

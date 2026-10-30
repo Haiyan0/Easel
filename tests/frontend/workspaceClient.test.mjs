@@ -227,6 +227,45 @@ test('202 admission keeps turnId idempotency and 409/503 stay typed', async () =
   );
 });
 
+test('attachment refs and persona ride the same admitted turn', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return response(202, {
+      runId: 'run-attach', state: 'accepted', duplicate: false,
+    });
+  };
+  const { client, workspace } = makeClient(fetchImpl);
+  const attachments = [{
+    id: 'i1', name: '素材.txt', path: '_inbox/a/b/素材.txt',
+  }];
+  await client.submitTurn(
+    's-1', 'turn-1', '看附件', undefined, attachments, '画像A');
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    sessionId: 's-1', turnId: 'turn-1', message: '看附件',
+    attachments, persona: '画像A',
+  });
+  const view = workspace.controlMessageView({
+    role: 'user', content: '看附件', attachments,
+  });
+  assert.equal(view.attachments.length, 1);
+  assert.equal(view.attachments[0].path, attachments[0].path);
+  assert.equal(workspace.controlMessageView({
+    role: 'user', content: 'x', attachments: [{ path: 1 }],
+  }).attachments, undefined);
+});
+
+test('fetchText keeps identity semantics for HTML previews', async () => {
+  const fetchImpl = async (url) => ({
+    status: 200, ok: true,
+    text: async () => `<html data-url="${url}"></html>`,
+  });
+  const { client, workspace } = makeClient(fetchImpl);
+  const html = await client.fetchText('/api/media/card.html');
+  assert.match(html, /card\.html/);
+  assert.equal(typeof workspace.controlMessageView, 'function');
+});
+
 test('401 invalidates only the captured identity epoch', async () => {
   const fetch401 = async () => response(401, { code: 'unauthorized' });
   const first = makeClient(fetch401);
@@ -373,8 +412,8 @@ test('server views keep original ChatPage types and control capabilities', () =>
   assert.equal(question.questions[0].options[0].value, 'qopt_allow');
 
   const control = workspace.workspaceModeFeatures('control');
-  assert.equal(control.personas, false);
-  assert.equal(control.attachments, false);
+  assert.equal(control.personas, true);
+  assert.equal(control.attachments, true);
   assert.equal(control.retry, false);
   const local = workspace.workspaceModeFeatures('local');
   assert.equal(local.personas, true);

@@ -3,8 +3,11 @@ import MessageBubble from './MessageBubble';
 import QuestionCards from './QuestionCards';
 import BrushEntry from './BrushEntry';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
-import { uploadFiles, adoptOversize } from '../lib/api';
 import type { ChatQuestion, UploadedFile } from '../lib/api';
+import {
+  oversizeUploadMessage, partitionUploads, workspaceErrorMessage,
+} from '../lib/workspaceData';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 
 interface ChatPageProps {
@@ -21,7 +24,8 @@ interface ChatPageProps {
   ) => void; // 重试：仅对最后一轮；control 暂不提供
   onQuestionAnswered?: (questionId: string) => void;   // 某道问答题提交成功（App 记录答过，重放不再出现）
   mode?: 'local' | 'control';
-  attachmentsEnabled?: boolean;  // control 暂未接通上传/本地收件箱时显式禁用
+  attachmentsEnabled?: boolean;
+  attachmentRequiresText?: boolean;  // control 附件必须随文字提交
   identityKey?: string;          // 身份切换时清理本页草稿/附件/上传状态
   notice?: string;
   retryAvailable?: boolean;
@@ -52,15 +56,17 @@ function greeting(): string {
 
 export default function ChatPage({
   apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered,
-  mode = 'local', attachmentsEnabled = true, identityKey,
-  notice, retryAvailable, onRetrySend, reconnectAvailable, onReconnect,
-  hasOlder, loadingOlder, onLoadOlder, onAnswerQuestion,
+  attachmentsEnabled = true, attachmentRequiresText = false,
+  identityKey, notice, retryAvailable, onRetrySend, reconnectAvailable,
+  onReconnect, hasOlder, loadingOlder, onLoadOlder, onAnswerQuestion,
 }: ChatPageProps) {
+  const data = useWorkspaceData();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [maxMb, setMaxMb] = useState(50);
+  const [uploadNotice, setUploadNotice] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -71,9 +77,10 @@ export default function ChatPage({
 
   useEffect(() => {
     if (!attachmentsEnabled) return;
-    fetch('/api/upload/limits').then((r) => r.json())
-      .then((d) => { if (d?.max_mb) setMaxMb(d.max_mb); }).catch(() => {});
-  }, [attachmentsEnabled]);
+    data.uploadLimits()
+      .then((d) => { if (d.max_mb > 0) setMaxMb(d.max_mb); })
+      .catch(() => { /* 保持保守默认 50MB */ });
+  }, [attachmentsEnabled, data]);
 
   // 身份切换时清理本页草稿/附件/上传状态，不能只清父会话数组。
   useEffect(() => {
@@ -81,24 +88,30 @@ export default function ChatPage({
     setAttachments([]);
     setUploading(false);
     setDragOver(false);
+    setUploadNotice('');
   }, [identityKey]);
 
   const doUpload = async (fs: FileList | File[]) => {
     if (!attachmentsEnabled) return;
     const arr = Array.from(fs);
     if (!arr.length) return;
-    const cap = maxMb * 1024 * 1024;
-    const big = arr.filter((f) => f.size > cap);
-    const small = arr.filter((f) => f.size <= cap);
+    setUploadNotice('');
+    const parts = partitionUploads(arr, maxMb);
+    const big = arr.filter((file) => parts.oversize.includes(file));
+    const small = arr.filter((file) => parts.accepted.includes(file));
 
     if (big.length) {
-      // 超限：不走上传通道，复制进收件箱后作为普通附件（界面零新增元素）
+      if (data.oversizeMode === 'reject' || !data.adoptOversize) {
+        setUploadNotice(oversizeUploadMessage(maxMb, 'reject'));
+        return;
+      }
+      // local 单机保留原通道：复制进本地素材目录后作为普通附件。
       setUploading(true);
       try {
-        const saved = await adoptOversize(big, session.id);
+        const saved = await data.adoptOversize(big, session.id);
         setAttachments((a) => [...a, ...saved]);
       } catch (err) {
-        alert((err as Error).message || '超限文件处理失败');
+        setUploadNotice(workspaceErrorMessage(err, '超限文件处理失败'));
       } finally {
         setUploading(false);
       }
@@ -106,10 +119,10 @@ export default function ChatPage({
     if (!small.length) return;
     setUploading(true);
     try {
-      const saved = await uploadFiles(small, session.id);
+      const saved = await data.uploadFiles(small, session.id);
       setAttachments((a) => [...a, ...saved]);
     } catch (err) {
-      alert((err as Error).message || '上传失败');
+      setUploadNotice(workspaceErrorMessage(err, '上传失败'));
     } finally {
       setUploading(false);
     }
@@ -143,10 +156,15 @@ export default function ChatPage({
   const handleSend = () => {
     const trimmed = input.trim();
     if ((!trimmed && attachments.length === 0) || isStreaming || uploading) return;
+    if (attachmentRequiresText && attachments.length > 0 && !trimmed) {
+      setUploadNotice('请先输入文字，再发送附件。');
+      return;
+    }
     // 附件通过结构化字段发送；用户消息气泡只显示用户实际输入的文字。
     onSend(trimmed, attachments);
     setInput('');
     setAttachments([]);
+    setUploadNotice('');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -180,6 +198,9 @@ export default function ChatPage({
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={(e) => { e.preventDefault(); setDragOver(false); }}
       onDrop={onDrop}>
+      {uploadNotice && (
+        <div className="composer-notice" role="status">{uploadNotice}</div>
+      )}
       {attachments.length > 0 && (
         <div className="composer-attachments">
           {attachments.map((a) => (
@@ -220,7 +241,9 @@ export default function ChatPage({
           onClick={() => fileInputRef.current?.click()}
           disabled={!attachmentsEnabled || isStreaming || uploading}
           title={attachmentsEnabled
-            ? `添加素材（图片/文档）；超过 ${maxMb}MB 的大文件将自动存为本地素材（不走上传）`
+            ? (data.oversizeMode === 'adopt'
+              ? `添加素材（图片/文档）；超过 ${maxMb}MB 的大文件将自动存为本地素材（不走上传）`
+              : `添加素材（图片/文档）；单个文件上限 ${maxMb}MB`)
             : '登录工作区的附件上传暂未开放'}>
           <IconPlus size={15} /> {!attachmentsEnabled
             ? '素材（暂未开放）' : uploading ? '上传中…' : '素材'}
@@ -319,7 +342,7 @@ export default function ChatPage({
                 activity={live ? stream!.activity : ''}
                 stillWorking={live ? stream!.stillWorking : ''}
                 actions={actions}
-                mediaEnabled={mode !== 'control'}
+                mediaEnabled
               />
             );
           })}

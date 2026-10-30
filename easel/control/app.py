@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import hmac
 import ipaddress
 import json
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -70,6 +71,13 @@ _IMPLEMENTED_EXACT = frozenset({
     ("POST", "/api/chat/stop"),
     ("POST", "/api/chat/question/answer"),
     ("POST", "/api/chat/question/status"),
+    # Task 5A：基础工作区（status/画像/内容/媒体/上传）
+    ("GET", "/api/status"),
+    ("GET", "/api/personas"),
+    ("GET", "/api/outputs"),
+    ("GET", "/api/artifacts/archive"),
+    ("GET", "/api/upload/limits"),
+    ("POST", "/api/upload"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
@@ -81,6 +89,14 @@ _IMPLEMENTED_PATTERNS = (
     ("GET", re.compile(r"^/api/sessions/[^/]+/messages$")),
     ("GET", re.compile(r"^/api/sessions/[^/]+/runs$")),
     ("GET", re.compile(r"^/api/chat/jobs/[^/]+/stream$")),
+    ("GET", re.compile(r"^/api/persona/[^/]+$")),
+    ("DELETE", re.compile(r"^/api/persona/[^/]+$")),
+    ("GET", re.compile(r"^/api/persona/[^/]+/files$")),
+    ("PUT", re.compile(r"^/api/persona/[^/]+/file$")),
+    ("GET", re.compile(r"^/api/output/.+$")),
+    ("DELETE", re.compile(r"^/api/output/.+$")),
+    ("GET", re.compile(r"^/api/media/.+$")),
+    ("HEAD", re.compile(r"^/api/media/.+$")),
     ("GET", re.compile(r"^/$")),
     ("GET", re.compile(r"^/onepage$")),
     ("GET", re.compile(r"^/assets/[^/].*$")),
@@ -92,6 +108,137 @@ _IMPLEMENTED_PATTERNS = (
 
 _MEMBER_CAPABILITIES = ("workspace",)
 _ADMIN_CAPABILITIES = ("workspace", "admin")
+
+_MAX_WORKSPACE_BODY = 60 * 1024 * 1024
+_MEDIA_HEADERS = frozenset({
+    "content-type", "content-length", "content-range", "content-disposition",
+    "accept-ranges", "etag", "last-modified", "cache-control",
+    "content-security-policy",
+})
+_RANGE_RE = re.compile(
+    r"^bytes=(?:[0-9]*-[0-9]*)(?:,\s*[0-9]*-[0-9]*)*$")
+_ETAG_RE = re.compile(r'^(W/)?"([^"\r\n]+)"$')
+
+
+def _no_store_json(payload: object, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        payload, status_code=status_code,
+        headers={"Cache-Control": "no-store"})
+
+
+def _workspace_scope_tag(workspace_id: str) -> str:
+    return "easel-" + hashlib.sha256(
+        workspace_id.encode("utf-8")).hexdigest()[:12] + "-"
+
+
+def _scope_etag(value: str, prefix: str) -> str | None:
+    match = _ETAG_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    weak = match.group(1) or ""
+    return f'{weak}"{prefix}{match.group(2)}"'
+
+
+def _unscope_etag_list(value: str, prefix: str) -> str | None:
+    """把浏览器回传的 workspace 作用域 ETag 列表还原为 worker 值。
+
+    任意一项不带本 workspace 前缀（含 ``*`` 或日期）时整头丢弃，宁可 200
+    让浏览器重新取，也不能拿另一身份的条件请求触发 304。
+    """
+    tags: list[str] = []
+    position = 0
+    text = value.strip()
+    while position < len(text):
+        match = re.match(r'\s*(W/)?"([^"]*)"\s*', text[position:])
+        if match is None:
+            return None
+        weak = match.group(1) or ""
+        inner = match.group(2)
+        if not inner.startswith(prefix):
+            return None
+        tags.append(f'{weak}"{inner[len(prefix):]}"')
+        position += match.end()
+        if position == len(text):
+            break
+        if text[position] != ",":
+            return None
+        position += 1
+    return ", ".join(tags) if tags else None
+
+
+def _media_request_headers(request: Request, workspace_id: str
+                           ) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    range_value = request.headers.get("range")
+    if range_value is not None:
+        if (len(range_value) > 1024
+                or _RANGE_RE.fullmatch(range_value) is None):
+            raise DomainError("invalid_request", 400)
+        headers["Range"] = range_value
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None:
+        unscoped = _unscope_etag_list(
+            if_none_match, _workspace_scope_tag(workspace_id))
+        if unscoped is not None:
+            headers["If-None-Match"] = unscoped
+    if_range = request.headers.get("if-range")
+    if if_range is not None:
+        # 只透传已带本 workspace 前缀的 ETag；日期条件会跨身份误命中。
+        original = _unscope_etag_list(
+            if_range, _workspace_scope_tag(workspace_id))
+        if original is not None:
+            headers["If-Range"] = original
+    return headers
+
+
+def _media_response_headers(headers: Mapping[str, str],
+                            workspace_id: str) -> dict[str, str]:
+    result = {
+        str(name).lower(): str(value)
+        for name, value in headers.items()
+        if str(name).lower() in _MEDIA_HEADERS
+    }
+    prefix = _workspace_scope_tag(workspace_id)
+    etag = result.get("etag")
+    if etag is not None:
+        scoped = _scope_etag(etag, prefix)
+        if scoped is None:
+            result.pop("etag", None)
+        else:
+            result["etag"] = scoped
+    content_type = result.get("content-type", "").lower()
+    result["cache-control"] = (
+        "private, no-store" if content_type.startswith("text/html")
+        else "private, no-cache")
+    result["vary"] = "Cookie"
+    result["x-content-type-options"] = "nosniff"
+    return result
+
+
+async def _workspace_body(request: Request,
+                          maximum: int = _MAX_WORKSPACE_BODY) -> bytes:
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise DomainError("invalid_request", 400) from None
+        if length < 0:
+            raise DomainError("invalid_request", 400)
+        if length > maximum:
+            raise DomainError("payload_too_large", 413)
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > maximum:
+            raise DomainError("payload_too_large", 413)
+        chunks.append(chunk)
+    if total == 0:
+        raise DomainError("invalid_request", 400)
+    return b"".join(chunks)
 
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
@@ -212,6 +359,55 @@ def _broker_route_registered(method: str, path: str) -> bool:
         and relative_path == expected_path
         for expected_channel, expected_method, expected_path, _body
         in BROKER_ROUTE_TABLE)
+
+
+async def _forward_workspace_json(request: Request, method: str, path: str,
+                                  *, query=None, payload=None,
+                                  body=None, content_type=None):
+    service = _workspace_service(request)
+    response = await service.request(
+        _identity(request), method, path, query=query, payload=payload,
+        body=body, content_type=content_type)
+    try:
+        data = response.json()
+    except ValueError:
+        raise DomainError("upstream_invalid", 502) from None
+    return _no_store_json(data)
+
+
+async def _workspace_media_response(request: Request, path: str):
+    service = _workspace_service(request)
+    actor = _identity(request)
+    method = "HEAD" if request.method.upper() == "HEAD" else "GET"
+    headers = _media_request_headers(request, actor.workspace_id)
+    stream = await service.open_stream(actor, method, f"/api/media/{path}",
+                                       headers=headers)
+    response_headers = _media_response_headers(
+        stream.headers, actor.workspace_id)
+    if method == "HEAD" or stream.status_code == 304:
+        await stream.aclose()
+        if stream.status_code == 304:
+            response_headers.pop("content-length", None)
+            response_headers.pop("content-range", None)
+        return Response(status_code=stream.status_code,
+                        headers=response_headers)
+    return StreamingResponse(
+        stream.chunks(), status_code=stream.status_code,
+        headers=response_headers)
+
+
+def _workspace_service(request: Request):
+    service = getattr(request.app.state, "workspace_api", None)
+    if service is None:
+        raise DomainError("capability_unavailable", 503)
+    return service
+
+
+def _identity(request: Request) -> Identity:
+    identity = getattr(request.state, "identity", None)
+    if not isinstance(identity, Identity):
+        raise DomainError("unauthorized", 401)
+    return identity
 
 
 def _config_service(request: Request) -> ConfigService:
@@ -482,6 +678,8 @@ def create_app(*, store: Store, auth: AuthService,
                gateway_required: bool = False,
                frontend_dir: str | Path | None = None,
                relay_factory: Callable[..., object] | None = None,
+               workspace_api=None,
+               workspace_factory: Callable[..., object] | None = None,
                harness_summary: dict | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
@@ -497,12 +695,19 @@ def create_app(*, store: Store, auth: AuthService,
     位置参数调用；``http_client`` 由 lifespan 创建并关闭，``db_runner`` 保证
     所有 SQLite 调用仍回到专用数据库线程。未提供 factory 时任务入口保持
     503，绝不直通旧本地 handler。
+
+    ``workspace_factory`` 接收
+    ``(runtime, store, http_client, db_runner)``；它只装配 Task 5A 的
+    status/画像/内容/媒体/上传路由。``workspace_api`` 可直接注入测试实现，
+    但与 factory 互斥。两者都未提供时这些已分类路由明确 503。
     """
     control_path = Path(store.path).absolute()
     if broker is not None and config_service is None:
         raise ValueError("broker requires config_service")
     if provisioner is not None and runtime is not None:
         raise ValueError("runtime and provisioner are mutually exclusive")
+    if workspace_api is not None and workspace_factory is not None:
+        raise ValueError("workspace_api and workspace_factory are exclusive")
     frontend_root: Path | None = None
     if frontend_dir is not None:
         frontend_root = Path(frontend_dir).resolve()
@@ -559,18 +764,27 @@ def create_app(*, store: Store, auth: AuthService,
                     db_runner=control_db_runner)
             else:
                 app.state.broker = None
-            if relay_factory is not None:
+            if relay_factory is not None or workspace_factory is not None:
                 # 客户端归 lifespan 所有：连接池随应用退出关闭，不在每次
                 # 请求内新建，也不修改共享默认凭证。内部签名包与服务凭证
                 # 只走直连，绝不读取宿主环境/注册表代理（否则内网请求可能
                 # 被外部代理截走或失败）。
                 http_client = httpx.AsyncClient(trust_env=False)
+            if relay_factory is not None:
                 app.state.relay = relay_factory(
                     app.state.runtime, app.state.sessions,
                     app.state.auth, app.state.control_store,
                     http_client, app.state.broker, control_db_runner)
             else:
                 app.state.relay = None
+            if workspace_api is not None:
+                app.state.workspace_api = workspace_api
+            elif workspace_factory is not None and http_client is not None:
+                app.state.workspace_api = workspace_factory(
+                    app.state.runtime, app.state.control_store,
+                    http_client, control_db_runner)
+            else:
+                app.state.workspace_api = None
             # 后台对账与 SSE/登录解耦：应用启动即恢复扫描，退出时先停止
             # 循环再关闭它使用的 HTTP 连接池。
             app.state.reconciler = None
@@ -637,6 +851,123 @@ def create_app(*, store: Store, auth: AuthService,
         """公开可信启动信息；未知/缺失时前端失败关闭，不猜测 local。"""
         return JSONResponse({"mode": "control"},
                             headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------
+    # Task 5A：基础工作区（画像/内容/媒体/附件）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/status")
+    async def workspace_status(request: Request):
+        service = _workspace_service(request)
+        return _no_store_json(
+            await service.status(_identity(request)))
+
+    @app.get("/api/personas")
+    async def workspace_personas(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/personas")
+
+    @app.get("/api/persona/{name}")
+    async def workspace_persona(request: Request, name: str):
+        from .workspace_api import canonical_persona_name
+
+        encoded = canonical_persona_name(name)
+        return await _forward_workspace_json(
+            request, "GET", f"/api/persona/{encoded}")
+
+    @app.get("/api/persona/{name}/files")
+    async def workspace_persona_files(request: Request, name: str):
+        from .workspace_api import canonical_persona_name
+
+        encoded = canonical_persona_name(name)
+        return await _forward_workspace_json(
+            request, "GET", f"/api/persona/{encoded}/files")
+
+    @app.put("/api/persona/{name}/file")
+    async def workspace_persona_file_save(request: Request, name: str):
+        from .workspace_api import canonical_persona_name
+
+        encoded = canonical_persona_name(name)
+        raw = await _workspace_body(request, maximum=2 * 1024 * 1024)
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            raise DomainError("invalid_request", 400) from None
+        if not isinstance(payload, dict):
+            raise DomainError("invalid_request", 400)
+        return await _forward_workspace_json(
+            request, "PUT", f"/api/persona/{encoded}/file",
+            payload=payload)
+
+    @app.delete("/api/persona/{name}")
+    async def workspace_persona_delete(request: Request, name: str):
+        from .workspace_api import canonical_persona_name
+
+        encoded = canonical_persona_name(name)
+        return await _forward_workspace_json(
+            request, "DELETE", f"/api/persona/{encoded}")
+
+    @app.get("/api/outputs")
+    async def workspace_outputs(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/outputs")
+
+    @app.get("/api/artifacts/archive")
+    async def workspace_archive(request: Request):
+        from .workspace_api import canonical_output_path
+
+        path = request.query_params.get("path")
+        if path is None:
+            raise DomainError("invalid_request", 400)
+        canonical_output_path(path)
+        return await _forward_workspace_json(
+            request, "GET", "/api/artifacts/archive",
+            query={"path": path})
+
+    @app.get("/api/output/{path:path}")
+    async def workspace_output(request: Request, path: str):
+        from .workspace_api import canonical_output_path
+
+        encoded = canonical_output_path(path)
+        return await _forward_workspace_json(
+            request, "GET", f"/api/output/{encoded}")
+
+    @app.api_route("/api/media/{path:path}", methods=["GET", "HEAD"])
+    async def workspace_media(request: Request, path: str):
+        from .workspace_api import canonical_output_path
+
+        encoded = canonical_output_path(path)
+        return await _workspace_media_response(request, encoded)
+
+    @app.delete("/api/output/{path:path}")
+    async def workspace_output_delete(request: Request, path: str):
+        from .workspace_api import canonical_output_path
+
+        encoded = canonical_output_path(path)
+        return await _forward_workspace_json(
+            request, "DELETE", f"/api/output/{encoded}")
+
+    @app.get("/api/upload/limits")
+    async def workspace_upload_limits(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/upload/limits")
+
+    @app.post("/api/upload")
+    async def workspace_upload(request: Request):
+        content_type = request.headers.get("content-type", "")
+        if (not content_type.lower().startswith("multipart/form-data;")
+                or "boundary=" not in content_type.lower()
+                or len(content_type) > 256):
+            raise DomainError("invalid_request", 400)
+        body = await _workspace_body(request)
+        service = _workspace_service(request)
+        response = await service.upload(
+            _identity(request), body, content_type)
+        try:
+            data = response.json()
+        except ValueError:
+            raise DomainError("upstream_invalid", 502) from None
+        return _no_store_json(data)
 
     @app.post("/api/auth/exchange")
     async def exchange(request: Request):

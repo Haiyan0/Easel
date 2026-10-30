@@ -309,6 +309,41 @@ export async function identityFetchRaw<T>(
   };
 }
 
+/** 同源文本请求（如 HTML 产物预览）：与 identityFetchRaw 同样的 401/CSRF。 */
+export async function identityFetchText(
+  request: IdentityRequest,
+): Promise<string> {
+  const fetchImpl = request.fetchImpl || fetch;
+  const method = (request.init?.method || 'GET').toUpperCase();
+  const headers: Record<string, string> = {
+    ...((request.init?.headers as Record<string, string> | undefined) || {}),
+  };
+  if (!SAFE_METHODS.has(method)) {
+    headers['X-CSRF-Token'] = request.ctx.csrfToken;
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(request.url, {
+      ...request.init,
+      method,
+      headers,
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  } catch {
+    throw new AuthError(0, 'network_unavailable');
+  }
+  if (response.status === 401) {
+    const owned = request.epochs.isCurrent(request.epoch);
+    if (owned) request.epochs.invalidate();
+    const error = new AuthError(401, 'unauthorized');
+    error.identityInvalidated = owned;
+    throw error;
+  }
+  if (!response.ok) throw await errorFrom(response);
+  return response.text();
+}
+
 export async function identityFetch<T>(
   request: IdentityRequest,
 ): Promise<T> {

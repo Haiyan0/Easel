@@ -47,6 +47,7 @@ from easel.gateway_endpoint import chat_completions_url, healthz_url, port_sourc
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
                            profile_exists, valid_persona_name, _FILE_ORDER)
+from easel import persona as _persona_module
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from easel.manual_publish import build_package, publishing_mode
 from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
@@ -323,6 +324,9 @@ def _qbridge_warn_once(key: str, message: str) -> None:
 
 # 代码/技能来自只读 code_root；产物/画像写 workspace_root；状态写 state_root。
 PROFILES_DIR = _RUNTIME_PATHS.workspace_root / "profiles"
+# worker 每进程只服务一个 workspace；共享画像助手必须跟随显式 workspace 根，
+# 不能继续读镜像内（code_root）/profiles。local 模式下二者相同，行为不变。
+_persona_module.PROFILES_DIR = PROFILES_DIR
 SKILLS_DIR = _RUNTIME_PATHS.code_root / "skills"
 OUTPUTS_DIR = _RUNTIME_PATHS.workspace_root / "outputs"
 
@@ -4700,6 +4704,20 @@ async def api_output_delete(path: str):
     return {"ok": True, "deleted": path, "kind": "dir" if is_dir else "file"}
 
 
+def _upload_names(files: list[UploadFile]) -> list[str]:
+    """在写盘前校验整批文件名/扩展名，避免部分成功留下孤儿附件。"""
+    if not files:
+        raise HTTPException(400, '没有文件')
+    names: list[str] = []
+    for f in files:
+        name = Path(f.filename or "file").name
+        ext = Path(name).suffix.lower()
+        if ext not in UPLOAD_EXTS:
+            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
+        names.append(name)
+    return names
+
+
 @app.post("/api/upload")
 async def api_upload(
     files: list[UploadFile] = File(...),
@@ -4708,21 +4726,18 @@ async def api_upload(
     """Store chat attachments in a session-scoped inbox and return opaque refs."""
     scope = _attachment_scope(sessionId)
     _check_worker_upload_count(files)
+    names = _upload_names(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)
     saved = []
-    for f in files:
-        name = Path(f.filename or "file").name
-        ext = Path(name).suffix.lower()
-        if ext not in UPLOAD_EXTS:
-            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
-        # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
-        cap = MAX_UPLOAD_MB * 1024 * 1024
-        target = _unique_upload_path(dest, name)
-        size = 0
-        try:
+    try:
+        for f, name in zip(files, names):
+            # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
+            # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
+            cap = MAX_UPLOAD_MB * 1024 * 1024
+            target = _unique_upload_path(dest, name)
+            size = 0
             with open(target, 'wb') as out:
                 while True:
                     chunk = await f.read(1024 * 1024)
@@ -4730,18 +4745,18 @@ async def api_upload(
                         break
                     size += len(chunk)
                     if size > cap:
-                        raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+                        raise HTTPException(
+                            413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
                     out.write(chunk)
-        except HTTPException:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-            raise
-        rel = f"_inbox/{scope}/{batch}/{target.name}"
-        saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
-    if not saved:
-        raise HTTPException(400, '没有文件')
+            rel = f"_inbox/{scope}/{batch}/{target.name}"
+            saved.append({"id": _attachment_id(scope, rel),
+                          "name": target.name, "path": rel})
+        if not saved:
+            raise HTTPException(400, '没有文件')
+    except BaseException:
+        # 超限、损坏、客户端取消或后续文件非法：整批删除，不返回伪成功。
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return {"ok": True, "files": saved}
 
 
@@ -4760,26 +4775,28 @@ async def api_upload_local(
     产出与 /api/upload 同构的附件引用（id/name/path），附件校验与清单链路零改动。"""
     scope = _attachment_scope(sessionId)
     _check_worker_upload_count(files)
+    names = _upload_names(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)
     saved = []
-    for f in files:
-        name = Path(f.filename or "file").name
-        ext = Path(name).suffix.lower()
-        if ext not in UPLOAD_EXTS:
-            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        target = _unique_upload_path(dest, name)
-        with open(target, 'wb') as out:
-            while True:
-                chunk = await f.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-        rel = f"_inbox/{scope}/{batch}/{target.name}"
-        saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
-    if not saved:
-        raise HTTPException(400, '没有文件')
+    try:
+        for f, name in zip(files, names):
+            target = _unique_upload_path(dest, name)
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            rel = f"_inbox/{scope}/{batch}/{target.name}"
+            saved.append({"id": _attachment_id(scope, rel),
+                          "name": target.name, "path": rel})
+        if not saved:
+            raise HTTPException(400, '没有文件')
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return {"ok": True, "files": saved}
 
 

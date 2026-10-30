@@ -7,7 +7,7 @@
  * 建立 AbortSignal，但 401 语义与 identityFetch 保持一致。
  */
 import type { AuthContext, IdentityEpoch } from './auth';
-import { AuthError, identityFetchRaw } from './auth';
+import { AuthError, identityFetchRaw, identityFetchText } from './auth';
 import {
   consumeSseChunk, isTerminalRun, parseAdmission, parseMessagePage,
   parseQuestionData, parseRunPage, parseSessionPage, stateFromEvent,
@@ -17,7 +17,7 @@ import type {
   ControlQuestion, RunMeta, ServerMessage, ServerSession, SseFrame,
 } from './control';
 import type { ChatMessage, ChatSession } from './store';
-import type { ChatQuestion } from './api';
+import type { ChatQuestion, UploadedFile } from './api';
 
 export interface ControlWorkspaceOptions {
   ctx: AuthContext;
@@ -56,6 +56,7 @@ export interface RunStreamResult {
 
 export interface ControlWorkspaceClient {
   call<T>(path: string, init?: RequestInit): Promise<T>;
+  fetchText(path: string, init?: RequestInit): Promise<string>;
   listSessions(
     offset: number, limit?: number, signal?: AbortSignal,
   ): Promise<SessionPage>;
@@ -72,6 +73,8 @@ export interface ControlWorkspaceClient {
   submitTurn(
     sessionId: string, turnId: string, text: string,
     signal?: AbortSignal,
+    attachments?: UploadedFile[],
+    persona?: string,
   ): Promise<{ runId: string; state: string; duplicate: boolean }>;
   streamRun(
     runId: string, after: number, handlers: RunStreamHandlers,
@@ -137,6 +140,17 @@ export function controlMessageView(message: ServerMessage): ChatMessage {
   };
   if (typeof message.thinking === 'string') view.thinking = message.thinking;
   if (typeof message.activity === 'string') view.activity = message.activity;
+  if (Array.isArray(message.attachments)) {
+    const attachments: UploadedFile[] = [];
+    for (const item of message.attachments) {
+      if (!item || typeof item !== 'object') continue;
+      const row = item as Record<string, unknown>;
+      if (typeof row.id !== 'string' || typeof row.name !== 'string'
+          || typeof row.path !== 'string') continue;
+      attachments.push({ id: row.id, name: row.name, path: row.path });
+    }
+    if (attachments.length) view.attachments = attachments;
+  }
   return view;
 }
 
@@ -168,7 +182,7 @@ export function workspaceModeFeatures(
   mode: 'control' | 'local',
 ): WorkspaceModeFeatures {
   return mode === 'control'
-    ? { personas: false, attachments: false, retry: false,
+    ? { personas: true, attachments: true, retry: false,
         localSettings: false }
     : { personas: true, attachments: true, retry: true,
         localSettings: true };
@@ -193,6 +207,17 @@ export function createControlWorkspaceClient(
 
   return {
     call,
+
+    async fetchText(path: string, init?: RequestInit): Promise<string> {
+      return identityFetchText({
+        epochs: options.epochs,
+        epoch: options.epoch,
+        ctx: options.ctx,
+        url: `${base}${path}`,
+        init,
+        fetchImpl,
+      });
+    },
 
     async listSessions(
       offset: number, limit = 100, signal?: AbortSignal,
@@ -262,6 +287,8 @@ export function createControlWorkspaceClient(
     async submitTurn(
       sessionId: string, turnId: string, text: string,
       signal?: AbortSignal,
+      attachments: UploadedFile[] = [],
+      persona?: string,
     ) {
       const raw = await identityFetchRaw<unknown>({
         epochs: options.epochs,
@@ -271,7 +298,11 @@ export function createControlWorkspaceClient(
         init: {
           method: 'POST',
           headers: jsonHeaders(),
-          body: JSON.stringify({ sessionId, turnId, message: text }),
+          body: JSON.stringify({
+            sessionId, turnId, message: text,
+            ...(attachments.length ? { attachments } : {}),
+            ...(persona ? { persona } : {}),
+          }),
           signal,
         },
         fetchImpl,

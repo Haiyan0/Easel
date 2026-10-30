@@ -31,6 +31,7 @@ export interface WorkspaceLayoutProps {
   identityLabel?: string;
   onLogout?: () => void;
   personasEnabled?: boolean;
+  personaCreateEnabled?: boolean;
   showEmptySessions?: boolean;
   statusText?: string;
   statusOnline?: boolean;
@@ -62,6 +63,7 @@ export default function WorkspaceLayout({
   identityLabel,
   onLogout,
   personasEnabled = true,
+  personaCreateEnabled = true,
   showEmptySessions = false,
   statusText,
   statusOnline,
@@ -93,6 +95,7 @@ export default function WorkspaceLayout({
         identityLabel={identityLabel}
         onLogout={onLogout}
         personasEnabled={personasEnabled}
+        personaCreateEnabled={personaCreateEnabled}
         showEmptySessions={showEmptySessions}
         statusText={statusText}
         statusOnline={statusOnline}

@@ -15,7 +15,7 @@ import type {
 import {
   isActiveRun, isTerminalRun, olderMessageWindow, recoveryAction,
 } from '../lib/control';
-import type { ChatQuestion } from '../lib/api';
+import type { ChatQuestion, UploadedFile } from '../lib/api';
 import type { ChatMessage, ChatSession, StreamState } from '../lib/store';
 import {
   controlMessageView, controlQuestionView, controlSessionView,
@@ -55,6 +55,8 @@ interface LocalSend {
   sessionId: string;
   turnId: string;
   text: string;
+  attachments: UploadedFile[];
+  persona?: string;
   generation: number;
   status: 'sending' | 'failed';
   runId?: string;
@@ -84,6 +86,7 @@ export interface UseWorkspaceResult {
   canReconnect: boolean;
   failedTurnId: string | null;
   call<T>(path: string, init?: RequestInit): Promise<T>;
+  fetchText(path: string, init?: RequestInit): Promise<string>;
   selectSession(id: string): void;
   newChat(): Promise<void>;
   renameSession(id: string, title: string): Promise<void>;
@@ -91,7 +94,8 @@ export interface UseWorkspaceResult {
   deleteSession(id: string): Promise<void>;
   loadMoreSessions(): Promise<void>;
   loadOlder(): Promise<void>;
-  send(text: string): Promise<void>;
+  send(text: string, attachments?: UploadedFile[],
+       persona?: string): Promise<void>;
   retryFailed(): Promise<void>;
   stop(): Promise<void>;
   reconnect(): void;
@@ -235,6 +239,23 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
   ): Promise<T> => {
     try {
       return await client.call<T>(path, init ? {
+        ...init,
+        signal: init.signal || requestAbort.current.signal,
+      } : { signal: requestAbort.current.signal });
+    } catch (error) {
+      if (error instanceof AuthError && error.status === 401
+          && error.identityInvalidated) {
+        onExpired();
+      }
+      throw error;
+    }
+  }, [client, onExpired]);
+
+  const fetchText = useCallback(async (
+    path: string, init?: RequestInit,
+  ): Promise<string> => {
+    try {
+      return await client.fetchText(path, init ? {
         ...init,
         signal: init.signal || requestAbort.current.signal,
       } : { signal: requestAbort.current.signal });
@@ -817,6 +838,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
         messages: [...withoutFailed, {
           role: 'user', content: text, pending: true,
           turnId: send.turnId,
+          ...(send.attachments?.length ? { attachments: send.attachments } : {}),
         }],
       };
     })));
@@ -851,7 +873,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     beginLocalSend(current, text);
     try {
       const admission = await client.submitTurn(
-        send.sessionId, send.turnId, text, requestAbort.current.signal);
+        send.sessionId, send.turnId, text, requestAbort.current.signal,
+        send.attachments || [], send.persona);
       if (!epochs.isCurrent(epoch)) return;
       const recovery = {
         runId: admission.runId, turnId: send.turnId, eventId: 0,
@@ -884,7 +907,9 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
   const activeSession = sessions.find((item) => item.id === activeId)
     || null;
 
-  const send = useCallback(async (text: string) => {
+  const send = useCallback(async (
+    text: string, attachments: UploadedFile[] = [], persona?: string,
+  ) => {
     const value = text.trim();
     if (!value || !activeId) return;
     if (activeSession?.archived) {
@@ -897,6 +922,8 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     }
     await submit({
       sessionId: activeId, turnId: makeTurnId(), text: value,
+      attachments: attachments.slice(),
+      ...(persona ? { persona } : {}),
       generation: 0, status: 'sending',
     }, value);
   }, [activeId, activeSession, submit]);
@@ -1059,6 +1086,7 @@ export function useWorkspace(options: UseWorkspaceOptions): UseWorkspaceResult {
     canReconnect,
     failedTurnId,
     call,
+    fetchText,
     selectSession: chooseSession,
     newChat,
     renameSession,

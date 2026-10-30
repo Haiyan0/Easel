@@ -946,6 +946,29 @@ def build_relay_factory(*, signing_key, revision: int, agent: dict,
     return relay_factory
 
 
+def build_workspace_factory(*, signing_key, revision: int,
+                            gateway_required: bool):
+    """Task 5A：基础工作区经同一签名 key/gateway 转发。
+
+    未启用 gateway 时返回 None，control 的 workspace 路由明确 503；不会
+    退回到直连 worker 或浏览器自选目标。
+    """
+    if not gateway_required:
+        return None
+    if not isinstance(signing_key, Ed25519PrivateKey):
+        raise TypeError("workspace routes need an Ed25519 signing key")
+
+    def workspace_factory(runtime, store, http_client, db_runner):
+        from .workspace_api import WorkspaceApi
+
+        return WorkspaceApi(
+            runtime, store, GatewayClient(signing_key, http_client),
+            revision=revision, db_runner=db_runner,
+            gateway_required=True)
+
+    return workspace_factory
+
+
 def _manifest_path(value: object) -> PurePosixPath:
     """清单路径只能是相对 POSIX 路径，禁止绝对路径、盘符和 .. 逃逸。"""
     if not isinstance(value, str) or not value or "\\" in value:
@@ -2413,6 +2436,7 @@ def cmd_serve_control(args) -> int:
             return 2
 
     relay_factory = None
+    workspace_factory = None
     harness_summary = None
     if signing_key is not None:
         revision, agent, broker_config = managed_agent
@@ -2438,6 +2462,9 @@ def cmd_serve_control(args) -> int:
             relay_factory = build_relay_factory(
                 signing_key=signing_key, revision=revision, agent=agent,
                 broker_config=broker_config,
+                gateway_required=gateway_required)
+            workspace_factory = build_workspace_factory(
+                signing_key=signing_key, revision=revision,
                 gateway_required=gateway_required)
         except (KeyError, TypeError, ValueError):
             print("错误：managed_config_invalid", file=sys.stderr)
@@ -2514,6 +2541,7 @@ def cmd_serve_control(args) -> int:
                          gateway_required=gateway_required,
                          frontend_dir=frontend_dir,
                          relay_factory=relay_factory,
+                         workspace_factory=workspace_factory,
                          harness_summary=harness_summary)
     finally:
         # 应用会在 lifespan 中按线程边界重新打开连接
