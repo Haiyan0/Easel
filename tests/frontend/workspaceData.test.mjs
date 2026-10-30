@@ -187,6 +187,28 @@ test('control parsers reject malformed payloads instead of faking empty data', a
   await assert.rejects(badContext.fetchScheduleContext(14), /日历摘要/);
 });
 
+test('control trend parser preserves stale cache metadata', async () => {
+  const control = data.createControlWorkspaceData({
+    call: async () => ({
+      trends: [{
+        platform: 'weibo', label: '微博', ok: false, stale: true,
+        cached_at: 1700000000,
+        items: [{ title: '旧热点', hot: '', url: '' }],
+      }],
+      updated: 1700000000,
+      stale: true,
+      failed_platforms: ['weibo'],
+    }),
+    fetchText: async () => '',
+  });
+  const result = await control.fetchTrends('weibo', 15);
+  assert.equal(result.stale, true);
+  assert.equal(result.updated, 1700000000);
+  assert.equal(result.trends[0].stale, true);
+  assert.equal(result.trends[0].cached_at, 1700000000);
+  assert.deepEqual(Array.from(result.failed_platforms), ['weibo']);
+});
+
 test('control workbench methods use identity call with exact paths and bodies', async () => {
   const calls = [];
   const idea = {

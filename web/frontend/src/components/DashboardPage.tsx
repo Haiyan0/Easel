@@ -49,6 +49,7 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
   const [outputs, setOutputs] = useState<OutputNode[]>([]);
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [ideas, setIdeas] = useState<Idea[]>([]);
+  const [trendStale, setTrendStale] = useState(false);
   const [loading, setLoading] = useState(true);
   const [workbenchError, setWorkbenchError] = useState('');
   const request = useRef<AbortController | null>(null);
@@ -83,6 +84,7 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
     request.current = controller;
     setLoading(true);
     setWorkbenchError('');
+    setTrendStale(false);
 
     if (data.workbenchEnabled) {
       const note = (error: unknown, fallback: string) => {
@@ -92,7 +94,12 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
       };
       const tasks = [
         data.fetchTrends('weibo,douyin', 6, controller.signal)
-          .then((value) => { if (!controller.signal.aborted) setTrends(value.trends); })
+          .then((value) => {
+            if (controller.signal.aborted) return;
+            setTrends(value.trends);
+            setTrendStale(value.stale === true
+              || value.trends.some((group) => group.stale === true));
+          })
           .catch((error) => note(error, '热点读取失败，请重试。')),
         data.fetchSchedule(controller.signal)
           .then((value) => { if (!controller.signal.aborted) setSchedule(value); })
@@ -228,17 +235,29 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
         {/* 今日热点 */}
         <div className="card dash-card">
           <div className="dash-card-head">
-            <span><IconFire size={16} /> 今日热点</span>
+            <span>
+              <IconFire size={16} /> 今日热点
+              {trendStale && (
+                <span className="badge" style={{ marginLeft: 6 }}>旧数据</span>
+              )}
+            </span>
             <button className="dash-more" onClick={() => onNavigate('trends')}>热点雷达 →</button>
           </div>
-          {trends.length === 0 && (
+          {trendStale && (
+            <div className="dash-empty" role="status">
+              热点刷新失败，显示缓存数据；时效以热点雷达页为准。
+            </div>
+          )}
+          {trends.length === 0 && !trendStale && (
             <div className="dash-empty">
               {loading ? '热点加载中…' : workbenchError ? '热点读取失败' : '暂无热点'}
             </div>
           )}
           {trends.map((g) => (
             <div key={g.platform} className="dash-trend-group">
-              <div className="dash-trend-plat">{g.label}</div>
+              <div className="dash-trend-plat">
+                {g.label}{g.stale ? ' · 旧数据' : ''}
+              </div>
               {g.items.slice(0, 3).map((it, i) => (
                 <div key={i} className="dash-trend-item" title={`${it.title}（点击做成内容）`}>
                   <span className="dash-trend-title" onClick={() => onUseTopic(it.title)}>{it.title}</span>

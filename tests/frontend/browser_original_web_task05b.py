@@ -582,6 +582,48 @@ async def scenario_member_no_accounts(browser, results, failures):
         await context.close()
 
 
+async def scenario_stale_trends(browser, results, failures):
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 800}, ignore_https_errors=True)
+    page = await context.new_page()
+    worker = SERVER.worker_app
+    cache = dict(worker._TREND_CACHE)
+    fetcher = worker._fetch_platform
+    try:
+        worker._TREND_CACHE.clear()
+        worker._TREND_CACHE["weibo"] = (
+            time.time() - 3600,
+            [{"title": "ONE-HOUR-OLD-SENTINEL", "hot": "1", "url": ""}])
+        worker._fetch_platform = lambda platform: []
+        await login(page, "a")
+        await open_dashboard(page)
+        await page.get_by_text("热点刷新失败，显示缓存数据").first.wait_for(
+            timeout=20000)
+        await page.get_by_role("button", name="看热点", exact=True).click()
+        await page.locator(".trends-page").wait_for(timeout=20000)
+        await page.get_by_text("ONE-HOUR-OLD-SENTINEL").first.wait_for(
+            timeout=20000)
+        body = await page.text_content("body") or ""
+        assert "ONE-HOUR-OLD-SENTINEL" in body, "缺旧缓存条目"
+        assert "刷新失败，显示缓存" in body, "缺刷新失败说明"
+        assert "旧数据" in body, "缺旧数据标记"
+        assert " 更新" not in body, f"仍显示当前更新时间：{body!r}"
+        await screenshot(page, "10-trends-stale-light.png")
+        results["stale_trends"] = True
+    except Exception as error:  # noqa: BLE001
+        body = ""
+        try:
+            body = (await page.text_content("body") or "")[:1500]
+        except Exception:
+            pass
+        failures.append(f"stale-trends: {error!r} body={body!r}")
+    finally:
+        worker._TREND_CACHE.clear()
+        worker._TREND_CACHE.update(cache)
+        worker._fetch_platform = fetcher
+        await context.close()
+
+
 async def scenario_dark_and_mobile(browser, results, failures):
     try:
         dark = await browser.new_context(
@@ -636,12 +678,13 @@ async def main() -> int:
             await scenario_workbench_flow(browser, results, failures)
             await scenario_identity_isolation(browser, results, failures)
             await scenario_member_no_accounts(browser, results, failures)
+            await scenario_stale_trends(browser, results, failures)
             await scenario_dark_and_mobile(browser, results, failures)
             await browser.close()
         print("TASK5B_BROWSER_RESULTS", results)
         print("FAILURES", failures)
         print("SCREENSHOTS", [str(path.relative_to(ROOT)) for path in SCREENSHOTS])
-        ok = not failures and len(results) >= 4
+        ok = not failures and len(results) >= 5
         print("TASK5B_BROWSER_OK", ok)
         return 0 if ok else 1
     finally:

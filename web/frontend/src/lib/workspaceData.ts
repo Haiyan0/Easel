@@ -62,7 +62,10 @@ export interface WorkspaceData {
   adoptOversize?: (files: File[], sessionId: string) => Promise<UploadedFile[]>;
   fetchTrends(
     platforms: string, limit?: number, signal?: AbortSignal,
-  ): Promise<{ trends: TrendGroup[]; updated: number }>;
+  ): Promise<{
+    trends: TrendGroup[]; updated: number; stale?: boolean;
+    failed_platforms?: string[];
+  }>;
   fetchSchedule(signal?: AbortSignal): Promise<ScheduleItem[]>;
   fetchScheduleContext(
     days?: number, signal?: AbortSignal,
@@ -201,7 +204,10 @@ function optionalString(row: Record<string, unknown>, key: string,
   return value;
 }
 
-function trendResponse(value: unknown): { trends: TrendGroup[]; updated: number } {
+function trendResponse(value: unknown): {
+  trends: TrendGroup[]; updated: number; stale?: boolean;
+  failed_platforms?: string[];
+} {
   const row = needObject(value, '热点响应无效');
   const trends = needArray(row.trends, '热点响应无效').map((item) => {
     const group = needObject(item, '热点响应无效');
@@ -216,15 +222,33 @@ function trendResponse(value: unknown): { trends: TrendGroup[]; updated: number 
       }
       return { title: trend.title, hot: trend.hot, url: trend.url };
     });
-    return {
+    const result: TrendGroup = {
       platform: group.platform, label: group.label, items,
       ...(typeof group.ok === 'boolean' ? { ok: group.ok } : {}),
     };
+    if (group.stale === true) result.stale = true;
+    if (typeof group.cached_at === 'number'
+        && Number.isFinite(group.cached_at)) {
+      result.cached_at = group.cached_at;
+    }
+    return result;
   });
   if (typeof row.updated !== 'number' || !Number.isFinite(row.updated)) {
     throw new Error('热点响应无效');
   }
-  return { trends, updated: row.updated };
+  const result: {
+    trends: TrendGroup[]; updated: number; stale?: boolean;
+    failed_platforms?: string[];
+  } = { trends, updated: row.updated };
+  if (row.stale === true) result.stale = true;
+  if (row.failed_platforms !== undefined) {
+    result.failed_platforms = needArray(
+      row.failed_platforms, '热点响应无效').map((item) => {
+      if (typeof item !== 'string') throw new Error('热点响应无效');
+      return item;
+    });
+  }
+  return result;
 }
 
 function scheduleItem(value: unknown): ScheduleItem {

@@ -27,6 +27,7 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
   const [error, setError] = useState('');
   const [saveError, setSaveError] = useState('');
   const [updated, setUpdated] = useState(0);
+  const [stale, setStale] = useState(false);
   const [saved, setSaved] = useState<Set<string>>(new Set());
   const request = useRef<AbortController | null>(null);
 
@@ -49,20 +50,26 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
     if (pfs.length === 0) {
       setGroups([]);
       setUpdated(0);
+      setStale(false);
       setLoading(false);
       return;
     }
     setLoading(true);
     setError('');
+    setStale(false);
     data.fetchTrends(pfs.join(','), 15, controller.signal)
       .then((d) => {
         if (controller.signal.aborted) return;
         setGroups(d.trends);
         setUpdated(d.updated);
+        setStale(d.stale === true
+          || d.trends.some((group) => group.stale === true));
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         setGroups([]);
+        setUpdated(0);
+        setStale(false);
         setError(workspaceErrorMessage(
           error, '热点拉取失败——请确认已配置外网代理（EASEL_PROXY）。'));
       })
@@ -86,7 +93,16 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
           <h1 className="page-title"><IconFire size={22} /> 热点雷达</h1>
           <p className="page-subtitle">
             多平台实时热搜，挑值得蹭的选题，一键交给 AI 做成你的内容。
-            {updated > 0 && <span style={{ color: 'var(--text-tertiary)' }}> · {new Date(updated * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 更新</span>}
+            {updated > 0 && (
+              <span style={{ color: 'var(--text-tertiary)' }}>
+                {' · '}
+                {stale ? '刷新失败，显示缓存 ' : ''}
+                {new Date(updated * 1000).toLocaleTimeString('zh-CN', {
+                  hour: '2-digit', minute: '2-digit',
+                })}
+                {stale ? '' : ' 更新'}
+              </span>
+            )}
           </p>
         </div>
         <button className="btn btn-sm" onClick={() => load(selected)} disabled={loading}>
@@ -108,7 +124,14 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
       <div className="trend-grid">
         {groups.map((g) => (
           <div key={g.platform} className="card trend-col">
-            <div className="trend-col-head">{g.label}<span className="trend-count">{g.items.length}</span></div>
+            <div className="trend-col-head">
+              {g.label}
+              <span className="trend-count">{g.items.length}</span>
+              {g.stale && (
+                <span className="trend-count" style={{ color: 'var(--red)' }}
+                  title="本次刷新失败，显示旧缓存">旧数据</span>
+              )}
+            </div>
             <div className="trend-list">
               {g.items.length === 0 && !loading && !error && (
                 <div className="trend-empty">

@@ -203,7 +203,14 @@ export function deletePersona(name: string): Promise<{ ok: boolean; deleted: str
 
 // ---- 热点雷达 ----
 export interface TrendItem { title: string; hot: string; url: string; }
-export interface TrendGroup { platform: string; label: string; items: TrendItem[]; ok?: boolean; }
+export interface TrendGroup {
+  platform: string;
+  label: string;
+  items: TrendItem[];
+  ok?: boolean;
+  stale?: boolean;       // 本次上游刷新失败，items 来自旧缓存
+  cached_at?: number;    // 旧缓存实际取数时间（秒）
+}
 export function fetchTrends(platforms: string, limit = 12): Promise<{ trends: TrendGroup[]; updated: number }> {
   return request(`/api/trends?platforms=${encodeURIComponent(platforms)}&limit=${limit}`);
 }

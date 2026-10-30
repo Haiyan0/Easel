@@ -1327,6 +1327,67 @@ def test_workbench_context_uses_fixed_script_and_absolute_data_path(
     assert kwargs["cwd"] == str(worker_app.PROJECT_ROOT)
 
 
+def test_workbench_outputs_junction_is_rejected_before_first_write(tmp_path):
+    from web import app as worker_app
+
+    private = tmp_path / "private-state"
+    private.mkdir()
+    outputs = tmp_path / "outputs"
+    kind = _link_directory(outputs, private)
+    if kind is None:
+        pytest.skip("当前环境不允许创建目录 junction/symlink")
+    prior = worker_app.OUTPUTS_DIR
+    worker_app.OUTPUTS_DIR = outputs
+    try:
+        cases = [
+            ("_ideas.json", worker_app.api_ideas_list,
+             worker_app.api_ideas_create,
+             worker_app.IdeaItem(title="越界选题")),
+            ("_schedule.json", worker_app.api_schedule_list,
+             worker_app.api_schedule_create,
+             worker_app.ScheduleItem(title="越界排期", date="2026-11-01")),
+        ]
+        for name, read, create, request in cases:
+            with pytest.raises(worker_app.HTTPException) as read_error:
+                asyncio.run(read())
+            assert read_error.value.status_code == 500
+            with pytest.raises(worker_app.HTTPException) as write_error:
+                asyncio.run(create(request))
+            assert write_error.value.status_code == 500
+            assert not (private / name).exists(), name
+        with pytest.raises(worker_app.HTTPException):
+            asyncio.run(worker_app.api_schedule_context(14))
+        assert list(private.iterdir()) == []
+    finally:
+        worker_app.OUTPUTS_DIR = prior
+
+
+def test_workbench_missing_outputs_directory_still_allows_first_create(
+        tmp_path):
+    from web import app as worker_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outputs = workspace / "outputs"
+    prior = worker_app.OUTPUTS_DIR
+    worker_app.OUTPUTS_DIR = outputs
+    try:
+        assert asyncio.run(worker_app.api_ideas_list()) == []
+        idea = asyncio.run(worker_app.api_ideas_create(
+            worker_app.IdeaItem(title="合法首次选题")))
+        assert idea["title"] == "合法首次选题"
+        assert (outputs / "_ideas.json").is_file()
+        assert asyncio.run(worker_app.api_ideas_list())[0]["title"] == \
+            "合法首次选题"
+
+        schedule = asyncio.run(worker_app.api_schedule_create(
+            worker_app.ScheduleItem(title="合法首次排期", date="2026-11-01")))
+        assert schedule["title"] == "合法首次排期"
+        assert (outputs / "_schedule.json").is_file()
+    finally:
+        worker_app.OUTPUTS_DIR = prior
+
+
 def test_workbench_directory_in_place_of_storage_is_rejected(
         worker_fixture):
     target = worker_fixture.root_a / "outputs" / "_ideas.json"

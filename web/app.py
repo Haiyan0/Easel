@@ -5971,23 +5971,57 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
     now = time.time()
     loop = asyncio.get_event_loop()
     result = []
+    updated_candidates: list[float] = []
+    stale_any = False
+    failed: list[str] = []
     for pf in pfs:
         c = _TREND_CACHE.get(pf)
+        cached_at = 0.0
+        stale = False
         if c and now - c[0] < 300:
+            # 有效期内缓存是正常数据，但 updated 必须保留实际取数时间。
             items = c[1]
+            cached_at = c[0]
+            ok = True
         else:
             items = await loop.run_in_executor(None, _fetch_platform, pf)
             if items:
                 _TREND_CACHE[pf] = (now, items)
+                cached_at = now
+                ok = True
             elif c:
+                # 上游失败但保留旧缓存：明确标记 stale，updated 不能是本次请求时间。
                 items = c[1]
-        result.append({
+                cached_at = c[0]
+                ok = False
+                stale = True
+                stale_any = True
+                failed.append(pf)
+            else:
+                items = []
+                ok = False
+                failed.append(pf)
+        if cached_at > 0:
+            updated_candidates.append(cached_at)
+        group = {
             "platform": pf,
             "label": TREND_LABELS.get(pf, pf),
             "items": items[:max(1, min(limit, 30))],
-            "ok": bool(items),
-        })
-    return {"trends": result, "updated": int(now)}
+            "ok": ok,
+        }
+        if cached_at > 0:
+            group["cached_at"] = int(cached_at)
+        if stale:
+            group["stale"] = True
+        result.append(group)
+    payload = {
+        "trends": result,
+        "updated": int(max(updated_candidates)) if updated_candidates else 0,
+    }
+    if stale_any:
+        payload["stale"] = True
+        payload["failed_platforms"] = failed
+    return payload
 
 
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
@@ -5995,9 +6029,48 @@ SCHEDULE_KINDS = {"content", "event"}
 _WORKBENCH_FILE_ATTRIBUTE_REPARSE = 0x400
 
 
+def _real_directory(path: Path) -> bool:
+    """验证目录本身及父链解析后仍是原路径；不存在返回 False。"""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if path.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "工作台存储不可用")
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path.absolute() or not resolved.is_dir():
+            raise HTTPException(500, "工作台存储不可用")
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    return True
+
+
+def _workbench_root(*, create: bool) -> Path:
+    """验证 outputs 根及其父链；仅在合法父目录下允许首次创建 outputs。"""
+    root = OUTPUTS_DIR
+    if not _real_directory(root.parent):
+        raise HTTPException(500, "工作台存储不可用")
+    if not _real_directory(root):
+        if not create:
+            return root
+        try:
+            root.mkdir()
+        except OSError:
+            raise HTTPException(500, "工作台存储不可用") from None
+        if not _real_directory(root):
+            raise HTTPException(500, "工作台存储不可用")
+    return root.resolve()
+
+
 def _workbench_file(name: str) -> Path:
     """返回本人 outputs 下的真实数据文件；拒绝链接、目录和越界解析。"""
-    root = OUTPUTS_DIR
+    root = _workbench_root(create=False)
     target = root / name
     try:
         info = target.lstat()
@@ -6011,7 +6084,7 @@ def _workbench_file(name: str) -> Path:
     try:
         resolved = target.resolve(strict=True)
         if (resolved != target.absolute()
-                or resolved.parent != root.resolve()
+                or resolved.parent != root
                 or not resolved.is_file()):
             raise HTTPException(500, "工作台存储不可用")
     except HTTPException:
@@ -6042,10 +6115,10 @@ def _write_workbench_json(name: str, label: str, items: list[dict]) -> None:
         raise HTTPException(500, f"{label}存储不可用")
     target = OUTPUTS_DIR / name
     try:
-        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        root = _workbench_root(create=True)
         target = _workbench_file(name)
         fd, temporary = tempfile.mkstemp(
-            prefix=f".{name}.", suffix=".tmp", dir=str(OUTPUTS_DIR))
+            prefix=f".{name}.", suffix=".tmp", dir=str(root))
     except HTTPException:
         raise
     except OSError:
