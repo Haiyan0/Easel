@@ -93,7 +93,7 @@ rendered="...刷新失败，显示缓存 13:37...旧数据...ONE-HOUR-OLD-SENTIN
 容器最终镜像：
 
 - control `easel-control:task5b-r1-20261030`
-  `sha256:f99887acce9c3967afa25f1c13cfeed5908693c5f3fe8b822c4213bb5917c089`
+  `sha256:d91b193e19cba2cb483100ca4536e8bf1f34a0e45e54c8f5ef9e4f911e99bde2`
 - gateway `easel-gateway:task5b-r1-20261030`
   `sha256:28563b83ba9b2e676949f358326547f55ac470f0447648f9972b153e81c6b2e9`
 - worker `easel-worker-execution:task5b-r1-20261030`
