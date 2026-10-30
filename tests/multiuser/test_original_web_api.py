@@ -532,7 +532,8 @@ def test_persona_links_cannot_read_or_mutate_outside_profiles(worker_fixture):
 
 def test_path_helpers_reject_traversal_absolute_and_internal():
     for bad in ("../x", "/abs", "a/../b", "a//b", "a\\b", "_login/x",
-                "analytics/x", ".easel.json", "a\x00b"):
+                "analytics/x", ".easel.json", "_ideas.json",
+                "_schedule.json", "a\x00b"):
         with pytest.raises(Exception):
             canonical_output_path(bad)
     for bad in ("..", "../x", "a/b", "a\\b", ".hidden", "_internal", ""):
@@ -920,9 +921,6 @@ def test_remaining_groups_stay_explicitly_unavailable(tmp_path):
         for method, path in [
             ("GET", "/api/skills"),
             ("GET", "/api/accounts"),
-            ("GET", "/api/trends"),
-            ("GET", "/api/schedule"),
-            ("GET", "/api/ideas"),
         ]:
             response = client.request(method, path)
             assert response.status_code == 503, (method, path)
@@ -933,6 +931,439 @@ def test_remaining_groups_stay_explicitly_unavailable(tmp_path):
         assert build.status_code == 503
         assert not any(len(call) > 2 and call[2] == "/api/profile/build"
                        for call in fake.calls)
+
+
+def _workbench_response(path: str, method: str, payload=None):
+    if path == "/api/trends":
+        return {"trends": [{"platform": "weibo", "label": "微博",
+                            "items": [{"title": "热搜", "hot": "1", "url": ""}],
+                            "ok": True}], "updated": 1}
+    if path == "/api/schedule":
+        if method == "GET":
+            return [{"id": "a1b2c3d4e5f6", "title": "排期", "date": "2026-10-30",
+                     "platform": "", "time": "", "status": "idea", "note": ""}]
+        return {"id": "a1b2c3d4e5f6", **payload}
+    if path == "/api/schedule/context":
+        return {"window_days": 14, "suggestions": []}
+    if path == "/api/ideas":
+        if method == "GET":
+            return [{"id": "a1b2c3d4e5f6", "title": "选题", "note": "",
+                     "source": "", "status": "pending", "created": 1}]
+        return {"id": "a1b2c3d4e5f6", **payload}
+    return {"ok": True}
+
+
+def test_control_workbench_routes_forward_exact_identity_requests(tmp_path):
+    class WorkbenchWorkspace(FakeWorkspace):
+        async def request(self, actor, method, path, *, query=None, payload=None,
+                          body=None, content_type=None, headers=None):
+            self.calls.append((method, actor, path, query, payload, body,
+                               content_type, headers))
+            return httpx.Response(200, json=_workbench_response(path, method,
+                                                                payload))
+
+    fake = WorkbenchWorkspace()
+    with control_api(tmp_path, fake) as (client, store, auth, admin, member):
+        body = login(client, auth, admin, member)
+        user_id = body["userId"]
+        csrf = body["csrfToken"]
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": csrf}
+
+        trends = client.get("/api/trends?platforms=weibo,douyin&limit=15")
+        assert trends.status_code == 200, trends.text
+        assert trends.json()["trends"][0]["ok"] is True
+        call = fake.calls[-1]
+        assert call[0] == "GET" and call[2] == "/api/trends"
+        assert call[1].user_id == user_id
+        assert call[3] == {"platforms": "weibo,douyin", "limit": "15"}
+
+        defaults = client.get("/api/trends")
+        assert defaults.status_code == 200, defaults.text
+        assert fake.calls[-1][3] == {
+            "platforms": "weibo,douyin,zhihu", "limit": "12",
+        }
+
+        schedule = client.get("/api/schedule")
+        assert schedule.status_code == 200
+        assert fake.calls[-1][2] == "/api/schedule"
+        created_schedule = client.post(
+            "/api/schedule",
+            json={"title": "新排期", "date": "2026-10-30", "platform": "微博",
+                  "time": "10:00", "status": "scheduled", "note": "备注",
+                  "kind": "content", "url": "", "source": "manual",
+                  "event_type": "", "end_date": "", "id": "forged"},
+            headers=headers)
+        assert created_schedule.status_code == 200, created_schedule.text
+        call = fake.calls[-1]
+        assert call[0] == "POST" and call[2] == "/api/schedule"
+        assert "id" not in call[4]
+        assert call[4]["title"] == "新排期"
+        assert set(call[4]) == {
+            "title", "date", "platform", "time", "status", "note",
+            "kind", "url", "source", "event_type", "end_date"}
+        updated_schedule = client.put(
+            "/api/schedule/a1b2c3d4e5f6",
+            json={"title": "改排期", "date": "2026-10-31"}, headers=headers)
+        assert updated_schedule.status_code == 200
+        deleted_schedule = client.delete(
+            "/api/schedule/a1b2c3d4e5f6", headers=headers)
+        assert deleted_schedule.status_code == 200
+        assert fake.calls[-1][0] == "DELETE"
+
+        context = client.get("/api/schedule/context?days=14")
+        assert context.status_code == 200, context.text
+        assert fake.calls[-1][3] == {"days": "14"}
+
+        ideas = client.get("/api/ideas")
+        assert ideas.status_code == 200
+        assert fake.calls[-1][2] == "/api/ideas"
+        created_idea = client.post(
+            "/api/ideas",
+            json={"title": "新选题", "note": "角度", "source": "微博热搜",
+                  "status": "pending", "created": 999, "id": "forged"},
+            headers=headers)
+        assert created_idea.status_code == 200, created_idea.text
+        call = fake.calls[-1]
+        assert call[2] == "/api/ideas"
+        assert call[4] == {"title": "新选题", "note": "角度",
+                           "source": "微博热搜", "status": "pending"}
+        updated_idea = client.put(
+            "/api/ideas/a1b2c3d4e5f6",
+            json={"title": "改选题", "note": "", "source": "",
+                  "status": "doing"}, headers=headers)
+        assert updated_idea.status_code == 200
+        deleted_idea = client.delete(
+            "/api/ideas/a1b2c3d4e5f6", headers=headers)
+        assert deleted_idea.status_code == 200
+        assert fake.calls[-1][0] == "DELETE"
+
+
+def test_control_workbench_rejects_malformed_targets_before_forwarding(tmp_path):
+    fake = FakeWorkspace()
+    with control_api(tmp_path, fake) as (client, store, auth, admin, member):
+        body = login(client, auth, admin, member)
+        csrf = body["csrfToken"]
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": csrf}
+        before = len(fake.calls)
+
+        for path in [
+            "/api/trends?platforms=weibo,evil",
+            "/api/trends?platforms=weibo&platforms=douyin",
+            "/api/trends?limit=0",
+            "/api/trends?limit=31",
+            "/api/trends?limit=not-a-number",
+            "/api/schedule/context?days=0",
+            "/api/schedule/context?days=91",
+            "/api/schedule/context?days=14&days=15",
+        ]:
+            response = client.get(path)
+            assert response.status_code == 400, (path, response.text)
+
+        for path in [
+            "/api/ideas/not-an-id", "/api/ideas/a1b2c3d4e5f",
+            "/api/schedule/a1b2c3d4e5f6z", "/api/schedule/%2e%2e",
+        ]:
+            response = client.put(path, json={"title": "x", "date": "x"},
+                                  headers=headers)
+            assert response.status_code == 400, (path, response.text)
+
+        for payload in [
+            {},
+            {"title": 1},
+            {"title": "x" * 201},
+            {"title": "x\x01"},
+            {"title": "x", "status": "x" * 33},
+        ]:
+            response = client.post("/api/ideas", json=payload, headers=headers)
+            assert response.status_code == 400, (payload, response.text)
+
+        for payload in [
+            {"title": "x"},
+            {"title": "x", "date": 1},
+            {"title": "x" * 201, "date": "2026-10-30"},
+            {"title": "x", "date": "2026-10-30", "note": "x" * 4001},
+        ]:
+            response = client.post("/api/schedule", json=payload,
+                                   headers=headers)
+            assert response.status_code == 400, (payload, response.text)
+
+        huge = client.post(
+            "/api/ideas", content=b'{"title":"' + b"x" * (70 * 1024) + b'"}',
+            headers={**headers, "Content-Type": "application/json"})
+        assert huge.status_code == 413, huge.text
+        assert len(fake.calls) == before
+
+        missing_csrf = client.post(
+            "/api/ideas", json={"title": "x"},
+            headers={"Origin": ORIGIN})
+        assert missing_csrf.status_code == 403
+        assert len(fake.calls) == before
+
+
+def test_control_workbench_requires_authentication(tmp_path):
+    fake = FakeWorkspace()
+    with control_api(tmp_path, fake) as (client, store, auth, admin, member):
+        for method, path in [
+            ("GET", "/api/trends"),
+            ("GET", "/api/schedule"),
+            ("GET", "/api/schedule/context"),
+            ("GET", "/api/ideas"),
+            ("POST", "/api/ideas"),
+            ("PUT", "/api/ideas/a1b2c3d4e5f6"),
+            ("DELETE", "/api/schedule/a1b2c3d4e5f6"),
+        ]:
+            response = client.request(method, path)
+            assert response.status_code == 401, (method, path)
+        assert fake.calls == []
+
+
+def test_workbench_ideas_and_schedule_are_isolated_and_persisted(
+        worker_fixture):
+    import json as json_module
+
+    same_idea = "a1b2c3d4e5f6"
+    same_schedule = "b1b2c3d4e5f6"
+    for root, label in ((worker_fixture.root_a, "A"),
+                        (worker_fixture.root_b, "B")):
+        (root / "outputs" / "_ideas.json").write_text(json_module.dumps([{
+            "id": same_idea, "title": f"{label} 选题", "note": "",
+            "source": "", "status": "pending", "created": 1,
+        }]), encoding="utf-8")
+        (root / "outputs" / "_schedule.json").write_text(json_module.dumps([{
+            "id": same_schedule, "title": f"{label} 排期",
+            "date": "2026-10-30", "platform": "", "time": "",
+            "status": "idea", "note": "",
+        }]), encoding="utf-8")
+
+    async def scenario():
+        a_ideas = await worker_fixture.api.request(
+            worker_fixture.a, "GET", "/api/ideas")
+        b_ideas = await worker_fixture.api.request(
+            worker_fixture.b, "GET", "/api/ideas")
+        a_schedule = await worker_fixture.api.request(
+            worker_fixture.a, "GET", "/api/schedule")
+        b_schedule = await worker_fixture.api.request(
+            worker_fixture.b, "GET", "/api/schedule")
+        created = await worker_fixture.api.request(
+            worker_fixture.a, "POST", "/api/ideas",
+            payload={"title": "A 新选题", "note": "角度",
+                     "source": "微博热搜", "status": "pending"})
+        created_schedule = await worker_fixture.api.request(
+            worker_fixture.a, "POST", "/api/schedule",
+            payload={"title": "A 新排期", "date": "2026-10-31",
+                     "platform": "微博", "time": "10:00",
+                     "status": "scheduled", "note": ""})
+        updated = await worker_fixture.api.request(
+            worker_fixture.a, "PUT", f"/api/ideas/{same_idea}",
+            payload={"title": "A 改选题", "note": "", "source": "",
+                     "status": "doing"})
+        b_after = await worker_fixture.api.request(
+            worker_fixture.b, "GET", "/api/ideas")
+        return (a_ideas.json(), b_ideas.json(), a_schedule.json(),
+                b_schedule.json(), created.json(), created_schedule.json(),
+                updated.json(), b_after.json())
+
+    (a_ideas, b_ideas, a_schedule, b_schedule, created, created_schedule,
+     updated, b_after) = asyncio.run(scenario())
+    assert a_ideas[0]["title"] == "A 选题"
+    assert b_ideas[0]["title"] == "B 选题"
+    assert a_schedule[0]["title"] == "A 排期"
+    assert b_schedule[0]["title"] == "B 排期"
+    assert created["id"] != same_idea
+    assert created["created"] > 0
+    assert created_schedule["id"] != same_schedule
+    assert updated["title"] == "A 改选题"
+    assert b_after[0]["title"] == "B 选题"
+
+    a_data = json_module.loads(
+        (worker_fixture.root_a / "outputs" / "_ideas.json").read_text(
+            encoding="utf-8"))
+    b_data = json_module.loads(
+        (worker_fixture.root_b / "outputs" / "_ideas.json").read_text(
+            encoding="utf-8"))
+    assert {item["title"] for item in a_data} == {"A 改选题", "A 新选题"}
+    assert {item["title"] for item in b_data} == {"B 选题"}
+
+    async def delete_both():
+        await worker_fixture.api.request(
+            worker_fixture.a, "DELETE", "/api/ideas/a1b2c3d4e5f6")
+        deleted_b = await worker_fixture.api.request(
+            worker_fixture.b, "DELETE", "/api/ideas/a1b2c3d4e5f6")
+        try:
+            await worker_fixture.api.request(
+                worker_fixture.a, "DELETE", "/api/ideas/a1b2c3d4e5f6")
+        except Exception as error:
+            return deleted_b.json(), error
+
+    deleted_b, error = asyncio.run(delete_both())
+    assert deleted_b["ok"] is True
+    assert getattr(error, "status", None) == 404
+    assert len(json_module.loads(
+        (worker_fixture.root_b / "outputs" / "_ideas.json").read_text(
+            encoding="utf-8"))) == 0
+
+
+def test_workbench_corrupt_storage_is_error_not_empty_or_overwritten(
+        worker_fixture):
+    broken = "{not-json"
+    for name in ("_ideas.json", "_schedule.json"):
+        (worker_fixture.root_a / "outputs" / name).write_text(
+            broken, encoding="utf-8")
+
+    async def scenario():
+        errors = []
+        for path in ("/api/ideas", "/api/schedule", "/api/schedule/context"):
+            try:
+                await worker_fixture.api.request(
+                    worker_fixture.a, "GET", path,
+                    query={"days": "14"} if path.endswith("context") else None)
+            except Exception as error:
+                errors.append(error)
+        return errors
+
+    errors = asyncio.run(scenario())
+    assert len(errors) == 3
+    assert all(getattr(error, "status", None) == 502 for error in errors)
+    for name in ("_ideas.json", "_schedule.json"):
+        assert (worker_fixture.root_a / "outputs" / name).read_text(
+            encoding="utf-8") == broken
+
+
+def test_workbench_concurrent_idea_creates_do_not_lose_records(
+        worker_fixture, monkeypatch):
+    from web import app as worker_app
+
+    original_read = worker_app._read_ideas
+
+    def slow_read():
+        items = original_read()
+        time.sleep(0.2)
+        return items
+
+    monkeypatch.setattr(worker_app, "_read_ideas", slow_read)
+
+    async def scenario():
+        first, second = await asyncio.gather(
+            worker_fixture.api.request(
+                worker_fixture.a, "POST", "/api/ideas",
+                payload={"title": "并发一", "note": "", "source": "",
+                         "status": "pending"}),
+            worker_fixture.api.request(
+                worker_fixture.a, "POST", "/api/ideas",
+                payload={"title": "并发二", "note": "", "source": "",
+                         "status": "pending"}),
+        )
+        return (await worker_fixture.api.request(
+            worker_fixture.a, "GET", "/api/ideas")).json()
+
+    ideas = asyncio.run(scenario())
+    assert {item["title"] for item in ideas} == {"并发一", "并发二"}
+
+
+def test_workbench_concurrent_schedule_creates_do_not_lose_records(
+        worker_fixture, monkeypatch):
+    from web import app as worker_app
+
+    original_read = worker_app._read_schedule
+
+    def slow_read():
+        items = original_read()
+        time.sleep(0.2)
+        return items
+
+    monkeypatch.setattr(worker_app, "_read_schedule", slow_read)
+
+    async def scenario():
+        await asyncio.gather(
+            worker_fixture.api.request(
+                worker_fixture.a, "POST", "/api/schedule",
+                payload={"title": "并发排期一", "date": "2026-11-01",
+                         "platform": "", "time": "", "status": "idea",
+                         "note": ""}),
+            worker_fixture.api.request(
+                worker_fixture.a, "POST", "/api/schedule",
+                payload={"title": "并发排期二", "date": "2026-11-02",
+                         "platform": "", "time": "", "status": "idea",
+                         "note": ""}),
+        )
+        return (await worker_fixture.api.request(
+            worker_fixture.a, "GET", "/api/schedule")).json()
+
+    items = asyncio.run(scenario())
+    assert {item["title"] for item in items} == {"并发排期一", "并发排期二"}
+
+
+def test_workbench_context_uses_fixed_script_and_absolute_data_path(
+        worker_fixture, monkeypatch):
+    from web import app as worker_app
+
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append((list(cmd), kwargs))
+
+        class Result:
+            returncode = 0
+            stdout = '{"window_days":14,"suggestions":["保持节奏"]}'
+
+        return Result()
+
+    monkeypatch.setattr(worker_app.subprocess, "run", fake_run)
+
+    async def scenario():
+        return await worker_fixture.api.request(
+            worker_fixture.a, "GET", "/api/schedule/context",
+            query={"days": "14"})
+
+    payload = asyncio.run(scenario())
+    assert payload.json()["suggestions"] == ["保持节奏"]
+    cmd, kwargs = captured[0]
+    script = Path(cmd[1])
+    assert script.name == "calendar_ops.py"
+    assert script.parent.name == "scripts"
+    assert cmd[cmd.index("--data") + 1] == str(
+        worker_fixture.root_a / "outputs" / "_schedule.json")
+    assert cmd[cmd.index("--days") + 1] == "14"
+    assert kwargs["cwd"] == str(worker_app.PROJECT_ROOT)
+
+
+def test_workbench_directory_in_place_of_storage_is_rejected(
+        worker_fixture):
+    target = worker_fixture.root_a / "outputs" / "_ideas.json"
+    target.mkdir()
+
+    async def scenario():
+        try:
+            await worker_fixture.api.request(
+                worker_fixture.a, "GET", "/api/ideas")
+        except Exception as error:
+            return error
+
+    error = asyncio.run(scenario())
+    assert getattr(error, "status", None) == 502
+    assert target.is_dir()
+
+
+def test_workbench_link_storage_is_rejected_if_symlink_available(
+        worker_fixture):
+    private = worker_fixture.root_a / "private-schedule.json"
+    private.write_text('[]', encoding="utf-8")
+    link = worker_fixture.root_a / "outputs" / "_schedule.json"
+    try:
+        link.symlink_to(private)
+    except OSError:
+        pytest.skip("当前环境不允许创建文件 symlink")
+
+    async def scenario():
+        try:
+            await worker_fixture.api.request(
+                worker_fixture.a, "GET", "/api/schedule")
+        except Exception as error:
+            return error
+
+    error = asyncio.run(scenario())
+    assert getattr(error, "status", None) == 502
+    assert link.is_symlink()
 
 
 def test_media_after_logout_is_unauthorized(tmp_path):

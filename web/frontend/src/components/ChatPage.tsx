@@ -24,6 +24,8 @@ interface ChatPageProps {
   ) => void; // 重试：仅对最后一轮；control 暂不提供
   onQuestionAnswered?: (questionId: string) => void;   // 某道问答题提交成功（App 记录答过，重放不再出现）
   mode?: 'local' | 'control';
+  initialInput?: string;
+  onInitialInputConsumed?: () => void;
   attachmentsEnabled?: boolean;
   attachmentRequiresText?: boolean;  // control 附件必须随文字提交
   identityKey?: string;          // 身份切换时清理本页草稿/附件/上传状态
@@ -56,6 +58,7 @@ function greeting(): string {
 
 export default function ChatPage({
   apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered,
+  initialInput, onInitialInputConsumed,
   attachmentsEnabled = true, attachmentRequiresText = false,
   identityKey, notice, retryAvailable, onRetrySend, reconnectAvailable,
   onReconnect, hasOlder, loadingOlder, onLoadOlder, onAnswerQuestion,
@@ -90,6 +93,13 @@ export default function ChatPage({
     setDragOver(false);
     setUploadNotice('');
   }, [identityKey]);
+
+  // 热点/选题跳转只预填，等待用户确认后再走既有会话/Run 接纳。
+  useEffect(() => {
+    if (!initialInput) return;
+    setInput(initialInput);
+    onInitialInputConsumed?.();
+  }, [initialInput, onInitialInputConsumed]);
 
   const doUpload = async (fs: FileList | File[]) => {
     if (!attachmentsEnabled) return;

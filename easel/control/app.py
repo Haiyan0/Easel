@@ -78,6 +78,13 @@ _IMPLEMENTED_EXACT = frozenset({
     ("GET", "/api/artifacts/archive"),
     ("GET", "/api/upload/limits"),
     ("POST", "/api/upload"),
+    # Task 5B：工作台数据（热点/选题/日历/概览）
+    ("GET", "/api/trends"),
+    ("GET", "/api/schedule"),
+    ("POST", "/api/schedule"),
+    ("GET", "/api/schedule/context"),
+    ("GET", "/api/ideas"),
+    ("POST", "/api/ideas"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
@@ -97,6 +104,10 @@ _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/output/.+$")),
     ("GET", re.compile(r"^/api/media/.+$")),
     ("HEAD", re.compile(r"^/api/media/.+$")),
+    ("PUT", re.compile(r"^/api/schedule/[^/]+$")),
+    ("DELETE", re.compile(r"^/api/schedule/[^/]+$")),
+    ("PUT", re.compile(r"^/api/ideas/[^/]+$")),
+    ("DELETE", re.compile(r"^/api/ideas/[^/]+$")),
     ("GET", re.compile(r"^/$")),
     ("GET", re.compile(r"^/onepage$")),
     ("GET", re.compile(r"^/assets/[^/].*$")),
@@ -239,6 +250,36 @@ async def _workspace_body(request: Request,
     if total == 0:
         raise DomainError("invalid_request", 400)
     return b"".join(chunks)
+
+
+def _workbench_query_value(request: Request, name: str) -> str | None:
+    values = request.query_params.getlist(name)
+    if len(values) > 1:
+        raise DomainError("invalid_request", 400)
+    return values[0] if values else None
+
+
+def _workbench_int(request: Request, name: str) -> int | None:
+    raw = _workbench_query_value(request, name)
+    if raw is None:
+        return None
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise DomainError("invalid_request", 400)
+    return int(raw)
+
+
+def _reject_json_constant(_value: str):
+    raise ValueError("non-finite json number")
+
+
+def _workbench_json_payload(raw: bytes) -> dict:
+    try:
+        payload = json.loads(raw, parse_constant=_reject_json_constant)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise DomainError("invalid_request", 400) from None
+    if not isinstance(payload, dict):
+        raise DomainError("invalid_request", 400)
+    return payload
 
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
@@ -697,8 +738,8 @@ def create_app(*, store: Store, auth: AuthService,
     503，绝不直通旧本地 handler。
 
     ``workspace_factory`` 接收
-    ``(runtime, store, http_client, db_runner)``；它只装配 Task 5A 的
-    status/画像/内容/媒体/上传路由。``workspace_api`` 可直接注入测试实现，
+    ``(runtime, store, http_client, db_runner)``；它装配 Task 5A/5B 的
+    status/画像/内容/媒体/上传与工作台数据路由。``workspace_api`` 可直接注入测试实现，
     但与 factory 互斥。两者都未提供时这些已分类路由明确 503。
     """
     control_path = Path(store.path).absolute()
@@ -968,6 +1009,101 @@ def create_app(*, store: Store, auth: AuthService,
         except ValueError:
             raise DomainError("upstream_invalid", 502) from None
         return _no_store_json(data)
+
+    # ------------------------------------------------------------------
+    # Task 5B：工作台数据（热点/选题/日历/概览）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/trends")
+    async def workspace_trends(request: Request):
+        from .workspace_api import canonical_trends_query
+
+        platforms = _workbench_query_value(request, "platforms")
+        limit = _workbench_int(request, "limit")
+        query = canonical_trends_query(platforms, limit)
+        return await _forward_workspace_json(
+            request, "GET", "/api/trends", query=query)
+
+    @app.get("/api/schedule")
+    async def workspace_schedule(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/schedule")
+
+    @app.post("/api/schedule")
+    async def workspace_schedule_create(request: Request):
+        from .workspace_api import canonical_schedule_payload
+
+        payload = _workbench_json_payload(
+            await _workspace_body(request, maximum=64 * 1024))
+        clean = canonical_schedule_payload(payload)
+        return await _forward_workspace_json(
+            request, "POST", "/api/schedule", payload=clean)
+
+    @app.get("/api/schedule/context")
+    async def workspace_schedule_context(request: Request):
+        from .workspace_api import canonical_schedule_days
+
+        days = canonical_schedule_days(_workbench_int(request, "days"))
+        return await _forward_workspace_json(
+            request, "GET", "/api/schedule/context",
+            query={"days": str(days)})
+
+    @app.put("/api/schedule/{sid}")
+    async def workspace_schedule_update(request: Request, sid: str):
+        from .workspace_api import (
+            canonical_schedule_payload, canonical_workbench_id,
+        )
+
+        record_id = canonical_workbench_id(sid)
+        payload = _workbench_json_payload(
+            await _workspace_body(request, maximum=64 * 1024))
+        clean = canonical_schedule_payload(payload)
+        return await _forward_workspace_json(
+            request, "PUT", f"/api/schedule/{record_id}", payload=clean)
+
+    @app.delete("/api/schedule/{sid}")
+    async def workspace_schedule_delete(request: Request, sid: str):
+        from .workspace_api import canonical_workbench_id
+
+        record_id = canonical_workbench_id(sid)
+        return await _forward_workspace_json(
+            request, "DELETE", f"/api/schedule/{record_id}")
+
+    @app.get("/api/ideas")
+    async def workspace_ideas(request: Request):
+        return await _forward_workspace_json(
+            request, "GET", "/api/ideas")
+
+    @app.post("/api/ideas")
+    async def workspace_idea_create(request: Request):
+        from .workspace_api import canonical_idea_payload
+
+        payload = _workbench_json_payload(
+            await _workspace_body(request, maximum=64 * 1024))
+        clean = canonical_idea_payload(payload)
+        return await _forward_workspace_json(
+            request, "POST", "/api/ideas", payload=clean)
+
+    @app.put("/api/ideas/{iid}")
+    async def workspace_idea_update(request: Request, iid: str):
+        from .workspace_api import (
+            canonical_idea_payload, canonical_workbench_id,
+        )
+
+        record_id = canonical_workbench_id(iid)
+        payload = _workbench_json_payload(
+            await _workspace_body(request, maximum=64 * 1024))
+        clean = canonical_idea_payload(payload)
+        return await _forward_workspace_json(
+            request, "PUT", f"/api/ideas/{record_id}", payload=clean)
+
+    @app.delete("/api/ideas/{iid}")
+    async def workspace_idea_delete(request: Request, iid: str):
+        from .workspace_api import canonical_workbench_id
+
+        record_id = canonical_workbench_id(iid)
+        return await _forward_workspace_json(
+            request, "DELETE", f"/api/ideas/{record_id}")
 
     @app.post("/api/auth/exchange")
     async def exchange(request: Request):

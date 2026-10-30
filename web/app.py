@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -5506,10 +5507,12 @@ def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = 
             sys.path.insert(0, scripts_dir)
         import calendar_ops
         with _schedule_lock():
+            # 损坏/链接文件不能被发布回流当成空列表覆盖。
+            _read_schedule()
             calendar_ops.record_publish(cfg['name'], title, note=body[:200],
                                         tags=tags, ptype=ptype,
                                         source='publish-page', profile=profile,
-                                        data_path=SCHEDULE_FILE, forward_log=True)
+                                        data_path=_schedule_path(), forward_log=True)
     except Exception:
         pass
 
@@ -5987,34 +5990,108 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
     return {"trends": result, "updated": int(now)}
 
 
-SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
 SCHEDULE_KINDS = {"content", "event"}
+_WORKBENCH_FILE_ATTRIBUTE_REPARSE = 0x400
+
+
+def _workbench_file(name: str) -> Path:
+    """返回本人 outputs 下的真实数据文件；拒绝链接、目录和越界解析。"""
+    root = OUTPUTS_DIR
+    target = root / name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if target.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "工作台存储不可用")
+    try:
+        resolved = target.resolve(strict=True)
+        if (resolved != target.absolute()
+                or resolved.parent != root.resolve()
+                or not resolved.is_file()):
+            raise HTTPException(500, "工作台存储不可用")
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    return resolved
+
+
+def _read_workbench_json(name: str, label: str) -> list[dict]:
+    path = _workbench_file(name)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+            RecursionError):
+        raise HTTPException(500, f"{label}存储不可用") from None
+    if (not isinstance(data, list)
+            or any(not isinstance(item, dict) for item in data)):
+        raise HTTPException(500, f"{label}存储不可用")
+    return data
+
+
+def _write_workbench_json(name: str, label: str, items: list[dict]) -> None:
+    if (not isinstance(items, list)
+            or any(not isinstance(item, dict) for item in items)):
+        raise HTTPException(500, f"{label}存储不可用")
+    target = OUTPUTS_DIR / name
+    try:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        target = _workbench_file(name)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{name}.", suffix=".tmp", dir=str(OUTPUTS_DIR))
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, f"{label}存储不可用") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(items, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise HTTPException(500, f"{label}存储不可用") from None
+
+
+def _schedule_path() -> Path:
+    return _workbench_file("_schedule.json")
+
+
+def _ideas_path() -> Path:
+    return _workbench_file("_ideas.json")
+
 
 # _schedule.json 读-改-写串行化：发布回流（后台线程 _run_publish_bg + 事件循环上的
 # api_publish 成功路径）与增删改端点并发时，不加锁会互相覆盖丢记录。
 _SCHEDULE_LOCK = threading.Lock()
+_IDEAS_LOCK = threading.Lock()
 
 
 def _schedule_lock() -> threading.Lock:
     return _SCHEDULE_LOCK
 
 
+def _ideas_lock() -> threading.Lock:
+    return _IDEAS_LOCK
+
+
 def _read_schedule() -> list[dict]:
-    if not SCHEDULE_FILE.is_file():
-        return []
-    try:
-        d = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    return _read_workbench_json("_schedule.json", "排期")
 
 
 def _write_schedule(items: list[dict]) -> None:
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SCHEDULE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SCHEDULE_FILE)
+    _write_workbench_json("_schedule.json", "排期", items)
 
 
 class ScheduleItem(BaseModel):
@@ -6099,38 +6176,39 @@ async def api_schedule_delete(sid: str):
 @app.get("/api/schedule/context")
 async def api_schedule_context(days: int = 14):
     """规划摘要（发布节奏/断更缺口 + 待发排期 + 临近节点 + 建议）——薄封装 calendar_ops，
-    前端页头「近期节点/建议」与 Agent 读回共用同一逻辑。失败返回空摘要不抛错。"""
+    前端页头「近期节点/建议」与 Agent 读回共用同一逻辑。
+
+    命令、脚本路径和本人数据文件均固定；浏览器只能影响有界 days。损坏
+    存储、脚本失败或无效输出明确报错，不能伪装成空摘要成功。
+    """
+    _read_schedule()
     cmd = [sys.executable, str(SHARED_SCRIPTS / "calendar_ops.py"),
-           "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
+           "--data", str(_schedule_path()), "context",
+           "--days", str(max(1, min(days, 90)))]
     try:
         # 冷启动要起一个 Python 子进程（最长 20s）：丢线程池，避免卡住事件循环
         proc = await asyncio.to_thread(
             subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
             capture_output=True, text=True, timeout=20)
-        return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise ValueError("calendar context failed")
+        payload = json.loads(proc.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("calendar context invalid")
+        return payload
     except Exception:
-        return {}
+        raise HTTPException(503, "日历摘要暂不可用") from None
 
 
-IDEAS_FILE = OUTPUTS_DIR / "_ideas.json"
 IDEA_STATUSES = {"pending", "doing", "done"}
 
 
 def _read_ideas() -> list[dict]:
-    if not IDEAS_FILE.is_file():
-        return []
-    try:
-        d = json.loads(IDEAS_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    return _read_workbench_json("_ideas.json", "选题")
 
 
 def _write_ideas(items: list[dict]) -> None:
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = IDEAS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(IDEAS_FILE)
+    _write_workbench_json("_ideas.json", "选题", items)
 
 
 class IdeaItem(BaseModel):
@@ -6147,44 +6225,47 @@ async def api_ideas_list():
 
 @app.post("/api/ideas")
 async def api_ideas_create(req: IdeaItem):
-    items = _read_ideas()
-    st = req.status if req.status in IDEA_STATUSES else "pending"
-    item = {
-        "id": uuid.uuid4().hex[:12],
-        "title": req.title.strip() or "未命名选题",
-        "note": req.note,
-        "source": req.source,
-        "status": st,
-        "created": int(time.time()),
-    }
-    items.insert(0, item)
-    _write_ideas(items)
+    with _ideas_lock():
+        items = _read_ideas()
+        st = req.status if req.status in IDEA_STATUSES else "pending"
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": req.title.strip() or "未命名选题",
+            "note": req.note,
+            "source": req.source,
+            "status": st,
+            "created": int(time.time()),
+        }
+        items.insert(0, item)
+        _write_ideas(items)
     return item
 
 
 @app.put("/api/ideas/{iid}")
 async def api_ideas_update(iid: str, req: IdeaItem):
-    items = _read_ideas()
-    for it in items:
-        if it.get("id") == iid:
-            it.update({
-                "title": req.title.strip() or it.get("title", "未命名选题"),
-                "note": req.note,
-                "source": req.source,
-                "status": req.status if req.status in IDEA_STATUSES else it.get("status", "pending"),
-            })
-            _write_ideas(items)
-            return it
+    with _ideas_lock():
+        items = _read_ideas()
+        for it in items:
+            if it.get("id") == iid:
+                it.update({
+                    "title": req.title.strip() or it.get("title", "未命名选题"),
+                    "note": req.note,
+                    "source": req.source,
+                    "status": req.status if req.status in IDEA_STATUSES else it.get("status", "pending"),
+                })
+                _write_ideas(items)
+                return it
     raise HTTPException(404, "选题不存在")
 
 
 @app.delete("/api/ideas/{iid}")
 async def api_ideas_delete(iid: str):
-    items = _read_ideas()
-    new = [it for it in items if it.get("id") != iid]
-    if len(new) == len(items):
-        raise HTTPException(404, "选题不存在")
-    _write_ideas(new)
+    with _ideas_lock():
+        items = _read_ideas()
+        new = [it for it in items if it.get("id") != iid]
+        if len(new) == len(items):
+            raise HTTPException(404, "选题不存在")
+        _write_ideas(new)
     return {"ok": True, "deleted": iid}
 
 

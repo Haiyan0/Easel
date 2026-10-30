@@ -3,20 +3,31 @@
  * 调用 Task 5A 已接通的工作区路由。组件不感知 Cookie、路径或服务地址。
  */
 import type {
-  OutputContent, OutputNode, PersonaFile, PersonaItem, UploadedFile,
+  Idea, IdeaInput, OutputContent, OutputNode, PersonaFile, PersonaItem,
+  ScheduleContext, ScheduleInput, ScheduleItem, TrendGroup, UploadedFile,
 } from './api';
 import {
   adoptOversize as localAdoptOversize,
+  createIdea as localCreateIdea,
+  createSchedule as localCreateSchedule,
+  deleteIdea as localDeleteIdea,
   deleteOutput as localDeleteOutput,
   deletePersona as localDeletePersona,
+  deleteSchedule as localDeleteSchedule,
   fetchArtifactArchive as localFetchArtifactArchive,
+  fetchIdeas as localFetchIdeas,
   fetchOutputContent as localFetchOutputContent,
   fetchOutputs as localFetchOutputs,
   fetchPersonaFiles as localFetchPersonaFiles,
   fetchPersonas as localFetchPersonas,
+  fetchSchedule as localFetchSchedule,
+  fetchScheduleContext as localFetchScheduleContext,
   fetchStatus as localFetchStatus,
+  fetchTrends as localFetchTrends,
   mediaUrl as localMediaUrl,
   savePersonaFile as localSavePersonaFile,
+  updateIdea as localUpdateIdea,
+  updateSchedule as localUpdateSchedule,
   uploadFiles as localUploadFiles,
 } from './api';
 
@@ -49,8 +60,30 @@ export interface WorkspaceData {
   uploadLimits(): Promise<UploadLimits>;
   uploadFiles(files: File[], sessionId: string): Promise<UploadedFile[]>;
   adoptOversize?: (files: File[], sessionId: string) => Promise<UploadedFile[]>;
+  fetchTrends(
+    platforms: string, limit?: number, signal?: AbortSignal,
+  ): Promise<{ trends: TrendGroup[]; updated: number }>;
+  fetchSchedule(signal?: AbortSignal): Promise<ScheduleItem[]>;
+  fetchScheduleContext(
+    days?: number, signal?: AbortSignal,
+  ): Promise<ScheduleContext>;
+  createSchedule(
+    item: ScheduleInput, signal?: AbortSignal,
+  ): Promise<ScheduleItem>;
+  updateSchedule(
+    id: string, item: ScheduleInput, signal?: AbortSignal,
+  ): Promise<ScheduleItem>;
+  deleteSchedule(id: string, signal?: AbortSignal): Promise<{ ok: boolean }>;
+  fetchIdeas(signal?: AbortSignal): Promise<Idea[]>;
+  createIdea(item: IdeaInput, signal?: AbortSignal): Promise<Idea>;
+  updateIdea(
+    id: string, item: IdeaInput, signal?: AbortSignal,
+  ): Promise<Idea>;
+  deleteIdea(id: string, signal?: AbortSignal): Promise<{ ok: boolean }>;
   personasEnabled: boolean;
   outputsEnabled: boolean;
+  workbenchEnabled: boolean;
+  accountsEnabled: boolean;
   attachmentsEnabled: boolean;
   personaBuildEnabled: boolean;
   wechatFetchEnabled: boolean;
@@ -160,6 +193,134 @@ function uploadList(value: unknown): UploadedFile[] {
   });
 }
 
+function optionalString(row: Record<string, unknown>, key: string,
+                       label: string): string | undefined {
+  const value = row[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw new Error(`${label}响应无效`);
+  return value;
+}
+
+function trendResponse(value: unknown): { trends: TrendGroup[]; updated: number } {
+  const row = needObject(value, '热点响应无效');
+  const trends = needArray(row.trends, '热点响应无效').map((item) => {
+    const group = needObject(item, '热点响应无效');
+    if (typeof group.platform !== 'string' || typeof group.label !== 'string') {
+      throw new Error('热点响应无效');
+    }
+    const items = needArray(group.items, '热点响应无效').map((entry) => {
+      const trend = needObject(entry, '热点响应无效');
+      if (typeof trend.title !== 'string' || typeof trend.hot !== 'string'
+          || typeof trend.url !== 'string') {
+        throw new Error('热点响应无效');
+      }
+      return { title: trend.title, hot: trend.hot, url: trend.url };
+    });
+    return {
+      platform: group.platform, label: group.label, items,
+      ...(typeof group.ok === 'boolean' ? { ok: group.ok } : {}),
+    };
+  });
+  if (typeof row.updated !== 'number' || !Number.isFinite(row.updated)) {
+    throw new Error('热点响应无效');
+  }
+  return { trends, updated: row.updated };
+}
+
+function scheduleItem(value: unknown): ScheduleItem {
+  const row = needObject(value, '日历响应无效');
+  if (typeof row.id !== 'string' || typeof row.title !== 'string'
+      || typeof row.date !== 'string') {
+    throw new Error('日历响应无效');
+  }
+  const result: ScheduleItem = {
+    id: row.id,
+    title: row.title,
+    date: row.date,
+    platform: typeof row.platform === 'string' ? row.platform : '',
+    time: typeof row.time === 'string' ? row.time : '',
+    status: typeof row.status === 'string' ? row.status : 'idea',
+    note: typeof row.note === 'string' ? row.note : '',
+  };
+  for (const key of ['kind', 'url', 'source', 'event_type', 'end_date'] as const) {
+    const text = optionalString(row, key, '日历');
+    if (text !== undefined) result[key] = text;
+  }
+  return result;
+}
+
+function scheduleList(value: unknown): ScheduleItem[] {
+  return needArray(value, '日历响应无效').map(scheduleItem);
+}
+
+function scheduleContext(value: unknown): ScheduleContext {
+  const row = needObject(value, '日历摘要响应无效');
+  const result: ScheduleContext = {};
+  if (row.today !== undefined) {
+    if (typeof row.today !== 'string') throw new Error('日历摘要响应无效');
+    result.today = row.today;
+  }
+  for (const key of ['window_days', 'published_recent'] as const) {
+    const number = row[key];
+    if (number === undefined) continue;
+    if (typeof number !== 'number' || !Number.isFinite(number)) {
+      throw new Error('日历摘要响应无效');
+    }
+    result[key] = number;
+  }
+  if (row.upcoming_schedules !== undefined) {
+    result.upcoming_schedules = scheduleList(row.upcoming_schedules);
+  }
+  if (row.upcoming_events !== undefined) {
+    result.upcoming_events = scheduleList(row.upcoming_events);
+  }
+  if (row.suggestions !== undefined) {
+    result.suggestions = needArray(row.suggestions, '日历摘要响应无效').map(
+      (item) => {
+        if (typeof item !== 'string') throw new Error('日历摘要响应无效');
+        return item;
+      });
+  }
+  if (row.per_platform !== undefined) {
+    result.per_platform = needArray(
+      row.per_platform, '日历摘要响应无效').map((item) => {
+      const platform = needObject(item, '日历摘要响应无效');
+      if (typeof platform.platform !== 'string'
+          || typeof platform.recent_count !== 'number') {
+        throw new Error('日历摘要响应无效');
+      }
+      return {
+        platform: platform.platform,
+        recent_count: platform.recent_count,
+        last_date: typeof platform.last_date === 'string'
+          ? platform.last_date : null,
+        days_since_last: typeof platform.days_since_last === 'number'
+          ? platform.days_since_last : null,
+      };
+    });
+  }
+  return result;
+}
+
+function ideaItem(value: unknown): Idea {
+  const row = needObject(value, '选题响应无效');
+  if (typeof row.id !== 'string' || typeof row.title !== 'string') {
+    throw new Error('选题响应无效');
+  }
+  return {
+    id: row.id,
+    title: row.title,
+    note: typeof row.note === 'string' ? row.note : '',
+    source: typeof row.source === 'string' ? row.source : '',
+    status: typeof row.status === 'string' ? row.status : 'pending',
+    created: typeof row.created === 'number' ? row.created : 0,
+  };
+}
+
+function ideaList(value: unknown): Idea[] {
+  return needArray(value, '选题响应无效').map(ideaItem);
+}
+
 function statusView(value: unknown): WorkspaceStatus {
   const row = needObject(value, '工作区状态响应无效');
   const states = new Set([
@@ -193,6 +354,9 @@ export function workspaceErrorMessage(error: unknown, fallback: string): string 
   if (status === 413) return '文件超过上传上限（413）。';
   if (status === 429) return '操作过于频繁，请稍后重试（429）。';
   if (status === 503) return '工作区服务暂不可用（503）。';
+  if (status !== null && status >= 500) {
+    return `工作区服务暂不可用（${status}）。`;
+  }
   if (status === 0) return '网络不可用，请检查连接。';
   if (error instanceof Error && error.message) return error.message;
   return fallback;
@@ -296,8 +460,71 @@ export function createControlWorkspaceData(
         method: 'POST', body: form,
       }));
     },
+    async fetchTrends(platforms, limit = 12, signal) {
+      return trendResponse(await call<unknown>(
+        `/api/trends?platforms=${encodeURIComponent(platforms)}&limit=${limit}`,
+        { signal }));
+    },
+    async fetchSchedule(signal) {
+      return scheduleList(await call<unknown>('/api/schedule', { signal }));
+    },
+    async fetchScheduleContext(days = 14, signal) {
+      return scheduleContext(await call<unknown>(
+        `/api/schedule/context?days=${days}`, { signal }));
+    },
+    async createSchedule(item, signal) {
+      return scheduleItem(await call<unknown>('/api/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item),
+        signal,
+      }));
+    },
+    async updateSchedule(id, item, signal) {
+      return scheduleItem(await call<unknown>(
+        `/api/schedule/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(item),
+          signal,
+        }));
+    },
+    async deleteSchedule(id, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/schedule/${encodeURIComponent(id)}`,
+        { method: 'DELETE', signal }), '日历响应无效');
+      return { ok: row.ok === true };
+    },
+    async fetchIdeas(signal) {
+      return ideaList(await call<unknown>('/api/ideas', { signal }));
+    },
+    async createIdea(item, signal) {
+      return ideaItem(await call<unknown>('/api/ideas', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item),
+        signal,
+      }));
+    },
+    async updateIdea(id, item, signal) {
+      return ideaItem(await call<unknown>(
+        `/api/ideas/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(item),
+          signal,
+        }));
+    },
+    async deleteIdea(id, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/ideas/${encodeURIComponent(id)}`,
+        { method: 'DELETE', signal }), '选题响应无效');
+      return { ok: row.ok === true };
+    },
     personasEnabled: true,
     outputsEnabled: true,
+    workbenchEnabled: true,
+    accountsEnabled: false,
     attachmentsEnabled: true,
     personaBuildEnabled: false,
     wechatFetchEnabled: false,
@@ -340,8 +567,20 @@ export const localWorkspaceData: WorkspaceData = {
   },
   uploadFiles: localUploadFiles,
   adoptOversize: localAdoptOversize,
+  fetchTrends: localFetchTrends,
+  fetchSchedule: localFetchSchedule,
+  fetchScheduleContext: localFetchScheduleContext,
+  createSchedule: localCreateSchedule,
+  updateSchedule: localUpdateSchedule,
+  deleteSchedule: localDeleteSchedule,
+  fetchIdeas: localFetchIdeas,
+  createIdea: localCreateIdea,
+  updateIdea: localUpdateIdea,
+  deleteIdea: localDeleteIdea,
   personasEnabled: true,
   outputsEnabled: true,
+  workbenchEnabled: true,
+  accountsEnabled: true,
   attachmentsEnabled: true,
   personaBuildEnabled: true,
   wechatFetchEnabled: true,

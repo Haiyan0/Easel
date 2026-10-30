@@ -99,6 +99,7 @@ def canonical(*segments: str) -> str:
 PERSONA = canonical("测试 画像")
 IMAGE = canonical("项目 甲", "封面 图.png")
 ZIP = canonical("项目 甲", "素材.zip")
+RECORD_ID = "a1b2c3d4e5f6"
 
 
 ROUTES = [
@@ -118,6 +119,19 @@ ROUTES = [
     ("GET", "/api/upload/limits", None, b"", None),
     ("POST", "/api/upload", None, b"--x\r\ncontent\r\n--x--\r\n",
      {"Content-Type": "multipart/form-data; boundary=x"}),
+    ("GET", "/api/trends", {"platforms": "weibo,douyin", "limit": "15"},
+     b"", None),
+    ("GET", "/api/schedule", None, b"", None),
+    ("POST", "/api/schedule", None,
+     b'{"title":"x","date":"2026-10-30"}', None),
+    ("GET", "/api/schedule/context", {"days": "14"}, b"", None),
+    ("PUT", f"/api/schedule/{RECORD_ID}", None,
+     b'{"title":"x","date":"2026-10-31"}', None),
+    ("DELETE", f"/api/schedule/{RECORD_ID}", None, b"", None),
+    ("GET", "/api/ideas", None, b"", None),
+    ("POST", "/api/ideas", None, b'{"title":"x"}', None),
+    ("PUT", f"/api/ideas/{RECORD_ID}", None, b'{"title":"x"}', None),
+    ("DELETE", f"/api/ideas/{RECORD_ID}", None, b"", None),
 ]
 
 
@@ -237,6 +251,17 @@ def test_media_304_is_not_treated_as_redirect():
     ("POST", "/api/status", 405),
     ("PUT", "/api/personas", 405),
     ("GET", "/api/upload", 405),
+    ("GET", "/api/trends?platforms=weibo,evil", 400),
+    ("GET", "/api/trends?platforms=weibo&platforms=douyin", 400),
+    ("GET", "/api/trends?limit=0", 400),
+    ("GET", "/api/schedule/context?days=91", 400),
+    ("GET", "/api/schedule/context?days=0", 400),
+    ("PUT", "/api/ideas/not-a-record", 400),
+    ("PUT", "/api/ideas/a1b2c3d4e5f", 400),
+    ("DELETE", "/api/schedule/a1b2c3d4e5f6z", 400),
+    ("GET", f"/api/ideas/{RECORD_ID}", 405),
+    ("POST", f"/api/ideas/{RECORD_ID}", 405),
+    ("GET", f"/api/schedule/{RECORD_ID}", 405),
 ])
 def test_workspace_route_negatives_never_reach_upstream(method, path, expected):
     handler, requests = capture()

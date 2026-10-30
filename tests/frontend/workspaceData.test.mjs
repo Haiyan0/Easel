@@ -32,6 +32,18 @@ const api = {
   deleteOutput: async () => ({ ok: true, deleted: 'a.txt' }),
   uploadFiles: async () => [],
   adoptOversize: async () => [],
+  fetchTrends: async () => ({ trends: [], updated: 1 }),
+  fetchSchedule: async () => [],
+  fetchScheduleContext: async () => ({ window_days: 14, suggestions: [] }),
+  createSchedule: async (item) => ({ id: 'a1b2c3d4e5f6', ...item }),
+  updateSchedule: async (id, item) => ({ id, ...item }),
+  deleteSchedule: async () => ({ ok: true }),
+  fetchIdeas: async () => [],
+  createIdea: async (item) => ({ id: 'a1b2c3d4e5f6', ...item,
+    note: item.note || '', source: item.source || '',
+    status: item.status || 'pending', created: 1 }),
+  updateIdea: async (id, item) => ({ id, ...item }),
+  deleteIdea: async () => ({ ok: true }),
 };
 
 const module = { exports: {} };
@@ -70,11 +82,15 @@ test('control workspace data exposes only implemented basic capabilities', () =>
   assert.equal(control.oversizeMode, 'reject');
   assert.equal(control.personasEnabled, true);
   assert.equal(control.outputsEnabled, true);
+  assert.equal(control.workbenchEnabled, true);
+  assert.equal(control.accountsEnabled, false);
   assert.equal(control.localSettingsEnabled, false);
 
   const local = data.localWorkspaceData;
   assert.equal(local.personaBuildEnabled, true);
   assert.equal(local.wechatFetchEnabled, true);
+  assert.equal(local.workbenchEnabled, true);
+  assert.equal(local.accountsEnabled, true);
   assert.equal(local.oversizeMode, 'adopt');
   assert.equal(local.localSettingsEnabled, true);
 });
@@ -136,6 +152,7 @@ test('errors keep 401/403/404/413/503 semantics', () => {
     [{ status: 413 }, /超过|上限/],
     [{ status: 429 }, /频繁|稍后/],
     [{ status: 503 }, /暂不可用/],
+    [{ status: 502 }, /暂不可用/],
     [{ status: 0 }, /网络/],
     [new Error('boom'), /boom/],
   ];
@@ -151,9 +168,111 @@ test('control parsers reject malformed payloads instead of faking empty data', a
   });
   await assert.rejects(bad.fetchPersonas(), /画像列表/);
   await assert.rejects(bad.fetchOutputs(), /内容库/);
+  await assert.rejects(bad.fetchIdeas(), /选题/);
+  await assert.rejects(bad.fetchSchedule(), /日历/);
   const badFiles = data.createControlWorkspaceData({
     call: async () => ({ name: 'A', files: 'bad' }),
     fetchText: async () => '',
   });
   await assert.rejects(badFiles.fetchPersonaFiles('A'), /画像文件/);
+  const badTrends = data.createControlWorkspaceData({
+    call: async () => ({ trends: 'bad', updated: 1 }),
+    fetchText: async () => '',
+  });
+  await assert.rejects(badTrends.fetchTrends('weibo', 12), /热点/);
+  const badContext = data.createControlWorkspaceData({
+    call: async () => ({ suggestions: 'bad' }),
+    fetchText: async () => '',
+  });
+  await assert.rejects(badContext.fetchScheduleContext(14), /日历摘要/);
+});
+
+test('control workbench methods use identity call with exact paths and bodies', async () => {
+  const calls = [];
+  const idea = {
+    id: 'a1b2c3d4e5f6', title: '选题', note: '', source: '',
+    status: 'pending', created: 1,
+  };
+  const schedule = {
+    id: 'b1b2c3d4e5f6', title: '排期', date: '2026-10-30',
+    platform: '', time: '', status: 'idea', note: '',
+  };
+  const control = data.createControlWorkspaceData({
+    call: async (path, init) => {
+      calls.push({ path, init });
+      if (path.startsWith('/api/trends')) {
+        return {
+          trends: [{
+            platform: 'weibo', label: '微博', ok: true,
+            items: [{ title: '热搜', hot: '1', url: '' }],
+          }], updated: 2,
+        };
+      }
+      if (path.startsWith('/api/schedule/context')) {
+        return { window_days: 14, suggestions: ['保持节奏'] };
+      }
+      if (path === '/api/schedule') {
+        return init?.method === 'POST' ? schedule : [schedule];
+      }
+      if (path.startsWith('/api/schedule/')) return schedule;
+      if (path === '/api/ideas') {
+        return init?.method === 'POST' ? idea : [idea];
+      }
+      if (path.startsWith('/api/ideas/')) return idea;
+      throw new Error(`unexpected ${path}`);
+    },
+    fetchText: async () => '',
+  });
+
+  const trends = await control.fetchTrends('weibo,douyin', 15);
+  assert.equal(trends.updated, 2);
+  assert.equal(trends.trends[0].items[0].title, '热搜');
+  assert.equal(calls.at(-1).path,
+    '/api/trends?platforms=weibo%2Cdouyin&limit=15');
+
+  assert.equal((await control.fetchSchedule())[0].id, schedule.id);
+  assert.equal((await control.fetchIdeas())[0].id, idea.id);
+  const context = await control.fetchScheduleContext(14);
+  assert.equal(context.window_days, 14);
+  assert.deepEqual(Array.from(context.suggestions || []), ['保持节奏']);
+  assert.equal(calls.at(-1).path, '/api/schedule/context?days=14');
+
+  await control.createIdea({ title: '新选题', status: 'pending' });
+  let call = calls.at(-1);
+  assert.equal(call.path, '/api/ideas');
+  assert.equal(call.init.method, 'POST');
+  assert.deepEqual(JSON.parse(call.init.body),
+    { title: '新选题', status: 'pending' });
+
+  await control.updateIdea('a1b2c3d4e5f6', { title: '改选题' });
+  call = calls.at(-1);
+  assert.equal(call.path, '/api/ideas/a1b2c3d4e5f6');
+  assert.equal(call.init.method, 'PUT');
+
+  await control.deleteIdea('a1b2c3d4e5f6');
+  call = calls.at(-1);
+  assert.equal(call.init.method, 'DELETE');
+
+  await control.createSchedule({
+    title: '新排期', date: '2026-10-30', platform: '', time: '',
+    status: 'idea', note: '',
+  });
+  call = calls.at(-1);
+  assert.equal(call.path, '/api/schedule');
+  assert.equal(call.init.method, 'POST');
+  assert.deepEqual(JSON.parse(call.init.body), {
+    title: '新排期', date: '2026-10-30', platform: '', time: '',
+    status: 'idea', note: '',
+  });
+
+  await control.updateSchedule('b1b2c3d4e5f6', {
+    title: '改排期', date: '2026-10-31',
+  });
+  call = calls.at(-1);
+  assert.equal(call.path, '/api/schedule/b1b2c3d4e5f6');
+  assert.equal(call.init.method, 'PUT');
+
+  await control.deleteSchedule('b1b2c3d4e5f6');
+  call = calls.at(-1);
+  assert.equal(call.init.method, 'DELETE');
 });

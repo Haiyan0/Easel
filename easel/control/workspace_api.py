@@ -1,4 +1,4 @@
-"""Task 5A：control 对本人基础工作区的受限转发。
+"""Task 5A/5B：control 对本人基础工作区和工作台数据的受限转发。
 
 本模块只做三件事：
 
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from urllib.parse import quote
 
@@ -24,6 +25,19 @@ _OUTPUT_INTERNAL = frozenset({"analytics", "wechat"})
 _MAX_UPLOAD_BYTES = 60 * 1024 * 1024
 _MAX_PERSONA = 200
 _MAX_PATH = 2048
+_WORKBENCH_ID = re.compile(r"^[0-9a-f]{12}$")
+_TREND_PLATFORMS = frozenset({
+    "weibo", "douyin", "zhihu", "bilibili", "baidu", "toutiao",
+})
+_TREND_PLATFORMS_TEXT = re.compile(
+    r"^(?:weibo|douyin|zhihu|bilibili|baidu|toutiao)"
+    r"(?:,(?:weibo|douyin|zhihu|bilibili|baidu|toutiao))*$")
+_SCHEDULE_FIELDS = {
+    "title": 200, "date": 32, "platform": 64, "time": 32, "status": 32,
+    "note": 4000, "kind": 32, "url": 2048, "source": 32,
+    "event_type": 64, "end_date": 32,
+}
+_IDEA_FIELDS = {"title": 200, "note": 4000, "source": 200, "status": 32}
 
 
 def canonical_persona_name(value: object) -> str:
@@ -37,6 +51,76 @@ def canonical_persona_name(value: object) -> str:
                    for character in value)):
         raise DomainError("invalid_request", 400)
     return quote(value, safe="-._~", encoding="utf-8", errors="strict")
+
+
+def canonical_workbench_id(value: object) -> str:
+    """工作台记录 id 与 worker 生成规则一致；不接受路径/编码别名。"""
+    if not isinstance(value, str) or not _WORKBENCH_ID.fullmatch(value):
+        raise DomainError("invalid_request", 400)
+    return value
+
+
+def canonical_trends_query(platforms: object, limit: object) -> dict[str, str]:
+    """校验热点查询：只允许原固定平台与 1..30 条。"""
+    if platforms is None:
+        platforms = "weibo,douyin,zhihu"
+    if (not isinstance(platforms, str) or not 1 <= len(platforms) <= 200
+            or not _TREND_PLATFORMS_TEXT.fullmatch(platforms)):
+        raise DomainError("invalid_request", 400)
+    selected = platforms.split(",")
+    if (len(selected) > 6 or len(set(selected)) != len(selected)
+            or any(item not in _TREND_PLATFORMS for item in selected)):
+        raise DomainError("invalid_request", 400)
+    if limit is None:
+        limit = 12
+    if type(limit) is not int or not 1 <= limit <= 30:
+        raise DomainError("invalid_request", 400)
+    return {"platforms": ",".join(selected), "limit": str(limit)}
+
+
+def canonical_schedule_days(value: object) -> int:
+    if value is None:
+        return 14
+    if type(value) is not int or not 1 <= value <= 90:
+        raise DomainError("invalid_request", 400)
+    return value
+
+
+def _canonical_text(value: object, field: str, maximum: int, *,
+                    required: bool) -> str:
+    if value is None and not required:
+        return ""
+    if (not isinstance(value, str) or len(value) > maximum
+            or any(ord(character) < 32 and character not in "\n\r\t"
+                   for character in value)):
+        raise DomainError("invalid_request", 400)
+    return value
+
+
+def canonical_schedule_payload(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise DomainError("invalid_request", 400)
+    result: dict[str, str] = {}
+    for field, maximum in _SCHEDULE_FIELDS.items():
+        required = field in ("title", "date")
+        if field not in value and not required:
+            continue
+        result[field] = _canonical_text(
+            value.get(field), field, maximum, required=required)
+    return result
+
+
+def canonical_idea_payload(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise DomainError("invalid_request", 400)
+    result: dict[str, str] = {}
+    for field, maximum in _IDEA_FIELDS.items():
+        required = field == "title"
+        if field not in value and not required:
+            continue
+        result[field] = _canonical_text(
+            value.get(field), field, maximum, required=required)
+    return result
 
 
 def canonical_output_path(value: object) -> str:

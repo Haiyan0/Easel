@@ -127,9 +127,13 @@ _ROUTES: dict[str, _Route] = {
                        frozenset({"limit", "offset"})),
 }
 
-# 基础工作区路由只覆盖 Task 5A 已实现的精确入口；skills/accounts 等未接组
-# 不在 gateway 放行，避免用前缀代理扩大边界。
+# 基础工作区/工作台路由只覆盖 Task 5A/5B 已实现的精确入口；skills/accounts
+# 等未接组不在 gateway 放行，避免用前缀代理扩大边界。
 _WS_OUTPUT_INTERNAL = frozenset({"analytics", "wechat"})
+_WS_RECORD_ID = re.compile(r"^[0-9a-f]{12}$")
+_WS_TREND_PLATFORMS = re.compile(
+    r"^(?:weibo|douyin|zhihu|bilibili|baidu|toutiao)"
+    r"(?:,(?:weibo|douyin|zhihu|bilibili|baidu|toutiao))*$")
 _WS_SIMPLE: dict[tuple[str, ...], _Route] = {
     ("api", "status"): _Route("ws_status", frozenset({"GET"}),
                               "/api/status", False, frozenset()),
@@ -145,6 +149,18 @@ _WS_SIMPLE: dict[tuple[str, ...], _Route] = {
     ("api", "artifacts", "archive"): _Route(
         "ws_archive", frozenset({"GET"}), "/api/artifacts/archive",
         False, frozenset({"path"})),
+    ("api", "trends"): _Route(
+        "ws_trends", frozenset({"GET"}), "/api/trends", False,
+        frozenset({"platforms", "limit"})),
+    ("api", "schedule"): _Route(
+        "ws_schedule", frozenset({"GET", "POST"}), "/api/schedule", False,
+        frozenset()),
+    ("api", "schedule", "context"): _Route(
+        "ws_schedule_context", frozenset({"GET"}), "/api/schedule/context",
+        False, frozenset({"days"})),
+    ("api", "ideas"): _Route(
+        "ws_ideas", frozenset({"GET", "POST"}), "/api/ideas", False,
+        frozenset()),
 }
 
 
@@ -427,6 +443,15 @@ def _workspace_segment(segment: str, *, persona: bool) -> str:
     return quote(value, safe="-._~", encoding="utf-8", errors="strict")
 
 
+def _workspace_record_id(segment: str) -> str:
+    """工作台记录 id 只接受 12 位小写十六进制，不允许路径别名。"""
+    encoded = _workspace_segment(segment, persona=False)
+    value = unquote(encoded, encoding="utf-8", errors="strict")
+    if not _WS_RECORD_ID.fullmatch(value):
+        raise _invalid_path()
+    return encoded
+
+
 def _workspace_output_path(parts: list[str]) -> str:
     if not parts:
         raise _invalid_path()
@@ -459,6 +484,12 @@ def _workspace_route(parts: list[str],
                           f"/api/persona/{name}/files", False, frozenset())
         return _Route("ws_persona_file", frozenset({"PUT"}),
                       f"/api/persona/{name}/file", False, frozenset())
+    if len(parts) == 3 and parts[1] in ("schedule", "ideas"):
+        record = _workspace_record_id(parts[2])
+        name = "ws_schedule_item" if parts[1] == "schedule" \
+            else "ws_idea_item"
+        return _Route(name, frozenset({"PUT", "DELETE"}),
+                      f"/api/{parts[1]}/{record}", False, frozenset())
     if len(parts) >= 3 and parts[1] in ("output", "media"):
         path = _workspace_output_path(parts[2:])
         if parts[1] == "output":
@@ -628,6 +659,12 @@ def _parse_query(raw_query: bytes, route: _Route,
                 raise _invalid_query()
             if parts[0].startswith("_") or parts[0] in _WS_OUTPUT_INTERNAL:
                 raise _invalid_query()
+        elif key == "platforms":
+            if (not 1 <= len(value) <= 200
+                    or not _WS_TREND_PLATFORMS.fullmatch(value)):
+                raise _invalid_query()
+        elif key == "days":
+            values[key] = _canonical_int(value, minimum=1, maximum=90)
         else:
             raise _invalid_query()
     return "&".join(

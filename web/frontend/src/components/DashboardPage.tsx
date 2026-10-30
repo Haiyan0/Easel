@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import {
-  fetchTrends, fetchSchedule, fetchOutputs, fetchAccounts, fetchIdeas,
-  fetchAnalyticsPlatforms, fetchAccountAnalytics,
+  fetchAccounts, fetchAnalyticsPlatforms, fetchAccountAnalytics,
 } from '../lib/api';
 import type {
   TrendGroup, ScheduleItem, OutputNode, AccountItem, Idea,
   AnalyticsPlatform, AccountAnalytics, AccountWhoami,
 } from '../lib/api';
 import type { Page } from './Sidebar';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { getWhoamiCache, verifyStale } from '../lib/whoami';
 import {
   IconFire, IconCalendar, IconOutputs, IconChat, IconSkills, IconAccounts,
@@ -41,15 +42,21 @@ interface DashboardProps {
 const STATUS_LABEL: Record<string, string> = { idea: '选题', draft: '草稿', scheduled: '待发', published: '已发' };
 
 export default function DashboardPage({ persona, gatewayStatus, apiDirect, agentRuntime, onNavigate, onUseTopic }: DashboardProps) {
+  const data = useWorkspaceData();
+  const accountsEnabled = data.accountsEnabled;
   const [trends, setTrends] = useState<TrendGroup[]>([]);
   const [schedule, setSchedule] = useState<ScheduleItem[]>([]);
   const [outputs, setOutputs] = useState<OutputNode[]>([]);
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [ideas, setIdeas] = useState<Idea[]>([]);
-  // 归因层：账号创作数据
+  const [loading, setLoading] = useState(true);
+  const [workbenchError, setWorkbenchError] = useState('');
+  const request = useRef<AbortController | null>(null);
+  // 归因层：账号创作数据。control 的账号/分析属于 5C，不能读取 local 缓存。
   const [anaPlats, setAnaPlats] = useState<AnalyticsPlatform[]>([]);
   const [anaSel, setAnaSel] = useState('');
   const [anaData, setAnaData] = useState<Record<string, AccountAnalytics | 'loading' | 'error'>>(() => {
+    if (!accountsEnabled) return {};
     try {
       const cache = JSON.parse(localStorage.getItem('easel_analytics') || '{}') as Record<string, AccountAnalytics | 'loading' | 'error'>;
       return Object.fromEntries(Object.entries(cache).filter(([platform, value]) =>
@@ -61,7 +68,8 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
   const [anaErrors, setAnaErrors] = useState<Record<string, string>>({});
   const [anaWin, setAnaWin] = useState<'last' | 'day' | 'week' | 'month' | 'year'>('week');
   // whoami 自愈：登录态以真实 profile 为准（与账号页共享 localStorage 缓存）
-  const [whoamiMap, setWhoamiMap] = useState<Record<string, AccountWhoami>>(() => getWhoamiCache());
+  const [whoamiMap, setWhoamiMap] = useState<Record<string, AccountWhoami>>(
+    () => (accountsEnabled ? getWhoamiCache() : {}));
   // 与 AccountsPage 同款：卸载后不再触发 setState（whoami 每个平台要起浏览器，最慢数秒）
   const aliveRef = useRef(true);
   useEffect(() => {
@@ -70,11 +78,44 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
   }, []);
 
   useEffect(() => {
-    fetchTrends('weibo,douyin', 6).then((d) => setTrends(d.trends)).catch(() => {});
-    fetchSchedule().then(setSchedule).catch(() => {});
-    fetchOutputs().then(setOutputs).catch(() => {});
+    const controller = new AbortController();
+    request.current?.abort();
+    request.current = controller;
+    setLoading(true);
+    setWorkbenchError('');
+
+    if (data.workbenchEnabled) {
+      const note = (error: unknown, fallback: string) => {
+        if (!controller.signal.aborted) {
+          setWorkbenchError(workspaceErrorMessage(error, fallback));
+        }
+      };
+      const tasks = [
+        data.fetchTrends('weibo,douyin', 6, controller.signal)
+          .then((value) => { if (!controller.signal.aborted) setTrends(value.trends); })
+          .catch((error) => note(error, '热点读取失败，请重试。')),
+        data.fetchSchedule(controller.signal)
+          .then((value) => { if (!controller.signal.aborted) setSchedule(value); })
+          .catch((error) => note(error, '日历读取失败，请重试。')),
+        data.fetchOutputs()
+          .then((value) => { if (!controller.signal.aborted) setOutputs(value); })
+          .catch((error) => note(error, '内容库读取失败，请重试。')),
+        data.fetchIdeas(controller.signal)
+          .then((value) => { if (!controller.signal.aborted) setIdeas(value); })
+          .catch((error) => note(error, '选题读取失败，请重试。')),
+      ];
+      void Promise.allSettled(tasks).then(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    } else {
+      setLoading(false);
+    }
+
+    if (!accountsEnabled) return () => {
+      controller.abort();
+    };
+
     fetchAccounts().then(setAccounts).catch(() => {});
-    fetchIdeas().then(setIdeas).catch(() => {});
     fetchAnalyticsPlatforms().then((ps) => {
       setAnaPlats(ps);
       const cache = getWhoamiCache();
@@ -92,7 +133,10 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
         },
       });
     }).catch(() => {});
-  }, []);
+    return () => {
+      controller.abort();
+    };
+  }, [data, accountsEnabled]);
 
   const runAna = (platform: string) => {
     setAnaSel(platform);
@@ -141,7 +185,7 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
     { label: '待做选题', value: String(pendingIdeas.length), page: 'ideas', Icon: IconIdea },
     { label: '待发排期', value: String(upcoming.length), page: 'calendar', Icon: IconCalendar },
     { label: '内容项目', value: String(outputs.length), page: 'outputs', Icon: IconOutputs },
-    { label: '已登录账号', value: `${loggedIn}/${accounts.length}`, page: 'accounts', Icon: IconAccounts },
+    { label: '已登录账号', value: accountsEnabled ? `${loggedIn}/${accounts.length}` : '未接通', page: 'accounts', Icon: IconAccounts },
   ];
 
   return (
@@ -167,6 +211,9 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
       </div>
 
       {/* 概览数字 */}
+      {workbenchError && <div className="notice-error" role="alert">{workbenchError}</div>}
+      {loading && <div className="dash-empty">工作台数据加载中…</div>}
+
       <div className="dash-stats">
         {stats.map((s) => (
           <button key={s.label} className="card card-hover dash-stat" onClick={() => onNavigate(s.page)}>
@@ -184,7 +231,11 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
             <span><IconFire size={16} /> 今日热点</span>
             <button className="dash-more" onClick={() => onNavigate('trends')}>热点雷达 →</button>
           </div>
-          {trends.length === 0 && <div className="dash-empty">热点加载中 / 需配置代理</div>}
+          {trends.length === 0 && (
+            <div className="dash-empty">
+              {loading ? '热点加载中…' : workbenchError ? '热点读取失败' : '暂无热点'}
+            </div>
+          )}
           {trends.map((g) => (
             <div key={g.platform} className="dash-trend-group">
               <div className="dash-trend-plat">{g.label}</div>
@@ -203,7 +254,11 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
             <span><IconIdea size={16} /> 选题库 · 待做</span>
             <button className="dash-more" onClick={() => onNavigate('ideas')}>全部 →</button>
           </div>
-          {pendingIdeas.length === 0 && <div className="dash-empty">还没攒选题，去热点雷达收藏几个吧</div>}
+          {pendingIdeas.length === 0 && (
+            <div className="dash-empty">
+              {loading ? '选题加载中…' : workbenchError ? '选题读取失败' : '还没攒选题，去热点雷达收藏几个吧'}
+            </div>
+          )}
           {pendingIdeas.slice(0, 5).map((it) => (
             <div key={it.id} className="dash-idea" onClick={() => onUseTopic(it.title)} title="点击做成内容">
               <span className="dash-idea-title">{it.title}</span>
@@ -218,7 +273,11 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
             <span><IconCalendar size={16} /> 近期排期</span>
             <button className="dash-more" onClick={() => onNavigate('calendar')}>日历 →</button>
           </div>
-          {upcoming.length === 0 && <div className="dash-empty">暂无排期，去日历安排一条吧</div>}
+          {upcoming.length === 0 && (
+            <div className="dash-empty">
+              {loading ? '排期加载中…' : workbenchError ? '排期读取失败' : '暂无排期，去日历安排一条吧'}
+            </div>
+          )}
           {upcoming.map((s) => (
             <div key={s.id} className="dash-sched" onClick={() => onNavigate('calendar')}>
               <span className="dash-sched-date">{s.date.slice(5)}</span>
@@ -234,7 +293,11 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
             <span><IconOutputs size={16} /> 最近产物</span>
             <button className="dash-more" onClick={() => onNavigate('outputs')}>内容库 →</button>
           </div>
-          {recent.length === 0 && <div className="dash-empty">还没有产物，去对话生成第一条吧</div>}
+          {recent.length === 0 && (
+            <div className="dash-empty">
+              {loading ? '产物加载中…' : workbenchError ? '产物读取失败' : '还没有产物，去对话生成第一条吧'}
+            </div>
+          )}
           {recent.map((g) => (
             <div key={g.name} className="dash-output" onClick={() => onNavigate('outputs')}>
               <span className="dash-output-name">{g.meta?.title || g.name}</span>
@@ -252,6 +315,13 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
             )}
           </div>
           {(() => {
+            if (!accountsEnabled) {
+              return (
+                <div className="dash-empty" role="status">
+                  账号与创作数据将在 5C 接通；当前未读取本机账号、创作指标或分析缓存。
+                </div>
+              );
+            }
             const logged = anaPlats.filter((p) => p.loggedIn || whoamiMap[p.platform]?.loggedIn);
             if (anaPlats.length === 0) return <div className="dash-empty">加载中 / 需配置代理</div>;
             if (logged.length === 0) {

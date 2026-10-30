@@ -2,6 +2,10 @@ import { useEffect, useMemo, useState } from 'react';
 import ChatPage from './ChatPage';
 import ControlSettingsPage from './ControlSettingsPage';
 import AdminSettingsPage from './AdminSettingsPage';
+import DashboardPage from './DashboardPage';
+import TrendsPage from './TrendsPage';
+import IdeasPage from './IdeasPage';
+import CalendarPage from './CalendarPage';
 import OutputsPage from './OutputsPage';
 import ProfilePage from './ProfilePage';
 import WorkspaceLayout from './WorkspaceLayout';
@@ -75,6 +79,7 @@ export default function WorkspaceApp({
     useState<WorkspaceStatus | null>(null);
   const [workspaceReady, setWorkspaceReady] = useState(false);
   const [outputsJump, setOutputsJump] = useState('');
+  const [draftPrompt, setDraftPrompt] = useState('');
   const workspace = useWorkspace({ ctx, epoch, epochs, onExpired });
   const features = workspaceModeFeatures('control');
   const admin = ctx.role === 'admin';
@@ -145,16 +150,27 @@ export default function WorkspaceApp({
   const newChat = () => {
     setSettingsOpen(false);
     setCurrentPage('chat');
+    setDraftPrompt('');
     void workspace.newChat();
   };
 
   const selectSession = (id: string) => {
     setSettingsOpen(false);
     setCurrentPage('chat');
+    setDraftPrompt('');
     // control 会话目录不保存 personas 元数据；切换历史会话时回到通用模式，
     // 避免把上一个会话选中的画像带进新请求。
     setSelectedPersona('');
     workspace.selectSession(id);
+  };
+
+  // 热点/选题「做内容」只导航并预填，不创建 Run、不自动发送。
+  const useTopic = (title: string) => {
+    const prompt = `围绕当前热点「${title}」：先判断它适不适合我的账号赛道；若合适，给 2-3 个差异化的二创角度，并把你最推荐的那条写成可直接发布的文案初稿。`;
+    setDraftPrompt(prompt);
+    setSettingsOpen(false);
+    setCurrentPage('chat');
+    if (!workspace.activeSession) void workspace.newChat();
   };
 
   const deleteSession = (id: string) => {
@@ -191,6 +207,27 @@ export default function WorkspaceApp({
     || workspaceReady;
 
   const renderContent = () => {
+    if (currentPage === 'dashboard') {
+      return (
+        <DashboardPage
+          persona={selectedPersona}
+          gatewayStatus={workspaceStatus?.gateway ? 'connected' : 'connecting'}
+          apiDirect={false}
+          agentRuntime="control"
+          onNavigate={navigate}
+          onUseTopic={useTopic}
+        />
+      );
+    }
+    if (currentPage === 'trends') {
+      return <TrendsPage onUseTopic={useTopic} />;
+    }
+    if (currentPage === 'ideas') {
+      return <IdeasPage onUseTopic={useTopic} />;
+    }
+    if (currentPage === 'calendar') {
+      return <CalendarPage />;
+    }
     if (currentPage === 'outputs') {
       return (
         <OutputsPage jumpPath={outputsJump}
@@ -236,6 +273,8 @@ export default function WorkspaceApp({
         }}
         onStop={() => { void workspace.stop(); }}
         mode="control"
+        initialInput={draftPrompt}
+        onInitialInputConsumed={() => setDraftPrompt('')}
         attachmentsEnabled={features.attachments}
         attachmentRequiresText
         identityKey={`${epoch}:${ctx.userId}:${ctx.workspaceId}`}
