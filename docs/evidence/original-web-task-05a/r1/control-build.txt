@@ -1,0 +1,196 @@
+docker : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:302
++ ... tch {} } }; docker build -f deploy/desktop/Dockerfile.control -t ease ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+#1 [internal] load build definition from Dockerfile.control
+#1 transferring dockerfile: 2.98kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/node:24-bookworm-slim
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/python:3.11.12-slim-bookworm
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 1.27kB done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [runtime  1/13] FROM docker.io/library/python:3.11.12-slim-bookworm@sha256:dbf1de478a55d6763afaa39c2f3d7b54b25230614
+980276de5cacdde79529d0c
+#6 resolve docker.io/library/python:3.11.12-slim-bookworm@sha256:dbf1de478a55d6763afaa39c2f3d7b54b25230614980276de5cacd
+de79529d0c 0.0s done
+#6 DONE 0.0s
+
+#7 [frontend 1/6] FROM docker.io/library/node:24-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e
+18fc08c9cbd605c
+#7 resolve docker.io/library/node:24-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd6
+05c 0.0s done
+#7 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 920.07kB 0.2s done
+#5 DONE 0.3s
+
+#8 [runtime  2/13] WORKDIR /opt/easel
+#8 CACHED
+
+#9 [frontend 3/6] COPY web/frontend/package.json web/frontend/package-lock.json ./
+#9 CACHED
+
+#10 [frontend 5/6] COPY web/frontend/ ./
+#10 CACHED
+
+#11 [frontend 2/6] WORKDIR /build
+#11 CACHED
+
+#12 [frontend 4/6] RUN npm ci
+#12 CACHED
+
+#13 [runtime  3/13] COPY pyproject.toml README.md ./
+#13 CACHED
+
+#14 [frontend 6/6] RUN npm run build
+#14 CACHED
+
+#15 [runtime  4/13] COPY easel ./easel
+#15 DONE 0.1s
+
+#16 [runtime  5/13] COPY skills/shared/scripts/model_registry.py ./skills/shared/scripts/model_registry.py
+#16 DONE 0.0s
+
+#17 [runtime  6/13] COPY deploy/desktop/keygen.py ./deploy/desktop/keygen.py
+#17 DONE 0.0s
+
+#18 [runtime  7/13] COPY deploy/desktop/initialize_state.py ./deploy/desktop/initialize_state.py
+#18 DONE 0.0s
+
+#19 [runtime  8/13] COPY deploy/desktop/read_stop_state.py ./deploy/desktop/read_stop_state.py
+#19 DONE 0.0s
+
+#20 [runtime  9/13] COPY deploy/desktop/provisioner_identity.py ./deploy/desktop/provisioner_identity.py
+#20 DONE 0.0s
+
+#21 [runtime 10/13] COPY deploy/multiuser/managed /opt/easel/managed
+#21 DONE 0.0s
+
+#22 [runtime 11/13] COPY deploy/multiuser/egress_proxy.py ./deploy/multiuser/egress_proxy.py
+#22 DONE 0.0s
+
+#23 [runtime 12/13] COPY --from=frontend /build/dist /opt/easel/web/frontend/dist
+#23 DONE 0.0s
+
+#24 [runtime 13/13] RUN pip install --no-cache-dir       "fastapi>=0.115,<1"       "uvicorn>=0.30,<1"       "httpx>=0.2
+7,<1"       "pydantic>=2.7,<3"       "cryptography>=42"  && groupadd --gid 10001 easel  && useradd --uid 10001 --gid 10
+001 --home-dir /home/easel             --create-home --shell /usr/sbin/nologin easel  && mkdir -p /srv/easel/control  &
+& chown 10001:10001 /srv/easel/control /home/easel  && chown -R root:root /opt/easel  && chmod -R a-w /opt/easel  && ch
+mod 0555 /opt/easel/deploy/desktop/keygen.py                     /opt/easel/deploy/desktop/initialize_state.py
+            /opt/easel/deploy/desktop/read_stop_state.py                     /opt/easel/deploy/desktop/provisioner_iden
+tity.py
+#24 1.800 Collecting fastapi<1,>=0.115
+#24 2.132   Downloading fastapi-0.162.0-py3-none-any.whl.metadata (26 kB)
+#24 2.366 Collecting uvicorn<1,>=0.30
+#24 2.487   Downloading uvicorn-0.54.0-py3-none-any.whl.metadata (6.6 kB)
+#24 2.630 Collecting httpx<1,>=0.27
+#24 2.750   Downloading httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+#24 3.081 Collecting pydantic<3,>=2.7
+#24 3.200   Downloading pydantic-2.14.2-py3-none-any.whl.metadata (137 kB)
+#24 3.317      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 137.6/137.6 kB 1.3 MB/s eta 0:00:00
+#24 3.683 Collecting cryptography>=42
+#24 3.804   Downloading cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl.metadata (4.4 kB)
+#24 3.963 Collecting starlette>=0.46.0 (from fastapi<1,>=0.115)
+#24 4.080   Downloading starlette-1.10.0-py3-none-any.whl.metadata (6.6 kB)
+#24 4.217 Collecting typing-extensions>=4.8.0 (from fastapi<1,>=0.115)
+#24 4.337   Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+#24 4.462 Collecting typing-inspection>=0.4.2 (from fastapi<1,>=0.115)
+#24 4.581   Downloading typing_inspection-0.4.4-py3-none-any.whl.metadata (2.6 kB)
+#24 4.707 Collecting annotated-doc>=0.0.2 (from fastapi<1,>=0.115)
+#24 4.829   Downloading annotated_doc-0.0.5-py3-none-any.whl.metadata (6.5 kB)
+#24 4.969 Collecting opentelemetry-api>=1.44.0 (from fastapi<1,>=0.115)
+#24 5.086   Downloading opentelemetry_api-1.45.2-py3-none-any.whl.metadata (1.4 kB)
+#24 5.220 Collecting click>=7.0 (from uvicorn<1,>=0.30)
+#24 5.343   Downloading click-8.5.0-py3-none-any.whl.metadata (2.6 kB)
+#24 5.468 Collecting h11>=0.8 (from uvicorn<1,>=0.30)
+#24 5.585   Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+#24 5.721 Collecting anyio (from httpx<1,>=0.27)
+#24 5.841   Downloading anyio-4.15.1-py3-none-any.whl.metadata (4.7 kB)
+#24 5.975 Collecting certifi (from httpx<1,>=0.27)
+#24 6.100   Downloading certifi-2026.10.23-py3-none-any.whl.metadata (2.5 kB)
+#24 6.230 Collecting httpcore==1.* (from httpx<1,>=0.27)
+#24 6.346   Downloading httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+#24 6.478 Collecting idna (from httpx<1,>=0.27)
+#24 6.603   Downloading idna-3.20-py3-none-any.whl.metadata (7.2 kB)
+#24 6.737 Collecting annotated-types>=0.6.0 (from pydantic<3,>=2.7)
+#24 6.867   Downloading annotated_types-0.8.0-py3-none-any.whl.metadata (15 kB)
+#24 7.605 Collecting pydantic-core==2.50.2 (from pydantic<3,>=2.7)
+#24 7.722   Downloading pydantic_core-2.50.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (6.5 k
+B)
+#24 7.918 Collecting cffi>=2.0.0 (from cryptography>=42)
+#24 8.034   Downloading cffi-2.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.5 kB)
+#24 8.164 Collecting pycparser (from cffi>=2.0.0->cryptography>=42)
+#24 8.283   Downloading pycparser-3.12-py3-none-any.whl.metadata (9.7 kB)
+#24 8.469 Downloading fastapi-0.162.0-py3-none-any.whl (148 kB)
+#24 8.523    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 148.9/148.9 kB 4.1 MB/s eta 0:00:00
+#24 8.644 Downloading uvicorn-0.54.0-py3-none-any.whl (87 kB)
+#24 8.662    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 87.4/87.4 kB 4.9 MB/s eta 0:00:00
+#24 8.783 Downloading httpx-0.28.1-py3-none-any.whl (73 kB)
+#24 8.799    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 73.5/73.5 kB 5.3 MB/s eta 0:00:00
+#24 8.916 Downloading httpcore-1.0.9-py3-none-any.whl (78 kB)
+#24 8.931    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 78.8/78.8 kB 5.4 MB/s eta 0:00:00
+#24 9.050 Downloading pydantic-2.14.2-py3-none-any.whl (490 kB)
+#24 9.155    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 490.4/490.4 kB 4.7 MB/s eta 0:00:00
+#24 9.270 Downloading pydantic_core-2.50.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (2.2 MB)
+#24 9.457    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.2/2.2 MB 12.1 MB/s eta 0:00:00
+#24 9.577 Downloading cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl (4.8 MB)
+#24 9.947    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.8/4.8 MB 12.9 MB/s eta 0:00:00
+#24 10.06 Downloading annotated_doc-0.0.5-py3-none-any.whl (5.3 kB)
+#24 10.18 Downloading annotated_types-0.8.0-py3-none-any.whl (13 kB)
+#24 10.30 Downloading cffi-2.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (217 kB)
+#24 10.31    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 217.8/217.8 kB 17.3 MB/s eta 0:00:00
+#24 10.42 Downloading click-8.5.0-py3-none-any.whl (125 kB)
+#24 10.43    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 125.3/125.3 kB 15.5 MB/s eta 0:00:00
+#24 10.55 Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+#24 10.67 Downloading opentelemetry_api-1.45.2-py3-none-any.whl (60 kB)
+#24 10.68    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 60.3/60.3 kB 16.8 MB/s eta 0:00:00
+#24 10.80 Downloading starlette-1.10.0-py3-none-any.whl (80 kB)
+#24 10.80    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 80.6/80.6 kB 21.9 MB/s eta 0:00:00
+#24 10.92 Downloading anyio-4.15.1-py3-none-any.whl (132 kB)
+#24 10.93    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 132.1/132.1 kB 16.8 MB/s eta 0:00:00
+#24 11.05 Downloading idna-3.20-py3-none-any.whl (69 kB)
+#24 11.06    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 69.6/69.6 kB 15.8 MB/s eta 0:00:00
+#24 11.17 Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+#24 11.18    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 45.6/45.6 kB 17.8 MB/s eta 0:00:00
+#24 11.30 Downloading typing_inspection-0.4.4-py3-none-any.whl (14 kB)
+#24 11.42 Downloading certifi-2026.10.23-py3-none-any.whl (135 kB)
+#24 11.43    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 135.1/135.1 kB 16.6 MB/s eta 0:00:00
+#24 11.55 Downloading pycparser-3.12-py3-none-any.whl (62 kB)
+#24 11.55    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 62.6/62.6 kB 15.5 MB/s eta 0:00:00
+#24 11.63 Installing collected packages: typing-extensions, pycparser, idna, h11, click, certifi, annotated-types, anno
+tated-doc, uvicorn, typing-inspection, pydantic-core, opentelemetry-api, httpcore, cffi, anyio, starlette, pydantic, ht
+tpx, cryptography, fastapi
+#24 12.59 Successfully installed annotated-doc-0.0.5 annotated-types-0.8.0 anyio-4.15.1 certifi-2026.10.23 cffi-2.1.1 c
+lick-8.5.0 cryptography-50.0.2 fastapi-0.162.0 h11-0.16.0 httpcore-1.0.9 httpx-0.28.1 idna-3.20 opentelemetry-api-1.45.
+2 pycparser-3.12 pydantic-2.14.2 pydantic-core-2.50.2 starlette-1.10.0 typing-extensions-4.16.0 typing-inspection-0.4.4
+ uvicorn-0.54.0
+#24 12.59 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the s
+ystem package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+#24 DONE 13.2s
+
+#25 exporting to image
+#25 exporting layers
+#25 exporting layers 1.2s done
+#25 exporting manifest sha256:97ccad4301ad7fd08d95899c565fb370a208617426051e993ddba635dfe8db0f 0.0s done
+#25 exporting config sha256:1f85d5fb91fee3b417da395e731658f631c03a37e12e11b0ee978ee51d9ac0ba 0.0s done
+#25 exporting attestation manifest sha256:a8e75fb17ae549aff3c505a97cd3965d44187f8609d8f614de7ce7975537138a 0.0s done
+#25 exporting manifest list sha256:3669a3accac4e869a17a1f3db633799f675ca9e469691116f0f6f778d1a2c7e0 0.0s done
+#25 naming to docker.io/library/easel-control:task5a-20261030 done
+#25 unpacking to docker.io/library/easel-control:task5a-20261030
+#25 unpacking to docker.io/library/easel-control:task5a-20261030 0.4s done
+#25 DONE 1.7s

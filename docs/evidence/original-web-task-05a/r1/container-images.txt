@@ -1,0 +1,3 @@
+[easel-control:task5a-20261030] sha256:3669a3accac4e869a17a1f3db633799f675ca9e469691116f0f6f778d1a2c7e0
+[easel-gateway:task5a-20261030] sha256:afaa29d093d93735ff08aaa9ee379978ff8b25ccf0b040c16162f910ef5d276f
+[easel-worker-execution:task5a-20261030] sha256:75426efd0ee0f12bdd71d17dae30c42b37d3eacac64dd40e5fde11f53043bace
