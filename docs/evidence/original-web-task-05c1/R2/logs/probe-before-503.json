@@ -1,0 +1,13 @@
+﻿{
+  "injected_503_count": 1,
+  "polls_at_failure": 1,
+  "polls_after_4_seconds": 1,
+  "backend_recovered_status": 200,
+  "backend_question_pending": false,
+  "backend_state": "awaiting_permission",
+  "visible_question_cards": 1,
+  "ui_still_pending": true,
+  "submit_still_disabled": true,
+  "executions": 1,
+  "temporary_directory_cleaned": true
+}

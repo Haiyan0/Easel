@@ -144,3 +144,9 @@ control/gateway/worker HTTP、真实 RunManager 与受控 ACP 执行器（夹具
 [`R1/README.md`](R1/README.md)；历史 `browser/01-06` 保留，R1 截图独立在
 `R1/browser/`。本轮 `tests/multiuser` 为 **1621 passed, 6 skipped**，
 5C1 浏览器为 **6/6**（含技能和画像权限题卡、画像停止）。
+
+## R2 返工（2026-10-30）
+
+技能状态查询一次临时 503 后停止轮询的问题已修复，证据见
+[`R2/README.md`](R2/README.md)。R2 5C1 浏览器为 **7/7**，新增
+`12-skill-status-recovered.png`，并保持 5B/5A/Task3/Task4 矩阵通过。
