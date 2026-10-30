@@ -1,0 +1,59 @@
+﻿docker.exe : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:1105
++ ... STEXITCODE; & docker build @proxyArgs -f tests/multiuser/Dockerfile.w ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+#1 [internal] load build definition from Dockerfile.worker-task5a
+#1 transferring dockerfile: 429B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-worker-execution:a4
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 DONE 0.0s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 resolve docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc
+61f4f24 0.0s done
+#5 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 65.39MB 5.0s
+#4 transferring context: 151.38MB 10.1s
+#4 transferring context: 224.02MB 15.1s
+#4 transferring context: 304.36MB 19.6s done
+#4 DONE 19.6s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 CACHED
+
+#6 [2/4] COPY easel /opt/easel/easel
+#6 DONE 0.3s
+
+#7 [3/4] COPY web /opt/easel/web
+#7 DONE 1.7s
+
+#8 [4/4] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#8 DONE 5.3s
+
+#9 exporting to image
+#9 exporting layers
+#9 exporting layers 8.1s done
+#9 exporting manifest sha256:5d8836222a243ec394d9e3c0ad6fb1eb44f72d043c3df0f006757119eeac6787 0.0s done
+#9 exporting config sha256:5b20932f6dbdb27d802e9117b97d3f5aa9f1512e960dda848524e2b809886288 0.0s done
+#9 exporting attestation manifest sha256:96a160378256934c6296198e3117bdc0b830b14eeb89b8684280d80ef5340196 0.0s done
+#9 exporting manifest list sha256:bf88660b6461a6e05ae284500875088bff0d11f046deaaaa9b2b36f884221f63 0.0s done
+#9 naming to docker.io/library/easel-worker-execution:task5b-20261030 done
+#9 unpacking to docker.io/library/easel-worker-execution:task5b-20261030
+#9 unpacking to docker.io/library/easel-worker-execution:task5b-20261030 3.2s done
+#9 DONE 11.4s
