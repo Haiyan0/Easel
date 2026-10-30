@@ -20,19 +20,70 @@ _FILE_ORDER = [
 ]
 
 
+def _safe_md_name(filename: object) -> bool:
+    return (
+        isinstance(filename, str)
+        and filename.endswith(".md")
+        and not filename.startswith(".")
+        and not any(character in filename for character in ("/", "\\"))
+        and not any(ord(character) < 32 for character in filename)
+    )
+
+
+def safe_profile_dir(name: str) -> Path | None:
+    """返回 profiles 根内的真实画像目录；目录链接/junction 一律拒绝。
+
+    只比较解析前路径与解析后路径，不用 ``parent`` 推断：这样指向根外的
+    junction、symlink 以及根内别名目录都不会被当成公开画像。
+    """
+    if not valid_persona_name(name):
+        return None
+    candidate = PROFILES_DIR / name
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved != candidate.absolute() or not resolved.is_dir():
+        return None
+    root = PROFILES_DIR.resolve()
+    if resolved.parent != root:
+        return None
+    return resolved
+
+
+def safe_profile_file(name: str, filename: object) -> Path | None:
+    """返回画像目录内真实 Markdown 文件；文件链接同样拒绝。"""
+    if not _safe_md_name(filename):
+        return None
+    assert isinstance(filename, str)
+    directory = safe_profile_dir(name)
+    if directory is None:
+        return None
+    candidate = directory / filename
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved != candidate.absolute() or not resolved.is_file():
+        return None
+    if resolved.parent != directory:
+        return None
+    return resolved
+
+
 def list_personas() -> list[str]:
     """列出所有可用画像目录名（排除下划线开头的内部目录）。"""
     if not PROFILES_DIR.is_dir():
         return []
     return sorted(
         d.name for d in PROFILES_DIR.iterdir()
-        if d.is_dir() and valid_persona_name(d.name)
+        if safe_profile_dir(d.name) is not None
     )
 
 
 def profile_exists(name: str) -> bool:
     """检查画像目录是否存在，拒绝把路径片段当作画像名。"""
-    return valid_persona_name(name) and (PROFILES_DIR / name).is_dir()
+    return safe_profile_dir(name) is not None
 
 
 def valid_persona_name(name: str) -> bool:
@@ -47,24 +98,25 @@ def valid_persona_name(name: str) -> bool:
 
 
 def load_profile_text(name: str) -> str:
-    """读取画像文件夹，按固定顺序拼接所有非空 .md。画像不存在返回空串。"""
-    if not valid_persona_name(name):
-        return ""
-    profile_dir = PROFILES_DIR / name
-    if not profile_dir.is_dir():
+    """读取画像文件夹，按固定顺序拼接所有非空 .md。画像不存在返回空串。
+
+    每个文件都重新经过 ``safe_profile_file``：目录链接越界后即使名字
+    合法，也不会读取根外内容。
+    """
+    profile_dir = safe_profile_dir(name)
+    if profile_dir is None:
         return ""
     parts: list[str] = []
-    for filename in _FILE_ORDER:
-        filepath = profile_dir / filename
-        if filepath.is_file():
-            text = filepath.read_text(encoding="utf-8").strip()
-            if text:
-                parts.append(text)
-    for filepath in sorted(profile_dir.glob("*.md")):
-        if filepath.name not in _FILE_ORDER:
-            text = filepath.read_text(encoding="utf-8").strip()
-            if text:
-                parts.append(text)
+    ordered = list(_FILE_ORDER) + sorted(
+        filepath.name for filepath in profile_dir.glob("*.md")
+        if filepath.name not in _FILE_ORDER)
+    for filename in ordered:
+        filepath = safe_profile_file(name, filename)
+        if filepath is None:
+            continue
+        text = filepath.read_text(encoding="utf-8").strip()
+        if text:
+            parts.append(text)
     return "\n\n---\n\n".join(parts)
 
 

@@ -451,6 +451,85 @@ def test_upload_batch_rejects_all_or_nothing(worker_fixture):
     assert not inbox.exists() or not any(inbox.rglob("good.txt"))
 
 
+def _link_directory(link: Path, target: Path) -> str | None:
+    """创建真实 junction/symlink；失败返回 None（不冒充已验证）。"""
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True)
+        return "junction" if result.returncode == 0 else None
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return None
+    return "symlink"
+
+
+def test_persona_links_cannot_read_or_mutate_outside_profiles(worker_fixture):
+    from easel import persona
+    from web import app as worker_app
+
+    private = worker_fixture.root_a / "private-state"
+    private.mkdir()
+    (private / "identity.md").write_text(
+        "PRIVATE-PERSONA-SENTINEL", encoding="utf-8")
+    link = worker_fixture.root_a / "profiles" / "外部画像"
+    kind = _link_directory(link, private)
+    if kind is None:
+        pytest.skip("当前环境不允许创建目录 junction/symlink")
+
+    worker_app.PROFILES_DIR = worker_fixture.root_a / "profiles"
+    persona.PROFILES_DIR = worker_app.PROFILES_DIR
+
+    names = [item["name"] for item in worker_app.list_personas()]
+    assert "外部画像" not in names
+    with pytest.raises(worker_app.HTTPException) as detail_error:
+        asyncio.run(worker_app.api_persona("外部画像"))
+    assert detail_error.value.status_code == 404
+    with pytest.raises(worker_app.HTTPException) as files_error:
+        asyncio.run(worker_app.api_persona_files("外部画像"))
+    assert files_error.value.status_code == 404
+
+    save_error = None
+    try:
+        asyncio.run(worker_app.api_persona_file_save(
+            "外部画像",
+            worker_app.PersonaFileRequest(
+                filename="identity.md", content="overwrite")))
+    except worker_app.HTTPException as error:
+        save_error = error
+    assert save_error is not None and save_error.status_code == 404
+    assert (private / "identity.md").read_text(
+        encoding="utf-8") == "PRIVATE-PERSONA-SENTINEL"
+
+    delete_error = None
+    try:
+        asyncio.run(worker_app.api_persona_delete("外部画像"))
+    except worker_app.HTTPException as error:
+        delete_error = error
+    assert delete_error is not None and delete_error.status_code == 404
+    assert (private / "identity.md").exists()
+
+    # 文件 symlink 在 Windows 可能无权限；能创建时必须同样拒绝。
+    normal = worker_fixture.root_a / "profiles" / "同名画像"
+    file_link = normal / "style.md"
+    if file_link.exists() or file_link.is_symlink():
+        file_link.unlink()
+    try:
+        file_link.symlink_to(private / "identity.md")
+    except OSError as error:
+        file_kind = f"NOT_RUN:{getattr(error, 'winerror', error.errno)}"
+    else:
+        file_kind = "symlink"
+        detail = asyncio.run(worker_app.api_persona("同名画像"))
+        files = asyncio.run(worker_app.api_persona_files("同名画像"))
+        assert "PRIVATE-PERSONA-SENTINEL" not in detail["content"]
+        assert all(
+            "PRIVATE-PERSONA-SENTINEL" not in item["content"]
+            for item in files["files"])
+    assert file_kind.startswith(("symlink", "NOT_RUN:"))
+
+
 def test_path_helpers_reject_traversal_absolute_and_internal():
     for bad in ("../x", "/abs", "a/../b", "a//b", "a\\b", "_login/x",
                 "analytics/x", ".easel.json", "a\x00b"):

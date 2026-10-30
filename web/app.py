@@ -46,7 +46,8 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
 from easel.gateway_endpoint import chat_completions_url, healthz_url, port_source
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
-                           profile_exists, valid_persona_name, _FILE_ORDER)
+                           profile_exists, safe_profile_dir, safe_profile_file,
+                           valid_persona_name, _FILE_ORDER)
 from easel import persona as _persona_module
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from easel.manual_publish import build_package, publishing_mode
@@ -902,11 +903,11 @@ def list_personas() -> list[dict]:
         return []
     result = []
     for d in sorted(PROFILES_DIR.iterdir()):
-        if not d.is_dir() or not valid_persona_name(d.name):
+        if safe_profile_dir(d.name) is None:
             continue
         desc = ''
-        identity = d / 'identity.md'
-        if identity.is_file():
+        identity = safe_profile_file(d.name, 'identity.md')
+        if identity is not None:
             for line in identity.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith('#') and not line.startswith('<!--'):
@@ -1791,29 +1792,47 @@ def _valid_persona_name(name: str) -> bool:
 
 
 def _persona_file_path(name: str, filename: str) -> Path:
-    """校验画像名/文件名，返回 profiles/<name>/<filename> 的安全路径。"""
+    """校验画像名/文件名，返回真实画像目录内的安全写入路径。"""
     if not _valid_persona_name(name):
         raise HTTPException(400, "画像名非法")
-    if not filename.endswith(".md") or "/" in filename or "\\" in filename or filename.startswith("."):
+    if (not filename.endswith(".md") or "/" in filename
+            or "\\" in filename or filename.startswith(".")):
         raise HTTPException(400, "文件名非法")
-    pd = (PROFILES_DIR / name).resolve()
-    fp = (pd / filename).resolve()
-    if pd != fp.parent or PROFILES_DIR.resolve() not in pd.parents:
+    pd = safe_profile_dir(name)
+    if pd is None:
+        raise HTTPException(404, "画像不存在")
+    fp = pd / filename
+    if fp.is_symlink():
         raise HTTPException(403, "非法路径")
+    if fp.exists():
+        safe = safe_profile_file(name, filename)
+        if safe is None:
+            raise HTTPException(403, "非法路径")
+        return safe
     return fp
 
 
 @app.get("/api/persona/{name}/files")
 async def api_persona_files(name: str):
-    """返回画像六维文件原文（按固定顺序 + 其余 .md），供在线编辑。"""
-    if not profile_exists(name):
+    """返回画像六维文件原文（按固定顺序 + 其余 .md），供在线编辑。
+
+    目录链接越界的画像在 ``safe_profile_dir`` 处即被拒绝；单个文件链接
+    由 ``safe_profile_file`` 拒绝，不会把根外 sentinel 当作画像内容。
+    """
+    pd = safe_profile_dir(name)
+    if pd is None:
         raise HTTPException(404, "画像不存在")
-    pd = PROFILES_DIR / name
-    ordered = list(_FILE_ORDER) + sorted(f.name for f in pd.glob("*.md") if f.name not in _FILE_ORDER)
+    ordered = list(_FILE_ORDER) + sorted(
+        f.name for f in pd.glob("*.md")
+        if f.name not in _FILE_ORDER
+        and safe_profile_file(name, f.name) is not None)
     files = []
     for fn in ordered:
-        fp = pd / fn
-        files.append({"filename": fn, "content": fp.read_text(encoding="utf-8") if fp.is_file() else ""})
+        fp = safe_profile_file(name, fn)
+        files.append({
+            "filename": fn,
+            "content": fp.read_text(encoding="utf-8") if fp is not None else "",
+        })
     return {"name": name, "files": files}
 
 
@@ -1828,7 +1847,7 @@ async def api_persona_file_save(name: str, req: PersonaFileRequest):
     if not profile_exists(name):
         raise HTTPException(404, "画像不存在")
     fp = _persona_file_path(name, req.filename)
-    tmp = fp.with_suffix(".md.tmp")
+    tmp = fp.parent / f".{req.filename}.{uuid.uuid4().hex}.tmp"
     tmp.write_text(req.content, encoding="utf-8")
     tmp.replace(fp)
     return {"ok": True, "filename": req.filename}
@@ -1839,8 +1858,8 @@ async def api_persona_delete(name: str):
     """删除整个画像目录。"""
     if not _valid_persona_name(name):
         raise HTTPException(400, "画像名非法")
-    pd = (PROFILES_DIR / name).resolve()
-    if PROFILES_DIR.resolve() not in pd.parents or not pd.is_dir():
+    pd = safe_profile_dir(name)
+    if pd is None:
         raise HTTPException(404, "画像不存在")
     import shutil
     shutil.rmtree(pd)

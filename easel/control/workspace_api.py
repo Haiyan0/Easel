@@ -122,7 +122,9 @@ class WorkspaceApi:
         self._runtime = runtime
         self._store = store
         self._gateway = gateway
-        self._default_revision = int(revision)
+        if type(revision) is not int or revision < 0:
+            raise ValueError("revision must be a non-negative int")
+        self._default_revision = revision
         self._db_runner = db_runner
         self._gateway_required = bool(gateway_required)
         self._request_lease_ttl = int(request_lease_ttl)
@@ -134,11 +136,16 @@ class WorkspaceApi:
         return await self._db_runner(function, *args)
 
     async def _revision(self, workspace_id: str) -> int:
+        """确认 workspace 真实存在，并返回受管配置的信任 revision。
+
+        聊天 Run 的 config 快照与 worker/gateway audience 都来自同一份
+        受管配置；workspaces.config_version 只是创建时的默认字段，不能
+        作为文件 API 的版本来源，否则会与聊天实例的版本来回切换。
+        """
         versions = await self._db(self._store.workspace_config_versions)
-        revision = versions.get(workspace_id)
-        if type(revision) is not int or revision < 0:
+        if workspace_id not in versions:
             raise DomainError("workspace_unavailable", 404)
-        return revision
+        return self._default_revision
 
     def _require_gateway(self) -> GatewayClient:
         if self._gateway is None or self._runtime is None:

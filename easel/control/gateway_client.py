@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -51,11 +52,14 @@ def _retry_after(response: httpx.Response) -> int | None:
     return number
 
 
-def _gateway_error(response: httpx.Response) -> str:
-    """只读取有界的错误码；不把响应正文或底层异常带出本模块。"""
+_ERROR_BODY_LIMIT = 64 * 1024
+
+
+def _parse_gateway_error(raw: bytes) -> str:
+    """只接受 gateway_ 前缀的稳定错误码；不把正文或异常带出本模块。"""
     try:
-        payload = response.json()
-    except ValueError:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
         return ""
     if not isinstance(payload, dict):
         return ""
@@ -67,6 +71,50 @@ def _gateway_error(response: httpx.Response) -> str:
                         or character == "_") for character in value)):
         return ""
     return value
+
+
+async def _read_gateway_error(response: httpx.Response) -> str:
+    """有界读取错误正文；流未消费时绝不能直接 ``response.json()``。"""
+    if response.is_stream_consumed:
+        raw = response.content
+        if len(raw) > _ERROR_BODY_LIMIT:
+            return ""
+        return _parse_gateway_error(raw)
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > _ERROR_BODY_LIMIT:
+                # 停止读取，由 finally 关闭连接丢弃剩余内容。
+                return ""
+            chunks.append(chunk)
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        return ""
+    return _parse_gateway_error(b"".join(chunks))
+
+
+def _retrieve_task(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+async def _close_response(response: httpx.Response) -> None:
+    """关闭错误响应；取消路径也不把底层连接留给 TTL/GC。"""
+    task = asyncio.create_task(response.aclose())
+    task.add_done_callback(_retrieve_task)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # cleanup 任务继续执行；调用方会把取消继续抛给 lease 释放路径。
+        raise
+    except Exception:
+        # 关闭失败不能掩盖稳定的 HTTP 错误语义；连接由底层池丢弃。
+        pass
 
 
 def _serialize_payload(payload: object) -> bytes:
@@ -285,8 +333,15 @@ class GatewayClient:
                                 status_mode: str = "relay") -> None:
         status = response.status_code
         retry_after = _retry_after(response)
-        gateway_error = _gateway_error(response)
-        await response.aclose()
+        gateway_error = ""
+        try:
+            # relay 的 401/403/503 仍需正文里的 gateway_* 码区分实例故障；
+            # stream=True 时先有界读取。workspace 业务错误只按状态映射，
+            # 不读取 worker 正文。
+            if status_mode == "relay" and status in (401, 403, 503):
+                gateway_error = await _read_gateway_error(response)
+        finally:
+            await _close_response(response)
         if status_mode == "workspace":
             # worker 业务错误保留可操作的状态语义；不把文件/上传失败伪装成
             # gateway 故障，也不回显 worker 的原始 detail。

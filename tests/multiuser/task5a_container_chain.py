@@ -331,6 +331,15 @@ def main() -> int:
             assert ranged.headers["cache-control"].startswith("private")
             assert ranged.headers["etag"].startswith('"easel-')
 
+            missing_media = client.get(
+                "/api/media/" + quote("项目/不存在.png", safe=""),
+                headers=headers)
+            assert missing_media.status_code == 404, missing_media.text
+            assert missing_media.json()["code"] == "not_found"
+            after_missing = client.get(media, headers={
+                **headers, "Range": "bytes=0-9"})
+            assert after_missing.status_code == 206, after_missing.text
+
             upload = client.post(
                 "/api/upload",
                 files={"files": ("附件.txt", b"container-attachment", "text/plain")},
@@ -374,7 +383,8 @@ def main() -> int:
         })
         print("CONTAINER_CHECK", {
             "status": True, "personas": True, "outputs": True, "text": True,
-            "media_head_range": True, "upload": True, "persona_write": True,
+            "media_head_range": True, "media_404_typed": True,
+            "upload": True, "persona_write": True,
             "delete": True, "anonymous_401": True,
         })
         print("TASK5A_CONTAINER_OK", True)
