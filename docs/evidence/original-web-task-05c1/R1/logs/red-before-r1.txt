@@ -1,0 +1,500 @@
+﻿FFFFFFFF                                                                 [100%]
+================================== FAILURES ===================================
+_________ test_skill_and_profile_signed_agent_use_issued_route_model __________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_skill_and_profile_signed_0')
+
+    def test_skill_and_profile_signed_agent_use_issued_route_model(tmp_path):
+        """新受管任务不能把静态 deepseek-chat 签进快照而 token 路由是 flash。"""
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            admin = store.create_user("Owner", "admin")
+            member = store.create_user("Member")
+            config = ConfigService(store, MASTER_KEY, model_catalog=CATALOG)
+            publish_chat(config, admin, "deepseek-flash")
+            broker = BrokerService(store, config, clock=lambda: 1000.0)
+            capture = DispatchCapture()
+            key = Ed25519PrivateKey.generate()
+    
+            async def scenario():
+                async with httpx.AsyncClient(
+                        transport=capture, trust_env=False) as client:
+                    factory = build_relay_factory(
+                        signing_key=key, revision=REVISION,
+                        agent={**make_agent(), "model": "deepseek-chat"},
+                        broker_config={
+                            "mode": "workspace-sidecar", "channel": "chat"},
+                        gateway_required=False)
+                    relay = factory(
+                        StaticRuntime(), SessionService(store), AuthService(store),
+                        store, client, broker, None)
+                    results = []
+                    for task_type in ("skill", "profile"):
+                        conversation = store.create_conversation(
+                            member, f"{task_type} 模型")
+                        admitted = await relay.submit_task(member, task_type, {
+                            "sessionId": conversation.id,
+                            "turnId": f"turn-{task_type}",
+                            "message": f"fixture {task_type}",
+                        })
+                        results.append((task_type, admitted, conversation.id))
+                    # 配置发布后同一 turn 重试仍应命中原 Run/原快照，不重新签发。
+                    config.publish(
+                        admin,
+                        {"defaults": {"chat": chat_route(
+                            "deepseek-v4-pro", ("deepseek-v4-pro",))}},
+                        expected_version=1)
+                    duplicate = await relay.submit_task(member, "skill", {
+                        "sessionId": results[0][2],
+                        "turnId": "turn-skill",
+                        "message": "fixture skill",
+                    })
+                    assert duplicate["duplicate"] is True
+                    assert duplicate["runId"] == results[0][1]["runId"]
+                    return results
+    
+            results = asyncio.run(scenario())
+            assert len(capture.posts) == 2
+            for task_type, admitted, _conversation_id in results:
+                envelope = capture.posts[
+                    [item[0] for item in results].index(task_type)]["body"][
+                        "envelope"]
+                route = broker.authorize(
+                    envelope["routes"]["broker_token"], member.workspace_id,
+                    admitted["runId"], "chat")
+                assert envelope["task_type"] == task_type
+>               assert envelope["agent"]["model"] == route.model == "deepseek-flash"
+E               AssertionError: assert 'deepseek-chat' == 'deepseek-flash'
+E                 
+E                 - deepseek-flash
+E                 + deepseek-chat
+
+tests\multiuser\test_task5c1_r1.py:197: AssertionError
+_______ test_skill_and_profile_question_status_exposes_permission_card ________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_skill_and_profile_questio0')
+
+    def test_skill_and_profile_question_status_exposes_permission_card(tmp_path):
+        """等待授权不能被折叠成 running；status 必须带可回答的题卡。"""
+        workspace = FakeWorkspace()
+        store = Store.connect(tmp_path / "control.sqlite3")
+        admin = store.create_user("Owner", "admin")
+        member = store.create_user("Member")
+        auth = AuthService(store)
+        relay = QuestionRelay(store, finish=False)
+        app = create_app(
+            store=store, auth=auth,
+            config=ControlConfig(public_origin=ORIGIN),
+            workspace_api=workspace,
+            relay_factory=lambda *args: relay)
+        try:
+            with TestClient(app, base_url=ORIGIN) as client:
+                _body, headers = _login(client, auth, admin, member)
+                skill = client.post(
+                    "/api/skill",
+                    json={"skill": "demo", "input": "需要授权", "turnId": "q-skill"},
+                    headers=headers)
+                assert skill.status_code == 202, skill.text
+                profile = client.post(
+                    "/api/profile/build",
+                    json={"name": "问题画像", "form": {"direction": "方向"},
+                          "turnId": "q-profile"},
+                    headers=headers)
+                assert profile.status_code == 200, profile.text
+                skill_status = client.get("/api/skill/status/demo")
+                profile_status = client.get("/api/profile/build/status/问题画像")
+                for status in (skill_status, profile_status):
+                    assert status.status_code == 200, status.text
+                    payload = status.json()
+>                   assert payload["state"] == "awaiting_permission"
+E                   AssertionError: assert 'running' == 'awaiting_permission'
+E                     
+E                     - awaiting_permission
+E                     + running
+
+tests\multiuser\test_task5c1_r1.py:234: AssertionError
+_________ test_question_status_failure_keeps_card_but_disables_submit _________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_question_status_failure_k0')
+
+    def test_question_status_failure_keeps_card_but_disables_submit(tmp_path):
+        """问答状态查询 503 时保留题卡，标记待确认，不能自动允许。"""
+        workspace = FakeWorkspace()
+        store = Store.connect(tmp_path / "control.sqlite3")
+        admin = store.create_user("Owner", "admin")
+        member = store.create_user("Member")
+        auth = AuthService(store)
+        relay = UnconfirmedQuestionRelay(store, finish=False)
+        app = create_app(
+            store=store, auth=auth,
+            config=ControlConfig(public_origin=ORIGIN),
+            workspace_api=workspace,
+            relay_factory=lambda *args: relay)
+        try:
+            with TestClient(app, base_url=ORIGIN) as client:
+                _body, headers = _login(client, auth, admin, member)
+                submitted = client.post(
+                    "/api/skill",
+                    json={"skill": "demo", "input": "待确认", "turnId": "unknown-q"},
+                    headers=headers)
+                assert submitted.status_code == 202, submitted.text
+                status = client.get("/api/skill/status/demo")
+                assert status.status_code == 200, status.text
+                payload = status.json()
+>               assert payload["state"] == "awaiting_permission"
+E               AssertionError: assert 'running' == 'awaiting_permission'
+E                 
+E                 - awaiting_permission
+E                 + running
+
+tests\multiuser\test_task5c1_r1.py:267: AssertionError
+_______ test_profile_prompt_contains_builder_directive_and_fixed_target _______
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_profile_prompt_contains_b0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002537AFCF7C0>
+
+    def test_profile_prompt_contains_builder_directive_and_fixed_target(
+            tmp_path, monkeypatch):
+        prompt = _profile_prompt_from_relay(tmp_path, monkeypatch)
+>       assert "/skill-profile-builder" in prompt
+E       AssertionError: assert '/skill-profile-builder' in '画像名：意图画像\n运营平台：（未填）\n起号状态：（未填）\n社媒主页链接：\n  （未提供）\n想做的方向：做数码内容\n为什么做/我的优势：（未填）\n运营目标：（未填）\n想产出的形式：（未填）\n喜欢看的内容/对标账号：（未填）\n期望调性：（未填）\n不做的内容/红线：（未填）\n'
+
+tests\multiuser\test_task5c1_r1.py:277: AssertionError
+_____ test_profile_preparation_blocks_delete_and_releases_after_admission _____
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_profile_preparation_block0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002537AF8FFD0>
+
+    def test_profile_preparation_blocks_delete_and_releases_after_admission(
+            tmp_path, monkeypatch):
+        profiles = tmp_path / "profiles"
+        profiles.mkdir()
+        monkeypatch.setattr(worker, "PROFILES_DIR", profiles)
+        monkeypatch.setattr(persona, "PROFILES_DIR", profiles)
+        workspace = GatedWorkspace()
+        store, auth, admin, member, relay, app = _app_with_tasks(
+            tmp_path, workspace)
+        holder: dict[str, object] = {}
+        thread = None
+        try:
+            with TestClient(app, base_url=ORIGIN) as client:
+                _body, headers = _login(client, auth, admin, member)
+    
+                def submit():
+                    holder["response"] = client.post(
+                        "/api/profile/build",
+                        json={"name": "准备期画像", "form": {"direction": "方向"},
+                              "turnId": "race-turn"},
+                        headers=headers)
+    
+                def delete():
+                    holder["deleted"] = client.delete(
+                        "/api/persona/准备期画像", headers=headers)
+    
+                thread = threading.Thread(target=submit)
+                thread.start()
+                assert workspace.ready.wait(5)
+                deleter = threading.Thread(target=delete)
+                deleter.start()
+                # 基线已完成但 Run 尚未接纳；并发删除必须明确 busy，不能
+                # 等到构建结束再自行删除。
+                workspace.release.wait(0.2)
+                deleted = holder.get("deleted")
+                if deleted is None:
+                    workspace.release.set()
+                deleter.join(10)
+                assert not deleter.is_alive()
+                deleted = holder["deleted"]
+>               assert deleted.status_code == 409, deleted.text
+E               AssertionError: {"ok":true,"deleted":"profile"}
+E               assert 200 == 409
+E                +  where 200 = <Response [200 OK]>.status_code
+
+tests\multiuser\test_task5c1_r1.py:326: AssertionError
+___________ test_same_name_concurrent_build_is_busy_while_preparing ___________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_same_name_concurrent_buil0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002537AEA6320>
+
+    def test_same_name_concurrent_build_is_busy_while_preparing(
+            tmp_path, monkeypatch):
+        profiles = tmp_path / "profiles"
+        profiles.mkdir()
+        monkeypatch.setattr(worker, "PROFILES_DIR", profiles)
+        monkeypatch.setattr(persona, "PROFILES_DIR", profiles)
+        workspace = GatedWorkspace()
+        store, auth, admin, member, relay, app = _app_with_tasks(
+            tmp_path, workspace)
+        holder: dict[str, object] = {}
+        first_thread = None
+        second_thread = None
+        try:
+            with TestClient(app, base_url=ORIGIN) as client:
+                _body, headers = _login(client, auth, admin, member)
+    
+                def first():
+                    holder["first"] = client.post(
+                        "/api/profile/build",
+                        json={"name": "并发同名画像",
+                              "form": {"direction": "方向"},
+                              "turnId": "same-name-1"},
+                        headers=headers)
+    
+                def second():
+                    holder["second"] = client.post(
+                        "/api/profile/build",
+                        json={"name": "并发同名画像",
+                              "form": {"direction": "方向"},
+                              "turnId": "same-name-2"},
+                        headers=headers)
+    
+                first_thread = threading.Thread(target=first)
+                first_thread.start()
+                assert workspace.ready.wait(5)
+                second_thread = threading.Thread(target=second)
+                second_thread.start()
+                second_thread.join(2)
+                if second_thread.is_alive():
+                    workspace.release.set()
+                    second_thread.join(10)
+                workspace.release.set()
+                first_thread.join(10)
+                assert not first_thread.is_alive()
+                second = holder.get("second")
+                assert second is not None and second.status_code == 409, second
+>               assert second.json()["code"] == "profile_busy"
+E               AssertionError: assert 'profile_exists' == 'profile_busy'
+E                 
+E                 - profile_busy
+E                 + profile_exists
+
+tests\multiuser\test_task5c1_r1.py:396: AssertionError
+__________ test_same_turn_profile_retry_does_not_dispatch_second_run __________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_same_turn_profile_retry_d0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002537C3AE740>
+
+    def test_same_turn_profile_retry_does_not_dispatch_second_run(
+            tmp_path, monkeypatch):
+        profiles = tmp_path / "profiles"
+        profiles.mkdir()
+        monkeypatch.setattr(worker, "PROFILES_DIR", profiles)
+        monkeypatch.setattr(persona, "PROFILES_DIR", profiles)
+        with Store.open(tmp_path / "retry.sqlite3") as store:
+            actor = store.create_user("RetryOwner")
+            relay = IdempotentRelay(store)
+            workspace = ReusingWorkspace()
+            tasks = WorkspaceTasks(
+                store, SessionService(store), relay, workspace)
+            first = asyncio.run(tasks.build_profile(actor, {
+                "name": "重试画像", "form": {"direction": "方向"},
+                "turnId": "same-turn",
+            }))
+>           second = asyncio.run(tasks.build_profile(actor, {
+                "name": "重试画像", "form": {"direction": "方向"},
+                "turnId": "same-turn",
+            }))
+
+tests\multiuser\test_task5c1_r1.py:457: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <easel.control.workspace_tasks.WorkspaceTasks object at 0x000002537C3AD4E0>
+actor = Identity(user_id='cdb69536aea84aba9bcfc1356a0d85c4', workspace_id='11bce13019f6460f963e4adad23900c0', role='member')
+payload = {'name': '重试画像', 'form': {'direction': '方向'}, 'turnId': 'same-turn'}
+
+    async def build_profile(self, actor: Identity, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise DomainError("invalid_argument", 400)
+        if set(payload) - {"name", "form", "turnId"}:
+            raise DomainError("invalid_argument", 400)
+        name = payload.get("name")
+        if (not isinstance(name, str) or not name or name != name.strip()
+                or len(name) > 200):
+            raise DomainError("invalid_argument", 400)
+        from ..persona import valid_persona_name
+        if not valid_persona_name(name):
+            raise DomainError("invalid_argument", 400)
+        form = payload.get("form")
+        if form is None:
+            form = {}
+        if not isinstance(form, dict):
+            raise DomainError("invalid_argument", 400)
+        try:
+            import json
+            encoded = json.dumps(
+                form, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8")
+        except (TypeError, ValueError):
+            raise DomainError("invalid_argument", 400) from None
+        if len(encoded) > _MAX_PAYLOAD:
+            raise DomainError("payload_too_large", 413)
+        turn_id = payload.get("turnId")
+        if turn_id is not None:
+            turn_id = _text(turn_id, _MAX_TURN)
+    
+        prepared = await self._worker_json(
+            actor, "/api/profile/baseline",
+            {"name": name, "form": form, "reuse": True})
+        created = prepared.get("created") is True
+        instruction = prepared.get("instruction")
+        if not isinstance(instruction, str) or not instruction:
+            raise DomainError("upstream_invalid", 502)
+    
+        conversation = await self._db(
+            self._store.get_task_conversation, actor, f"profile:{name}")
+        if not created:
+            if conversation is None:
+                raise DomainError("profile_exists", 409)
+            latest = await self._latest_run(actor, conversation.id)
+            if latest is not None:
+                if (turn_id is None
+>                       or latest.client_request_id != turn_id):
+E                       AttributeError: 'RunRecord' object has no attribute 'client_request_id'
+
+easel\control\workspace_tasks.py:259: AttributeError
+______ test_profile_admission_failure_releases_claim_but_keeps_baseline _______
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4047/test_profile_admission_failure0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002537C35DEA0>
+
+    def test_profile_admission_failure_releases_claim_but_keeps_baseline(
+            tmp_path, monkeypatch):
+        profiles = tmp_path / "profiles"
+        profiles.mkdir()
+        monkeypatch.setattr(worker, "PROFILES_DIR", profiles)
+        monkeypatch.setattr(persona, "PROFILES_DIR", profiles)
+    
+        class RealBaseline:
+            async def request(self, actor, method, path, *, payload, **kwargs):
+                result = await worker.api_profile_baseline(
+                    worker.ProfileBaselineRequest(**payload))
+                return httpx.Response(200, json=result)
+    
+        with Store.open(tmp_path / "failure.sqlite3") as store:
+            actor = store.create_user("FailureOwner")
+            tasks = WorkspaceTasks(
+                store, SessionService(store), BrokenRelay(store), RealBaseline())
+            result = asyncio.run(tasks.build_profile(actor, {
+                "name": "失败画像", "form": {"direction": "方向"},
+                "turnId": "failed-turn",
+            }))
+            assert result["created"] is True
+            assert result["status"] == "failed"
+            assert (profiles / "失败画像" / "identity.md").is_file()
+            # 接纳失败必须释放准备声明；同名新请求不能永久 busy。
+>           assert tasks.claim_profile(actor, "失败画像") is True
+E           AttributeError: 'WorkspaceTasks' object has no attribute 'claim_profile'
+
+tests\multiuser\test_task5c1_r1.py:491: AttributeError
+============================== warnings summary ===============================
+tests/multiuser/test_task5c1_r1.py::test_profile_preparation_blocks_delete_and_releases_after_admission
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-4 (submit)
+  
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\tests\multiuser\test_task5c1_r1.py", line 302, in submit
+      holder["response"] = client.post(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py", line 556, in post
+      return super().post(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 1204, in post
+      return self.request(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py", line 455, in request
+      return super().request(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 797, in request
+      return self.send(request, auth=auth, follow_redirects=follow_redirects)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 980, in send
+      response = self._send_handling_auth(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 1008, in _send_handling_auth
+      response = self._send_handling_redirects(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 1043, in _send_handling_redirects
+      response = self._send_single_request(request)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py", line 1076, in _send_single_request
+      response = transport.handle_request(request)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py", line 354, in handle_request
+      raise exc
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py", line 351, in handle_request
+      portal.call(self.app, scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py", line 334, in call
+      return cast(T_Retval, self.start_task_soon(func, *args).result())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py", line 458, in result
+      return self.__get_result()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py", line 403, in __get_result
+      raise self._exception
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py", line 259, in _call_func
+      retval = await retval_or_awaitable
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\applications.py", line 1159, in __call__
+      await super().__call__(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\applications.py", line 96, in __call__
+      await self.middleware_stack(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
+      raise exc
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
+      await self.app(scope, receive, _send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py", line 193, in __call__
+      response = await self.dispatch_func(request, call_next)
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\easel\control\app.py", line 870, in control_guard
+      response = await _guard_request(request, call_next)
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\easel\control\app.py", line 719, in _guard_request
+      return await call_next(request)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py", line 168, in call_next
+      raise app_exc from app_exc.__cause__ or app_exc.__context__
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py", line 144, in coro
+      await self.app(scope, receive_or_disconnect, send_no_error)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
+      await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+      raise exc
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+      await app(scope, receive, sender)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\middleware\asyncexitstack.py", line 18, in __call__
+      await self.app(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py", line 670, in __call__
+      await self.middleware_stack(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py", line 690, in app
+      await route.handle(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py", line 280, in handle
+      await self.app(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\routing.py", line 134, in app
+      await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+      raise exc
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+      await app(scope, receive, sender)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\routing.py", line 120, in app
+      response = await f(request)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\routing.py", line 674, in app
+      raw_response = await run_endpoint_function(
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\routing.py", line 328, in run_endpoint_function
+      return await dependant.call(**values)
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\easel\control\app.py", line 1164, in workspace_profile_build
+      result = await service.build_profile(
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\easel\control\workspace_tasks.py", line 243, in build_profile
+      prepared = await self._worker_json(
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\easel\control\workspace_tasks.py", line 76, in _worker_json
+      response = await self._require_api().request(
+    File "C:\Users\hyh\AppData\Local\Temp\easel-r1-red-a2c05d91d2994c23964b623dc1d878c5\tests\multiuser\test_task5c1_r1.py", line 52, in request
+      raise AssertionError("baseline gate timed out")
+  AssertionError: baseline gate timed out
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_task5c1_r1.py::test_skill_and_profile_signed_agent_use_issued_route_model
+FAILED tests/multiuser/test_task5c1_r1.py::test_skill_and_profile_question_status_exposes_permission_card
+FAILED tests/multiuser/test_task5c1_r1.py::test_question_status_failure_keeps_card_but_disables_submit
+FAILED tests/multiuser/test_task5c1_r1.py::test_profile_prompt_contains_builder_directive_and_fixed_target
+FAILED tests/multiuser/test_task5c1_r1.py::test_profile_preparation_blocks_delete_and_releases_after_admission
+FAILED tests/multiuser/test_task5c1_r1.py::test_same_name_concurrent_build_is_busy_while_preparing
+FAILED tests/multiuser/test_task5c1_r1.py::test_same_turn_profile_retry_does_not_dispatch_second_run
+FAILED tests/multiuser/test_task5c1_r1.py::test_profile_admission_failure_releases_claim_but_keeps_baseline
+8 failed, 1 warning in 10.74s

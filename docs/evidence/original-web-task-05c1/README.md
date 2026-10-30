@@ -137,3 +137,10 @@ control/gateway/worker HTTP、真实 RunManager 与受控 ACP 执行器（夹具
   `test_gateway_workspace.py`、`test_task_leases.py`、
   `tests/frontend/workspaceData.test.mjs`
 - 更新 Task 3/5A 浏览器中对“技能暂未接通/画像新建禁用”的过期断言
+
+## R1 返工（2026-10-30）
+
+首轮复审四项 P2 的修复、红绿测试、探针、浏览器和增量容器证据见
+[`R1/README.md`](R1/README.md)；历史 `browser/01-06` 保留，R1 截图独立在
+`R1/browser/`。本轮 `tests/multiuser` 为 **1621 passed, 6 skipped**，
+5C1 浏览器为 **6/6**（含技能和画像权限题卡、画像停止）。
