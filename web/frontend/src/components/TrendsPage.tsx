@@ -129,7 +129,9 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
               <span className="trend-count">{g.items.length}</span>
               {g.stale && (
                 <span className="trend-count" style={{ color: 'var(--red)' }}
-                  title="本次刷新失败，显示旧缓存">旧数据</span>
+                  title="本次刷新失败，显示旧缓存">
+                  旧数据{g.cached_at ? ` ${new Date(g.cached_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` : ''}
+                </span>
               )}
             </div>
             <div className="trend-list">
