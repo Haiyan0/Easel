@@ -1,0 +1,10 @@
+{
+  "source": "web/frontend/src/components/TrendsPage.tsx",
+  "fixture": "过期一小时缓存的返回形状：旧条目 + ok=true + updated=本次请求时间",
+  "hasOldItem": true,
+  "updateLabel": "",
+  "expectedTime": "14:37",
+  "hasFailureOrStale": true,
+  "rendered": " 热点雷达多平台实时热搜，挑值得蹭的选题，一键交给 AI 做成你的内容。 · 刷新失败，显示缓存 13:37 刷新微博抖音知乎B站百度头条微博1旧数据1ONE-HOUR-OLD-SENTINEL1做内容",
+  "misleadingFreshness": false
+}

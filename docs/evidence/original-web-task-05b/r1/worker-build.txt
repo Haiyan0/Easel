@@ -1,0 +1,52 @@
+docker.exe : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:987
++ ... STEXITCODE; & docker build @proxyArgs -f tests/multiuser/Dockerfile.w ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+#1 [internal] load build definition from Dockerfile.worker-task5a
+#1 transferring dockerfile: 429B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-worker-execution:a4
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB done
+#3 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#4 resolve docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc
+61f4f24 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 71.78MB 5.1s
+#5 transferring context: 146.90MB 10.1s
+#5 transferring context: 217.97MB 15.2s
+#5 transferring context: 304.37MB 20.1s done
+#5 DONE 20.1s
+
+#6 [2/4] COPY easel /opt/easel/easel
+#6 CACHED
+
+#7 [3/4] COPY web /opt/easel/web
+#7 DONE 1.3s
+
+#8 [4/4] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#8 DONE 4.3s
+
+#9 exporting to image
+#9 exporting layers
+#9 exporting layers 7.6s done
+#9 exporting manifest sha256:bf9d2465f3b7af31e757ae786da86ef05fa948980d9fcb17618bfbc5482c4e53 0.0s done
+#9 exporting config sha256:8abf74aac8820f9d31acbeb61db32e9ecfe595d5f7c57384f0fd4c819ac7ff96 done
+#9 exporting attestation manifest sha256:9db5a25a8f2adb5a3d0e4ff055813dff7bb104413775e1522e5fc918e362d1b2 0.0s done
+#9 exporting manifest list sha256:8bf1553e4aae00dd5b1c137ae4748e5d96680badd40cdda5c52c4997a454fba3 0.0s done
+#9 naming to docker.io/library/easel-worker-execution:task5b-r1-20261030 done
+#9 unpacking to docker.io/library/easel-worker-execution:task5b-r1-20261030
+#9 unpacking to docker.io/library/easel-worker-execution:task5b-r1-20261030 3.8s done
+#9 DONE 11.5s

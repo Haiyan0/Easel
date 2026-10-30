@@ -1,0 +1,23 @@
+{
+  "trends": [
+    {
+      "platform": "weibo",
+      "label": "微博",
+      "items": [
+        {
+          "title": "ONE-HOUR-OLD-SENTINEL",
+          "hot": "1",
+          "url": ""
+        }
+      ],
+      "ok": false,
+      "cached_at": 1793338648,
+      "stale": true
+    }
+  ],
+  "updated": 1793338648,
+  "stale": true,
+  "failed_platforms": [
+    "weibo"
+  ]
+}

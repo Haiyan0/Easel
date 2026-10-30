@@ -1,0 +1,59 @@
+docker.exe : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:807
++ ... STEXITCODE; & docker build @proxyArgs -f deploy/desktop/Dockerfile.ga ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+#1 [internal] load build definition from Dockerfile.gateway
+#1 transferring dockerfile: 1.60kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.11.12-slim-bookworm
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 DONE 0.0s
+
+#5 [1/6] FROM docker.io/library/python:3.11.12-slim-bookworm@sha256:dbf1de478a55d6763afaa39c2f3d7b54b25230614980276de5c
+acdde79529d0c
+#5 resolve docker.io/library/python:3.11.12-slim-bookworm@sha256:dbf1de478a55d6763afaa39c2f3d7b54b25230614980276de5cacd
+de79529d0c 0.0s done
+#5 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 3.24kB 0.0s done
+#4 DONE 0.1s
+
+#6 [2/6] RUN groupadd --gid 10001 easel  && useradd --uid 10001 --gid 10001 --home-dir /home/easel             --create
+-home --shell /usr/sbin/nologin easel  && mkdir -p /opt/easel /keys /run/easel  && chown 10001:10001 /run/easel
+#6 CACHED
+
+#7 [3/6] WORKDIR /opt/easel
+#7 CACHED
+
+#8 [4/6] COPY pyproject.toml README.md ./
+#8 CACHED
+
+#9 [5/6] COPY easel ./easel
+#9 CACHED
+
+#10 [6/6] RUN pip install --no-cache-dir       "fastapi==0.115.6"       "uvicorn==0.32.1"       "httpx==0.28.1"       "
+pydantic==2.10.4"       "cryptography==44.0.0"  && chown -R root:root /opt/easel  && chmod -R a-w /opt/easel
+#10 CACHED
+
+#11 exporting to image
+#11 exporting layers done
+#11 exporting manifest sha256:994b1dbb74cd923d1a5bfc8232296e716b1a46ccb5019018f4c1f6cca6970c5b done
+#11 exporting config sha256:3d0b3efab22ab7ec5258b069b67aa5987b23c7c118a9ea26de94f80baadb5258 done
+#11 exporting attestation manifest sha256:fa6ba1cc097581eacf47ccabd8bf0d02f4e505a10ae150fd02ce276cc04df694 0.0s done
+#11 exporting manifest list sha256:28563b83ba9b2e676949f358326547f55ac470f0447648f9972b153e81c6b2e9
+#11 exporting manifest list sha256:28563b83ba9b2e676949f358326547f55ac470f0447648f9972b153e81c6b2e9 0.0s done
+#11 naming to docker.io/library/easel-gateway:task5b-r1-20261030 done
+#11 unpacking to docker.io/library/easel-gateway:task5b-r1-20261030 done
+#11 DONE 0.1s
