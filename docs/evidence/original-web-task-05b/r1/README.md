@@ -82,7 +82,7 @@ rendered="...刷新失败，显示缓存 13:37...旧数据...ONE-HOUR-OLD-SENTIN
 | 全部 frontend Node | **145 passed, 0 failed** |
 | `tests/test_trends.py` + manual publish + bugfix（排除无关项） | **63 passed, 1 deselected** |
 | control static + persona security | **22 passed** |
-| build | 成功，`dist/assets/index-BDOY5u8u.js` |
+| build | 成功，`dist/assets/index-DQjpBhyr.js` |
 | lint | 退出 0 |
 | 5B 浏览器（含旧缓存场景） | **5/5，3 次 `FAILURES=[]`** |
 | 5A 浏览器回归 | **4/4，3 次 `FAILURES=[]`** |
