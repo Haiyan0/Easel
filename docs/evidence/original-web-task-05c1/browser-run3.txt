@@ -1,0 +1,6 @@
+BROWSER_VERSION 151.0.7922.34
+TASK5C1_BROWSER_RESULTS {'skill_run': True, 'profile_wizard': True, 'skill_stop': True, 'dark_mobile': True}
+TASK5C1_EXECUTIONS [('skill', '请执行 /copywriting，内容如下：\n\n写一条受控技能测试文案'), ('profile', '画像名：浏览器新画像\n运营平台：（未填）\n起号状态：全新起号\n社媒主页链接：\n  （未提供）\n想做的方向：做受控测试内容\n为什么做/我的优势：（未填）\n运营目标：（未填）\n想产出的形式：（未填）\n喜欢看的内容/对标账号：（未填）\n期望调性：（未填）\n不做的内容/红线：（未填）'), ('skill', '请执行 /copywriting，内容如下：\n\n停止中的技能任务')]
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05c1\\browser\\01-skill-run-light.png', 'docs\\evidence\\original-web-task-05c1\\browser\\02-skill-result-refresh.png', 'docs\\evidence\\original-web-task-05c1\\browser\\03-profile-created.png', 'docs\\evidence\\original-web-task-05c1\\browser\\06-skill-stop.png', 'docs\\evidence\\original-web-task-05c1\\browser\\04-skills-dark.png', 'docs\\evidence\\original-web-task-05c1\\browser\\05-skills-mobile.png']
+TASK5C1_BROWSER_OK True
