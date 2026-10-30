@@ -300,6 +300,36 @@ def test_archive_index_is_scoped_to_own_zip(worker_fixture):
     }
 
 
+def test_other_workspace_paths_and_personas_are_not_found(worker_fixture):
+    _write_output(worker_fixture.root_a, "仅A/私密.txt", b"A only")
+    only_a = canonical_output_path("仅A/私密.txt")
+    only_persona = canonical_persona_name("仅A画像")
+    (worker_fixture.root_a / "profiles" / "仅A画像").mkdir()
+    (worker_fixture.root_a / "profiles" / "仅A画像" / "identity.md").write_text(
+        "A only", encoding="utf-8")
+
+    async def scenario():
+        output = None
+        persona = None
+        try:
+            await worker_fixture.api.request(
+                worker_fixture.b, "GET", f"/api/output/{only_a}")
+        except Exception as error:
+            output = error
+        try:
+            await worker_fixture.api.request(
+                worker_fixture.b, "GET", f"/api/persona/{only_persona}")
+        except Exception as error:
+            persona = error
+        return output, persona
+
+    output, persona = asyncio.run(scenario())
+    assert getattr(output, "status", None) == 404
+    assert getattr(persona, "status", None) == 404
+    assert not (worker_fixture.root_b / "outputs" / "仅A").exists()
+    assert not (worker_fixture.root_b / "profiles" / "仅A画像").exists()
+
+
 def test_output_delete_only_removes_own_file(worker_fixture):
     output = canonical_output_path("项目/甲.txt")
 
