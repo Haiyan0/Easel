@@ -126,7 +126,7 @@ workspace 服务凭证到固定 worker。未接入的技能库、工作台数据
 | 全部 frontend Node | **143 passed, 0 failed** |
 | `tsc -b && vite build` | 成功，`index-Bw-bcRB_.js` |
 | `oxlint` | 退出 0 |
-| `tests/multiuser` 全量 | **1558 passed, 5 skipped** |
+| `tests/multiuser` 全量 | **1559 passed, 5 skipped** |
 | `tests/test_core.py` + `tests/test_agent_harnesses.py` | **155 passed, 4 skipped** |
 | control static | **3 passed** |
 | Task 5A browser matrix | **4/4 组场景，3 次全部通过，FAILURES=[]** |
