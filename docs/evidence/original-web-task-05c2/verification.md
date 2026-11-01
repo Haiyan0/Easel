@@ -3,8 +3,9 @@
 日期：2026-11-01（Asia/Shanghai）。
 
 - 父基线：`654305a69c1d68d6b157b608dbd2c7d5f96d6298`
-- 实施提交：`0801343`（完整 SHA 见文末 `git log`，本轮仅 5C2）
-- 证据提交：本文件所在提交
+- 实施提交：`0801343ddcdc4111af111108a5f15897ae1f1b43`
+- 证据提交：`f05bd37`（本文件首次提交）
+- 最终 tip：证据 SHA 记录提交（`docs: 记录 5C2 证据 SHA`）
 - 实施 worktree：`C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics`
 
 ## 1. 结论摘要
