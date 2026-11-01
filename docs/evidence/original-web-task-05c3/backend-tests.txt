@@ -133,7 +133,7 @@ tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-443 passed, 1 skipped, 7 warnings in 28.56s
+443 passed, 1 skipped, 7 warnings in 28.66s
 ..........................................................s............. [ 21%]
 ........................................................................ [ 43%]
 ........................................................................ [ 64%]
@@ -159,4 +159,4 @@ tests/multiuser/test_worker_skills_profile.py::test_profile_baseline_rejects_lin
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-333 passed, 1 skipped, 1 warning in 14.83s
+333 passed, 1 skipped, 1 warning in 14.53s
