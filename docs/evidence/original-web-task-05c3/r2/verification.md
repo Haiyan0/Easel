@@ -44,7 +44,7 @@ $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r2/browser-red'
 
 旧构建（`index-CfTWRFga.js`，SHA256 `6f7123fc…`）结果见
 [browser-red.log](browser-red.log)：11 组原有场景通过，新增两组失败，失败即
-本轮缺陷：
+本轮缺陷。红灯截图与本轮基线场景重复，未保留；红灯以该日志为准。
 
 - `explicit-media-edit-after-lost-ack`：首次 POST 在客户端截断且不转发，
   `posts[0].media=['project/cover.png']`、后台执行 0 次；取消 cover.png 后
