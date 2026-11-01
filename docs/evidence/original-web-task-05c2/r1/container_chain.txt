@@ -1,0 +1,28 @@
+BUILD control
+BUILD gateway
+BUILD worker
+CONTAINER_IMAGE_IDS {"control": "sha256:1e3cf0b6684969cf1087a0ec7065380d9f51a0081c97efaf0a2eb044171532d4", "gateway": "sha256:4316aa71f57465ccf77a75eb088b3b1d6e920f49dbc964fe4ec4517f765a997e", "worker": "sha256:586915838d0570065709a348cd94c8f228817119118cc97f7f9c6d43d6304328"}
+SOURCE_HASH control easel/control/workspace_accounts.py 8d91f51a3b7ed9add010ba2d37a038b6e68ed73cf45f158c04c17f6f25fd882b
+SOURCE_HASH control easel/control/app.py b1162f42574f45e5cc50c37ddc974c14a36d1e7f5d3f0869df004ad273a53937
+SOURCE_HASH control easel/control/policy.py fb6ae060ef259db6c84ba3306d09bd66d2b528b8d7020bcd2007d228f387548c
+SOURCE_HASH control easel/control/tasks.py 137f3384f2c746e626df4c94aa4d34267557f19f4a4e8fc86056bc08522dec81
+SOURCE_HASH gateway easel/gateway/app.py 3a0868a14fadfec7eab5250baddff4e0bfcd0b65f31a7a50792665150ba3bf0b
+SOURCE_HASH worker easel/worker/runs.py e83fc06ca1a4497484c0aba3766aa799f4e284750052b33333b151c8ce9f939b
+SOURCE_HASH worker easel/worker/browser_tasks.py 26c8673f24874120abfad835fb923a5c96adf74c37b08e9ddd36cd88f5ad5d46
+SOURCE_HASH worker web/app.py 75ed8dd234a9d6169f431cc8d011310ecba239f1142e653ff2a10416ba37752d
+SOURCE_HASH control web/frontend/dist/assets/index-zM18pZTN.js 5f251ed0c53b5880e30c2b92bdd5567518f33849c3f9eb455c4b417fcd857eb7
+LOGIN_START {'state': 'starting', 'message': '', 'qr': '', 'qrTs': 0, 'mode': 'qr', 'runId': 'f66871fcc3f64e00955bea61334fced8'}
+LOGIN_QR_BYTES 871 240 240
+CHROMIUM_PROCESS True
+LOGIN_SUCCESS True
+WHOAMI {'loggedIn': True, 'name': '容器受控昵称', 'avatar': ''}
+ANALYTICS 12
+CREDENTIALS True
+STOP_RELEASE True
+CAPACITY_AFTER_STOP True
+TIMEOUT_RELEASE True
+CROSS_SITE_GET_NO_TASK True
+CONTAINER_IMAGES {"control": "easel-control:task5c2-r1-20261101", "gateway": "easel-gateway:task5c2-r1-20261101", "worker": "easel-worker-execution:task5c2-r1-20261101", "ids": {"control": "sha256:1e3cf0b6684969cf1087a0ec7065380d9f51a0081c97efaf0a2eb044171532d4", "gateway": "sha256:4316aa71f57465ccf77a75eb088b3b1d6e920f49dbc964fe4ec4517f765a997e", "worker": "sha256:586915838d0570065709a348cd94c8f228817119118cc97f7f9c6d43d6304328"}}
+CONTAINER_CHECK {"login_dispatch": true, "qr_png": true, "profile": true, "chromium_process": true, "sms_success": true, "whoami": true, "analytics": true, "credentials": true, "stop_release": true, "timeout_release": true, "capacity_after_stop": true, "cross_site_get_no_task": true}
+TASK5C2_CONTAINER_OK True
+CLEANUP_ERRORS []

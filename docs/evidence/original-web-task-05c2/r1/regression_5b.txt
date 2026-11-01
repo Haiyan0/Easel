@@ -1,0 +1,5 @@
+BROWSER_VERSION 151.0.7922.34
+TASK5B_BROWSER_RESULTS {'workbench_flow': True, 'identity_isolation': True, 'member_accounts_connected': True, 'stale_trends': True, 'dark_mobile': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\01-dashboard-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\02-trends-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\03-ideas-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\04-calendar-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\05-topic-draft-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\06-identity-b.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\07-accounts-connected.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\10-trends-stale-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\08-dashboard-dark.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5b\\09-dashboard-mobile.png']
+TASK5B_BROWSER_OK True

@@ -1,0 +1,14 @@
+﻿✔ control login start sends a stable request id and parses qrUrl (11.1212ms)
+✔ control credentials mode is distinct from qr login (0.6471ms)
+✔ control whoami and analytics caches are per adapter identity (0.7158ms)
+✔ control account parser keeps the two wechat login states separate (0.6279ms)
+✔ control login status keeps 503 semantics and does not fake success (0.8749ms)
+✔ local adapter keeps localStorage analytics and has no stop action (0.5813ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 273.2368

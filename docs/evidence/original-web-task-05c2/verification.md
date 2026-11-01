@@ -2,6 +2,10 @@
 
 日期：2026-11-01（Asia/Shanghai）。
 
+> 本文件是首轮 5C2 交付记录。R1 复审的四项定点修复、隔离容器闭环与本轮证据见
+> [r1/verification.md](r1/verification.md)。首轮 `.log` 证据已转为受跟踪的 `.txt`
+> （内容未改写，仅扩展名与链接更新）；历史截图保持原样。
+
 - 父基线：`654305a69c1d68d6b157b608dbd2c7d5f96d6298`
 - 实施提交：`0801343ddcdc4111af111108a5f15897ae1f1b43`
 - 证据提交：`f05bd37`（本文件首次提交）
@@ -36,22 +40,22 @@ local handler：账号/分析经 WorkspaceData 适配，浏览器任务经既有
 
 | 命令 | 结果 | 日志 |
 |---|---|---|
-| `pytest tests/multiuser/test_workspace_accounts.py tests/multiuser/test_worker_browser_tasks.py ...` | 退出 2：`No module named easel.control.workspace_accounts`、`browser_tasks` 不存在 | [baseline_red_backend.log](baseline_red_backend.log) |
-| `pytest tests/multiuser/test_task5c2_security.py tests/multiuser/test_task5c2_chain.py`（父基线） | 5 failed / 2 errors：无二维码入口、无 `_wechat_verify_credentials`、无 Run 链路 | [baseline_red_security_chain.log](baseline_red_security_chain.log) |
+| `pytest tests/multiuser/test_workspace_accounts.py tests/multiuser/test_worker_browser_tasks.py ...` | 退出 2：`No module named easel.control.workspace_accounts`、`browser_tasks` 不存在 | [baseline_red_backend.txt](baseline_red_backend.txt) |
+| `pytest tests/multiuser/test_task5c2_security.py tests/multiuser/test_task5c2_chain.py`（父基线） | 5 failed / 2 errors：无二维码入口、无 `_wechat_verify_credentials`、无 Run 链路 | [baseline_red_security_chain.txt](baseline_red_security_chain.txt) |
 
 绿测：
 
 | 命令 | 结果 | 日志 |
 |---|---|---|
-| `pytest tests/multiuser/test_workspace_accounts.py` | 16 passed | [control_accounts_result.log](control_accounts_result.log) |
-| `pytest tests/multiuser/test_worker_browser_tasks.py` | 9 passed | [worker_browser_tasks_result.log](worker_browser_tasks_result.log) |
-| `pytest tests/multiuser/test_task5c2_security.py` | 5 passed | [security_result.log](security_result.log) |
-| `pytest tests/multiuser/test_task5c2_chain.py` | 2 passed（真实 control/gateway/worker ASGI 链路） | [chain_test.log](chain_test.log) |
-| `pytest tests/multiuser/test_workspace_accounts.py tests/multiuser/test_worker_browser_tasks.py tests/multiuser/test_task5c2_security.py tests/multiuser/test_task5c2_chain.py tests/multiuser/test_task_leases.py tests/multiuser/test_policy.py tests/multiuser/test_workspace_tasks.py tests/multiuser/test_original_web_api.py tests/multiuser/test_gateway_forward.py tests/multiuser/test_gateway_workspace.py` | 282 passed, 1 skipped | [regression_backend_final.log](regression_backend_final.log) |
-| `pytest tests/test_login_start.py tests/test_login_transport.py tests/test_account_whoami.py tests/test_web_analytics.py tests/multiuser/test_browser_profiles.py` | 79 passed | [regression_original_accounts_final.log](regression_original_accounts_final.log) |
-| `node --test tests/frontend/*.test.mjs` | 154 passed | [node_tests_final.log](node_tests_final.log) |
-| `npm --prefix web/frontend run build` | 退出 0；仅既有 >500KB chunk 警告 | [frontend_build_final.log](frontend_build_final.log) |
-| `npm --prefix web/frontend run lint` | 退出 0 | [frontend_lint_final.log](frontend_lint_final.log) |
+| `pytest tests/multiuser/test_workspace_accounts.py` | 16 passed | [control_accounts_result.txt](control_accounts_result.txt) |
+| `pytest tests/multiuser/test_worker_browser_tasks.py` | 9 passed | [worker_browser_tasks_result.txt](worker_browser_tasks_result.txt) |
+| `pytest tests/multiuser/test_task5c2_security.py` | 5 passed | [security_result.txt](security_result.txt) |
+| `pytest tests/multiuser/test_task5c2_chain.py` | 2 passed（真实 control/gateway/worker ASGI 链路） | [chain_test.txt](chain_test.txt) |
+| `pytest tests/multiuser/test_workspace_accounts.py tests/multiuser/test_worker_browser_tasks.py tests/multiuser/test_task5c2_security.py tests/multiuser/test_task5c2_chain.py tests/multiuser/test_task_leases.py tests/multiuser/test_policy.py tests/multiuser/test_workspace_tasks.py tests/multiuser/test_original_web_api.py tests/multiuser/test_gateway_forward.py tests/multiuser/test_gateway_workspace.py` | 282 passed, 1 skipped | [regression_backend_final.txt](regression_backend_final.txt) |
+| `pytest tests/test_login_start.py tests/test_login_transport.py tests/test_account_whoami.py tests/test_web_analytics.py tests/multiuser/test_browser_profiles.py` | 79 passed | [regression_original_accounts_final.txt](regression_original_accounts_final.txt) |
+| `node --test tests/frontend/*.test.mjs` | 154 passed | [node_tests_final.txt](node_tests_final.txt) |
+| `npm --prefix web/frontend run build` | 退出 0；仅既有 >500KB chunk 警告 | [frontend_build_final.txt](frontend_build_final.txt) |
+| `npm --prefix web/frontend run lint` | 退出 0 | [frontend_lint_final.txt](frontend_lint_final.txt) |
 
 ## 4. 5C2 浏览器矩阵
 
@@ -67,18 +71,18 @@ gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台脚本入口为
 | stop_503_401 | true | 停止登录终止当前 Run，不新增浏览器；control 层一次 503 后轮询恢复；撤销会话 401 卸载私人页回登录 |
 
 结果文件：[browser_results.json](browser/browser_results.json)；日志
-[browser_run_final.log](browser_run_final.log)。截图 01–09 在
+[browser_run_final.txt](browser_run_final.txt)。截图 01–09 在
 [browser/](browser/)；`stop_modal_failure.png` 为修复前调试截图，已从交付删除。
 
 ## 5. 既有浏览器矩阵回归
 
 | 套件 | 结果 | 日志 |
 |---|---|---|
-| 5C1 技能/画像 7 组 | 7/7 true，`TASK5C1_BROWSER_OK True` | [regression_browser_original_web_task05c1.log](regression_browser_original_web_task05c1.log) |
-| 5B 工作台 5 组（更新账号已接通语义） | 5/5 true | [regression_5b_updated.log](regression_5b_updated.log) |
-| 5A 基础工作区 4 组 | 4/4 true | [regression_browser_original_web_workspace.log](regression_browser_original_web_workspace.log) |
-| Task3 共用认证/会话 33 组（更新账号已接通语义） | 33/33 true | [regression_task3_updated.log](regression_task3_updated.log) |
-| Task4 登录/主题 8 组 | 8/8 true | [regression_browser_original_web_login.log](regression_browser_original_web_login.log) |
+| 5C1 技能/画像 7 组 | 7/7 true，`TASK5C1_BROWSER_OK True` | [regression_browser_original_web_task05c1.txt](regression_browser_original_web_task05c1.txt) |
+| 5B 工作台 5 组（更新账号已接通语义） | 5/5 true | [regression_5b_updated.txt](regression_5b_updated.txt) |
+| 5A 基础工作区 4 组 | 4/4 true | [regression_browser_original_web_workspace.txt](regression_browser_original_web_workspace.txt) |
+| Task3 共用认证/会话 33 组（更新账号已接通语义） | 33/33 true | [regression_task3_updated.txt](regression_task3_updated.txt) |
+| Task4 登录/主题 8 组 | 8/8 true | [regression_browser_original_web_login.txt](regression_browser_original_web_login.txt) |
 
 回归脚本运行时使用 `EASEL_BROWSER_EVIDENCE` 指向本组 regression 子目录；5B/Task3 新增
 截图在 `regression/5b`、`regression/task3`，未覆盖既有历史截图（历史目录已从 git 恢复）。
@@ -86,7 +90,7 @@ gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台脚本入口为
 已知既有失败（非本组引入）：父基线上把
 `tests/multiuser/test_worker_server.py` 与 `tests/multiuser/test_worker_execution_gate.py`
 放在同一进程顺序运行时，3 个流式门禁用例因 Starlette/anyio 测试客户端顺序问题失败；
-单独运行通过。父基线复现日志：[baseline_existing_order_failure.log](baseline_existing_order_failure.log)。
+单独运行通过。父基线复现日志：[baseline_existing_order_failure.txt](baseline_existing_order_failure.txt)。
 本组未改动这两个模块的执行逻辑，不据此宣称全仓通过。
 
 ## 6. 任务/路径/互斥/凭证证据

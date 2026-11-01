@@ -1,0 +1,59 @@
+﻿BROWSER_VERSION 151.0.7922.34
+python.exe : Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+At line:1 char:687
++ ... ension($s); & $py -u $s *> "docs/evidence/original-web-task-05c2/regr ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Exception in ca...tion_lost(None):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+TASK5B_BROWSER_RESULTS {'identity_isolation': True, 'stale_trends': True, 'dark_mobile': True}
+FAILURES ["workbench-flow: AssertionError() body='\\n    Easel通用模式测试画像+ 新建画像…成员账户退出工作台对话技能库内容库账号画像对话 新对话已登录 · 服务端会话 设置下午好 👋control CLI 已安装；原生登录及模型可用性请发送消息验证。 通用模式——指定画像效果更好。从热点到发布，一站式搞定今天的内容。开始对话看热点拆爆款记选题排日历去发布1待做选题1待发排期1内容项目0/7已登录账号 今日热点热点雷达 →微博weibo测试热点抖音douyin测试热点 选题库 · 待做全部 →A 初始选题manual 近期排期日历 →11-06[微博] A 初始排期待发 最近产物内容库 →项目1 文件 创作数据去账号页登录后，这里看各平台粉丝 / 获赞 / 关注、增长趋势与最新笔记 →\\n\\n  \\n\\n' responses=['200 https://127.0.0.1:57711/', '200 https://127.0.0.1:57711/assets/index-BfRQV5Ij.css', '200 https://127.0.0.1:57711/assets/index-TsTnX71Z.js', '200 https://127.0.0.1:57711/static/easel-icon-transparent.png', '200 https://127.0.0.1:57711/api/runtime', '401 https://127.0.0.1:57711/api/auth/me', '200 https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@0,6..96,400..700;1,6..96,400..700&family=Manrope:wght@400;500;600&family=Noto+Serif+SC:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap', '200 https://127.0.0.1:57711/api/auth/exchange', '200 https://127.0.0.1:57711/api/sessions?limit=100&offset=0&include_archived=true', '200 https://127.0.0.1:57711/api/status', '200 https://127.0.0.1:57711/api/personas', '200 https://127.0.0.1:57711/api/status', '200 https://127.0.0.1:57711/api/schedule', '200 https://127.0.0.1:57711/api/trends?platforms=weibo%2Cdouyin&limit=6', '200 https://127.0.0.1:57711/api/accounts', '200 https://127.0.0.1:57711/api/analytics/platforms', '200 https://127.0.0.1:57711/api/outputs', '200 https://127.0.0.1:57711/api/ideas'] console=['%cEasel build: subnav-1 color:#8b5cf6;font-weight:bold', 'Failed to load resource: the server responded with a status of 401 (Unauthorized)']", 'member-no-accounts: TimeoutError(\'Locator.wait_for: Timeout 20000ms exceeded.\\nCall log:\\n  - waiting for get_by_text("账号与创作数据将在 5C 接通").first to be visible\\n\')']
+SCREENSHOTS ['docs\\evidence\\original-web-task-05b\\browser\\06-identity-b.png', 'docs\\evidence\\original-web-task-05b\\browser\\10-trends-stale-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\08-dashboard-dark.png', 'docs\\evidence\\original-web-task-05b\\browser\\09-dashboard-mobile.png']
+TASK5B_BROWSER_OK False

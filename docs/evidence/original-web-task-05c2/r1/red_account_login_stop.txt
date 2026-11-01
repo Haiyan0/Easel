@@ -1,0 +1,80 @@
+✔ a failed old avatar does not prevent a newly verified avatar from rendering (9.8601ms)
+✔ manual account verification updates the card and identity from the same result (5.1816ms)
+✔ failed account verification preserves the last verified nickname and avatar (3.7283ms)
+✖ late stop success cannot overwrite a newer login modal (1.8893ms)
+✖ late stop failure cannot overwrite a newer login modal (0.7896ms)
+✖ late stop finally does not clear a newer stop busy state (0.6526ms)
+✔ handleLogin serializes polling and never overwrites terminal success (1.0317ms)
+✔ handleLogin surfaces persistent polling failures instead of spinning forever (0.724ms)
+✔ handleLogin opens the login modal before its start request resolves (0.5419ms)
+✔ handleLogin keeps a closed modal closed when its start response arrives (0.496ms)
+✔ handleLogin shows startup failures inside the open modal (0.5006ms)
+✔ handleLogin discards polling responses from a previous login (0.4871ms)
+✔ handleMpLogin serializes polling and never overwrites terminal success (0.6061ms)
+✔ handleMpLogin surfaces persistent polling failures instead of spinning forever (0.5801ms)
+✔ handleMpLogin opens the login modal before its start request resolves (0.4183ms)
+✔ handleMpLogin keeps a closed modal closed when its start response arrives (0.3662ms)
+✔ handleMpLogin shows startup failures inside the open modal (0.3743ms)
+✔ handleMpLogin discards polling responses from a previous login (0.4009ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 15
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 256.2352
+
+✖ failing tests:
+
+test at tests\frontend\accountLogin.test.mjs:177:1
+✖ late stop success cannot overwrite a newer login modal (1.8893ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'error'
+  - 'starting'
+  
+      at TestContext.<anonymous> (file:///C:/Users/hyh/AppData/Local/Temp/easel-5c2-r1-red/tests/frontend/accountLogin.test.mjs:188:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'error',
+    expected: 'starting',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\frontend\accountLogin.test.mjs:192:1
+✖ late stop failure cannot overwrite a newer login modal (0.7896ms)
+  AssertionError [ERR_ASSERTION]: Expected "actual" to be strictly unequal to:
+  
+  '旧停止请求失败'
+      at TestContext.<anonymous> (file:///C:/Users/hyh/AppData/Local/Temp/easel-5c2-r1-red/tests/frontend/accountLogin.test.mjs:200:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '旧停止请求失败',
+    expected: '旧停止请求失败',
+    operator: 'notStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\frontend\accountLogin.test.mjs:203:1
+✖ late stop finally does not clear a newer stop busy state (0.6526ms)
+  AssertionError [ERR_ASSERTION]: 旧请求的 finally 不能清掉新请求的停止状态
+  
+  false !== true
+  
+      at TestContext.<anonymous> (file:///C:/Users/hyh/AppData/Local/Temp/easel-5c2-r1-red/tests/frontend/accountLogin.test.mjs:215:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
