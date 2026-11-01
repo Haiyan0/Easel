@@ -3,8 +3,8 @@
 日期：2026-11-01（Asia/Shanghai）。
 
 - 父基线：`a7c8ce253905918987f2a35fc269a1936a93dd6f`
-- 修复提交：`7195efe3ef63bb2cc6fc7192347acffb1780832a`
-- 证据提交：`5e3c6e5bfd4a571a693a0ad9a4e935086ff00563`
+- 修复提交：`b1e49cb9bd69b3ba9cdec8713cc113cdcfea4681`
+- 证据提交：`eaa0c6a7436d46487efa8f9ac36cfceeaff84033`
 - 实施 worktree：`C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics`
 
 ## 1. 结论
