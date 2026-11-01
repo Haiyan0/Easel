@@ -252,7 +252,8 @@ export interface WorkspaceData {
     options?: { requestId?: string }, signal?: AbortSignal,
   ): Promise<PublishStartView>;
   publishStatus(
-    platform: string, signal?: AbortSignal,
+    platform: string,
+    options?: { signal?: AbortSignal; requestId?: string },
   ): Promise<PublishStatusView>;
   submitPublishSms(
     platform: string, code: string, options?: { runId?: string },
@@ -736,6 +737,13 @@ function statusOf(error: unknown): number | null {
 export function isIdentityExpired(error: unknown): boolean {
   return statusOf(error) === 401
     && (error as { identityInvalidated?: unknown }).identityInvalidated === true;
+}
+
+/** 网络中断/408/5xx：服务端可能已接纳，不能当作“确定未发布”或自动补发。 */
+export function isUncertainPublishError(error: unknown): boolean {
+  const status = statusOf(error);
+  // status=0 是前端网络层（AuthError(0, 'network_unavailable')）。
+  return status === null || status === 0 || status === 408 || status >= 500;
 }
 
 export function workspaceErrorMessage(error: unknown, fallback: string): string {  const status = statusOf(error);
@@ -1379,9 +1387,14 @@ export function createControlWorkspaceData(
           signal,
         }));
     },
-    async publishStatus(platform, signal) {
+    async publishStatus(platform, options = {}) {
+      // 带 requestId 时只查询该次用户意图的原 Run；未确认时服务端返回
+      // runId=""，页面据此保留意图而不是当作确定未发布。
+      const query = options.requestId
+        ? `?requestId=${encodeURIComponent(options.requestId)}` : '';
       return publishStatusView(await call<unknown>(
-        `/api/publish/${encodeURIComponent(platform)}/status`, { signal }));
+        `/api/publish/${encodeURIComponent(platform)}/status${query}`,
+        { signal: options.signal }));
     },
     async submitPublishSms(platform, code, options = {}, signal) {
       const row = needObject(await call<unknown>(

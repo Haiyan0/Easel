@@ -1471,10 +1471,15 @@ def create_app(*, store: Store, auth: AuthService,
 
     @app.get("/api/publish/{platform}/status")
     async def publishing_status(request: Request, platform: str):
-        _no_query(request)
+        # 唯一允许的查询参数是本次用户意图的 requestId；其余一律拒绝，
+        # 避免把任意字符串当查询键。重复参数也视为无效请求。
+        items = request.query_params.multi_items()
+        if len(items) > 1 or any(key != "requestId" for key, _ in items):
+            raise DomainError("invalid_request", 400)
+        request_id = request.query_params.get("requestId")
         return _no_store_json(
             await _publishing_service(request).status(
-                _identity(request), platform))
+                _identity(request), platform, request_id=request_id))
 
     @app.post("/api/publish/{platform}/sms")
     async def publishing_sms(request: Request, platform: str):

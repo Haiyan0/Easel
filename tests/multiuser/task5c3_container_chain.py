@@ -265,7 +265,9 @@ def main() -> int:
             ("control", images["control"],
              ["easel/control/workspace_publishing.py",
               "easel/control/app.py", "easel/control/tasks.py",
-              "easel/control/proxy.py", "easel/manual_publish.py"]),
+              "easel/control/proxy.py", "easel/control/store.py",
+              "easel/control/types.py", "easel/control/cli.py",
+              "easel/manual_publish.py"]),
             ("gateway", images["gateway"], ["easel/gateway/app.py"]),
             ("worker", images["worker"],
              ["easel/worker/browser_tasks.py", "easel/manual_publish.py",
@@ -295,6 +297,7 @@ def main() -> int:
     worker_volume = f"easel-task5c3-ws-{run_id}"
     home_volume = f"easel-task5c3-home-{run_id}"
     containers: list[str] = []
+    volumes = [control_volume, worker_volume, home_volume]
     try:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -333,7 +336,6 @@ def main() -> int:
             (work / name).write_text(source, encoding="utf-8")
 
         run(["docker", "network", "create", *labels_args("network"), network])
-        volumes = [control_volume, worker_volume, home_volume]
         for name, component in ((control_volume, "control-volume"),
                                 (worker_volume, "worker-volume"),
                                 (home_volume, "home-volume")):
@@ -396,6 +398,99 @@ def main() -> int:
             "python", "/run/easel/gateway_launcher.py",
         ]).stdout.strip())
 
+        def wait_invite(container: str, timeout: float = 90) -> str:
+            value = ""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not value:
+                for line in container_logs(container).splitlines():
+                    if line.startswith("TASK5C3_INVITE "):
+                        value = line.split(" ", 1)[1].strip()
+                        break
+                if not value:
+                    time.sleep(0.3)
+            if not value:
+                raise RuntimeError(
+                    "control 未输出邀请\n" + container_logs(container))
+            return value
+
+        # 第一轮：独立 control 卷以 manual 启动，证明策略在 Run 接纳前拒绝，
+        # 不创建 Run、不调用 worker。随后移除容器，再用正式 automated 卷跑
+        # 原 5C3 检查，避免两个 control 共享同一账本。
+        manual_volume = f"easel-task5c3-control-manual-{run_id}"
+        run(["docker", "volume", "create", *labels_args("control-volume"),
+             manual_volume])
+        volumes.append(manual_volume)
+        manual_sock = socket.socket()
+        manual_sock.bind(("127.0.0.1", 0))
+        manual_port = manual_sock.getsockname()[1]
+        manual_sock.close()
+        manual_origin = f"https://127.0.0.1:{manual_port}"
+        manual_name = f"easel-task5c3-control-manual-{run_id}"
+        manual_id = run([
+            "docker", "run", "-d", "--name", manual_name,
+            *labels_args("control"),
+            "--network", network,
+            "-p", f"127.0.0.1:{manual_port}:7861",
+            "-v", f"{manual_volume}:/srv/easel/control",
+            "-v", f"{work / 'control_launcher.py'}:/run/easel/control_launcher.py:ro",
+            "-v", f"{private_key}:/run/easel/control-key.pem:ro",
+            "-e", "PUBLISH_MODE=manual",
+            "-e", f"WORKSPACE_ID={workspace}",
+            "-e", f"WORKER_CONTAINER_ID={container_id}",
+            "-e", f"GATEWAY_INSTANCE_ID={gateway_instance}",
+            "-e", f"BOOT_GENERATION={boot}",
+            "-e", f"WORKER_SERVICE_TOKEN={service}",
+            "-e", "GATEWAY_ORIGIN=http://gateway:8897",
+            "-e", "WORKER_ORIGIN=http://worker:7860",
+            "-e", f"PUBLIC_ORIGIN={manual_origin}",
+            "-e", "CONTROL_DIR=/srv/easel/control",
+            "-e", "SIGNING_KEY=/run/easel/control-key.pem",
+            "-e", "PYTHONPATH=/opt/easel",
+            images["control"],
+            "python", "/run/easel/control_launcher.py",
+        ]).stdout.strip()
+        containers.append(manual_id)
+        try:
+            wait_http(f"http://127.0.0.1:{manual_port}/api/health")
+            manual_invite = wait_invite(manual_name)
+            with httpx.Client(
+                    base_url=f"http://127.0.0.1:{manual_port}",
+                    timeout=30.0, verify=False,
+                    follow_redirects=False) as manual_client:
+                exchanged = manual_client.post(
+                    "/api/auth/exchange", json={"token": manual_invite},
+                    headers={"Origin": manual_origin})
+                assert exchanged.status_code == 200, exchanged.text
+                manual_body = exchanged.json()
+                manual_token = exchanged.headers["set-cookie"].split(
+                    ";", 1)[0].split("=", 1)[1]
+                manual_headers = {
+                    "Cookie": f"__Host-easel_session={manual_token}",
+                    "Origin": manual_origin,
+                    "X-CSRF-Token": manual_body["csrfToken"],
+                }
+                policy = manual_client.get(
+                    "/api/publishing-policy", headers=manual_headers)
+                assert policy.status_code == 200, policy.text
+                assert policy.json()["mode"] == "manual", policy.text
+                rejected = manual_client.post(
+                    "/api/publish/xiaohongshu",
+                    json={"title": "容器人工策略", "body": "容器正文",
+                          "tags": "", "media": ["project/cover.png"],
+                          "persona": "", "requestId": "container-manual"},
+                    headers=manual_headers)
+                assert rejected.status_code == 403, rejected.text
+                assert rejected.json()["code"] == "publishing_manual_only"
+                assert sql(
+                    manual_name, "SELECT COUNT(*) FROM runs")[0][0] == 0
+                assert worker_counter(worker_name) == []
+                print("MANUAL_POLICY_REJECTED", True, flush=True)
+        finally:
+            removed = run(
+                ["docker", "rm", "-f", manual_name], check=False)
+            if removed.returncode == 0 and manual_id in containers:
+                containers.remove(manual_id)
+
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -410,6 +505,7 @@ def main() -> int:
             "-v", f"{control_volume}:/srv/easel/control",
             "-v", f"{work / 'control_launcher.py'}:/run/easel/control_launcher.py:ro",
             "-v", f"{private_key}:/run/easel/control-key.pem:ro",
+            "-e", "PUBLISH_MODE=automated",
             "-e", f"WORKSPACE_ID={workspace}",
             "-e", f"WORKER_CONTAINER_ID={container_id}",
             "-e", f"GATEWAY_INSTANCE_ID={gateway_instance}",
@@ -427,17 +523,12 @@ def main() -> int:
 
         base = f"http://127.0.0.1:{port}"
         wait_http(base + "/api/health")
-        invite = ""
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline and not invite:
-            for line in container_logs(control_name).splitlines():
-                if line.startswith("TASK5C3_INVITE "):
-                    invite = line.split(" ", 1)[1].strip()
-                    break
-            if not invite:
-                time.sleep(0.3)
-        if not invite:
-            raise RuntimeError("control 未输出邀请\n" + container_logs(control_name))
+        mode_lines = [
+            line for line in container_logs(control_name).splitlines()
+            if line.startswith("TASK5C3_PUBLISH_MODE ")]
+        assert mode_lines and mode_lines[0].split(" ", 1)[1].strip() == (
+            "automated"), mode_lines
+        invite = wait_invite(control_name)
 
         with httpx.Client(base_url=base, timeout=30.0,
                           verify=False, follow_redirects=False) as client:
@@ -521,6 +612,33 @@ def main() -> int:
             assert duplicate.status_code == 200, duplicate.text
             assert duplicate.json()["runId"] == run_id_1
             assert worker_counter(worker_name) == [run_id_1]
+            # R1-02/R1-03：按 requestId 精确恢复原 Run；同 ID 改稿必须 409，
+            # 不新增 Run，也不触发第二次受控发布。
+            intent = client.get(
+                "/api/publish/xiaohongshu/status"
+                "?requestId=container-publish-1", headers=headers)
+            assert intent.status_code == 200, intent.text
+            assert intent.json()["runId"] == run_id_1
+            assert intent.json()["state"] == "success"
+            missing = client.get(
+                "/api/publish/xiaohongshu/status"
+                "?requestId=container-never-sent", headers=headers)
+            assert missing.status_code == 200, missing.text
+            assert missing.json()["runId"] == ""
+            assert missing.json()["state"] == "unknown"
+            runs_before = sql(control_name, "SELECT COUNT(*) FROM runs")[0][0]
+            changed = client.post(
+                "/api/publish/xiaohongshu",
+                json={"title": "容器改稿", "body": "容器改稿",
+                      "tags": "工具", "media": ["project/cover.png"],
+                      "persona": "", "requestId": "container-publish-1"},
+                headers=headers)
+            assert changed.status_code == 409, changed.text
+            assert changed.json()["code"] == "request_conflict"
+            assert worker_counter(worker_name) == [run_id_1]
+            assert sql(
+                control_name, "SELECT COUNT(*) FROM runs")[0][0] == runs_before
+            print("REQUEST_CONTENT_BOUND", True, flush=True)
             print("PUBLISH_ONCE", run_id_1, flush=True)
             wait_publish_capacity(control_name, worker_name)
 
@@ -593,6 +711,19 @@ def main() -> int:
             assert timed.status_code == 200, timed.text
             timed_body = timed.json()
             assert timed_body["async"] is True, timed_body
+            # 运行中同 ID 改稿：409，不新增 Run/外部提交。
+            runs_before = sql(control_name, "SELECT COUNT(*) FROM runs")[0][0]
+            active_changed = client.post(
+                "/api/publish/kuaishou",
+                json={"title": "容器超时改稿", "body": "容器超时改稿",
+                      "tags": "", "media": ["project/cover.png"],
+                      "persona": "", "requestId": "container-timeout"},
+                headers=headers)
+            assert active_changed.status_code == 409, active_changed.text
+            assert active_changed.json()["code"] == "request_conflict"
+            assert sql(
+                control_name, "SELECT COUNT(*) FROM runs")[0][0] == runs_before
+            print("ACTIVE_CONTENT_BOUND", True, flush=True)
             timed_status = wait_status(
                 client, "kuaishou", ("unknown",), headers, timeout=40)
             assert timed_status["runId"] == timed_body["runId"], timed_status
@@ -658,6 +789,10 @@ def main() -> int:
             "calendar_once": True, "douyin_sms_owner": True,
             "stop_release": True, "timeout_release": True,
             "status_recovery": True, "restart_no_replay": True,
+            "manual_policy_rejected": True,
+            "status_by_intent": True,
+            "request_content_bound": True,
+            "active_content_bound": True,
             "controlled_runner_executed": True, "profile_lock": True,
             "original_platform_scripts_executed": [],
             "substituted_entries": [
@@ -675,8 +810,7 @@ def main() -> int:
         return 1
     finally:
         if not args.keep:
-            errors = cleanup(containers, network,
-                             [control_volume, worker_volume, home_volume])
+            errors = cleanup(containers, network, volumes)
             print("CLEANUP_ERRORS", errors, flush=True)
         shutil.rmtree(work, ignore_errors=True)
 
@@ -845,13 +979,16 @@ def relay_factory(runtime, sessions, auth, store, http_client, broker,
         db_runner=db_runner, gateway_required=True)
 
 
+publish_mode = os.environ.get("PUBLISH_MODE", "automated")
+assert publish_mode in ("automated", "manual"), publish_mode
 app = create_app(
     store=store, auth=auth,
     config=ControlConfig(public_origin=os.environ["PUBLIC_ORIGIN"],
-                         publish_mode="automated"),
+                         publish_mode=publish_mode),
     runtime=runtime, frontend_dir="/opt/easel/web/frontend/dist",
     workspace_factory=workspace_factory, relay_factory=relay_factory)
 store.close()
+print("TASK5C3_PUBLISH_MODE " + publish_mode, flush=True)
 print("TASK5C3_INVITE " + invite, flush=True)
 uvicorn.run(app, host="0.0.0.0", port=7861, proxy_headers=False)
 '''

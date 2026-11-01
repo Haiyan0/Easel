@@ -77,7 +77,7 @@ _BACKUP_DEPLOYMENT_FIELDS = frozenset({
     "project", "origin", "port", "control_image", "worker_image",
     "gateway_image", "frontend_sha256", "config_sha256", "engine_id",
     "engine_context", "source_commit", "harness_revision", "workspace_root",
-    "data_root", "egress_ca_sha256",
+    "data_root", "egress_ca_sha256", "publish_mode",
 })
 _BACKUP_SECRET_FIELDS = frozenset({
     "secret", "secrets", "token", "password", "credential", "credentials",
@@ -344,6 +344,10 @@ def _validate_deployment_metadata(deployment: object) -> dict:
         value = deployment.get(key)
         if value is not None and not isinstance(value, str):
             raise DomainError("backup_deployment_metadata_invalid", 400)
+    # 旧备份没有该字段；一旦出现必须是受管策略的精确取值。
+    publish_mode = deployment.get("publish_mode")
+    if publish_mode is not None and publish_mode not in ("automated", "manual"):
+        raise DomainError("backup_deployment_metadata_invalid", 400)
     return dict(deployment)
 
 

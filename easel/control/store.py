@@ -2570,6 +2570,24 @@ class Store:
                 raise DomainError("request_conflict", 409)
             return _run_record(existing)
 
+    def find_run_by_client_request(
+            self, actor: Identity, conversation_id: str,
+            client_request_id: str) -> RunRecord | None:
+        """按本人幂等键读取原 Run；只返回本会话，不接受跨会话/跨用户探测。
+
+        与 :meth:`lookup_run` 不同，这里没有当前输入可用于摘要校验；调用方
+        只把它当作“原意图是否已接纳”的只读查询，真正提交仍走摘要校验。
+        """
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, client_request_id,"
+            " input_digest, status, config_version FROM runs"
+            " WHERE workspace_id = ? AND client_request_id = ?",
+            (workspace_id, _text(client_request_id))).fetchone()
+        if row is None or row["conversation_id"] != _text(conversation_id):
+            return None
+        return _run_record(row)
+
     def reserve_run(self, actor: Identity, conversation_id: str, client_request_id: str,
                     input_digest: str, config_version: int) -> RunRecord:
         """幂等接纳一次任务；重复请求返回原 Run，不重复占用并发预算。
@@ -3226,7 +3244,7 @@ def _conversation_record(row: sqlite3.Row) -> ConversationRecord:
 def _run_record(row: sqlite3.Row) -> RunRecord:
     return RunRecord(row["id"], row["workspace_id"], row["conversation_id"],
                      row["status"], row["config_version"],
-                     row["client_request_id"])
+                     row["client_request_id"], row["input_digest"])
 
 
 def _restrict_directory(directory: Path) -> None:

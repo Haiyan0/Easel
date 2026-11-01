@@ -19,6 +19,7 @@ import re
 import time
 import uuid
 
+from ..worker.config import run_input_digest
 from .store import Store
 from .types import DomainError, Identity
 
@@ -320,25 +321,39 @@ class WorkspacePublishing:
         run = await self._db(self._store.get_run, actor, run_id)
         return admission, run
 
+    def _input_matches(self, run, task_type: str, descriptor: str) -> bool:
+        """同 requestId 必须绑定同一输入；摘要与 WorkerRelay 完全一致。"""
+        return run.input_digest == run_input_digest(
+            conversation_id=run.conversation_id, task_type=task_type,
+            message=descriptor, attachments=(), persona=None)
+
     async def _join_or_submit(self, actor: Identity, key: str, title: str,
                               task_type: str, descriptor: str,
                               request_id: str, *, busy_code: str):
-        """同一任务键最多一个在途 Run；同 requestId 加入，不同请求拒绝。"""
+        """同一任务键最多一个在途 Run；同请求同输入加入，异输入 409。"""
         active = await self._active(actor, key)
         if active is not None:
             if active.client_request_id == request_id:
-                return {"runId": active.id, "duplicate": True}, active
+                if self._input_matches(active, task_type, descriptor):
+                    return {"runId": active.id, "duplicate": True}, active
+                raise DomainError("request_conflict", 409)
             raise DomainError(busy_code, 409)
         try:
             return await self._submit(
                 actor, key, title, task_type, descriptor, request_id)
         except DomainError as error:
-            if error.code not in ("conversation_busy", "request_conflict"):
+            # relay 已按持久摘要判定冲突时直接返回 409，不能再用 requestId
+            # 字符串把它降级成“加入原 Run”。
+            if error.code == "request_conflict":
+                raise
+            if error.code != "conversation_busy":
                 raise
             active = await self._active(actor, key)
             if active is not None:
                 if active.client_request_id == request_id:
-                    return {"runId": active.id, "duplicate": True}, active
+                    if self._input_matches(active, task_type, descriptor):
+                        return {"runId": active.id, "duplicate": True}, active
+                    raise DomainError("request_conflict", 409) from None
                 raise DomainError(busy_code, 409) from None
             raise
 
@@ -488,12 +503,7 @@ class WorkspacePublishing:
         return {"mode": "publish", "state": "unknown",
                 "message": message, "runId": run.id}
 
-    async def status(self, actor: Identity, platform: object) -> dict:
-        platform = canonical_platform(platform)
-        run = await self._latest(actor, publish_task_key(platform))
-        if run is None:
-            return {"mode": "publish", "state": "unknown",
-                    "message": "", "runId": ""}
+    async def _status_for_run(self, actor: Identity, run) -> dict:
         if run.status in _TERMINAL:
             await self._finish(actor, run, run.status)
             return await self._terminal_status(actor, run, run.status)
@@ -516,6 +526,36 @@ class WorkspacePublishing:
         return {"mode": "publish", "state": state_value,
                 "message": _clean_message(browser.get("message")),
                 "runId": run.id}
+
+    async def status(self, actor: Identity, platform: object, *,
+                     request_id: object = None) -> dict:
+        """读取发布状态；带 requestId 时只查询该次用户意图的原 Run。
+
+        未确认的意图返回 ``runId=""`` 的 unknown，让页面保留意图并允许重试；
+        不带 requestId 时保持原行为（当前会话最近一次 Run）。
+        """
+        platform = canonical_platform(platform)
+        key = publish_task_key(platform)
+        if request_id is not None:
+            request_id = canonical_request_id(request_id)
+            conversation = await self._db(
+                self._store.get_task_conversation, actor, key)
+            if conversation is None:
+                run = None
+            else:
+                run = await self._db(
+                    self._store.find_run_by_client_request, actor,
+                    conversation.id, request_id)
+            if run is None:
+                return {"mode": "publish", "state": "unknown",
+                        "message": "尚未确认该发布请求已被接纳，可重试同一请求。",
+                        "runId": ""}
+            return await self._status_for_run(actor, run)
+        run = await self._latest(actor, key)
+        if run is None:
+            return {"mode": "publish", "state": "unknown",
+                    "message": "", "runId": ""}
+        return await self._status_for_run(actor, run)
 
     async def submit_sms(self, actor: Identity, platform: object,
                          code: object, *, run_id: object = None) -> dict:

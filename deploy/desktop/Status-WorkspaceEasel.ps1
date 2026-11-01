@@ -455,6 +455,7 @@ try {
             Write-Output "version_source_commit=$([string]$deployment.source_commit)"
             Write-Output "version_harness_revision=$([string]$deployment.harness_revision)"
             Write-Output "version_project=$([string]$deployment.project)"
+            Write-Output "version_publish_mode=$([string]$deployment.publish_mode)"
         }
         catch {
             Add-Failure 'deployment_metadata_invalid'

@@ -59,3 +59,62 @@ test('scoped draft stays independent when the global draft changes', () => {
   assert.equal(store.loadPublishDraft('user-a:ws-a').title, 'A');
   assert.equal(store.loadPublishDraft().title, '本机新稿');
 });
+
+test('publish intent is scoped per identity and never global', () => {
+  const { store, storage } = load();
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-a', fingerprint: 'fp-1' },
+  }, 'user-a:ws-a');
+  const reloaded = store.loadPublishIntents('user-a:ws-a');
+  assert.equal(reloaded.xiaohongshu.requestId, 'req-a');
+  assert.equal(reloaded.xiaohongshu.fingerprint, 'fp-1');
+  assert.equal(Object.keys(store.loadPublishIntents('user-b:ws-b')).length, 0);
+  assert.equal(Object.keys(store.loadPublishIntents()).length, 0);
+  assert.equal(storage.has('easel_publish_intent'), false);
+  assert.equal([...storage.keys()].every(
+    key => key.includes('user-a:ws-a')), true);
+});
+
+test('publish intent clear removes only the requested platform', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-a', fingerprint: 'fp-1' },
+    douyin: { requestId: 'req-b', fingerprint: 'fp-2' },
+  }, scope);
+  store.clearPublishIntent('xiaohongshu', scope);
+  const remaining = store.loadPublishIntents(scope);
+  assert.equal(remaining.xiaohongshu, undefined);
+  assert.equal(remaining.douyin.requestId, 'req-b');
+  store.clearPublishIntent('xiaohongshu', 'user-b:ws-b');
+  assert.equal(store.loadPublishIntents(scope).douyin.requestId, 'req-b');
+});
+
+test('stale terminal response cannot clear a newer intent', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-new', fingerprint: 'fp-new' },
+  }, scope);
+  store.clearPublishIntent('xiaohongshu', scope, 'req-old');
+  assert.equal(
+    store.loadPublishIntents(scope).xiaohongshu.requestId, 'req-new');
+  store.clearPublishIntent('xiaohongshu', scope, 'req-new');
+  assert.equal(store.loadPublishIntents(scope).xiaohongshu, undefined);
+});
+
+test('corrupt publish intent data is ignored', () => {
+  const { store, storage } = load();
+  const key = 'easel_publish_intent:user-a:ws-a';
+  storage.set(key, '{not-json');
+  assert.equal(Object.keys(store.loadPublishIntents('user-a:ws-a')).length, 0);
+  storage.set(key, JSON.stringify({
+    xiaohongshu: { requestId: 1, fingerprint: null },
+    douyin: { requestId: 'ok', fingerprint: 'fp' },
+    bad: 'value',
+  }));
+  const parsed = store.loadPublishIntents('user-a:ws-a');
+  assert.equal(Object.keys(parsed).length, 1);
+  assert.equal(parsed.douyin.requestId, 'ok');
+  assert.equal(parsed.douyin.fingerprint, 'fp');
+});

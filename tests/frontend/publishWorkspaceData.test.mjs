@@ -156,6 +156,32 @@ test('control publish status and sms are bound to the current run', async () => 
   });
 });
 
+test('control publish status can query the original intent request id', async () => {
+  const data = load();
+  const calls = recorder({
+    '/api/publish/douyin/status?requestId=intent%2F1': {
+      mode: 'publish', state: 'success', message: '', runId: 'run-9',
+    },
+  });
+  const control = data.createControlWorkspaceData(calls);
+  const status = await control.publishStatus('douyin', { requestId: 'intent/1' });
+  assert.equal(status.runId, 'run-9');
+  assert.equal(calls.calls[0].path,
+    '/api/publish/douyin/status?requestId=intent%2F1');
+  assert.equal(calls.calls[0].init.method, undefined);
+});
+
+test('uncertain publish errors are not treated as definite rejection', () => {
+  const data = load();
+  assert.equal(data.isUncertainPublishError(new Error('network down')), true);
+  assert.equal(data.isUncertainPublishError({ status: 0 }), true);
+  assert.equal(data.isUncertainPublishError({ status: 502 }), true);
+  assert.equal(data.isUncertainPublishError({ status: 504 }), true);
+  assert.equal(data.isUncertainPublishError({ status: 409 }), false);
+  assert.equal(data.isUncertainPublishError({ status: 403 }), false);
+  assert.equal(data.isUncertainPublishError({ status: 400 }), false);
+});
+
 test('control export only accepts an unpublished package result', async () => {
   const data = load();
   const path = '_publish/manual/easel-xiaohongshu-0123456789ab.zip';

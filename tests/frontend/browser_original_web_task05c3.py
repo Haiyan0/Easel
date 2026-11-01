@@ -12,12 +12,14 @@ import datetime as dt
 import inspect
 import ipaddress
 import json
+import os
 import shutil
 import socket
 import sys
 import threading
 import time
 import traceback
+import weakref
 import zipfile
 from pathlib import Path
 
@@ -34,7 +36,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c3" / "browser"
+# 默认保持历史证据目录；返工轮用 EASEL_5C3_EVIDENCE 指向本组 r1 子目录，
+# 避免重跑覆盖历史截图。
+_EVIDENCE_OVERRIDE = os.environ.get("EASEL_5C3_EVIDENCE", "")
+EVIDENCE = (Path(_EVIDENCE_OVERRIDE) if _EVIDENCE_OVERRIDE
+            else ROOT / "docs" / "evidence" / "original-web-task-05c3" / "browser")
+if not EVIDENCE.is_absolute():
+    EVIDENCE = ROOT / EVIDENCE
 SHOTS: list[Path] = []
 FAILURES: list[str] = []
 RESULTS: dict[str, bool] = {}
@@ -76,6 +84,8 @@ class FakePublisher:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.cancelled = 0
+        # 模拟“后台仍 running”的丢响应场景；正常矩阵保持 0。
+        self.delay = 0.0
 
     async def __call__(self, platform, cmd, env, status_file, code_file,
                        timeout, emit):
@@ -84,6 +94,8 @@ class FakePublisher:
             "status_file": status_file, "code_file": code_file,
         })
         try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
             if platform == "douyin" and status_file is not None:
                 status_file.parent.mkdir(parents=True, exist_ok=True)
                 self._status(status_file, emit, "sms_required",
@@ -169,10 +181,15 @@ class Server:
         self.store = Store.connect(root / "control.sqlite3")
         self.admin = self.store.create_user("BrowserOwner", "admin")
         self.member = self.store.create_user("BrowserMember")
+        # 第二身份只为发布页草稿/意图隔离；不装配第二个 worker。
+        self.member_b = self.store.create_user("BrowserMemberB")
         self.auth = AuthService(self.store)
         self.invites = [
             self.auth.create_invite(self.admin, self.member.user_id)
-            for _ in range(8)]
+            for _ in range(16)]
+        self.invites_b = [
+            self.auth.create_invite(self.admin, self.member_b.user_id)
+            for _ in range(6)]
         self.key = Ed25519PrivateKey.generate()
         self.handle = WorkerHandle(
             self.member.workspace_id, f"{0x5C3:064x}",
@@ -225,10 +242,16 @@ class Server:
                 self.handle = handle
 
             async def ensure_ready(self, workspace_id, config_version):
-                assert workspace_id == self.handle.workspace_id
+                # 第二身份 B 没有 worker：按正式语义返回不可用，而不是在
+                # 测试替身里断言崩溃。
+                if workspace_id != self.handle.workspace_id:
+                    from easel.control.types import DomainError
+                    raise DomainError("workspace_unavailable", 403)
                 return self.handle
 
             async def bound_handle(self, workspace_id, container, revision):
+                if workspace_id != self.handle.workspace_id:
+                    return None
                 return self.handle
 
         self.runtime = Runtime(self.handle)
@@ -355,12 +378,15 @@ async def screenshot(page, name: str) -> None:
     SHOTS.append(path)
 
 
-async def login(page, server: Server) -> None:
-    invite = server.invites.pop(0)
+async def login_with(page, server: Server, invite: str) -> None:
     await page.goto(server.origin, wait_until="domcontentloaded", timeout=20000)
     await page.fill("#invite", invite)
     await page.get_by_role("button", name="进入工作区").click()
     await page.locator(".sidebar").wait_for(timeout=20000)
+
+
+async def login(page, server: Server) -> None:
+    await login_with(page, server, server.invites.pop(0))
 
 
 async def open_publish(page) -> None:
@@ -569,8 +595,15 @@ async def modal_open(page) -> int:
     return await page.locator(".modal").count()
 
 
+_DIALOG_PAGES: "weakref.WeakSet" = weakref.WeakSet()
+
+
 async def _submit_publish(page) -> None:
-    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    # 同一页面只注册一次确认框处理器；重复注册会让后一个处理器收到
+    # “already handled” 噪声。
+    if page not in _DIALOG_PAGES:
+        page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+        _DIALOG_PAGES.add(page)
     await page.get_by_role("button", name="一键发布").click()
 
 
@@ -729,6 +762,282 @@ async def scenario_duplicate_submit(browser, server: Server) -> None:
     await context.close()
 
 
+def publish_done_count(server: Server, member=None) -> int:
+    """控制库中该身份发布会话已 done 的 Run 数；用于“后台已 done”时序。"""
+    import sqlite3
+
+    target = member or server.member
+    connection = sqlite3.connect(server.root / "control.sqlite3")
+    try:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM runs WHERE status='done'"
+            " AND workspace_id=? AND conversation_id IN"
+            " (SELECT id FROM conversations WHERE workspace_id=?"
+            " AND title='发布：xiaohongshu')",
+            (target.workspace_id, target.workspace_id)).fetchone()[0])
+    finally:
+        connection.close()
+
+
+async def _open_auto_publish(page) -> None:
+    await open_publish(page)
+    await page.get_by_role("button", name="自动发布").click()
+    await page.locator(".publish-editor").wait_for(timeout=20000)
+
+
+async def _fill_xhs_draft(page, title: str, body: str = "自动发布正文") -> None:
+    await page.locator(".publish-editor input.field").first.fill(title)
+    await page.locator(".publish-editor textarea.field").first.fill(body)
+    if await _chip_active(page, "抖音"):
+        await page.get_by_role("button", name="抖音", exact=True).click()
+    if not await _chip_active(page, "小红书"):
+        await page.get_by_role("button", name="小红书", exact=True).click()
+    if await page.locator(".media-grid").count() == 0:
+        await page.get_by_role("button", name="选择媒体").click()
+    await page.locator(".media-grid").wait_for(timeout=20000)
+    await wait_for(
+        lambda: media_cell_ready(page, "project/cover.png"), 20,
+        "cover media cell missing")
+    index = await media_cell_index(page, "project/cover.png")
+    cell = page.locator(".media-cell").nth(index)
+    if "sel" not in ((await cell.get_attribute("class")) or ""):
+        await cell.click()
+
+
+async def _lose_first_publish_ack(page) -> list[dict]:
+    """第一次 POST 实际到达服务端，但只把浏览器侧响应丢弃。"""
+    posts: list[dict] = []
+
+    async def handler(route):
+        if route.request.method != "POST":
+            await route.continue_()
+            return
+        posts.append(json.loads(route.request.post_data or "{}"))
+        if len(posts) == 1:
+            response = await route.fetch()
+            assert response.status == 200, await response.text()
+            await route.abort("failed")
+        else:
+            await route.continue_()
+
+    await page.route("**/api/publish/xiaohongshu", handler)
+    return posts
+
+
+async def _intent_storage(page) -> dict:
+    return await page.evaluate(
+        """() => {
+          const out = {};
+          for (let i = 0; i < localStorage.length; i += 1) {
+            const key = localStorage.key(i);
+            if (key.startsWith('easel_publish_intent:')
+                || key.startsWith('easel_publish_draft:')) {
+              out[key] = localStorage.getItem(key);
+            }
+          }
+          return out;
+        }""")
+
+
+async def scenario_lost_ack_running_retry(browser, server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "丢失接纳-running")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts = await _lose_first_publish_ack(page)
+    server.fake.delay = 5.0
+    try:
+        await _submit_publish(page)
+        await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+        # 后台仍 running 时同稿重试：复用同一 requestId，不新增外部提交。
+        await _submit_publish(page)
+        await page.locator(".pv-pubstate.ok").wait_for(timeout=40000)
+    finally:
+        server.fake.delay = 0.0
+    assert len(posts) == 2, posts
+    assert posts[0]["requestId"] == posts[1]["requestId"], posts
+    assert len(server.fake.calls) == calls_before + 1, server.fake.calls
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "08-lost-ack-running-retry.png")
+    await context.close()
+
+
+async def scenario_lost_ack_done_retry(browser, server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "丢失接纳-done")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts = await _lose_first_publish_ack(page)
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 1, 20,
+        "first accepted run did not settle")
+    assert len(server.fake.calls) == calls_before + 1
+    # 原 Run 已 done，但浏览器从未收到接纳响应：同稿重试仍是同一意图。
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=30000)
+    assert len(posts) == 2, posts
+    assert posts[0]["requestId"] == posts[1]["requestId"], posts
+    assert len(server.fake.calls) == calls_before + 1, server.fake.calls
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "09-lost-ack-done-retry.png")
+    await context.close()
+
+
+async def scenario_lost_ack_refresh(browser, server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "丢失接纳-refresh")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts = await _lose_first_publish_ack(page)
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 1, 20,
+        "first accepted run did not settle")
+    await page.reload(wait_until="domcontentloaded")
+    await page.locator(".sidebar").wait_for(timeout=20000)
+    await _open_auto_publish(page)
+    # 刷新后按已保存的 requestId 找回原 Run，不创建第二个任务。
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=20000)
+    assert len(posts) == 1, posts
+    assert len(server.fake.calls) == calls_before + 1, server.fake.calls
+    assert publish_done_count(server) == done_before + 1
+    scope = f"{server.member.user_id}:{server.member.workspace_id}"
+    intents = json.loads((await _intent_storage(page)).get(
+        f"easel_publish_intent:{scope}", "{}"))
+    assert "xiaohongshu" not in intents
+    await screenshot(page, "10-lost-ack-refresh-recovered.png")
+    await context.close()
+
+
+async def scenario_new_intent_after_success(browser, server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "明确新意图")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts: list[dict] = []
+
+    async def record(route):
+        if route.request.method == "POST":
+            posts.append(json.loads(route.request.post_data or "{}"))
+        await route.continue_()
+
+    await page.route("**/api/publish/xiaohongshu", record)
+    await _submit_publish(page)
+    await wait_for(
+        lambda: len(server.fake.calls) == calls_before + 1, 20,
+        "first explicit publish did not execute")
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 1, 20,
+        "first explicit publish did not settle")
+    # 明确完成后再次点击同稿发布：这是用户主动的新意图，应生成新请求号。
+    await _submit_publish(page)
+    await wait_for(
+        lambda: len(server.fake.calls) == calls_before + 2, 20,
+        "second explicit publish did not execute")
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 2, 20,
+        "second explicit publish did not settle")
+    assert len(posts) == 2, posts
+    assert posts[0]["requestId"] != posts[1]["requestId"], posts
+    await page.unroute("**/api/publish/xiaohongshu", record)
+    await screenshot(page, "11-explicit-new-intent.png")
+    await context.close()
+
+
+async def scenario_identity_switch_isolates_intent(browser,
+                                                   server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "身份A-未确认稿")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts = await _lose_first_publish_ack(page)
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 1, 20,
+        "identity A accepted run did not settle")
+    assert len(posts) == 1, posts
+    a_request = posts[0]["requestId"]
+    a_scope = f"{server.member.user_id}:{server.member.workspace_id}"
+    a_intent_key = f"easel_publish_intent:{a_scope}"
+    stored = await _intent_storage(page)
+    assert a_request in stored[a_intent_key], stored
+
+    await page.get_by_role("button", name="退出").click()
+    await page.locator("#invite").wait_for(timeout=20000)
+    await login_with(page, server, server.invites_b.pop(0))
+    await _open_auto_publish(page)
+    # B 的编辑区不显示 A 的草稿，B 的 scope 也没有 A 的意图。
+    assert await page.locator(
+        ".publish-editor input.field").first.input_value() == ""
+    b_scope = f"{server.member_b.user_id}:{server.member_b.workspace_id}"
+    stored_b = await _intent_storage(page)
+    assert f"easel_publish_intent:{b_scope}" not in stored_b, stored_b
+    b_draft = stored_b.get(f"easel_publish_draft:{b_scope}", "{}")
+    assert "身份A" not in b_draft, stored_b
+    assert "自动发布正文" not in b_draft, stored_b
+    assert a_request in stored_b[a_intent_key], stored_b
+
+    b_posts: list[dict] = []
+
+    async def record_b(route):
+        if route.request.method == "POST":
+            b_posts.append(json.loads(route.request.post_data or "{}"))
+        await route.continue_()
+
+    await page.route("**/api/publish/**", record_b)
+    await page.locator(".publish-editor input.field").first.fill("身份B新稿")
+    await page.locator(
+        ".publish-editor textarea.field").first.fill("B 正文")
+    await _submit_publish(page)
+    # B 未登录/无媒体：发布不会到达 POST，更不能重发 A 的 requestId。
+    await page.locator(".pv-pubstate.fail").first.wait_for(timeout=20000)
+    assert b_posts == [], b_posts
+    assert len(server.fake.calls) == calls_before + 1
+    await page.unroute("**/api/publish/**", record_b)
+
+    # 切回 A：草稿与未确认意图仍在，恢复原 Run 且不重复提交。
+    await page.get_by_role("button", name="退出").click()
+    await page.locator("#invite").wait_for(timeout=20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    assert await page.locator(
+        ".publish-editor input.field").first.input_value() == "身份A-未确认稿"
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=20000)
+    assert len(server.fake.calls) == calls_before + 1
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "12-identity-switch-isolated.png")
+    await context.close()
+
+
 async def main() -> int:
     if not DIST.is_dir():
         print("frontend build missing", flush=True)
@@ -754,6 +1063,25 @@ async def main() -> int:
                     await check(
                         "duplicate-submit-once",
                         lambda: scenario_duplicate_submit(browser, automated))
+                    await check(
+                        "lost-ack-running-retry-once",
+                        lambda: scenario_lost_ack_running_retry(
+                            browser, automated))
+                    await check(
+                        "lost-ack-done-retry-once",
+                        lambda: scenario_lost_ack_done_retry(
+                            browser, automated))
+                    await check(
+                        "lost-ack-refresh-recovers",
+                        lambda: scenario_lost_ack_refresh(browser, automated))
+                    await check(
+                        "explicit-new-intent",
+                        lambda: scenario_new_intent_after_success(
+                            browser, automated))
+                    await check(
+                        "identity-switch-isolates-intent",
+                        lambda: scenario_identity_switch_isolates_intent(
+                            browser, automated))
                 finally:
                     await automated.stop()
                 manual = Server(

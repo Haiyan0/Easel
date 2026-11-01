@@ -26,6 +26,7 @@ from easel.control.workspace_publishing import (
     export_task_key,
     publish_task_key,
 )
+from easel.worker.config import run_input_digest
 
 ORIGIN = "https://easel.test"
 PLATFORM = "xiaohongshu"
@@ -53,19 +54,22 @@ class FakeRelay:
     async def submit_task(self, actor, task_type, payload):
         if self.submit_error is not None:
             raise self.submit_error
-        self.submissions.append((actor, task_type, dict(payload)))
-        if self.submit_started is not None:
-            self.submit_started.set()
+        # 与真实 WorkerRelay 一致：摘要覆盖会话、任务类型、正文/附件/人设。
+        digest = run_input_digest(
+            conversation_id=payload["sessionId"], task_type=task_type,
+            message=payload["message"], attachments=payload["attachments"],
+            persona=payload.get("persona"))
         with Store.open(self.path) as store:
             existing = store.lookup_run(
-                actor, payload["sessionId"], payload["turnId"],
-                f"digest-{task_type}-{payload['turnId']}")
+                actor, payload["sessionId"], payload["turnId"], digest)
             if existing is not None:
                 return {"runId": existing.id, "state": existing.status,
                         "duplicate": True}
+            self.submissions.append((actor, task_type, dict(payload)))
+            if self.submit_started is not None:
+                self.submit_started.set()
             run = store.reserve_run(
-                actor, payload["sessionId"], payload["turnId"],
-                f"digest-{task_type}-{payload['turnId']}", 0)
+                actor, payload["sessionId"], payload["turnId"], digest, 0)
             store.mark_running(actor, run.id)
         self.states[run.id] = "running"
         if self.auto_state is not None:
@@ -101,14 +105,15 @@ class FakeRelay:
             page = self.message_log[offset:offset + limit]
             return {"messages": page, "total": len(self.message_log)}
         with Store.open(self.path) as store:
-            run = store.latest_run_for_conversation(actor, conversation_id)
-        if run is None:
-            return {"messages": []}
-        text = self.results.get(run.id)
-        if text is None:
-            return {"messages": []}
-        return {"messages": [{
-            "role": "assistant", "content": text, "runId": run.id}]}
+            runs = store.list_runs(actor, conversation_id)
+        # 与真实 relay 一致：会话内多个 Run 的助手结果都可见，由调用方按
+        # runId 选取本次 Run 的结果，不能只返回“最近一个 Run”。
+        messages = [{
+            "role": "assistant", "content": text, "runId": run.id}
+            for run in runs for text in [self.results.get(run.id)]
+            if text is not None]
+        return {"messages": messages[offset:offset + limit],
+                "total": len(messages)}
 
     async def stop(self, actor, payload):
         run_id = payload["runId"]
@@ -292,6 +297,115 @@ def test_auto_publish_admits_one_owned_run_and_dedupes_same_request(tmp_path):
         store.close()
 
 
+def test_same_request_id_changed_input_conflicts_while_active(tmp_path):
+    store, _auth, _admin, member, _other, relay, workspace, _app = _fixture(
+        tmp_path)
+    try:
+        async def scenario():
+            service = _service(store, relay, workspace)
+            first = await service.publish(
+                member, DOUYIN,
+                _publish_payload(media=["project/clip.mp4"]),
+                request_id="same-request")
+            with pytest.raises(DomainError) as conflict:
+                await service.publish(
+                    member, DOUYIN,
+                    _publish_payload(
+                        title="修改后的标题", body="修改后的正文",
+                        media=["project/clip.mp4"]),
+                    request_id="same-request")
+            assert conflict.value.status == 409
+            assert conflict.value.code == "request_conflict"
+            # 异输入不能重复接纳，也不能开启第二次外部动作。
+            assert len(relay.submissions) == 1
+            same = await service.publish(
+                member, DOUYIN,
+                _publish_payload(media=["project/clip.mp4"]),
+                request_id="same-request")
+            assert same["runId"] == first["runId"]
+            assert len(relay.submissions) == 1
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_same_request_id_changed_input_conflicts_after_terminal(tmp_path):
+    store, _auth, _admin, member, _other, relay, workspace, _app = _fixture(
+        tmp_path)
+    try:
+        async def scenario():
+            relay.auto_state = "done"
+            relay.auto_result = {
+                "state": "success", "ok": True, "message": "发布成功"}
+            service = _service(store, relay, workspace)
+            first = await service.publish(
+                member, DOUYIN,
+                _publish_payload(media=["project/clip.mp4"]),
+                request_id="terminal-request")
+            with pytest.raises(DomainError) as conflict:
+                await service.publish(
+                    member, DOUYIN,
+                    _publish_payload(
+                        title="终态改稿", body="终态改稿",
+                        media=["project/clip.mp4"]),
+                    request_id="terminal-request")
+            assert conflict.value.status == 409
+            assert conflict.value.code == "request_conflict"
+            assert len(relay.submissions) == 1
+            same = await service.publish(
+                member, DOUYIN,
+                _publish_payload(media=["project/clip.mp4"]),
+                request_id="terminal-request")
+            assert same["runId"] == first["runId"]
+            assert len(relay.submissions) == 1
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_export_same_request_id_changed_input_conflicts_while_active(
+        tmp_path):
+    store, _auth, _admin, member, _other, relay, workspace, _app = _fixture(
+        tmp_path)
+    try:
+        async def scenario():
+            service = _service(store, relay, workspace)
+            path = "_publish/manual/easel-xiaohongshu-0123456789ab.zip"
+            payload = {"title": "标题", "body": "正文", "tags": "",
+                       "media": [], "reviewed": True}
+            first = asyncio.create_task(service.manual_export(
+                member, PLATFORM, payload, request_id="export-same"))
+            while not relay.submissions:
+                await asyncio.sleep(0.005)
+            changed = asyncio.create_task(service.manual_export(
+                member, PLATFORM,
+                {**payload, "title": "改稿", "body": "改稿"},
+                request_id="export-same"))
+            with Store.open(store.path) as opened:
+                conversation = opened.get_task_conversation(
+                    member, export_task_key(PLATFORM))
+                run = opened.latest_run_for_conversation(
+                    member, conversation.id)
+            relay.finish(member, run.id, "done", {
+                "path": path, "filename": path.rsplit("/", 1)[-1],
+                "published": False})
+            result = await first
+            assert result["path"] == path
+            try:
+                await changed
+            except DomainError as error:
+                assert error.status == 409
+            else:
+                pytest.fail("同 requestId 的改稿导出被当作原稿件包接纳")
+            assert len(relay.submissions) == 1
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
 def test_two_users_same_platform_have_isolated_runs(tmp_path):
     store, _auth, _admin, member, other, relay, workspace, _app = _fixture(
         tmp_path)
@@ -315,6 +429,66 @@ def test_two_users_same_platform_have_isolated_runs(tmp_path):
             assert own_b["runId"] == b["runId"]
 
         asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_status_by_request_id_returns_exact_owned_run(tmp_path):
+    store, _auth, _admin, member, other, relay, workspace, app = _fixture(
+        tmp_path)
+    try:
+        with TestClient(app, base_url=ORIGIN) as client:
+            _body, headers = _login(client, _auth, _admin, member)
+            first = client.post(
+                f"/api/publish/{PLATFORM}",
+                json=_with_request(_publish_payload(), "intent-a"),
+                headers=headers)
+            assert first.status_code == 200, first.text
+            first_run = first.json()["runId"]
+            relay.finish(member, first_run, "done", {
+                "state": "success", "ok": True, "message": "发布成功"})
+            # 明确完成后的再次发布是新意图；旧意图仍可按 requestId 精确查询。
+            second = client.post(
+                f"/api/publish/{PLATFORM}",
+                json=_with_request(_publish_payload(), "intent-b"),
+                headers=headers)
+            assert second.status_code == 200, second.text
+            second_run = second.json()["runId"]
+            assert second_run != first_run
+
+            old = client.get(
+                f"/api/publish/{PLATFORM}/status?requestId=intent-a")
+            assert old.status_code == 200, old.text
+            assert old.json()["runId"] == first_run
+            assert old.json()["state"] == "success"
+
+            unknown = client.get(
+                f"/api/publish/{PLATFORM}/status?requestId=never-sent")
+            assert unknown.status_code == 200, unknown.text
+            assert unknown.json()["runId"] == ""
+            assert unknown.json()["state"] == "unknown"
+
+            bad = client.get(
+                f"/api/publish/{PLATFORM}/status?requestId=intent-a&other=1",
+                headers=headers)
+            assert bad.status_code == 400, bad.text
+            invalid = client.get(
+                f"/api/publish/{PLATFORM}/status?requestId=bad request",
+                headers=headers)
+            assert invalid.status_code == 400, invalid.text
+            # 未带 requestId 的旧查询仍返回当前 Run。
+            latest = client.get(f"/api/publish/{PLATFORM}/status")
+            assert latest.status_code == 200
+            assert latest.json()["runId"] == second_run
+
+        async def isolated():
+            service = _service(store, relay, workspace)
+            foreign_status = await service.status(
+                other, PLATFORM, request_id="intent-a")
+            assert foreign_status["runId"] == ""
+            assert foreign_status["state"] == "unknown"
+
+        asyncio.run(isolated())
     finally:
         store.close()
 

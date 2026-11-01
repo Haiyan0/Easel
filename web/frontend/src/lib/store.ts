@@ -83,6 +83,69 @@ export function savePublishDraft(d: PublishDraft, scope?: string): void {
   } catch { /* quota */ }
 }
 
+/** 一次用户发布意图：同稿重试/刷新复用 requestId，新稿才换新值。 */
+export interface PublishIntent {
+  requestId: string;
+  fingerprint: string;
+}
+const PUBLISH_INTENT_KEY = 'easel_publish_intent';
+
+function publishIntentKey(scope: string): string {
+  return `${PUBLISH_INTENT_KEY}:${scope}`;
+}
+
+/** 意图只能按 identity/workspace 保存；无 scope 的 local 模式不落盘。 */
+export function loadPublishIntents(
+  scope?: string,
+): Record<string, PublishIntent> {
+  if (!scope) return {};
+  try {
+    const raw = localStorage.getItem(publishIntentKey(scope));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, PublishIntent> = {};
+    for (const [platform, value] of Object.entries(
+      parsed as Record<string, unknown>,
+    )) {
+      if (!value || typeof value !== 'object') continue;
+      const item = value as { requestId?: unknown; fingerprint?: unknown };
+      if (typeof item.requestId !== 'string' || !item.requestId
+          || typeof item.fingerprint !== 'string') continue;
+      result[platform] = {
+        requestId: item.requestId, fingerprint: item.fingerprint,
+      };
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+export function savePublishIntents(
+  intents: Record<string, PublishIntent>, scope?: string,
+): void {
+  if (!scope) return;
+  try {
+    localStorage.setItem(publishIntentKey(scope), JSON.stringify(intents));
+  } catch { /* quota */ }
+}
+
+export function clearPublishIntent(
+  platform: string, scope?: string, requestId?: string,
+): void {
+  if (!scope) return;
+  const intents = loadPublishIntents(scope);
+  const current = intents[platform];
+  if (!current) return;
+  // 迟到的旧 Run 只能清除它自己的意图，不能删掉用户随后发起的新意图。
+  if (requestId && current.requestId !== requestId) return;
+  delete intents[platform];
+  savePublishIntents(intents, scope);
+}
+
 const STORAGE_KEY = 'easel_sessions';
 const ACTIVE_KEY = 'easel_active_session';
 const MAX_SESSIONS = 100;

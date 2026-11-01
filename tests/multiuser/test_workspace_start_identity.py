@@ -78,6 +78,10 @@ function global:docker {{
     Add-StubCall ('docker ' + ($items -join ' '))
     $global:LASTEXITCODE = 0
     $joined = $items -join ' '
+    if ($joined -match 'test -e /data/control\\.sqlite3') {{
+        $global:LASTEXITCODE = 1
+        return
+    }}
     if ($joined -match 'keygen\\.py' -and $joined -match 'fingerprints') {{
         Write-Output 'key=exists'
         Write-Output 'signing_key=exists'

@@ -46,6 +46,8 @@ param(
     [Parameter(Mandatory = $true)][string]$GatewayImage,
     [string]$ProjectName = 'easel-workspace-desktop',
     [ValidateRange(1, 65535)][int]$Port = 7861,
+    # 受管发布策略：全新部署可省略（保留 automated）；旧部署必须显式迁移。
+    [ValidateSet('automated', 'manual')][string]$PublishMode = '',
     [string]$Distro = 'Ubuntu-26.04',
     [string]$WslRepo = '/mnt/c/Code/Easel',
     [string]$WorkspaceRoot = 'C:\Easel\workspaces',
@@ -197,11 +199,68 @@ try {
         throw 'compose_missing'
     }
 
+    # 发布策略只读正式部署登记（deployment.json）或显式 -PublishMode；
+    # 不读取 worker/宿主 .env。旧部署没有登记时必须显式迁移，不能因为
+    # 新 CLI 默认值把 manual 静默升级成 automated。
+    $deploymentFile = Join-Path $logDir 'deployment.json'
+    $registeredPublishMode = ''
+    $probeMissingDeployment = $false
+    if (Test-Path -LiteralPath $deploymentFile -PathType Leaf) {
+        try {
+            $existingDeployment = Get-Content -LiteralPath $deploymentFile -Raw |
+                ConvertFrom-Json
+        }
+        catch {
+            throw 'deployment_metadata_invalid'
+        }
+        if ([string]$existingDeployment.project -ne $ProjectName) {
+            throw 'deployment_project_mismatch'
+        }
+        $registeredPublishMode = [string]$existingDeployment.publish_mode
+        if ($registeredPublishMode -and
+            $registeredPublishMode -notin @('automated', 'manual')) {
+            throw 'deployment_publish_mode_invalid'
+        }
+        if (-not $registeredPublishMode -and -not $PublishMode) {
+            throw 'publish_mode_migration_required'
+        }
+    }
+    else {
+        # 登记丢失时延后到镜像 pin 校验之后探测控制卷，避免为无效镜像
+        # 触发拉取；已有控制库说明不是全新部署。
+        $probeMissingDeployment = $true
+    }
+
     Assert-EaselVolumeContract -ProjectName $ProjectName -Volumes $volumes `
         -IncludeEgress
     Assert-EaselNetworkContract -ProjectName $ProjectName `
         -NetworkName $network
     Test-EaselImagePin -Image $Image
+    if ($probeMissingDeployment) {
+        $dbProbe = Invoke-EaselDocker -Arguments @(
+            'run', '--rm', '--network', 'none', '--read-only',
+            '--user', '10001:10001', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges:true',
+            '--entrypoint', 'sh',
+            '--mount', "type=volume,src=$($volumes.Control),dst=/data,readonly",
+            $Image, '-c', 'test -e /data/control.sqlite3')
+        if ($dbProbe.ExitCode -eq 0 -and -not $PublishMode) {
+            throw 'publish_mode_migration_required'
+        }
+        if ($dbProbe.ExitCode -notin @(0, 1)) {
+            throw 'publish_mode_probe_failed'
+        }
+    }
+    if ($PublishMode) {
+        $resolvedPublishMode = $PublishMode
+    }
+    elseif ($registeredPublishMode) {
+        $resolvedPublishMode = $registeredPublishMode
+    }
+    else {
+        # 全新部署保留原默认自动发布；旧部署已在上方要求显式迁移。
+        $resolvedPublishMode = 'automated'
+    }
     foreach ($pin in @($WorkerImage, $GatewayImage)) {
         $inspect = Invoke-EaselDocker -Arguments @(
             'image', 'inspect', '--format', '{{.Id}}', $pin)
@@ -429,7 +488,8 @@ try {
         "EASEL_CONTROL_PORT=$Port",
         "EASEL_CONTROL_NETWORK=$network",
         "EASEL_PROVISIONER_GID=$ProvisionerGid",
-        "EASEL_PROVISIONER_SOCKET=$socket"
+        "EASEL_PROVISIONER_SOCKET=$socket",
+        "EASEL_PUBLISH_MODE=$resolvedPublishMode"
     )
     $composeArgs = @(
         '-d', $Distro, '--', 'env') + $envArgs + @(
@@ -584,6 +644,7 @@ try {
         engine_context = $engineIdentity.Context
         source_commit = $sourceCommit
         harness_revision = $harnessRevision
+        publish_mode = $resolvedPublishMode
         workspace_root = $WorkspaceRoot
         data_root = $DataRoot
     }
@@ -593,9 +654,9 @@ try {
         ($deployment | ConvertTo-Json -Compress),
         (New-Object System.Text.UTF8Encoding($false)))
 
-    Write-Output ("started project={0} origin={1} port={2} control={3} worker={4} gateway={5} network={6} provisioner_socket={7}" -f `
+    Write-Output ("started project={0} origin={1} port={2} control={3} worker={4} gateway={5} network={6} provisioner_socket={7} publish_mode={8}" -f `
         $ProjectName, $PublicOrigin, $Port, $Image, $WorkerImage,
-        $GatewayImage, $network, $socket)
+        $GatewayImage, $network, $socket, $resolvedPublishMode)
     Write-Output "deployment_file=$deploymentFile"
     Write-Output "config_sha256=$identityConfigSha256"
     Write-Output "frontend_sha256=$frontendSha"

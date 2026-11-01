@@ -628,6 +628,14 @@ function Assert-EaselUpgradeBackup {
             [string]$oldDeployment.data_root) {
         throw 'upgrade_deployment_mismatch'
     }
+    # 旧部署/旧备份可能都没有策略字段；两者都有时必须一致，不能靠其中
+    # 一侧的登记把 manual 升级成 automated。
+    $oldPublishMode = [string]$oldDeployment.publish_mode
+    $backupPublishMode = [string]$manifest.deployment.publish_mode
+    if ($oldPublishMode -and $backupPublishMode -and
+        $oldPublishMode -ne $backupPublishMode) {
+        throw 'upgrade_deployment_mismatch'
+    }
 
     # 备份必须来自“当前正式控制库的同一轮 Stop”；只读副本查询控制库，
     # 不打开 Store、不执行 schema 迁移、不写正式卷。

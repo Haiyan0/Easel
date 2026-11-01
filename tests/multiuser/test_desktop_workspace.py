@@ -14,6 +14,7 @@ INITIALIZE = DEPLOY / "Initialize-WorkspaceEasel.ps1"
 START = DEPLOY / "Start-WorkspaceEasel.ps1"
 STOP = DEPLOY / "Stop-WorkspaceEasel.ps1"
 STATUS = DEPLOY / "Status-WorkspaceEasel.ps1"
+RESTORE = DEPLOY / "Restore-WorkspaceEasel.ps1"
 COMMON = DEPLOY / "EaselDesktop.Common.ps1"
 KEYGEN = DEPLOY / "keygen.py"
 
@@ -45,6 +46,11 @@ def test_workspace_compose_binds_signing_keys_and_gateway_mode():
     assert "/run/easel/provisioner.sock" in command
     assert "--egress-policy" in command
     assert "--egress-proxy" in command
+    # 正式编排必须能表达受管发布策略；不能只留 serve-control 手动参数。
+    assert "--publish-mode" in command
+    mode_value = command[command.index("--publish-mode") + 1]
+    assert "EASEL_PUBLISH_MODE" in mode_value
+    assert mode_value.startswith("${EASEL_PUBLISH_MODE")
     assert control["user"] == "10001:10001"
     assert control["read_only"] is True
     assert control["cap_drop"] == ["ALL"]
@@ -97,6 +103,23 @@ def test_initialize_binds_key_creation_and_private_network():
     _assert_no_authtoken_read(text)
     assert "chmod 777" not in text
     assert "chmod 666" not in text
+
+
+def test_restore_reuses_registered_publish_mode():
+    text = RESTORE.read_text(encoding="utf-8")
+    assert "manifest.deployment.publish_mode" in text
+    assert "-PublishMode" in text
+    assert "backup_manifest_invalid" in text
+
+
+def test_start_exposes_managed_publish_mode_parameter():
+    text = START.read_text(encoding="utf-8")
+    assert "$PublishMode" in text
+    assert "EASEL_PUBLISH_MODE" in text
+    assert "publish_mode" in text
+    # 旧部署没有登记策略时必须显式迁移，不能静默按新默认放开自动发布。
+    assert "publish_mode_migration_required" in text
+    assert "deployment_project_mismatch" in text
 
 
 def test_start_diagnoses_missing_dependencies_before_starting():

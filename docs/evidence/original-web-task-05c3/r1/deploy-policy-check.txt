@@ -1,0 +1,6 @@
+## compose with EASEL_PUBLISH_MODE=manual
+WITH_MANUAL_EXIT:0
+
+## compose without EASEL_PUBLISH_MODE (must fail closed)
+error while interpolating services.control.command.[]: required variable EASEL_PUBLISH_MODE is missing a value: 请设置受管发布策略 automated|manual
+WITHOUT_MODE_EXIT:1

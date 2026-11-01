@@ -14,9 +14,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
+from easel import cli
 from easel.control.app import ControlConfig, create_app
 from easel.control.auth import AuthService
 from easel.control.gateway_client import GatewayClient
@@ -43,6 +45,7 @@ class FakePublisher:
         self.calls: list[dict] = []
         self.mode = "success"
         self.cancelled = 0
+        self.slow_seconds = 30.0
 
     async def __call__(self, platform, cmd, env, status_file, code_file,
                        timeout, emit):
@@ -77,7 +80,7 @@ class FakePublisher:
             if self.mode == "error":
                 return {"returncode": 1, "status": None}
             if self.mode == "slow":
-                await asyncio.sleep(30)
+                await asyncio.sleep(self.slow_seconds)
             return {"returncode": 0, "status": None}
         except asyncio.CancelledError:
             self.cancelled += 1
@@ -141,11 +144,12 @@ class Chain:
             worker, "_WORKER_IDENTITY",
             WorkerIdentity(self.member.workspace_id,
                            self.handle.service_token))
+        self.sessions = WorkspaceSessionStore(
+            self.paths.state_root, self.member.workspace_id)
         self.manager = RunManager(
             workspace_id=self.member.workspace_id, paths=self.paths,
             public_key=self.key.public_key(),
-            sessions=WorkspaceSessionStore(
-                self.paths.state_root, self.member.workspace_id),
+            sessions=self.sessions,
             base_env={"PATH": "", "HOME": str(self.paths.home)},
             recover=False)
         worker._RUNS = self.manager
@@ -300,6 +304,31 @@ def test_chain_manual_export_downloads_and_unpacks(chain):
         assert len(packages) == 1
 
 
+def test_chain_export_same_request_id_changed_content_conflicts(chain):
+    """导出也走真实 control/gateway/worker 链；终态改稿必须 409。"""
+    chain.media()
+    base = {"title": "导出稿", "body": "正文", "tags": "",
+            "media": ["project/cover.png"], "reviewed": True}
+    with TestClient(chain.app, base_url=ORIGIN) as client:
+        csrf = chain.login(client)
+        first = client.post(
+            "/api/manual-publish/xiaohongshu/export",
+            json={**base, "requestId": "export-bound"},
+            headers=_headers(csrf))
+        assert first.status_code == 200, first.text
+        assert first.json()["published"] is False
+        changed = client.post(
+            "/api/manual-publish/xiaohongshu/export",
+            json={**base, "title": "导出改稿", "body": "导出改稿",
+                  "requestId": "export-bound"},
+            headers=_headers(csrf))
+        assert changed.status_code == 409, changed.text
+        assert changed.json()["code"] == "request_conflict"
+        packages = list(
+            (chain.outputs / "_publish" / "manual").glob("*.zip"))
+        assert len(packages) == 1
+
+
 def test_chain_publish_success_records_calendar_once(chain):
     chain.media()
     with TestClient(chain.app, base_url=ORIGIN) as client:
@@ -333,6 +362,105 @@ def test_chain_publish_success_records_calendar_once(chain):
         schedule = json.loads(
             (chain.outputs / "_schedule.json").read_text(encoding="utf-8"))
         assert len(schedule) == 1
+
+
+def test_chain_same_request_id_changed_content_conflicts_while_active(chain):
+    chain.media()
+    chain.fake.mode = "slow"
+    request_id = "chain-content-bound"
+    with TestClient(chain.app, base_url=ORIGIN) as client:
+        csrf = chain.login(client)
+        first = client.post(
+            "/api/publish/xiaohongshu",
+            json=_publish_body(request_id=request_id),
+            headers=_headers(csrf))
+        assert first.status_code == 200, first.text
+        run_id = first.json()["runId"]
+        changed = client.post(
+            "/api/publish/xiaohongshu",
+            json={**_publish_body(request_id=request_id),
+                  "title": "修改后的标题", "body": "修改后的正文"},
+            headers=_headers(csrf))
+        assert changed.status_code == 409, changed.text
+        assert changed.json()["code"] == "request_conflict"
+        assert len(chain.fake.calls) == 1
+        same = client.post(
+            "/api/publish/xiaohongshu",
+            json=_publish_body(request_id=request_id),
+            headers=_headers(csrf))
+        assert same.status_code == 200, same.text
+        assert same.json()["runId"] == run_id
+        assert len(chain.fake.calls) == 1
+        stopped = client.post(
+            "/api/chat/stop", json={"runId": run_id},
+            headers=_headers(csrf))
+        assert stopped.status_code == 200, stopped.text
+
+
+def test_chain_same_request_id_changed_content_conflicts_after_done(chain):
+    chain.media()
+    request_id = "chain-content-terminal"
+    with TestClient(chain.app, base_url=ORIGIN) as client:
+        csrf = chain.login(client)
+        first = client.post(
+            "/api/publish/xiaohongshu",
+            json=_publish_body(request_id=request_id),
+            headers=_headers(csrf))
+        assert first.status_code == 200, first.text
+        run_id = first.json()["runId"]
+        assert _wait_status(
+            client, PLATFORM, ("success",))["runId"] == run_id
+        changed = client.post(
+            "/api/publish/xiaohongshu",
+            json={**_publish_body(request_id=request_id),
+                  "title": "终态改稿", "body": "终态改稿"},
+            headers=_headers(csrf))
+        assert changed.status_code == 409, changed.text
+        assert changed.json()["code"] == "request_conflict"
+        assert len(chain.fake.calls) == 1
+        same = client.post(
+            "/api/publish/xiaohongshu",
+            json=_publish_body(request_id=request_id),
+            headers=_headers(csrf))
+        assert same.status_code == 200, same.text
+        assert same.json()["runId"] == run_id
+        assert len(chain.fake.calls) == 1
+
+
+def test_chain_status_by_request_id_recovers_original_run(chain):
+    chain.media()
+    with TestClient(chain.app, base_url=ORIGIN) as client:
+        csrf = chain.login(client)
+        first = client.post(
+            "/api/publish/xiaohongshu",
+            json=_publish_body(request_id="intent-original"),
+            headers=_headers(csrf))
+        assert first.status_code == 200, first.text
+        first_run = first.json()["runId"]
+        assert _wait_status(
+            client, PLATFORM, ("success",))["runId"] == first_run
+        second = client.post(
+            "/api/publish/xiaohongshu",
+            json={**_publish_body(request_id="intent-new"),
+                  "title": "新意图"},
+            headers=_headers(csrf))
+        assert second.status_code == 200, second.text
+        second_run = second.json()["runId"]
+        assert second_run != first_run
+        assert _wait_status(
+            client, PLATFORM, ("success",))["runId"] == second_run
+
+        original = client.get(
+            f"/api/publish/xiaohongshu/status?requestId=intent-original")
+        assert original.status_code == 200, original.text
+        assert original.json()["runId"] == first_run
+        assert original.json()["state"] == "success"
+        missing = client.get(
+            "/api/publish/xiaohongshu/status?requestId=never-accepted")
+        assert missing.status_code == 200, missing.text
+        assert missing.json()["runId"] == ""
+        assert missing.json()["state"] == "unknown"
+        assert len(chain.fake.calls) == 2
 
 
 def test_chain_douyin_sms_binds_current_run(chain):
@@ -419,6 +547,61 @@ def test_chain_stop_marks_unknown_and_does_not_replay(chain):
         assert client.get(f"/api/publish/{DOUYIN}/status").json()[
             "state"] == "unknown"
         assert len(chain.fake.calls) == 1
+
+
+def _formal_publish_mode(monkeypatch, mode: str) -> str:
+    """按正式 Compose 的 argv 装配解析策略，而不是测试里手工传参。"""
+    compose = yaml.safe_load(
+        (Path(__file__).resolve().parents[2]
+         / "deploy" / "desktop" / "compose.workspace.yaml").read_text(
+             encoding="utf-8"))
+    command = compose["services"]["control"]["command"]
+    argv = []
+    for item in command[command.index("serve-control"):]:
+        if "EASEL_PUBLIC_ORIGIN" in item:
+            argv.append(ORIGIN)
+        elif "EASEL_PUBLISH_MODE" in item:
+            argv.append(mode)
+        else:
+            argv.append(item)
+    captured: dict = {}
+    original = cli.cmd_serve_control
+    monkeypatch.setattr(
+        cli, "cmd_serve_control",
+        lambda args: captured.update(vars(args)) or 0)
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        monkeypatch.setattr(cli, "cmd_serve_control", original)
+    assert captured["publish_mode"] == mode
+    return captured["publish_mode"]
+
+
+@pytest.mark.parametrize("mode", ["automated", "manual"])
+def test_formal_compose_argv_resolves_managed_publish_mode(
+        tmp_path, monkeypatch, mode):
+    assert _formal_publish_mode(monkeypatch, mode) == mode
+
+
+def test_formal_compose_manual_policy_rejects_before_run(
+        tmp_path, monkeypatch):
+    mode = _formal_publish_mode(monkeypatch, "manual")
+    chain = Chain(tmp_path, monkeypatch, publish_mode=mode)
+    chain.media()
+    try:
+        with TestClient(chain.app, base_url=ORIGIN) as client:
+            csrf = chain.login(client)
+            response = client.post(
+                "/api/publish/xiaohongshu", json=_publish_body(),
+                headers=_headers(csrf))
+            assert response.status_code == 403, response.text
+            assert response.json()["code"] == "publishing_manual_only"
+            assert chain.fake.calls == []
+            with Store.open(chain.store.path) as opened:
+                assert opened.get_task_conversation(
+                    chain.member, "publish:xiaohongshu") is None
+    finally:
+        asyncio.run(chain.close())
 
 
 def test_manual_policy_rejects_before_worker_and_run(manual_chain):
