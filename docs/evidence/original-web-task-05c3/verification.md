@@ -187,3 +187,5 @@ A/B 跨身份迟到/隔离由 `tests/multiuser/test_workspace_publishing.py` 的
 | `tests/frontend/publishWorkspaceData.test.mjs`、`publishDraftScope.test.mjs` | 前端适配/草稿隔离 |
 | `tests/frontend/browser_original_web_task05c3.py` | 浏览器矩阵 |
 | `tests/multiuser/task5c3_container_chain.py`、`task5c3_controlled_publisher.py`、Dockerfile.*5c3 | 容器闭环 |
+| `tests/multiuser/test_task_leases.py`、`test_gateway_workspace.py`、`test_original_web_api.py` | 任务表/网关/旧路由可用性更新 |
+| `tests/multiuser/test_task5c2_chain.py` | 终态落账有界等待（测试时序） |
