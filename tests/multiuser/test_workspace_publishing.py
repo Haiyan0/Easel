@@ -334,6 +334,12 @@ def test_status_reads_only_current_run_events_and_never_legacy_state(tmp_path):
             assert wait.json()["state"] == "starting"
             assert wait.json()["runId"] == run_id
 
+            # 脚本先写 success 但 Run 未终态：不能提前结算为成功。
+            relay.status_event(run_id, "success", "发布成功")
+            pending = client.get(f"/api/publish/{DOUYIN}/status")
+            assert pending.status_code == 200, pending.text
+            assert pending.json()["state"] == "starting"
+
             relay.status_event(run_id, "sms_required", "请输入验证码")
             sms = client.get(f"/api/publish/{DOUYIN}/status")
             assert sms.status_code == 200, sms.text

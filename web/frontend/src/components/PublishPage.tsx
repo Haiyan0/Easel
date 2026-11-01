@@ -311,7 +311,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
         clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
         setPub((r) => ({ ...r, [key]: { status: 'fail', msg: s.message || '发布失败' } }));
         resolve();
-      } else if (s.state === 'unknown') {
+      } else if (s.state === 'unknown' && !data.localSettingsEnabled) {
         clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
         setPub((r) => ({ ...r, [key]: {
           status: 'unknown',

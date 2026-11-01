@@ -2,7 +2,8 @@
 
 父基线：`fcb351d532301d22afe3be0c91373b19f3505ca7`
 实施 worktree：`C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics`
-实施提交：`<待提交后回填>`
+实施提交：`206060aca2683d905421457822947aa59ec3ea91`（实现）、`877d2a9`（收口）
+证据提交：本文件所在提交
 日期：2026-11-01
 
 ## 1. 盘点与接口表
@@ -77,7 +78,7 @@ node --test tests/frontend/publishWorkspaceData.test.mjs tests/frontend/publishi
 333 passed, 1 skipped
 ```
 
-原始输出：[backend-tests.txt](backend-tests.txt)。两批文件不重叠，共 **776 passed、2 skipped**。
+原始输出：[backend-tests.txt](backend-tests.txt)。两批文件不重叠，共 **776 passed、2 skipped**；另有 7+1 条既有 resource/thread 警告，命令退出码为 0，未作为通过项掩盖。
 
 ```powershell
 node --test tests/frontend/*.test.mjs
@@ -87,7 +88,7 @@ node --test tests/frontend/*.test.mjs
 原始输出：[node-tests.txt](node-tests.txt)。
 
 ```powershell
-npm --prefix web/frontend run build   # 退出 0，index-DXvNQgIN.js
+npm --prefix web/frontend run build   # 退出 0，index-Cnj9zjPQ.js
 npm --prefix web/frontend run lint    # 退出 0
 ```
 
@@ -112,6 +113,8 @@ npm --prefix web/frontend run lint    # 退出 0
 
 浏览器替身说明：发布子进程与技能执行器为受控替身，不访问真实平台/模型；页面、control、gateway、WorkerRelay、RunManager、ZIP 导出与下载为真实层。
 
+A/B 跨身份迟到/隔离由 `tests/multiuser/test_workspace_publishing.py` 的双用户 Run 归属测试覆盖，Task3 既有浏览器 `control_cross_identity_late_results` 回归保持；本组 5C3 浏览器矩阵聚焦发布页面的同身份迟到短信/停止/刷新与重复提交。
+
 ## 5. 隔离容器闭环
 
 ```powershell
@@ -122,9 +125,9 @@ npm --prefix web/frontend run lint    # 退出 0
 原始输出：[container-chain.txt](container-chain.txt)。
 
 - 增量构建三个镜像（基于 5C2 已验收镜像，不无缓存重建全栈）：
-  - control `sha256:bd5cbcce5b4dbbedd87d1e11efa25dd57ac79422a22f8c2ebf9faa2be9d2368d`
-  - gateway `sha256:1f0dcc60feecb816d492dd685b9b85bd353add28d16d30293ab89737da7ded06`
-  - worker `sha256:55c9482fbb21107fefb2b0829053f7dc8c133535779114a48dc3c7b8faadbd2b`
+  - control `sha256:07d359274ba5b439c6516946f10af7f4a1c1f867d1f8f72f83e69a9ffdd73b7c`
+  - gateway `sha256:f778221c003cae140452aff976331790ca9f0e90f302bf461a92204ff164c872`
+  - worker `sha256:d46f0dd1f17273e91f3d3cca7e68854ca1dc55231a64b446ef058ad7b5066ec8`
 - 镜像内源码/前端哈希与当前源码一致（见 container-chain.txt 的 `SOURCE_HASH`）。
 - 真实层：固定身份/签名、control/gateway/worker、Gateway、WorkspaceApi、WorkerRelay、RunManager、受管发布执行器、镜像内受控发布子进程 + Playwright Chromium + `browser_state.ProfileLock`、真实 ZIP 导出/下载、进程树取消、worker 重启。
 - 替身层：原平台脚本未执行；`xhs_publish.py`、`douyin_publish.py`、`web_publisher.py`、`weixin_mp_stats.py`、`biliup` 单项列为 substituted，不声称真实平台通过。

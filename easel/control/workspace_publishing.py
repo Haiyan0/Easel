@@ -508,6 +508,11 @@ class WorkspacePublishing:
         state_value = browser.get("state")
         if state_value not in PUBLISH_STATES:
             state_value = "unknown"
+        if state_value in _TERMINAL_PUBLISH_STATES:
+            # 脚本可能先写 success/error 再收尾；只有 Run 终态才对外结算，
+            # 否则会漏掉日历失败/终态收尾等结果。
+            return {"mode": "publish", "state": "starting",
+                    "message": "正在确认发布结果…", "runId": run.id}
         return {"mode": "publish", "state": state_value,
                 "message": _clean_message(browser.get("message")),
                 "runId": run.id}
