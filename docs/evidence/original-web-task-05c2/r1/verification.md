@@ -200,6 +200,9 @@ git ls-tree -r --name-only HEAD docs/evidence/original-web-task-05c2 | grep -E '
 
 确认干净 checkout 也能取得这些证据，而不只存在于本机。
 
+日志中出现的 `old-secret` / `new-secret` / `container-secret` 等均为临时测试字面量，
+不是真实凭证；证据未包含真实 AppSecret、用户 Cookie、邀请码或 Key。
+
 ## 9. not-run / 边界
 
 - 未执行真实平台扫码、真实短信、真实 AppSecret 验证、真实发布/导出；受控夹具不等于
