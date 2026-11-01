@@ -93,9 +93,9 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
     ),
     TaskEntry(
         task_type="publish",
-        label="发布",
+        label="发布与导出",
         kind=BROWSER,
-        implemented=False,
+        implemented=True,
         routes=(
             TaskRoute("POST", r"/api/publish/([^/]+)"),
             TaskRoute("POST", r"/api/publish/([^/]+)/sms"),

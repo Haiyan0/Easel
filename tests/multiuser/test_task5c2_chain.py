@@ -426,8 +426,13 @@ def test_real_chain_login_sms_whoami_analytics_credentials_logout(chain):
         assert success.json()["state"] == "success", success.text
         assert chain.fake.login_starts == [PLATFORM]
         assert chain.fake.whoami_calls == []
-        # 控制库 Run 已终态，容量释放
-        run = chain.store.get_run(chain.member, run_id)
+        # 状态事件可能先于 worker 终态落账；等待 control 账本结算完成。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = chain.store.get_run(chain.member, run_id)
+            if run.status == "done":
+                break
+            time.sleep(0.02)
         assert run.status == "done"
 
         # 显式 whoami：受控 runner 写本人产物，页面读取昵称/头像

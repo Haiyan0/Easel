@@ -11,6 +11,10 @@ Run 事件。它不是第二套调度，也不保存独立任务账本。
 * ``{"action":"whoami","platform":"xiaohongshu","force":true}``
 * ``{"action":"analytics","platform":"xiaohongshu"}``
 * ``{"action":"credentials","platform":"wechat-oa"}``
+* ``{"action":"publish","platform":"xiaohongshu","title":…,"body":…,
+  "tags":…,"media":[…],"persona":…}``
+* ``{"action":"manual-export","platform":"xiaohongshu","title":…,
+  "body":…,"tags":…,"media":[…],"reviewed":true}``
 
 凭证校验的 AppSecret 不进入签名快照或 Run 事件；control 在 Run 接纳后另走
 一次带身份的短请求交接给原 handler，执行器只等待该 Run 的受控结果。
@@ -22,7 +26,7 @@ import json
 
 from easel.control.types import DomainError
 
-BROWSER_TASK_TYPES = frozenset({"browser", "analytics"})
+BROWSER_TASK_TYPES = frozenset({"browser", "analytics", "publish"})
 
 LOGIN_PLATFORMS = frozenset({
     "xiaohongshu", "kuaishou", "weixin-channels", "zhihu",
@@ -33,6 +37,27 @@ ANALYTICS_PLATFORMS = frozenset({
     "bilibili", "wechat-oa",
 })
 CREDENTIAL_PLATFORMS = frozenset({"wechat-oa"})
+PUBLISH_PLATFORMS = frozenset({
+    "xiaohongshu", "douyin", "kuaishou", "weixin-channels", "zhihu",
+    "bilibili", "wechat-oa",
+})
+MEDIA_REQUIRED_PLATFORMS = frozenset({
+    "xiaohongshu", "douyin", "kuaishou", "weixin-channels", "bilibili",
+})
+VIDEO_ONLY_PLATFORMS = frozenset({"douyin", "weixin-channels", "bilibili"})
+IMAGE_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif",
+})
+VIDEO_EXTS = frozenset({
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".flv", ".ts",
+})
+MAX_MEDIA = 32
+MAX_TITLE = 1000
+MAX_BODY = 100_000
+MAX_TAGS = 2000
+MAX_PERSONA = 200
+MAX_MEDIA_PATH = 2048
+_MAX_PROMPT_BYTES = 2 * 1024 * 1024
 
 _ACTION_FIELDS = {
     "login": frozenset({"action", "platform"}),
@@ -40,6 +65,11 @@ _ACTION_FIELDS = {
     "whoami": frozenset({"action", "platform", "force"}),
     "analytics": frozenset({"action", "platform"}),
     "credentials": frozenset({"action", "platform"}),
+    "publish": frozenset({
+        "action", "platform", "title", "body", "tags", "media", "persona"}),
+    "manual-export": frozenset({
+        "action", "platform", "title", "body", "tags", "media",
+        "reviewed"}),
 }
 _TERMINAL_LOGIN_STATES = frozenset({"success", "expired", "error"})
 _MAX_POLL_SECONDS = 0.5
@@ -56,9 +86,77 @@ def _invalid(code: str = "browser_task_invalid") -> BrowserTaskError:
     return BrowserTaskError(code, 400)
 
 
+def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
+    if (not isinstance(value, str)
+            or (not allow_empty and not value)
+            or len(value) > maximum
+            or any(ord(character) < 32 and character not in "\n\r\t"
+                   for character in value)):
+        raise _invalid()
+    return value
+
+
+def _media_paths(value: object) -> list[str]:
+    if not isinstance(value, list) or len(value) > MAX_MEDIA:
+        raise _invalid()
+    result: list[str] = []
+    for item in value:
+        if (not isinstance(item, str) or not item
+                or len(item) > MAX_MEDIA_PATH
+                or item.startswith(("/", "\\"))
+                or any(character in item for character in "\\:\x00\r\n")
+                or any(ord(character) < 32 or ord(character) == 127
+                       for character in item)):
+            raise _invalid("publish_media_invalid")
+        parts = item.split("/")
+        if (any(not part or part in (".", "..") or part.startswith(".")
+                for part in parts)
+                or parts[0].startswith("_")
+                or parts[0] in ("analytics", "wechat")):
+            raise _invalid("publish_media_invalid")
+        suffix = "." + item.rsplit(".", 1)[-1].lower() \
+            if "." in item.rsplit("/", 1)[-1] else ""
+        if suffix not in IMAGE_EXTS | VIDEO_EXTS:
+            raise _invalid("publish_media_invalid")
+        if item in result:
+            raise _invalid("publish_media_invalid")
+        result.append(item)
+    return result
+
+
+def _validate_publish(value: dict, action: str) -> None:
+    platform = value["platform"]
+    if platform not in PUBLISH_PLATFORMS:
+        raise _invalid("browser_platform_unsupported")
+    title = _text(value.get("title"), MAX_TITLE, allow_empty=True)
+    body = _text(value.get("body"), MAX_BODY, allow_empty=True)
+    _text(value.get("tags"), MAX_TAGS, allow_empty=True)
+    media = _media_paths(value.get("media"))
+    if not title.strip() and not body.strip():
+        raise _invalid("publish_content_required")
+    kinds = {
+        "image" if "." + path.rsplit(".", 1)[-1].lower() in IMAGE_EXTS
+        else "video" for path in media}
+    if "image" in kinds and "video" in kinds:
+        raise _invalid("publish_media_invalid")
+    if action == "publish":
+        _text(value.get("persona"), MAX_PERSONA, allow_empty=True)
+        if platform in MEDIA_REQUIRED_PLATFORMS and not media:
+            raise _invalid("publish_media_required")
+        if platform in VIDEO_ONLY_PLATFORMS and "video" not in kinds:
+            raise _invalid("publish_video_required")
+        if platform == "wechat-oa":
+            if "video" in kinds or "image" not in kinds:
+                raise _invalid("publish_media_invalid")
+    else:
+        if value.get("reviewed") is not True:
+            raise _invalid("publish_review_required")
+
+
 def parse_action(prompt: object, task_type: str) -> dict:
     """严格解析 control 生成的 JSON 描述；未知字段/平台一律拒绝。"""
-    if not isinstance(prompt, str) or len(prompt) > 4096:
+    if (not isinstance(prompt, str)
+            or len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES):
         raise _invalid()
     try:
         value = json.loads(prompt)
@@ -85,11 +183,18 @@ def parse_action(prompt: object, task_type: str) -> dict:
         raise _invalid("browser_platform_unsupported")
     if action == "credentials" and platform not in CREDENTIAL_PLATFORMS:
         raise _invalid("browser_platform_unsupported")
+    if action in ("publish", "manual-export"):
+        _validate_publish(value, action)
     if action == "whoami" and type(value.get("force")) is not bool:
         raise _invalid()
     if task_type == "analytics" and action != "analytics":
         raise _invalid("browser_task_type_mismatch")
     if task_type == "browser" and action == "analytics":
+        raise _invalid("browser_task_type_mismatch")
+    if task_type == "publish" and action not in ("publish", "manual-export"):
+        raise _invalid("browser_task_type_mismatch")
+    if task_type in ("browser", "analytics") and action in (
+            "publish", "manual-export"):
         raise _invalid("browser_task_type_mismatch")
     return value
 
@@ -236,8 +341,26 @@ async def _run_credentials(web_app, descriptor: dict, context, emit) -> dict:
     }
 
 
+async def _run_publish(web_app, descriptor, context, emit) -> str:
+    if descriptor["action"] == "manual-export":
+        runner = getattr(web_app, "run_managed_manual_export", None)
+    else:
+        runner = getattr(web_app, "run_managed_publish", None)
+    if not callable(runner):
+        raise BrowserTaskError("publish_unavailable", 503)
+    try:
+        return await runner(descriptor, context.run_id, emit)
+    except web_app.HTTPException as error:
+        code = (
+            "publish_invalid" if error.status_code == 400
+            else "publish_media_missing" if error.status_code == 404
+            else "publish_media_invalid" if error.status_code == 403
+            else "publish_failed")
+        raise BrowserTaskError(code, error.status_code) from None
+
+
 async def execute_browser_task(request, context, bind, emit, ask):
-    """RunManager 的 browser/analytics 执行器；返回结果写回既有 Run 终态。"""
+    """RunManager 的 browser/analytics/publish 执行器；结果写回既有 Run 终态。"""
     del bind, ask
     descriptor = parse_action(request.prompt, context.task_type)
     from web import app as web_app
@@ -258,9 +381,12 @@ async def execute_browser_task(request, context, bind, emit, ask):
             result = await _run_credentials(
                 web_app, descriptor, context, emit)
             return json.dumps(result, ensure_ascii=False)
+        if action in ("publish", "manual-export"):
+            return await _run_publish(web_app, descriptor, context, emit)
         raise _invalid("browser_task_action_unsupported")
     except asyncio.CancelledError:
-        await _cancel(web_app, action, platform)
+        await _cancel(web_app, "publish" if action in (
+            "publish", "manual-export") else action, platform)
         raise
 
 

@@ -131,6 +131,9 @@ _ROUTES: dict[str, _Route] = {
 # 等未接组不在 gateway 放行，避免用前缀代理扩大边界。
 _WS_OUTPUT_INTERNAL = frozenset({"analytics", "wechat"})
 _WS_RECORD_ID = re.compile(r"^[0-9a-f]{12}$")
+_WS_EXPORT_NAME = re.compile(
+    r"^easel-(?:xiaohongshu|douyin|kuaishou|weixin-channels|zhihu|bilibili"
+    r"|wechat-oa)-[0-9a-f]{12}\.zip$")
 _WS_ACCOUNT_PLATFORMS = frozenset({
     "xiaohongshu", "kuaishou", "weixin-channels", "zhihu",
     "bilibili", "douyin", "wechat-oa",
@@ -475,14 +478,21 @@ def _workspace_record_id(segment: str) -> str:
     return encoded
 
 
-def _workspace_output_path(parts: list[str]) -> str:
+def _workspace_output_path(parts: list[str], *,
+                           allow_export: bool = False) -> str:
     if not parts:
         raise _invalid_path()
     first = _workspace_segment(parts[0], persona=False)
     decoded_first = unquote(first, encoding="utf-8", errors="strict")
     if (decoded_first.startswith("_")
             or decoded_first in _WS_OUTPUT_INTERNAL):
-        raise _invalid_path()
+        export = (
+            allow_export and len(parts) == 3 and decoded_first == "_publish"
+            and unquote(parts[1], encoding="utf-8", errors="strict") == "manual"
+            and _WS_EXPORT_NAME.fullmatch(
+                unquote(parts[2], encoding="utf-8", errors="strict")) is not None)
+        if not export:
+            raise _invalid_path()
     canonical = [first]
     for part in parts[1:]:
         canonical.append(_workspace_segment(part, persona=False))
@@ -518,12 +528,19 @@ def _workspace_route(parts: list[str],
         return _Route("ws_skill", frozenset({"GET"}),
                       f"/api/skill/{name}", False, frozenset())
     if len(parts) >= 3 and parts[1] in ("output", "media"):
-        path = _workspace_output_path(parts[2:])
+        path = _workspace_output_path(
+            parts[2:], allow_export=(parts[1] == "media"))
         if parts[1] == "output":
             return _Route("ws_output", frozenset({"GET", "DELETE"}),
                           f"/api/output/{path}", False, frozenset())
         return _Route("ws_media", frozenset({"GET", "HEAD"}),
                       f"/api/media/{path}", True, frozenset())
+    if len(parts) == 4 and parts[1] == "publish" and parts[3] == "sms":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        return _Route("ws_publish_sms", frozenset({"POST"}),
+                      f"/api/publish/{platform}/sms", False, frozenset())
     if len(parts) >= 3 and parts[1] == "login":
         platform = _workspace_segment(parts[2], persona=False)
         if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { createSchedule, executeSkill, exportManualPackage, fetchOutputs, mediaUrl, runAgent, streamChat } from '../lib/api';
 import type { OutputFile } from '../lib/api';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { loadPublishDraft, savePublishDraft } from '../lib/store';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconCalendar, IconCheck, IconCopy, IconEdit, IconPublish, IconSkills, IconStop, IconTrash } from './icons';
@@ -26,7 +27,9 @@ function today() {
 }
 
 export default function ManualPublishPage({ persona }: { persona: string }) {
-  const initial = useRef(loadPublishDraft()).current;
+  const data = useWorkspaceData();
+  const draftScope = data.publishDraftScope;
+  const initial = useRef(loadPublishDraft(draftScope)).current;
   const [title, setTitle] = useState(initial.title);
   const [body, setBody] = useState(initial.body);
   const [platforms, setPlatforms] = useState<string[]>(initial.platforms);
@@ -46,12 +49,16 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
   const [checkResult, setCheckResult] = useState('');
   const [exporting, setExporting] = useState('');
   const [saving, setSaving] = useState(false);
-  const ctl = useRef<AbortController | null>(null);
+  const ctl = useRef<{ abort(): void } | null>(null);
+  const adaptRun = useRef('');
 
-  useEffect(() => { savePublishDraft({ title, body, platforms, overrides, tags }); }, [title, body, platforms, overrides, tags]);
+  useEffect(() => {
+    savePublishDraft(
+      { title, body, platforms, overrides, tags }, draftScope);
+  }, [title, body, platforms, overrides, tags, draftScope]);
   useEffect(() => () => ctl.current?.abort(), []);
   useEffect(() => {
-    fetchOutputs().then((roots) => {
+    data.fetchOutputs().then((roots) => {
       const files: OutputFile[] = [];
       const walk = (node: OutputFile) => {
         if (node.type === 'file') { if (node.kind === 'image' || node.kind === 'video') files.push(node); }
@@ -60,7 +67,7 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
       roots.forEach(walk);
       setMediaFiles(files.sort((a, b) => (b.mtime || 0) - (a.mtime || 0)));
     }).catch(() => setToast('内容库暂时无法读取，仍可编辑和复制文案'));
-  }, []);
+  }, [data]);
 
   const effective = (key: string) => overrides[key] ?? body;
   const snapshot = (key: string) => JSON.stringify([title, effective(key), tags, selectedMedia]);
@@ -86,14 +93,35 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
     let acc = '';
     const base = { ...overrides };
     setAdapting(true);
-    ctl.current = streamChat(prompt, persona, `manual-adapt-${Date.now()}`, (chunk) => {
-      acc += chunk;
-      const parsed = sections(acc);
-      const next = { ...base };
-      selected.forEach((p) => { if (parsed[p.label] != null) next[p.key] = parsed[p.label]; });
-      setOverrides(next);
-    }, () => { setAdapting(false); showToast(Object.keys(sections(acc)).length ? 'AI 排版完成，请逐个平台人工审核' : '未解析到平台正文，请重试'); },
-    (error) => { setAdapting(false); showToast(error.message || '排版失败，请重试'); });
+    adaptRun.current = '';
+    ctl.current = data.adaptContent(prompt, persona, {
+      onToken: (chunk) => {
+        acc += chunk;
+        const parsed = sections(acc);
+        const next = { ...base };
+        selected.forEach((p) => { if (parsed[p.label] != null) next[p.key] = parsed[p.label]; });
+        setOverrides(next);
+      },
+      onDone: () => {
+        setAdapting(false);
+        showToast(Object.keys(sections(acc)).length
+          ? 'AI 排版完成，请逐个平台人工审核'
+          : '未解析到平台正文，请重试');
+      },
+      onError: (error) => {
+        setAdapting(false);
+        showToast(workspaceErrorMessage(error, '排版失败，请重试'));
+      },
+      onAdmission: (runId) => { adaptRun.current = runId; },
+    });
+  };
+
+  const stopAdapt = () => {
+    ctl.current?.abort();
+    const runId = adaptRun.current;
+    adaptRun.current = '';
+    if (runId) void data.stopTask(runId).catch(() => { /* 停止失败保留原提示 */ });
+    setAdapting(false);
   };
 
   const check = async () => {
@@ -102,11 +130,13 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
     const content = `标题：${title}\n${PLATFORMS.filter((p) => platforms.includes(p.key)).map((p) => `${p.label}：${effective(p.key)}`).join('\n\n')}\n话题：${tags}`;
     try {
       const [general, consistency] = await Promise.all([
-        runAgent(`仅给审核建议，不发布、不调用发布脚本。检查内容中的事实依据、夸大表述、版权和标题正文一致性，给出修改建议；不能确认的事项明确列出，不能保证平台审核结果。\n${content}`),
-        persona ? executeSkill('persona-check', content, persona) : Promise.resolve(null),
+        data.runAgent(`仅给审核建议，不发布、不调用发布脚本。检查内容中的事实依据、夸大表述、版权和标题正文一致性，给出修改建议；不能确认的事项明确列出，不能保证平台审核结果。\n${content}`),
+        persona ? data.executeSkill('persona-check', content, persona) : Promise.resolve(null),
       ]);
       setCheckResult(general.response + (consistency ? `\n\n## 人设一致性\n${consistency.response}` : ''));
-    } catch (error) { setCheckResult(`检查未完成：${error instanceof Error ? error.message : '请稍后重试'}`); }
+    } catch (error) {
+      setCheckResult(`检查未完成：${workspaceErrorMessage(error, '请稍后重试')}`);
+    }
     finally { setChecking(false); }
   };
 
@@ -123,12 +153,16 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
     if (!approved(key) || exporting) return;
     setExporting(key);
     try {
-      const result = await exportManualPackage(key, { title, body: effective(key), tags, media: [...selectedMedia], reviewed: true });
+      const result = await data.exportManualPackage(
+        key, { title, body: effective(key), tags,
+               media: [...selectedMedia], reviewed: true });
       const a = document.createElement('a');
-      a.href = mediaUrl(result.path); a.download = result.filename;
+      a.href = data.mediaUrl(result.path); a.download = result.filename;
       document.body.appendChild(a); a.click(); a.remove();
       showToast('已生成稿件包并发起下载；尚未上传或发布');
-    } catch (error) { showToast(error instanceof Error ? error.message : '导出失败'); }
+    } catch (error) {
+      showToast(workspaceErrorMessage(error, '导出失败'));
+    }
     finally { setExporting(''); }
   };
 
@@ -159,12 +193,14 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
     setSaving(true);
     const version = snapshot(key);
     try {
-      await createSchedule({ title: title.trim() || effective(key).slice(0, 20), date: today(), time: '',
+      await data.createSchedule({ title: title.trim() || effective(key).slice(0, 20), date: today(), time: '',
         platform: PLATFORMS.find((p) => p.key === key)?.label || '', status: published ? 'published' : 'draft',
         note: published ? `【人工确认已发布，未自动验证平台状态】\n${link}\n\n${effective(key)}` : effective(key) });
       if (published) setRecorded((prev) => ({ ...prev, [key]: version + (links[key] || '') }));
       showToast(published ? '已按你的确认记录到日历，未自动校验平台结果' : '已保存为日历草稿，不会自动发布');
-    } catch (error) { showToast(error instanceof Error ? error.message : '保存失败'); }
+    } catch (error) {
+      showToast(workspaceErrorMessage(error, '保存失败'));
+    }
     finally { setSaving(false); }
   };
 
@@ -190,12 +226,12 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
       {showPicker && <div className="media-grid">
         {!mediaFiles.length && <p className="dash-empty">内容库暂无图片或视频，可先导出文案。</p>}
         {mediaFiles.slice(0, 80).map((f) => <button type="button" key={f.path} className={`media-cell ${selectedMedia.includes(f.path) ? 'sel' : ''}`} onClick={() => toggleMedia(f.path)} title={f.path}>
-          {f.kind === 'image' ? <img src={mediaUrl(f.path)} alt={f.name} loading="lazy" /> : <span className="media-vid">视频 · {f.name}</span>}
+          {f.kind === 'image' ? <img src={data.mediaUrl(f.path)} alt={f.name} loading="lazy" /> : <span className="media-vid">视频 · {f.name}</span>}
           {selectedMedia.includes(f.path) && <span className="media-check">✓</span>}
         </button>)}
       </div>}
       <div className="publish-actions">
-        {adapting ? <button className="btn btn-sm" onClick={() => { ctl.current?.abort(); setAdapting(false); }}><IconStop size={13} /> 停止排版</button>
+        {adapting ? <button className="btn btn-sm" onClick={stopAdapt}><IconStop size={13} /> 停止排版</button>
           : <button className="btn btn-sm btn-primary" disabled={empty || !platforms.length} onClick={adapt}><IconSkills size={14} /> AI 排版 / 适配</button>}
         <button className="btn btn-sm" disabled={empty || checking || adapting} onClick={check}><IconCheck size={14} />{checking ? '检查中…' : 'AI 辅助检查'}</button>
         <button className="btn btn-sm" disabled={empty || saving || adapting} onClick={() => addToCalendar(platforms[0] || 'xiaohongshu')}><IconCalendar size={14} /> 存草稿并排期</button>

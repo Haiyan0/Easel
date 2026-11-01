@@ -533,9 +533,18 @@ def test_persona_links_cannot_read_or_mutate_outside_profiles(worker_fixture):
 def test_path_helpers_reject_traversal_absolute_and_internal():
     for bad in ("../x", "/abs", "a/../b", "a//b", "a\\b", "_login/x",
                 "analytics/x", ".easel.json", "_ideas.json",
-                "_schedule.json", "a\x00b"):
+                "_schedule.json", "a\x00b",
+                "_publish/manual/easel-xiaohongshu-0123456789ab.zip"):
         with pytest.raises(Exception):
             canonical_output_path(bad)
+    export = "_publish/manual/easel-xiaohongshu-0123456789ab.zip"
+    assert canonical_output_path(export, allow_export=True) == export
+    for bad in ("_publish/manual/other.zip",
+                "_publish/manual/easel-evil-0123456789ab.zip",
+                "_publish/manual/easel-xiaohongshu-0123.zip",
+                "_publish/manual/sub/easel-xiaohongshu-0123456789ab.zip"):
+        with pytest.raises(Exception):
+            canonical_output_path(bad, allow_export=True)
     for bad in ("..", "../x", "a/b", "a\\b", ".hidden", "_internal", ""):
         with pytest.raises(Exception):
             canonical_persona_name(bad)
@@ -913,19 +922,25 @@ def test_control_upload_forwards_bounded_multipart_and_requires_csrf(tmp_path):
         assert json_upload.status_code == 400
 
 
-def test_remaining_groups_stay_explicitly_unavailable(tmp_path):
+def test_publishing_routes_need_relay_capability(tmp_path):
     fake = FakeWorkspace()
     with control_api(tmp_path, fake) as (client, store, auth, admin, member):
         body = login(client, auth, admin, member)
         headers = {"Origin": ORIGIN, "X-CSRF-Token": body["csrfToken"]}
-        # 5C2 已接通账号/登录/分析；发布/导出仍必须明确 503。
-        for method, path in [
-            ("POST", "/api/publish/xiaohongshu"),
-            ("POST", "/api/manual-publish/xiaohongshu/export"),
-        ]:
-            response = client.request(method, path, json={}, headers=headers)
-            assert response.status_code == 503, (method, path)
-            assert response.json()["code"] == "capability_unavailable"
+        # 5C3 已接通发布/导出路由；缺少 relay 时必须是明确 503，不能假成功。
+        publish = client.post(
+            "/api/publish/xiaohongshu",
+            json={"title": "T", "body": "B",
+                  "media": ["project/cover.png"], "requestId": "r1"},
+            headers=headers)
+        assert publish.status_code == 503, publish.text
+        assert publish.json()["code"] == "capability_unavailable"
+        export = client.post(
+            "/api/manual-publish/xiaohongshu/export",
+            json={"title": "T", "body": "B", "media": [], "reviewed": True},
+            headers=headers)
+        assert export.status_code == 503, export.text
+        assert export.json()["code"] == "capability_unavailable"
 
 
 def _workbench_response(path: str, method: str, payload=None):

@@ -54,13 +54,15 @@ _MAX_PERSONA = 200
 # 这些已启用任务实际走 chat broker 通道；签发路由也必须覆盖其 Agent 快照。
 BROKER_MODEL_TASK_TYPES = frozenset(("chat", "skill", "profile"))
 # 浏览器/分析任务不调用模型；不需要 broker token，但复用同一 Run 容量/终态。
-_BROWSER_TASK_TYPES = frozenset(("browser", "analytics"))
+_BROWSER_TASK_TYPES = frozenset(("browser", "analytics", "publish"))
 _BROWSER_ACTION_TIMEOUTS = {
     "login": 600,
     "mp-login": 600,
     "whoami": 90,
     "analytics": 300,
     "credentials": 90,
+    "publish": 900,
+    "manual-export": 600,
 }
 # 这些错误表示 gateway/worker 暂时不可用，不能作为“实例已消失”的结算依据。
 _GATEWAY_TRANSIENT = frozenset({

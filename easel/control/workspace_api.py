@@ -26,6 +26,9 @@ _MAX_UPLOAD_BYTES = 60 * 1024 * 1024
 _MAX_PERSONA = 200
 _MAX_PATH = 2048
 _WORKBENCH_ID = re.compile(r"^[0-9a-f]{12}$")
+_MANUAL_EXPORT_NAME = re.compile(
+    r"^easel-(?:xiaohongshu|douyin|kuaishou|weixin-channels|zhihu|bilibili"
+    r"|wechat-oa)-[0-9a-f]{12}\.zip$")
 _TREND_PLATFORMS = frozenset({
     "weibo", "douyin", "zhihu", "bilibili", "baidu", "toutiao",
 })
@@ -123,11 +126,12 @@ def canonical_idea_payload(value: object) -> dict[str, str]:
     return result
 
 
-def canonical_output_path(value: object) -> str:
+def canonical_output_path(value: object, *, allow_export: bool = False) -> str:
     """校验 outputs 相对路径并返回逐段规范编码。
 
     拒绝绝对路径、反斜杠、点段、隐藏首段、内部系统目录与空段；不解析
-    symlink/junction——那必须由 worker 在本人根目录内复核。
+    symlink/junction——那必须由 worker 在本人根目录内复核。媒体下载额外
+    放行人工导出包的精确形状（``allow_export``），其余 ``_publish`` 仍拒绝。
     """
     if (not isinstance(value, str) or not value or len(value) > _MAX_PATH
             or value.startswith(("/", "\\"))
@@ -139,7 +143,11 @@ def canonical_output_path(value: object) -> str:
     if any(not part or part in (".", "..") or part.startswith(".")
            for part in parts):
         raise DomainError("invalid_request", 400)
-    if parts[0].startswith("_") or parts[0] in _OUTPUT_INTERNAL:
+    export = (allow_export and len(parts) == 3 and parts[0] == "_publish"
+              and parts[1] == "manual"
+              and _MANUAL_EXPORT_NAME.fullmatch(parts[2]) is not None)
+    if not export and (parts[0].startswith("_")
+                       or parts[0] in _OUTPUT_INTERNAL):
         raise DomainError("invalid_request", 400)
     return "/".join(
         quote(part, safe="-._~", encoding="utf-8", errors="strict")

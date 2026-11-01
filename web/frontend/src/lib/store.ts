@@ -45,6 +45,10 @@ export interface PublishDraft {
 const PUBLISH_KEY = 'easel_publish_draft';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
 
+function publishKey(scope?: string): string {
+  return scope ? `${PUBLISH_KEY}:${scope}` : PUBLISH_KEY;
+}
+
 function readMigratedLocalValue(key: string, suffix: string): string | null {
   const current = localStorage.getItem(key);
   if (current !== null) return current;
@@ -60,17 +64,23 @@ function readMigratedLocalValue(key: string, suffix: string): string | null {
 const PUBLISH_DEFAULT: PublishDraft = {
   title: '', body: '', platforms: ['xiaohongshu', 'douyin'], overrides: {}, tags: '',
 };
-export function loadPublishDraft(): PublishDraft {
+export function loadPublishDraft(scope?: string): PublishDraft {
   try {
-    const raw = readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+    // control 必须按 identity/workspace 分组，不能读取旧全局草稿；
+    // local 保持原全局键与历史迁移行为。
+    const raw = scope
+      ? localStorage.getItem(publishKey(scope))
+      : readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
     if (!raw) return { ...PUBLISH_DEFAULT };
     return { ...PUBLISH_DEFAULT, ...(JSON.parse(raw) as PublishDraft) };
   } catch {
     return { ...PUBLISH_DEFAULT };
   }
 }
-export function savePublishDraft(d: PublishDraft): void {
-  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(d)); } catch { /* quota */ }
+export function savePublishDraft(d: PublishDraft, scope?: string): void {
+  try {
+    localStorage.setItem(publishKey(scope), JSON.stringify(d));
+  } catch { /* quota */ }
 }
 
 const STORAGE_KEY = 'easel_sessions';

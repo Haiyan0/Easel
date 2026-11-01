@@ -138,6 +138,12 @@ ROUTES = [
      b'{"skill":"demo","input":"x"}', None),
     ("POST", "/api/profile/baseline", None,
      b'{"name":"p","form":{}}', None),
+    # 5C3：受管发布短信与人工导出包下载。
+    ("POST", "/api/publish/douyin/sms", None,
+     b'{"code":"123456","runId":"run-1"}', None),
+    ("GET",
+     "/api/media/_publish/manual/easel-xiaohongshu-0123456789ab.zip",
+     None, b"", None),
 ]
 
 
@@ -253,6 +259,11 @@ def test_media_304_is_not_treated_as_redirect():
     ("GET", "/api/artifacts/archive?path=%2e%2e%2fx", 400),
     ("GET", "/api/accounts/evil-platform/qr", 400),
     ("GET", "/api/accounts/xiaohongshu/unknown", 404),
+    ("GET", "/api/media/_publish/manual/other.zip", 400),
+    ("GET", "/api/output/_publish/manual/easel-xiaohongshu-0123456789ab.zip",
+     400),
+    ("POST", "/api/publish/evil/sms", 400),
+    ("GET", "/api/publish/douyin/sms", 405),
     ("POST", "/api/outputs", 405),
     ("POST", "/api/status", 405),
     ("PUT", "/api/personas", 405),

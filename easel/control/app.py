@@ -92,6 +92,8 @@ _IMPLEMENTED_EXACT = frozenset({
     # Task 5C2：账号/登录/分析
     ("GET", "/api/accounts"),
     ("GET", "/api/analytics/platforms"),
+    # Task 5C3：发布策略（发布/导出/短信为任务入口）
+    ("GET", "/api/publishing-policy"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
@@ -135,6 +137,11 @@ _IMPLEMENTED_PATTERNS = (
     # GET 只读缓存；启动刷新必须是显式 POST（带 Origin/CSRF）。
     ("GET", re.compile(r"^/api/analytics/[^/]+$")),
     ("POST", re.compile(r"^/api/analytics/[^/]+$")),
+    # Task 5C3：发布/导出任务与当前 Run 状态。平台白名单在适配层复核。
+    ("POST", re.compile(r"^/api/publish/[^/]+$")),
+    ("GET", re.compile(r"^/api/publish/[^/]+/status$")),
+    ("POST", re.compile(r"^/api/publish/[^/]+/sms$")),
+    ("POST", re.compile(r"^/api/manual-publish/[^/]+/export$")),
     ("GET", re.compile(r"^/$")),
     ("GET", re.compile(r"^/onepage$")),
     ("GET", re.compile(r"^/assets/[^/].*$")),
@@ -367,13 +374,20 @@ def _normalize_public_origin(value: str) -> str:
 
 @dataclass(frozen=True)
 class ControlConfig:
-    """控制面公共配置；公共 Origin 必须由管理员显式给出。"""
+    """控制面公共配置；公共 Origin 必须由管理员显式给出。
+
+    ``publish_mode`` 是 control 部署侧的受管发布策略，不从 worker/宿主
+    ``.env`` 读取；成员没有写入口。默认保留原 Web 的自动发布路径。
+    """
 
     public_origin: str
+    publish_mode: str = "automated"
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_origin, str):
             raise ValueError("public_origin 必须显式配置")
+        if self.publish_mode not in ("automated", "manual"):
+            raise ValueError("publish_mode 必须为 automated 或 manual")
         object.__setattr__(
             self, "public_origin", _normalize_public_origin(self.public_origin))
 
@@ -749,6 +763,8 @@ def create_app(*, store: Store, auth: AuthService,
                workspace_api=None,
                workspace_factory: Callable[..., object] | None = None,
                workspace_accounts=None,
+               workspace_publishing=None,
+               publish_mode: str = "automated",
                harness_summary: dict | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
@@ -788,6 +804,10 @@ def create_app(*, store: Store, auth: AuthService,
     if public_origin is not None:
         # 允许调用方传入自定义 config 对象，但仍强制 HTTPS Origin 规则
         public_origin = _normalize_public_origin(public_origin)
+    effective_publish_mode = (
+        config.publish_mode if config is not None else publish_mode)
+    if effective_publish_mode not in ("automated", "manual"):
+        raise ValueError("publish_mode 必须为 automated 或 manual")
     normalized_harness = _normalize_harness_summary(harness_summary)
 
     @asynccontextmanager
@@ -866,6 +886,16 @@ def create_app(*, store: Store, auth: AuthService,
                 app.state.workspace_accounts = WorkspaceAccounts(
                     app.state.control_store, app.state.relay,
                     app.state.workspace_api, db_runner=control_db_runner)
+            app.state.publish_mode = effective_publish_mode
+            if workspace_publishing is not None:
+                app.state.workspace_publishing = workspace_publishing
+            else:
+                from .workspace_publishing import WorkspacePublishing
+                app.state.workspace_publishing = WorkspacePublishing(
+                    app.state.control_store, app.state.relay,
+                    app.state.workspace_api,
+                    publish_mode=effective_publish_mode,
+                    db_runner=control_db_runner)
             # 后台对账与 SSE/登录解耦：应用启动即恢复扫描，退出时先停止
             # 循环再关闭它使用的 HTTP 连接池。
             app.state.reconciler = None
@@ -1036,7 +1066,7 @@ def create_app(*, store: Store, auth: AuthService,
     async def workspace_media(request: Request, path: str):
         from .workspace_api import canonical_output_path
 
-        encoded = canonical_output_path(path)
+        encoded = canonical_output_path(path, allow_export=True)
         return await _workspace_media_response(request, encoded)
 
     @app.delete("/api/output/{path:path}")
@@ -1410,6 +1440,65 @@ def create_app(*, store: Store, auth: AuthService,
     @app.get("/api/accounts/{platform}/mp-login/qr")
     async def accounts_mp_qr(request: Request, platform: str):
         return await _account_qr_response(request, platform, mp=True)
+
+    # ------------------------------------------------------------------
+    # Task 5C3：发布工作台与稿件导出
+    # ------------------------------------------------------------------
+
+    def _publishing_service(request: Request):
+        service = getattr(request.app.state, "workspace_publishing", None)
+        if service is None:
+            raise DomainError("capability_unavailable", 503)
+        return service
+
+    @app.get("/api/publishing-policy")
+    async def publishing_policy(request: Request):
+        _no_query(request)
+        return _no_store_json(_publishing_service(request).policy())
+
+    @app.post("/api/publish/{platform}")
+    async def publishing_submit(request: Request, platform: str):
+        _no_query(request)
+        payload = await _read_json_body(request, limit=1_500_000)
+        allowed = {"title", "body", "tags", "media", "persona", "requestId"}
+        if set(payload) - allowed:
+            raise DomainError("invalid_argument", 400)
+        request_id = payload.pop("requestId", None)
+        return _no_store_json(
+            await _publishing_service(request).publish(
+                _identity(request), platform, payload,
+                request_id=request_id))
+
+    @app.get("/api/publish/{platform}/status")
+    async def publishing_status(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _publishing_service(request).status(
+                _identity(request), platform))
+
+    @app.post("/api/publish/{platform}/sms")
+    async def publishing_sms(request: Request, platform: str):
+        _no_query(request)
+        payload = await _read_json_body(request, limit=4096)
+        if set(payload) - {"code", "runId"}:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _publishing_service(request).submit_sms(
+                _identity(request), platform, payload.get("code"),
+                run_id=payload.get("runId")))
+
+    @app.post("/api/manual-publish/{platform}/export")
+    async def publishing_manual_export(request: Request, platform: str):
+        _no_query(request)
+        payload = await _read_json_body(request, limit=1_500_000)
+        allowed = {"title", "body", "tags", "media", "reviewed", "requestId"}
+        if set(payload) - allowed:
+            raise DomainError("invalid_argument", 400)
+        request_id = payload.pop("requestId", None)
+        return _no_store_json(
+            await _publishing_service(request).manual_export(
+                _identity(request), platform, payload,
+                request_id=request_id))
 
     @app.post("/api/auth/exchange")
     async def exchange(request: Request):

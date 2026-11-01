@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { fetchPublishingPolicy } from '../lib/api';
 import type { PublishingPolicy } from '../lib/api';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import AutomatedPublishPage from './PublishPage';
 import ManualPublishPage from './ManualPublishPage';
 
 export default function PublishingPage({ persona }: { persona: string }) {
+  const data = useWorkspaceData();
   const [policy, setPolicy] = useState<PublishingPolicy | null>(null);
   const [mode, setMode] = useState<PublishingPolicy['mode']>('automated');
   const [error, setError] = useState('');
@@ -12,15 +14,19 @@ export default function PublishingPage({ persona }: { persona: string }) {
   useEffect(() => {
     let active = true;
     setError('');
-    fetchPublishingPolicy().then((value) => {
+    data.fetchPublishingPolicy().then((value) => {
       if (active) {
         setPolicy(value);
         setMode(value.mode === 'automated' && value.automaticSubmission ? 'automated' : 'manual');
       }
     })
-      .catch(() => { if (active) setError('无法读取发布方式，请重试。'); });
+      .catch((reason) => {
+        if (active) {
+          setError(workspaceErrorMessage(reason, '无法读取发布方式，请重试。'));
+        }
+      });
     return () => { active = false; };
-  }, [retry]);
+  }, [data, retry]);
   if (error) return <div className="panel" role="alert">{error}
     <button className="btn btn-sm" onClick={() => setRetry((value) => value + 1)}>重新读取</button>
   </div>;

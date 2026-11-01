@@ -7,6 +7,7 @@ import type {
   ChatQuestion, ChatQuestionItem, ChatQuestionOption, CredentialStatus,
   Idea, IdeaInput, LoginStart, LoginStatus, OutputContent, OutputNode,
   PersonaFile, PersonaItem, ProfileBuildResponse, ProfileBuildStatus,
+  PublishResult, PublishStatus, PublishingPolicy,
   ScheduleContext, ScheduleInput, ScheduleItem, SkillDetail, SkillItem,
   SkillResponse, TrendGroup, UploadedFile,
 } from './api';
@@ -25,6 +26,8 @@ import {
   fetchArtifactArchive as localFetchArtifactArchive,
   buildProfile as localBuildProfile,
   executeSkill as localExecuteSkill,
+  exportManualPackage as localExportManualPackage,
+  fetchPublishingPolicy as localFetchPublishingPolicy,
   fetchIdeas as localFetchIdeas,
   fetchSkillDetail as localFetchSkillDetail,
   fetchSkills as localFetchSkills,
@@ -42,11 +45,16 @@ import {
   mediaUrl as localMediaUrl,
   mpLoginStatus as localMpLoginStatus,
   profileBuildStatus as localProfileBuildStatus,
+  publishNow as localPublishNow,
+  publishStatus as localPublishStatus,
+  runAgent as localRunAgent,
   saveCredentials as localSaveCredentials,
   savePersonaFile as localSavePersonaFile,
   startLogin as localStartLogin,
   startMpLogin as localStartMpLogin,
+  streamChat as localStreamChat,
   submitLoginSms as localSubmitLoginSms,
+  submitPublishSms as localSubmitPublishSms,
   updateIdea as localUpdateIdea,
   updateSchedule as localUpdateSchedule,
   uploadFiles as localUploadFiles,
@@ -87,6 +95,51 @@ export interface StopLoginResult {
   state: string;
 }
 export type AnalyticsCache = Record<string, AccountAnalytics>;
+
+export interface PublishStartView extends PublishResult {
+  state?: string;
+  runId?: string;
+  calendarRecorded?: boolean;
+  calendarError?: string;
+}
+
+export interface PublishStatusView extends PublishStatus {
+  runId?: string;
+  calendarRecorded?: boolean;
+  calendarError?: string;
+}
+
+export interface ExportPackageResult {
+  path: string;
+  filename: string;
+  published: false;
+  runId?: string;
+}
+
+export interface PublishRequestPayload {
+  title: string;
+  body: string;
+  tags: string;
+  media: string[];
+  persona?: string;
+}
+
+export interface ManualExportPayload {
+  title: string;
+  body: string;
+  tags: string;
+  media: string[];
+  reviewed: boolean;
+}
+
+export interface AdaptCallbacks {
+  onToken(chunk: string): void;
+  onDone?(): void;
+  onError(error: Error): void;
+  onAdmission?(runId: string): void;
+}
+
+export interface AdaptHandle { abort(): void }
 
 export interface WorkspaceData {
   fetchStatus(): Promise<WorkspaceStatus>;
@@ -189,6 +242,31 @@ export interface WorkspaceData {
   fetchAccountAnalytics(
     platform: string, signal?: AbortSignal,
   ): Promise<AccountAnalytics>;
+  fetchPublishingPolicy(signal?: AbortSignal): Promise<PublishingPolicy>;
+  exportManualPackage(
+    platform: string, payload: ManualExportPayload,
+    options?: { requestId?: string }, signal?: AbortSignal,
+  ): Promise<ExportPackageResult>;
+  publishNow(
+    platform: string, payload: PublishRequestPayload,
+    options?: { requestId?: string }, signal?: AbortSignal,
+  ): Promise<PublishStartView>;
+  publishStatus(
+    platform: string, signal?: AbortSignal,
+  ): Promise<PublishStatusView>;
+  submitPublishSms(
+    platform: string, code: string, options?: { runId?: string },
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean }>;
+  runAgent(
+    message: string, persona?: string, signal?: AbortSignal,
+  ): Promise<{ response: string }>;
+  adaptContent(
+    prompt: string, persona: string | undefined,
+    callbacks: AdaptCallbacks,
+  ): AdaptHandle;
+  /** 发布草稿的本地存储作用域；local 为空以保留原全局键。 */
+  publishDraftScope: string;
   accountQrUrl(platform: string, mp?: boolean): string;
   whoami: WhoamiStore;
   getAnalyticsCache(): AnalyticsCache;
@@ -700,6 +778,7 @@ export interface ControlWorkspaceOptions {
   runTask?(
     sessionId: string, runId: string, signal?: AbortSignal,
   ): Promise<{ state: string; response?: string }>;
+  identityKey?: string;
   onExpired?: () => void;
 }
 
@@ -820,6 +899,78 @@ function profileStatus(value: unknown): ProfileBuildStatus {
   };
 }
 
+function publishingPolicy(value: unknown): PublishingPolicy {
+  const row = needObject(value, '发布方式响应无效');
+  if ((row.mode !== 'manual' && row.mode !== 'automated')
+      || typeof row.automaticSubmission !== 'boolean') {
+    throw new Error('发布方式响应无效');
+  }
+  return {
+    mode: row.mode,
+    automaticSubmission: row.automaticSubmission,
+  };
+}
+
+function publishStartView(value: unknown): PublishStartView {
+  const row = needObject(value, '发布响应无效');
+  const message = typeof row.message === 'string' ? row.message : '';
+  const runId = typeof row.runId === 'string' ? row.runId : '';
+  if (row.async === true) {
+    if (row.pending !== true) throw new Error('发布响应无效');
+    return {
+      async: true, pending: true, message,
+      state: typeof row.state === 'string' ? row.state : 'starting',
+      runId,
+    };
+  }
+  if (typeof row.ok !== 'boolean'
+      || (row.state !== 'success' && row.state !== 'unknown'
+          && row.state !== 'error')) {
+    throw new Error('发布响应无效');
+  }
+  if (row.state === 'success' && row.ok !== true) {
+    throw new Error('发布响应无效');
+  }
+  return {
+    ok: row.ok, state: row.state as PublishStartView['state'],
+    message, runId,
+    ...(typeof row.detail === 'string' ? { detail: row.detail } : {}),
+    ...(typeof row.calendarRecorded === 'boolean'
+      ? { calendarRecorded: row.calendarRecorded } : {}),
+    ...(typeof row.calendarError === 'string'
+      ? { calendarError: row.calendarError } : {}),
+  };
+}
+
+function publishStatusView(value: unknown): PublishStatusView {
+  const row = needObject(value, '发布状态响应无效');
+  if (typeof row.state !== 'string' || !row.state) {
+    throw new Error('发布状态响应无效');
+  }
+  return {
+    mode: 'publish', state: row.state,
+    message: typeof row.message === 'string' ? row.message : '',
+    ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+    ...(typeof row.calendarRecorded === 'boolean'
+      ? { calendarRecorded: row.calendarRecorded } : {}),
+    ...(typeof row.calendarError === 'string'
+      ? { calendarError: row.calendarError } : {}),
+  };
+}
+
+function exportPackageView(value: unknown): ExportPackageResult {
+  const row = needObject(value, '导出响应无效');
+  if (row.published !== false
+      || typeof row.path !== 'string' || !row.path
+      || typeof row.filename !== 'string' || !row.filename) {
+    throw new Error('导出响应无效：稿件包不能标记为已发布');
+  }
+  return {
+    path: row.path, filename: row.filename, published: false,
+    ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+  };
+}
+
 function makeTaskId(): string {
   try {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -854,6 +1005,34 @@ export function createControlWorkspaceData(
     },
     concurrency: 1,
   });
+  const executeSkillControl = async (
+    skill: string, input: string, persona?: string,
+    signal?: AbortSignal, turnId?: string,
+    onAdmission?: (runId: string, sessionId: string) => void,
+  ): Promise<{ response: string }> => {
+    const admission = await call<unknown>('/api/skill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        skill, input, turnId: turnId || makeTaskId(),
+        ...(persona ? { persona } : {}),
+      }),
+      signal,
+    });
+    const row = needObject(admission, '技能执行接纳响应无效');
+    if (typeof row.runId !== 'string' || typeof row.sessionId !== 'string'
+        || !row.runId || !row.sessionId) {
+      throw new Error('技能执行接纳响应无效');
+    }
+    if (!options.runTask) throw new Error('任务执行未装配');
+    onAdmission?.(row.runId, row.sessionId);
+    const result = await options.runTask(
+      row.sessionId, row.runId, signal);
+    if (result.state !== 'done') {
+      throw new Error(`任务${result.state}`);
+    }
+    return { response: result.response || '' };
+  };
   return {
     async fetchStatus() {
       return statusView(await call<unknown>('/api/status'));
@@ -992,29 +1171,9 @@ export function createControlWorkspaceData(
       return skillDetail(await call<unknown>(
         `/api/skill/${encodeURIComponent(name)}`, { signal }));
     },
-    async executeSkill(skill, input, persona, signal, turnId, onAdmission) {
-      const admission = await call<unknown>('/api/skill', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          skill, input, turnId: turnId || makeTaskId(),
-          ...(persona ? { persona } : {}),
-        }),
-        signal,
-      });
-      const row = needObject(admission, '技能执行接纳响应无效');
-      if (typeof row.runId !== 'string' || typeof row.sessionId !== 'string'
-          || !row.runId || !row.sessionId) {
-        throw new Error('技能执行接纳响应无效');
-      }
-      if (!options.runTask) throw new Error('任务执行未装配');
-      onAdmission?.(row.runId, row.sessionId);
-      const result = await options.runTask(
-        row.sessionId, row.runId, signal);
-      if (result.state !== 'done') {
-        throw new Error(`任务${result.state}`);
-      }
-      return { response: result.response || '' };
+    executeSkill(skill, input, persona, signal, turnId, onAdmission) {
+      return executeSkillControl(
+        skill, input, persona, signal, turnId, onAdmission);
     },
     async stopTask(runId, signal) {
       await call<unknown>('/api/chat/stop', {
@@ -1194,6 +1353,72 @@ export function createControlWorkspaceData(
         `/api/analytics/${encodeURIComponent(platform)}`,
         { method: 'POST', signal }));
     },
+    async fetchPublishingPolicy(signal) {
+      return publishingPolicy(
+        await call<unknown>('/api/publishing-policy', { signal }));
+    },
+    async exportManualPackage(platform, payload, options = {}, signal) {
+      return exportPackageView(await call<unknown>(
+        `/api/manual-publish/${encodeURIComponent(platform)}/export`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload, requestId: options.requestId || makeTaskId(),
+          }),
+          signal,
+        }));
+    },
+    async publishNow(platform, payload, options = {}, signal) {
+      return publishStartView(await call<unknown>(
+        `/api/publish/${encodeURIComponent(platform)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload, requestId: options.requestId || makeTaskId(),
+          }),
+          signal,
+        }));
+    },
+    async publishStatus(platform, signal) {
+      return publishStatusView(await call<unknown>(
+        `/api/publish/${encodeURIComponent(platform)}/status`, { signal }));
+    },
+    async submitPublishSms(platform, code, options = {}, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/publish/${encodeURIComponent(platform)}/sms`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code, ...(options.runId ? { runId: options.runId } : {}),
+          }),
+          signal,
+        }), '发布短信响应无效');
+      return { ok: row.ok === true };
+    },
+    runAgent(message, persona, signal) {
+      // control 复用已审 SKILL Run，不另开直连模型通道。
+      return executeSkillControl('quality-gate', message, persona, signal);
+    },
+    adaptContent(prompt, persona, callbacks) {
+      const controller = new AbortController();
+      const turnId = makeTaskId();
+      void (async () => {
+        try {
+          const result = await executeSkillControl(
+            'content-repurposing', prompt, persona, controller.signal,
+            turnId, callbacks.onAdmission);
+          if (controller.signal.aborted) return;
+          callbacks.onToken(result.response);
+          callbacks.onDone?.();
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          callbacks.onError(
+            error instanceof Error ? error : new Error('AI 排版失败'));
+        }
+      })();
+      return { abort: () => controller.abort() };
+    },
+    publishDraftScope: options.identityKey || 'control',
     accountQrUrl: qrUrlFor,
     whoami: whoamiStore,
     getAnalyticsCache() {
@@ -1332,6 +1557,31 @@ export const localWorkspaceData: WorkspaceData = {
   saveCredentials: localSaveCredentials,
   fetchAnalyticsPlatforms: localFetchAnalyticsPlatforms,
   fetchAccountAnalytics: localFetchAccountAnalytics,
+  fetchPublishingPolicy: localFetchPublishingPolicy,
+  exportManualPackage: (platform, payload) =>
+    localExportManualPackage(platform, payload),
+  async publishNow(platform, payload) {
+    const result = await localPublishNow(platform, payload);
+    return {
+      ...result,
+      state: result.async ? 'starting' : result.ok ? 'success' : 'error',
+      runId: '',
+    };
+  },
+  async publishStatus(platform) {
+    const result = await localPublishStatus(platform);
+    return { ...result, runId: '' };
+  },
+  submitPublishSms: (platform, code) => localSubmitPublishSms(platform, code),
+  runAgent: (message, persona) => localRunAgent(message, persona),
+  adaptContent(prompt, persona, callbacks) {
+    const controller = localStreamChat(
+      prompt, persona, `manual-adapt-${Date.now()}`,
+      callbacks.onToken, () => callbacks.onDone?.(),
+      callbacks.onError);
+    return { abort: () => controller.abort() };
+  },
+  publishDraftScope: '',
   accountQrUrl: localQrUrl,
   whoami: {
     get: getWhoamiCache,

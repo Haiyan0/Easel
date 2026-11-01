@@ -2388,7 +2388,9 @@ def cmd_serve_control(args) -> int:
     """启动 control HTTP 服务；应用在 lifespan 中管理自己的数据库线程。"""
     try:
         # Origin 必须在打开控制库、启动 HTTP 之前校验失败
-        config = ControlConfig(public_origin=args.public_origin)
+        config = ControlConfig(
+            public_origin=args.public_origin,
+            publish_mode=getattr(args, "publish_mode", "automated"))
     except ValueError:
         print("错误：invalid_origin", file=sys.stderr)
         return 2

@@ -11,6 +11,7 @@ import IdeasPage from './IdeasPage';
 import CalendarPage from './CalendarPage';
 import OutputsPage from './OutputsPage';
 import ProfilePage from './ProfilePage';
+import PublishingPage from './PublishingPage';
 import WorkspaceLayout from './WorkspaceLayout';
 import type { Page } from './Sidebar';
 import type { AuthContext, IdentityEpoch } from '../lib/auth';
@@ -96,8 +97,10 @@ export default function WorkspaceApp({
     fetchText: (url, signal) => workspaceFetchText(url, { signal }),
     runTask: (sessionId, runId, signal) =>
       workspaceRunTask(sessionId, runId, signal),
+    identityKey: `${ctx.userId}:${ctx.workspaceId}`,
     onExpired,
-  }), [workspaceCall, workspaceFetchText, workspaceRunTask, onExpired]);
+  }), [workspaceCall, workspaceFetchText, workspaceRunTask,
+       ctx.userId, ctx.workspaceId, onExpired]);
 
   useEffect(() => {
     const onHash = () => {
@@ -236,6 +239,9 @@ export default function WorkspaceApp({
     }
     if (currentPage === 'calendar') {
       return <CalendarPage />;
+    }
+    if (currentPage === 'publish') {
+      return <PublishingPage key={epoch} persona={selectedPersona} />;
     }
     if (currentPage === 'skills') {
       return <SkillPage persona={selectedPersona} />;

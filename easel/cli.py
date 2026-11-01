@@ -280,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="受保护的 32 字节 AES-GCM master key 文件")
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_serve.add_argument("--port", type=int, default=7861, help="端口（默认 7861）")
+    p_serve.add_argument(
+        "--publish-mode", choices=("automated", "manual"),
+        default="automated",
+        help="受管发布策略（默认 automated，保留原自动发布路径）")
     p_serve.add_argument("--egress-proxy", default=None,
                          help="受控出口代理 URL，例如 http://127.0.0.1:8899")
     p_serve.add_argument("--egress-policy", default=None,
