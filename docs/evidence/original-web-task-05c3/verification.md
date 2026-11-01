@@ -2,7 +2,7 @@
 
 父基线：`fcb351d532301d22afe3be0c91373b19f3505ca7`
 实施 worktree：`C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics`
-实施提交：`206060aca2683d905421457822947aa59ec3ea91`（实现）、`877d2a9`（收口）
+实施提交：`206060aca2683d905421457822947aa59ec3ea91`（实现）、`877d2a9`（收口）、`8d90f42`（终态结算/local 兼容）
 证据提交：本文件所在提交
 日期：2026-11-01
 
