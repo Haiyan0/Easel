@@ -927,6 +927,58 @@ async def scenario_lost_ack_refresh(browser, server: Server) -> None:
     await context.close()
 
 
+async def scenario_lost_ack_refresh_retry_stored_payload(browser,
+                                                         server: Server) -> None:
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "丢失接纳-刷新保留媒体")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    posts = await _lose_first_publish_ack(page)
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    await wait_for(
+        lambda: publish_done_count(server) == done_before + 1, 20,
+        "first accepted run did not settle")
+    await page.reload(wait_until="domcontentloaded")
+    await page.locator(".sidebar").wait_for(timeout=20000)
+    # 让刷新恢复查询失败一次：意图必须保留，且重试不能因为本次页面
+    # 丢失了媒体选择就生成新 requestId/第二次外部提交。
+    failed = {"count": 1}
+
+    async def fail_restore_status(route):
+        if failed["count"] > 0:
+            failed["count"] -= 1
+            await route.abort("failed")
+            return
+        await route.continue_()
+
+    await page.route(
+        "**/api/publish/xiaohongshu/status**", fail_restore_status)
+    await _open_auto_publish(page)
+    await asyncio.sleep(0.8)
+    await page.unroute(
+        "**/api/publish/xiaohongshu/status**", fail_restore_status)
+    assert await page.locator(
+        ".publish-editor input.field").first.input_value() == (
+            "丢失接纳-刷新保留媒体")
+    # 页面刷新后 selectedMedia 为空；服务端应使用落盘 payload 的媒体和
+    # 原 requestId 恢复，而不是被前端“需附带媒体”挡住或新开请求。
+    await _submit_publish(page)
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=30000)
+    assert len(posts) == 2, posts
+    assert posts[0]["requestId"] == posts[1]["requestId"], posts
+    assert posts[1]["media"] == ["project/cover.png"], posts
+    assert len(server.fake.calls) == calls_before + 1, server.fake.calls
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "13-lost-ack-refresh-stored-payload.png")
+    await context.close()
+
+
 async def scenario_new_intent_after_success(browser, server: Server) -> None:
     context = await browser.new_context(
         viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
@@ -1074,6 +1126,10 @@ async def main() -> int:
                     await check(
                         "lost-ack-refresh-recovers",
                         lambda: scenario_lost_ack_refresh(browser, automated))
+                    await check(
+                        "lost-ack-refresh-retry-stored-payload",
+                        lambda: scenario_lost_ack_refresh_retry_stored_payload(
+                            browser, automated))
                     await check(
                         "explicit-new-intent",
                         lambda: scenario_new_intent_after_success(

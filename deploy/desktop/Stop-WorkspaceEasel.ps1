@@ -118,7 +118,10 @@ try {
         "EASEL_CONTROL_PORT=7861",
         "EASEL_CONTROL_NETWORK=$network",
         "EASEL_PROVISIONER_GID=1000",
-        "EASEL_PROVISIONER_SOCKET=$socket"
+        "EASEL_PROVISIONER_SOCKET=$socket",
+        # down 不启动 control；该必填变量只为 compose 插值成功，使用
+        # 非法的保守占位值，绝不用于启动。
+        "EASEL_PUBLISH_MODE=placeholder-not-used-for-down"
     )
     $composeArgs = @('-d', $Distro, '--', 'env') + $envArgs + @(
         'docker', 'compose', '-p', $ProjectName, '-f', $composeWsl, 'down')

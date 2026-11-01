@@ -1,6 +1,7 @@
 """A4.4：完整 Desktop 开发编排与初始化/启动/停止/诊断契约。"""
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +88,23 @@ def test_workspace_compose_egress_uses_policy_volume_only():
         "${EASEL_EGRESS_VOLUME")
 
 
+def test_compose_required_variables_are_supplied_by_start_and_stop():
+    # down 也会加载 compose 并对 command 做插值；Start/Stop 的 envArgs
+    # 都必须提供全部 ${VAR:?} 必填变量，否则正常 Stop 会在 barrier 之后失败。
+    required = set(re.findall(
+        r"\$\{([A-Z_]+):\?",
+        COMPOSE.read_text(encoding="utf-8")))
+    assert "EASEL_PUBLISH_MODE" in required
+    for script in (START, STOP):
+        text = script.read_text(encoding="utf-8")
+        match = re.search(
+            r"\$envArgs\s*=\s*@\((?P<body>.*?)\n\s*\)", text, re.S)
+        assert match is not None, f"{script.name} envArgs missing"
+        body = match.group("body")
+        missing = sorted(name for name in required if f"{name}=" not in body)
+        assert not missing, f"{script.name} envArgs missing {missing}"
+
+
 def test_initialize_binds_key_creation_and_private_network():
     text = INITIALIZE.read_text(encoding="utf-8")
     assert "--signing-key" in text
@@ -108,6 +126,7 @@ def test_initialize_binds_key_creation_and_private_network():
 def test_restore_reuses_registered_publish_mode():
     text = RESTORE.read_text(encoding="utf-8")
     assert "manifest.deployment.publish_mode" in text
+    assert "ToLowerInvariant" in text
     assert "-PublishMode" in text
     assert "backup_manifest_invalid" in text
 

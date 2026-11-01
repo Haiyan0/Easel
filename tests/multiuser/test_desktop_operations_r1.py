@@ -614,6 +614,36 @@ def test_start_explicit_manual_migration_is_persisted(tmp_path):
     assert (tmp_path / "wsl-state" / "compose-up").is_file()
 
 
+def test_start_normalizes_publish_mode_case(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode=None)
+    result = _run_ps(
+        START, *_start_args(
+            data_root, workspace_root, "-PublishMode", "Manual"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "manual"
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(tmp_path)
+
+    # 登记文件里人工写成混合大小写时同样归一化，不把 Manual 传给 argparse。
+    second = tmp_path / "registered"
+    second.mkdir(parents=True, exist_ok=True)
+    env2 = _base_env(second)
+    _fake_docker(second, env2)
+    _fake_wsl(second, env2)
+    data_root2, workspace_root2 = _seed_deployment(
+        second, env2, publish_mode="Manual")
+    result2 = _run_ps(
+        START, *_start_args(data_root2, workspace_root2), env=env2)
+    assert result2.returncode == 0, result2.stdout + result2.stderr
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(
+        tmp_path / "registered")
+
+
 def test_start_reuses_registered_manual_mode_without_silent_upgrade(tmp_path):
     env = _base_env(tmp_path)
     _fake_docker(tmp_path, env)

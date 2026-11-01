@@ -91,7 +91,8 @@ try {
     }
     # 备份若登记了受管发布策略，恢复后的正式启动也要沿用；旧备份没有
     # 该字段时仍由 Start 的显式迁移规则处理。
-    $restoredPublishMode = [string]$manifest.deployment.publish_mode
+    $restoredPublishMode = (
+        [string]$manifest.deployment.publish_mode).ToLowerInvariant()
     if ($restoredPublishMode -and
         $restoredPublishMode -notin @('automated', 'manual')) {
         throw 'backup_manifest_invalid'

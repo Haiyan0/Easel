@@ -75,6 +75,32 @@ test('publish intent is scoped per identity and never global', () => {
     key => key.includes('user-a:ws-a')), true);
 });
 
+test('publish intent persists the full payload for refresh retry', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  const payload = {
+    title: '标题', body: '正文', media: ['project/cover.png'],
+    tags: '工具', persona: '复测画像',
+  };
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-payload', fingerprint: 'fp', payload },
+  }, scope);
+  const loaded = store.loadPublishIntents(scope).xiaohongshu;
+  assert.equal(loaded.requestId, 'req-payload');
+  assert.equal(loaded.payload.persona, '复测画像');
+  assert.equal(loaded.payload.media[0], 'project/cover.png');
+  // 损坏的 payload 被忽略，但 requestId 仍保留用于原请求核对。
+  store.savePublishIntents({
+    xiaohongshu: {
+      requestId: 'req-broken', fingerprint: 'fp',
+      payload: { title: 1, body: '正文', media: 'x', tags: '', persona: '' },
+    },
+  }, scope);
+  const broken = store.loadPublishIntents(scope).xiaohongshu;
+  assert.equal(broken.requestId, 'req-broken');
+  assert.equal(broken.payload, undefined);
+});
+
 test('publish intent clear removes only the requested platform', () => {
   const { store } = load();
   const scope = 'user-a:ws-a';

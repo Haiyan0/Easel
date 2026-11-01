@@ -2,10 +2,10 @@
 ## pytest tests/multiuser/{test_workspace_publishing,test_task5c3_chain,test_publish_worker,test_store,test_runs,test_gateway_workspace,test_policy,test_task_leases,test_workspace_accounts,test_workspace_tasks,test_desktop_workspace,test_desktop_operations_r1,test_workspace_start_identity}.py -q
 ........................................................................ [ 18%]
 ........................................................................ [ 37%]
-........................................................................ [ 56%]
+........................................................................ [ 55%]
 ........................................................................ [ 74%]
 ...............................s........................................ [ 93%]
-.........................                                                [100%]
+...........................                                              [100%]
 ============================== warnings summary ===============================
 tests/multiuser/test_publish_worker.py::test_media_staging_copies_into_run_dir_and_rejects_escape
   C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-39 (_readerthread)
@@ -62,8 +62,9 @@ tests/multiuser/test_publish_worker.py::test_build_package_rejects_export_direct
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-384 passed, 1 skipped, 3 warnings in 49.27s
+386 passed, 1 skipped, 3 warnings in 56.73s
 EXIT:0
+
 
 ## Batch 2: 5C1/5C2, auth/admin/config/session/account/analytics, gateway/broker/worker/proxy, desktop operations
 ## pytest <独立进程的 60 个 tests/multiuser 文件> -q

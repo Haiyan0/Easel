@@ -24,21 +24,30 @@
     要求显式 `-PublishMode`；
   - 全新部署仍保留 `automated` 默认；
   - 解析结果通过 `EASEL_PUBLISH_MODE` 传给 Compose，并写回
-    `deployment.json`，后续重启/升级复用。
+    `deployment.json`，后续重启/升级复用；大小写统一归一化为小写。
+- `Stop-WorkspaceEasel.ps1` 的 `compose down` 同样会加载 command 并做
+  必填插值，因此 envArgs 也提供保守占位 `EASEL_PUBLISH_MODE`；新增
+  契约测试遍历 Compose 全部 `${VAR:?}`，要求 Start/Stop 的 envArgs
+  都提供。Stop env 列表对正式 Compose 的 `config --quiet` 退出 0
+  （见 [deploy-policy-check.txt](deploy-policy-check.txt) 的
+  `WITH_STOP_ENV_EXIT:0`）。
 - `Status-WorkspaceEasel.ps1` 只读输出 `version_publish_mode`。
 - 备份元数据允许并校验 `publish_mode`；恢复后的下一条 Start 命令沿用该
   策略；升级时旧登记与备份清单都有策略且不一致则拒绝。
 
 ### T5C3-R1-02 接纳响应丢失后的意图恢复
 
-- 前端在首次发送前把“平台 + 稿件版本指纹 + requestId”写入按
-  `userId:workspaceId` 分组的本地意图存储；同稿重试/刷新复用同一
-  requestId，新稿才生成新请求号。
+- 前端在首次发送前把“平台 + 稿件版本指纹 + 完整 payload + requestId”
+  写入按 `userId:workspaceId` 分组的本地意图存储；同稿重试/刷新复用同一
+  requestId 与 payload，新稿才生成新请求号。
 - 网络中断/408/5xx 时保留意图并显示“未知/核对中”，不自动补发；用户
   再次点击只重试同一请求。
 - `GET /api/publish/{platform}/status?requestId=…` 只查询本会话该意图的
   原 Run；未确认返回 `runId=""` 的 unknown，刷新时据此恢复或保留意图。
 - 明确成功/失败/未知终态后才清除意图；明确完成后的再次发布是新意图。
+- 意图同时保存完整 payload（title/body/media/tags/persona）；刷新或切身份
+  丢失 media/persona 选择时，只要标题/正文/标签未变，仍复用原 payload 与
+  requestId 重试，不会因为前端状态丢失而生成第二次外部提交。
 - 迟到旧回应只能清除同一 requestId 的意图；轮询发现当前平台意图已更换
   即停止旧轮询，不能覆盖新卡片或删除新意图。
 - 意图与草稿都按身份/workspace 隔离；身份切换后 B 不读取 A 的草稿或
@@ -103,12 +112,12 @@
 # 30 passed（含 requestId 状态查询）
 
 node --test tests/frontend/*.test.mjs
-# 172 passed（含意图存储身份隔离、迟到旧回应不删新意图、requestId 状态查询、不确定错误分类）
+# 173 passed（含意图 payload 持久化、身份隔离、迟到旧回应不删新意图、requestId 状态查询）
 
 $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r1/browser'
 & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' `
   tests/frontend/browser_original_web_task05c3.py
-# TASK5C3_BROWSER_OK True；10/10 场景通过
+# TASK5C3_BROWSER_OK True；11/11 场景通过
 ```
 
 ### T5C3-R1-01
@@ -139,7 +148,7 @@ $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r1/browser'
 
 ```powershell
 # Batch 1（5C3/发布/worker/正式部署/Store/Run/policy/leases）
-# 384 passed, 1 skipped
+# 386 passed, 1 skipped
 # Batch 2（5C1/5C2/auth/admin/config/session/gateway/broker/worker/desktop）
 # 947 passed, 4 skipped
 # Batch 3（worker execution gate 独立进程）
@@ -159,12 +168,30 @@ $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r1/browser'
 分批验收（与首轮主审对浏览器夹具的要求一致）。
 
 ```powershell
-npm --prefix web/frontend run build   # 退出 0，index-CeDVLP7z.js
+npm --prefix web/frontend run build   # 退出 0，index-CfTWRFga.js
 npm --prefix web/frontend run lint    # 退出 0
-node --test tests/frontend/*.test.mjs # 172 passed
+node --test tests/frontend/*.test.mjs # 173 passed
 ```
 
 原始输出：[build-lint.txt](build-lint.txt)、[node-tests.txt](node-tests.txt)。
+
+### 首轮提交后补洞（独立审查发现并复现）
+
+1. **Stop 也要求必填策略变量**：`docker compose down` 仍会加载 command
+   并做 `${EASEL_PUBLISH_MODE:?}` 插值；首轮 Stop envArgs 未提供该变量，
+   正常 Stop 会在 barrier 之后失败。已给 Stop envArgs 加保守占位值，并
+   新增 `test_compose_required_variables_are_supplied_by_start_and_stop`
+   遍历 Compose 全部 `${VAR:?}`，要求 Start/Stop 都提供。
+2. **意图 payload 需要随意图持久化**：刷新/切身份会丢失未持久化的
+   `selectedMedia`/`persona`，旧实现会因指纹变化生成新 requestId。现在
+   意图保存完整 payload；标题/正文/标签不变时复用原 payload 与
+   requestId。新增浏览器场景
+   `lost-ack-refresh-retry-stored-payload`：丢 ack、后台 done、刷新且
+   恢复查询失败一次、媒体选择丢失后重试，断言两次 POST 的 requestId
+   相同、媒体仍为原选择、受控执行只 +1。
+3. **策略大小写归一化**：Start/Restore 统一 `ToLowerInvariant()`，避免
+   `-PublishMode Manual` 或登记文件混合大小写被 PowerShell 接受后被
+   argparse 拒绝；新增 `test_start_normalizes_publish_mode_case`。
 
 ## 3. 正式部署迁移说明
 
@@ -214,7 +241,7 @@ deploy/desktop/Start-WorkspaceEasel.ps1 ... -PublishMode automated
 ```powershell
 $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r1/browser'
 & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' tests/frontend/browser_original_web_task05c3.py
-# TASK5C3_BROWSER_OK True；10 场景全部通过，failures=[]，退出 0
+# TASK5C3_BROWSER_OK True；11 场景全部通过，failures=[]，退出 0
 ```
 
 新增场景：
@@ -227,7 +254,10 @@ $env:EASEL_5C3_EVIDENCE = 'docs/evidence/original-web-task-05c3/r1/browser'
    不创建第二个任务，意图在明确成功后清除。
 4. `explicit-new-intent`：明确成功后用户再次发布同稿；生成新 requestId，
    作为新意图执行（不永久去重同文）。
-5. `identity-switch-isolates-intent`：A 丢响应后切 B；B 看不到 A 的草稿/
+5. `lost-ack-refresh-retry-stored-payload`：丢响应、后台 done、刷新并让
+   恢复查询失败一次；页面丢失媒体选择后重试，仍用落盘 payload 的媒体和
+   原 requestId 恢复，受控执行次数不增加。
+6. `identity-switch-isolates-intent`：A 丢响应后切 B；B 看不到 A 的草稿/
    意图、不会重发 A 的 requestId；切回 A 后原意图和草稿恢复，执行次数不变。
 
 原五组（人工导出审核、自动策略、短信/停止/刷新、双击一次、manual 策略）
@@ -273,12 +303,12 @@ gateway/worker 沿用 5C3 已验收镜像；未无缓存重建全栈。原始输
 
 镜像：
 
-- control `sha256:e9c745a1db964800e366ce9fc7e929794841414936a0cb6e2511d9c49107c7d4`
+- control `sha256:902de6c1330d8d773dcd6e532943d5ef485e55a40344a2be34d6250af293ddee`
 - gateway `sha256:f778221c003cae140452aff976331790ca9f0e90f302bf461a92204ff164c872`
 - worker `sha256:d46f0dd1f17273e91f3d3cca7e68854ca1dc55231a64b446ef058ad7b5066ec8`
 
 镜像内源码/前端哈希与当前源码一致（见 `SOURCE_HASH` 行，control 新
-`index-CeDVLP7z.js`）。
+`index-CfTWRFga.js`）。
 
 真实层：固定身份/签名、control/gateway/worker、Gateway、WorkspaceApi、
 WorkerRelay、RunManager、受管发布执行器、镜像内受控发布子进程、进程树
@@ -360,7 +390,7 @@ WorkerRelay、RunManager、受管发布执行器、镜像内受控发布子进�
 | control | `easel/control/types.py` | `0b796cde6b89834015a9cd4832fd9ee6f41b4d11873df6bae62d684f833eb780` |
 | control | `easel/control/cli.py` | `82a0d91e817e6e6f5943c2cb64900745d006cf2ed49181b91d5f7d22dac47b31` |
 | control | `easel/manual_publish.py` | `6c8648d7299e1dad33ec7a0fcee71a4dce0048aa8901c8874f44e7a980d6937e` |
-| control | `web/frontend/dist/assets/index-CeDVLP7z.js` | `7caebc5b0eb352d1c16da37b2fc8cb09dfbde6711619f3d04788b738c10181d1` |
+| control | `web/frontend/dist/assets/index-CfTWRFga.js` | `6f7123fc6617e8ef40a74200bb3ef195bdfd7339aa0fc17b2f3a85ea1668a9f3` |
 | gateway | `easel/gateway/app.py` | `96f71488fd8332441452fb4d16142a674004e360bf1eabef575232e8c1b9a464` |
 | worker | `easel/worker/browser_tasks.py` | `007ff68315e4eacb98e531fb66998280dfa7a28b85d0c8a428b55403020e1109` |
 | worker | `easel/manual_publish.py` | `6c8648d7299e1dad33ec7a0fcee71a4dce0048aa8901c8874f44e7a980d6937e` |

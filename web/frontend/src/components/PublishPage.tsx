@@ -58,18 +58,40 @@ function publishFingerprint(platform: string, payload: PublishPayload): string {
   ]);
 }
 
-/** 发送前固定一次用户发布意图；同稿重试/刷新复用，新稿才换新号。 */
-function acquirePublishIntent(
+type PublishIntentMatch = { requestId: string; payload: PublishPayload };
+
+/** 找到仍对应当前可见稿件的意图；刷新丢失 media/persona 时复用原 payload。 */
+function findPublishIntent(
   scope: string, platform: string, payload: PublishPayload,
-): string {
+): PublishIntentMatch | null {
+  const prior = loadPublishIntents(scope)[platform];
+  if (!prior) return null;
+  if (prior.fingerprint === publishFingerprint(platform, payload)) {
+    return { requestId: prior.requestId, payload: prior.payload ?? payload };
+  }
+  // media/persona 不随草稿持久化；标题/正文/标签未变时仍视为同一可见
+  // 稿件，复用落盘 payload，避免刷新/切身份后生成第二次外部提交。
+  if (prior.payload
+      && prior.payload.title === payload.title
+      && prior.payload.body === payload.body
+      && prior.payload.tags === payload.tags) {
+    return { requestId: prior.requestId, payload: prior.payload };
+  }
+  return null;
+}
+
+/** 首次发送前固定意图并落盘；同稿重试/刷新复用，新稿才换新号。 */
+function rememberPublishIntent(
+  scope: string, platform: string, payload: PublishPayload,
+  requestId: string,
+): void {
   const intents = loadPublishIntents(scope);
-  const fingerprint = publishFingerprint(platform, payload);
-  const prior = intents[platform];
-  if (prior && prior.fingerprint === fingerprint) return prior.requestId;
-  const requestId = newPublishRequestId(platform);
-  intents[platform] = { requestId, fingerprint };
+  intents[platform] = {
+    requestId,
+    fingerprint: publishFingerprint(platform, payload),
+    payload,
+  };
   savePublishIntents(intents, scope);
-  return requestId;
 }
 
 export default function PublishPage({ persona }: PublishPageProps) {
@@ -262,26 +284,37 @@ export default function PublishPage({ persona }: PublishPageProps) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '未登录 · 去账号页登录' } }));
         continue;
       }
-      if (MEDIA_REQUIRED.has(t.key) && selectedMedia.length === 0) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '需附带图片/视频' } }));
-        continue;
-      }
-      if (VIDEO_ONLY.has(t.key) && !selectedMedia.some((p) => VIDEO_RE.test(p))) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: `${t.label}只能发视频，请从内容库选一个视频` } }));
-        continue;
-      }
       const payload: PublishPayload = {
         title, body: effective(t.key), media: selectedMedia, tags, persona,
       };
       // 首次发送前就固定意图并落盘；接纳结果不明时刷新/重试仍用同一个
-      // requestId，服务端据此返回同一个 Run，不会开启第二次外部动作。
+      // requestId 与落盘 payload，服务端据此返回同一个 Run，不会开启
+      // 第二次外部动作。
       const intentScope = data.publishDraftScope;
-      const requestId = intentScope
-        ? acquirePublishIntent(intentScope, t.key, payload)
-        : newPublishRequestId(t.key);
+      const prior = intentScope
+        ? findPublishIntent(intentScope, t.key, payload) : null;
+      const pending = prior
+        ? { requestId: prior.requestId, payload: prior.payload }
+        : { requestId: newPublishRequestId(t.key), payload };
+      const pendingMedia = pending.payload.media;
+      if (MEDIA_REQUIRED.has(t.key) && pendingMedia.length === 0) {
+        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '需附带图片/视频' } }));
+        continue;
+      }
+      if (VIDEO_ONLY.has(t.key)
+          && !pendingMedia.some((p) => VIDEO_RE.test(p))) {
+        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: `${t.label}只能发视频，请从内容库选一个视频` } }));
+        continue;
+      }
+      if (intentScope && !prior) {
+        rememberPublishIntent(
+          intentScope, t.key, payload, pending.requestId);
+      }
+      const requestId = pending.requestId;
       setPub((r) => ({ ...r, [t.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
       try {
-        const res = await data.publishNow(t.key, payload, { requestId });
+        const res = await data.publishNow(
+          t.key, pending.payload, { requestId });
         publishRuns.current[t.key] = res.runId || '';
         if (res.async) {
           // 所有平台都先接纳后轮询；短信只绑定当前 Run。

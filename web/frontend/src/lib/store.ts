@@ -83,10 +83,20 @@ export function savePublishDraft(d: PublishDraft, scope?: string): void {
   } catch { /* quota */ }
 }
 
+/** 意图对应的完整发布输入；刷新/切身份后必须能据此重试原请求。 */
+export interface PublishIntentPayload {
+  title: string;
+  body: string;
+  media: string[];
+  tags: string;
+  persona: string;
+}
+
 /** 一次用户发布意图：同稿重试/刷新复用 requestId，新稿才换新值。 */
 export interface PublishIntent {
   requestId: string;
   fingerprint: string;
+  payload?: PublishIntentPayload;
 }
 const PUBLISH_INTENT_KEY = 'easel_publish_intent';
 
@@ -111,12 +121,31 @@ export function loadPublishIntents(
       parsed as Record<string, unknown>,
     )) {
       if (!value || typeof value !== 'object') continue;
-      const item = value as { requestId?: unknown; fingerprint?: unknown };
+      const item = value as {
+        requestId?: unknown; fingerprint?: unknown; payload?: unknown;
+      };
       if (typeof item.requestId !== 'string' || !item.requestId
           || typeof item.fingerprint !== 'string') continue;
-      result[platform] = {
+      const intent: PublishIntent = {
         requestId: item.requestId, fingerprint: item.fingerprint,
       };
+      const payload = item.payload;
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const fields = payload as Record<string, unknown>;
+        if (typeof fields.title === 'string'
+            && typeof fields.body === 'string'
+            && Array.isArray(fields.media)
+            && fields.media.every((item) => typeof item === 'string')
+            && typeof fields.tags === 'string'
+            && typeof fields.persona === 'string') {
+          intent.payload = {
+            title: fields.title, body: fields.body,
+            media: fields.media as string[], tags: fields.tags,
+            persona: fields.persona,
+          };
+        }
+      }
+      result[platform] = intent;
     }
     return result;
   } catch {

@@ -133,6 +133,8 @@ ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有�
 [5C3] scenario ok: lost-ack-done-retry-once
 [5C3] scenario start: lost-ack-refresh-recovers
 [5C3] scenario ok: lost-ack-refresh-recovers
+[5C3] scenario start: lost-ack-refresh-retry-stored-payload
+[5C3] scenario ok: lost-ack-refresh-retry-stored-payload
 [5C3] scenario start: explicit-new-intent
 [5C3] scenario ok: explicit-new-intent
 [5C3] scenario start: identity-switch-isolates-intent
@@ -148,6 +150,7 @@ ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有�
     "lost-ack-running-retry-once": true,
     "lost-ack-done-retry-once": true,
     "lost-ack-refresh-recovers": true,
+    "lost-ack-refresh-retry-stored-payload": true,
     "explicit-new-intent": true,
     "identity-switch-isolates-intent": true,
     "policy-manual": true
@@ -163,6 +166,7 @@ ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有�
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\08-lost-ack-running-retry.png",
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\09-lost-ack-done-retry.png",
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\10-lost-ack-refresh-recovered.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\13-lost-ack-refresh-stored-payload.png",
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\11-explicit-new-intent.png",
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\12-identity-switch-isolated.png",
     "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\05-policy-manual.png"

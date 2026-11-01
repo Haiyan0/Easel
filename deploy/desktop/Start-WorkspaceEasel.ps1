@@ -216,7 +216,8 @@ try {
         if ([string]$existingDeployment.project -ne $ProjectName) {
             throw 'deployment_project_mismatch'
         }
-        $registeredPublishMode = [string]$existingDeployment.publish_mode
+        $registeredPublishMode = (
+            [string]$existingDeployment.publish_mode).ToLowerInvariant()
         if ($registeredPublishMode -and
             $registeredPublishMode -notin @('automated', 'manual')) {
             throw 'deployment_publish_mode_invalid'
@@ -252,7 +253,7 @@ try {
         }
     }
     if ($PublishMode) {
-        $resolvedPublishMode = $PublishMode
+        $resolvedPublishMode = $PublishMode.ToLowerInvariant()
     }
     elseif ($registeredPublishMode) {
         $resolvedPublishMode = $registeredPublishMode
