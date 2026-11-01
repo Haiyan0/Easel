@@ -68,7 +68,7 @@ pytest tests/multiuser/test_workspace_accounts.py tests/multiuser/test_worker_br
 
 ## 4. 5C2 浏览器矩阵
 
-[源码](../../../tests/frontend/browser_original_web_task05c2.py) 真实 React 构建、HTTPS
+[源码](../../../../tests/frontend/browser_original_web_task05c2.py) 真实 React 构建、HTTPS
 control、gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台入口为受控替身，
 真实 Chromium 驱动 UI。本轮新增/保留 6 组，全部 true：
 
@@ -103,11 +103,11 @@ control、gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台入�
 
 增量 Dockerfile（均为当前提交源码，基线镜像层复用，不重建 Harness/Chromium 全栈）：
 
-- [Dockerfile.control-task5c2-r1](../../../tests/multiuser/Dockerfile.control-task5c2-r1)：
+- [Dockerfile.control-task5c2-r1](../../../../tests/multiuser/Dockerfile.control-task5c2-r1)：
   基于已验收 `easel-control:task5c1-r1-20261030`，覆盖 `easel/` 与当前 `web/frontend/dist`。
-- [Dockerfile.gateway-task5c2-r1](../../../tests/multiuser/Dockerfile.gateway-task5c2-r1)：
+- [Dockerfile.gateway-task5c2-r1](../../../../tests/multiuser/Dockerfile.gateway-task5c2-r1)：
   基于已验收 `easel-gateway:task5c1-20261030`，覆盖 `easel/`。
-- [Dockerfile.worker-task5c2-r1](../../../tests/multiuser/Dockerfile.worker-task5c2-r1)：
+- [Dockerfile.worker-task5c2-r1](../../../../tests/multiuser/Dockerfile.worker-task5c2-r1)：
   基于已验收 `easel-worker-execution:a4`（含 Playwright/Chromium），覆盖 `easel/` 与
   `web/app.py`；补装 `PyYAML==6.0.3`（已加入
   `deploy/multiuser/requirements-worker.txt`，容器闭环发现原镜像缺此依赖）。
@@ -146,7 +146,7 @@ control、gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台入�
 
 夹具（不访问真实平台/账号）：
 
-- 本地固定 [task5c2_controlled_platform.py](../../../tests/multiuser/task5c2_controlled_platform.py)
+- 本地固定 [task5c2_controlled_platform.py](../../../../tests/multiuser/task5c2_controlled_platform.py)
   在同一镜像内以真实 Python 子进程运行，启动 Chromium 并读写二维码/状态/profile；
 - 平台站点、二维码内容、短信码（固定 `123456`）、whoami 昵称、analytics 数值、微信
   凭证验证结果均为本地夹具；
@@ -156,7 +156,7 @@ control、gateway、WorkspaceApi、WorkerRelay、worker RunManager；平台入�
 
 ### 6.3 容器检查项
 
-[task5c2_container_chain.py](../../../tests/multiuser/task5c2_container_chain.py) 在全新
+[task5c2_container_chain.py](../../../../tests/multiuser/task5c2_container_chain.py) 在全新
 标签网络/卷/容器中验证：
 
 - 一次受管登录派发：`starting`→`qr_ready`→`sms_required`→`success`，control Run
