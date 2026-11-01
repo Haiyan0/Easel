@@ -20,4 +20,3 @@ dist/assets/index-Cnj9zjPQ.js   656.61 kB │ gzip: 201.76 kB
 
 > frontend@0.0.0 lint
 > oxlint
-
