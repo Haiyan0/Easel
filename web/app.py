@@ -835,13 +835,15 @@ async def _await_credentials_job(platform: str, run_id: str,
         await asyncio.sleep(0.02)
 
 
-def _verify_and_save_credentials(platform: str, app_id: str, app_secret: str,
-                                 name: str, author: str) -> dict:
-    ok, message = _wechat_verify_credentials(app_id, app_secret)
-    if not ok:
-        # 失败不写 YAML：旧的有效凭证继续可用，避免一次输错覆盖可工作配置。
-        return {"ok": False,
-                "message": f"凭证未保存，验证未通过：{message}。原有配置保持不变。"}
+def _verification_failure(message: str) -> dict:
+    # 失败不写 YAML：旧的有效凭证继续可用，避免一次输错覆盖可工作配置。
+    return {"ok": False,
+            "message": f"凭证未保存，验证未通过：{message}。原有配置保持不变。"}
+
+
+def _commit_credentials(platform: str, app_id: str, app_secret: str,
+                        name: str, author: str) -> dict:
+    """验证通过后的唯一落盘提交点；调用方必须已持有 Run 提交栅栏。"""
     try:
         _wechat_save_credentials(app_id, app_secret, name=name, author=author)
     except OSError:
@@ -850,6 +852,30 @@ def _verify_and_save_credentials(platform: str, app_id: str, app_secret: str,
         _WHOAMI_CACHE.pop(platform, None)
     _write_login_marker(platform, 'success', name or '微信公众号')
     return {"ok": True, "message": "公众号凭证已保存并验证通过"}
+
+
+def _verify_and_save_credentials(platform: str, app_id: str, app_secret: str,
+                                 name: str, author: str) -> dict:
+    """local 模式：验证后直接提交；worker 受管链路使用拆分后的栅栏流程。"""
+    ok, message = _wechat_verify_credentials(app_id, app_secret)
+    if not ok:
+        return _verification_failure(message)
+    return _commit_credentials(platform, app_id, app_secret, name, author)
+
+
+async def _wait_credentials_terminal(run_id: str, timeout: float = 5.0) -> None:
+    """提交栅栏内等待 supervisor 提交真实终态；有界，绝不无限等平台。"""
+    manager = _RUNS
+    if manager is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while manager.state(run_id) not in (
+            "done", "failed", "interrupted", "cancelled"):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.01, remaining))
 
 
 def _k(env, label, required=True, secret=True, aliases=None):
@@ -5275,20 +5301,43 @@ async def api_save_credentials(platform: str, req: WechatCredentials):
                    app_id + app_secret + name + author)):
         raise HTTPException(400, '凭证或名称格式非法')
     run_id = (req.runId or '').strip()
-    future = None
-    if _SERVICE_MODE == "worker":
-        # 只接受 control 为本平台已接纳的凭证 Run；直接调用不会获得交接槽。
-        if (not run_id or len(run_id) > 128
-                or any(ord(character) < 32 for character in run_id)):
-            raise HTTPException(409, '凭证校验未获接纳')
-        future = await _await_credentials_job(platform, run_id)
-        if future is None:
-            raise HTTPException(409, '凭证校验未获接纳')
-    result = await asyncio.to_thread(
-        _verify_and_save_credentials, platform, app_id, app_secret,
-        name, author)
-    if future is not None and not future.done():
-        future.set_result(result)
+    if _SERVICE_MODE != "worker":
+        # local 单用户模式没有 Run 账本，保持原有直接验证/保存语义。
+        return await asyncio.to_thread(
+            _verify_and_save_credentials, platform, app_id, app_secret,
+            name, author)
+    # 只接受 control 为本平台已接纳的凭证 Run；直接调用不会获得交接槽。
+    if (not run_id or len(run_id) > 128
+            or any(ord(character) < 32 for character in run_id)):
+        raise HTTPException(409, '凭证校验未获接纳')
+    key = _credentials_job_key(platform, run_id)
+    future = await _await_credentials_job(platform, run_id)
+    manager = _RUNS
+    if future is None or manager is None:
+        raise HTTPException(409, '凭证校验未获接纳')
+
+    # 验证可以慢、可以在线程/子进程里跑；提交必须回到事件循环重新确认
+    # 当前 Run/交接槽仍有效。检查与落盘之间不 await，因此 stop 无法在
+    # 检查通过后、写盘前插入并把提交留下。
+    ok, message = await asyncio.to_thread(
+        _wechat_verify_credentials, app_id, app_secret)
+    if _CREDENTIAL_JOBS.get(key) is not future or future.done():
+        raise HTTPException(409, '凭证校验已取消，未保存')
+    if not manager.begin_commit(run_id):
+        raise HTTPException(409, '凭证校验已取消，未保存')
+    try:
+        if not ok:
+            result = _verification_failure(message)
+        else:
+            result = _commit_credentials(
+                platform, app_id, app_secret, name, author)
+        if not future.done():
+            future.set_result(result)
+        # 让 stop 在 committing=1 期间等待，并观察提交后的真实终态；
+        # 已提交的 Run 不应再被标成 cancelled。
+        await _wait_credentials_terminal(run_id)
+    finally:
+        manager.end_commit(run_id)
     return result
 
 

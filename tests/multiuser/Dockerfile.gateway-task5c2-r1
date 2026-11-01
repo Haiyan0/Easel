@@ -1,0 +1,7 @@
+# Task 5C2 R1：在已验收 gateway 镜像上增量覆盖当前源码。
+ARG BASE_IMAGE=easel-gateway:task5c1-20261030
+FROM ${BASE_IMAGE}
+USER root
+COPY easel /opt/easel/easel
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+USER 10001:10001

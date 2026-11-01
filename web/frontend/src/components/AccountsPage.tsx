@@ -258,6 +258,9 @@ export default function AccountsPage() {
     data.whoami.set(a.platform, null);
     setTerminalMsg('');
     setBusy(a.platform);
+    // 新弹窗属于新的登录序列：旧停止请求即使还没回来，也不能让新弹窗
+    // 一直停留在“停止中…”。
+    setStopBusy(false);
     setSmsCode(''); setSmsErr('');
     qrPlatformRef.current = a.platform;
     qrRunRef.current = '';
@@ -345,6 +348,7 @@ export default function AccountsPage() {
     stopPoll();
     setErr('');
     setBusy(a.platform + ':mp');
+    setStopBusy(false);
     setSmsCode(''); setSmsErr('');
     qrPlatformRef.current = a.platform;
     qrRunRef.current = '';
@@ -443,28 +447,48 @@ export default function AccountsPage() {
   }, [load, data, expireIfNeeded]);
 
   // 显式停止：终止本人当前登录 Run/浏览器；与「关闭弹窗」语义不同。
+  // 停止是异步请求；用户可能在它返回前关闭 A、打开 B。回包只能修改它
+  // 发起时那个弹窗（序列 + platform/mp/runId），不得覆盖新平台/新 Run。
   const handleStopLogin = useCallback(async () => {
     if (!qr) return;
-    qrRequest.current += 1;
+    const sequence = ++qrRequest.current;
+    const owner = {
+      platform: qr.platform, mp: qr.mp, runId: qr.runId || '',
+    };
     stopPoll();
     setStopBusy(true);
+    const isCurrent = () => aliveRef.current && qrRequest.current === sequence;
+    const owns = (previous: QRState | null) => Boolean(
+      previous
+      && previous.platform === owner.platform
+      && previous.mp === owner.mp
+      && (previous.runId || '') === owner.runId);
     try {
-      await data.stopLogin(qr.platform, {
-        mp: qr.mp, ...(qr.runId ? { runId: qr.runId } : {}),
+      const result = await data.stopLogin(owner.platform, {
+        mp: owner.mp, ...(owner.runId ? { runId: owner.runId } : {}),
       });
-      setQr((previous) => previous && ({
-        ...previous, state: 'error', message: '已停止登录',
-        qr: '', qrUrl: '',
-      }));
-      data.whoami.set(qr.platform, null);
+      if (!isCurrent()) return;
+      if (owner.runId && result.runId && result.runId !== owner.runId) return;
+      setQr((previous) => {
+        if (!previous || !owns(previous)) return previous;
+        return {
+          ...previous, state: 'error', message: '已停止登录',
+          qr: '', qrUrl: '',
+        };
+      });
+      data.whoami.set(owner.platform, null);
       load();
     } catch (e) {
+      if (!isCurrent()) return;
       expireIfNeeded(e);
-      setQr((previous) => previous && ({
-        ...previous, message: workspaceErrorMessage(e, '停止登录失败'),
-      }));
+      setQr((previous) => {
+        if (!previous || !owns(previous)) return previous;
+        return {
+          ...previous, message: workspaceErrorMessage(e, '停止登录失败'),
+        };
+      });
     } finally {
-      setStopBusy(false);
+      if (isCurrent()) setStopBusy(false);
     }
   }, [qr, data, stopPoll, load, expireIfNeeded]);
 

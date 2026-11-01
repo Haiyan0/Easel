@@ -112,6 +112,32 @@ def _status_view(value: object) -> dict:
     }
 
 
+def _browser_status_from_events(events: object) -> dict | None:
+    """只取当前 Run 自己写下的最新 ``browser_status`` 事件。
+
+    worker 的 Run 事件按 runId 隔离；共享平台 status 文件没有归属信息，
+    不能用来判断新 Run 是否已成功/失败。无法解析的事件一律忽略。
+    """
+    if not isinstance(events, list):
+        return None
+    for event in reversed(events):
+        if (not isinstance(event, dict)
+                or event.get("event") != "activity"):
+            continue
+        data = event.get("data")
+        if not isinstance(data, str) or len(data) > 4096:
+            continue
+        try:
+            value = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(value, dict)
+                or value.get("event") != "browser_status"):
+            continue
+        return _status_view(value)
+    return None
+
+
 def _public_account(value: object) -> dict:
     if not isinstance(value, dict):
         raise DomainError("upstream_invalid", 502)
@@ -241,20 +267,28 @@ class WorkspaceAccounts:
                 raise
             return {"runId": active.id, "duplicate": True}, active
 
-    async def _sync_run(self, actor: Identity, run) -> str:
+    async def _run_view(self, actor: Identity, run):
+        """读取当前 Run 的状态与它自己写下的最新浏览器状态。
+
+        返回 ``(state, browser_status)``。浏览器状态只从该 Run 的持久事件中
+        读取（事件按 runId 存储），共享平台 status 文件没有 Run 归属，不能
+        用于推进或伪造当前 Run 的终态。
+        """
         if run.status in _TERMINAL:
-            return run.status
+            return run.status, None
         relay = self._require_relay()
         try:
             page = await relay.events(actor, run.id, after=0)
         except DomainError as error:
             if error.status == 503:
                 raise
-            return run.status
-        state = page.get("state") if isinstance(page, dict) else None
-        if isinstance(state, str) and state:
-            return state
-        return run.status
+            return run.status, None
+        if not isinstance(page, dict):
+            return run.status, None
+        state = page.get("state")
+        if not isinstance(state, str) or not state:
+            state = run.status
+        return state, _browser_status_from_events(page.get("events"))
 
     async def _finish(self, actor: Identity, run, status: str) -> None:
         if status not in _TERMINAL:
@@ -422,54 +456,65 @@ class WorkspaceAccounts:
 
     async def _login_view(self, actor: Identity, platform: str, run,
                           *, mp: bool, tolerate_status_error: bool) -> dict:
-        status: dict | None = None
-        try:
-            raw = await self._signed_json(
-                actor, "GET",
-                (f"/api/accounts/{platform}/mp-login/status" if mp
-                 else f"/api/login/{platform}/status"))
-            status = _status_view(raw)
-        except DomainError:
-            if not tolerate_status_error:
-                raise
+        """登录弹窗视图：有 Run 时只信该 Run 自己的状态/事件。
+
+        共享平台 status 文件没有 Run/代次归属，可能是上一次登录遗留的
+        success/expired/error；它既不能推进终态，也不能冒充当前 Run 的
+        二维码或短信状态。只有完全没有受管 Run 时才读取共享状态。
+        """
         state = run.status if run is not None else "unknown"
+        run_status: dict | None = None
+        shared_status: dict | None = None
         if run is not None:
             try:
-                state = await self._sync_run(actor, run)
+                state, run_status = await self._run_view(actor, run)
             except DomainError:
                 if not tolerate_status_error:
                     raise
-        if state in _TERMINAL:
-            if state == "done":
-                view = status or {
-                    "state": "success", "message": "", "qr": "", "qrTs": 0}
-                view["state"] = "success"
-            else:
-                view = {
-                    "state": "error",
-                    "message": ("登录任务已停止，请重新登录"
-                                if state == "cancelled"
-                                else "登录任务已结束，请重新登录"),
-                    "qr": "", "qrTs": 0,
-                }
-                if status is not None and status["state"] == "success":
-                    # 迟到状态不能复活已停止/注销的任务。
-                    view = status
-                    view["state"] = "error"
-                    view["message"] = "登录任务已停止，请重新登录"
-                    view["qr"] = ""
-                    view["qrTs"] = 0
-        elif status is not None:
-            view = status
-            if status["state"] in ("success", "expired", "error"):
-                await self._finish(
-                    actor, run,
-                    "done" if status["state"] == "success" else "failed")
+                state = run.status
         else:
-            view = {"state": "starting",
-                    "message": "正在启动浏览器并准备二维码…",
-                    "qr": "", "qrTs": 0}
-        view = dict(view)
+            try:
+                raw = await self._signed_json(
+                    actor, "GET",
+                    (f"/api/accounts/{platform}/mp-login/status" if mp
+                     else f"/api/login/{platform}/status"))
+                shared_status = _status_view(raw)
+            except DomainError:
+                if not tolerate_status_error:
+                    raise
+
+        if run is not None and state in _TERMINAL:
+            if state == "done":
+                view = (dict(run_status)
+                        if run_status is not None
+                        and run_status["state"] == "success"
+                        else {"state": "success", "message": "登录成功"})
+                view["state"] = "success"
+                view["qr"] = ""
+                view["qrTs"] = 0
+            else:
+                message = ""
+                if run_status is not None and run_status["state"] in (
+                        "expired", "error"):
+                    message = run_status["message"]
+                if state == "cancelled":
+                    message = "登录任务已停止，请重新登录"
+                elif not message:
+                    message = "登录任务已结束，请重新登录"
+                view = {"state": "error", "message": message,
+                        "qr": "", "qrTs": 0}
+        elif run is not None:
+            view = (dict(run_status) if run_status is not None else {
+                "state": "starting",
+                "message": "正在启动浏览器并准备二维码…",
+                "qr": "", "qrTs": 0,
+            })
+        else:
+            view = (dict(shared_status) if shared_status is not None else {
+                "state": "starting",
+                "message": "正在启动浏览器并准备二维码…",
+                "qr": "", "qrTs": 0,
+            })
         view["mode"] = "qr"
         view["runId"] = run.id if run is not None else ""
         if view["qr"]:
@@ -592,10 +637,11 @@ class WorkspaceAccounts:
             current = await self._active(actor, login_task_key(platform))
         if current is None:
             raise DomainError("sms_not_pending", 409)
-        raw = await self._signed_json(
-            actor, "GET", f"/api/login/{platform}/status")
-        status = _status_view(raw)
-        if status["state"] != "sms_required":
+        # 只认当前 Run 自己写下的状态事件；共享 status 文件可能来自旧任务，
+        # 不能据此把验证码交给尚未进入短信墙的新 Run。
+        state, status = await self._run_view(actor, current)
+        if (state in _TERMINAL or status is None
+                or status["state"] != "sms_required"):
             raise DomainError("sms_not_pending", 409)
         result = await self._signed_json(
             actor, "POST", f"/api/login/{platform}/sms", payload={"code": code})
@@ -629,9 +675,10 @@ class WorkspaceAccounts:
         platform = canonical_platform(platform)
         if platform not in LOGIN_PLATFORMS:
             raise DomainError("not_found", 404)
-        # 先停本人该平台现有登录任务并等终态，再删除 profile/状态；迟到
-        # success 不会把已注销的登录态写回来。
-        for key in (login_task_key(platform), mp_login_task_key(platform)):
+        # 先停本人该平台现有登录/凭证任务并等终态，再删除 profile/状态；
+        # 迟到 success 或迟到凭证提交都不会把已注销的登录态写回来。
+        for key in (login_task_key(platform), mp_login_task_key(platform),
+                    credentials_task_key(platform)):
             active = await self._active(actor, key)
             if active is not None:
                 await self._stop_and_wait(actor, active)
@@ -680,6 +727,37 @@ class WorkspaceAccounts:
             "avatar": result.get("avatar")
             if isinstance(result.get("avatar"), str) else "",
         }
+
+    async def analytics_cached(self, actor: Identity,
+                               platform: object) -> dict:
+        """只读缓存：返回本人该平台最近一次成功分析的持久结果。
+
+        GET 不再启动 Run/浏览器/平台请求；没有成功缓存时明确 404，
+        前端需要刷新必须走带 CSRF/来源校验的显式 POST。
+        """
+        platform = canonical_platform(platform)
+        if platform not in ANALYTICS_PLATFORMS:
+            raise DomainError("not_found", 404)
+        conversation = await self._db(
+            self._store.get_task_conversation, actor,
+            analytics_task_key(platform))
+        if conversation is None:
+            raise DomainError("analytics_cache_missing", 404)
+        runs = await self._db(self._store.list_runs, actor, conversation.id)
+        for run in reversed(runs):
+            if run.status != "done":
+                continue
+            try:
+                result = await self._result(actor, run)
+            except DomainError:
+                continue
+            if not isinstance(result, dict):
+                continue
+            if ("platform" in result
+                    and result.get("platform") != platform):
+                continue
+            return result
+        raise DomainError("analytics_cache_missing", 404)
 
     async def analytics(self, actor: Identity, platform: object, *,
                         request_id: object = None) -> dict:

@@ -132,7 +132,9 @@ _IMPLEMENTED_PATTERNS = (
     ("POST", re.compile(r"^/api/login/[^/]+/sms$")),
     ("POST", re.compile(r"^/api/login/[^/]+/stop$")),
     ("POST", re.compile(r"^/api/logout/[^/]+$")),
+    # GET 只读缓存；启动刷新必须是显式 POST（带 Origin/CSRF）。
     ("GET", re.compile(r"^/api/analytics/[^/]+$")),
+    ("POST", re.compile(r"^/api/analytics/[^/]+$")),
     ("GET", re.compile(r"^/$")),
     ("GET", re.compile(r"^/onepage$")),
     ("GET", re.compile(r"^/assets/[^/].*$")),
@@ -1364,6 +1366,15 @@ def create_app(*, store: Store, auth: AuthService,
                 _identity(request)))
 
     @app.get("/api/analytics/{platform}")
+    async def analytics_cached(request: Request, platform: str):
+        # 顶层跨站 GET 也可能携带 SameSite=Lax Cookie；这里只能读缓存，
+        # 绝不启动 Run、浏览器或平台请求。
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).analytics_cached(
+                _identity(request), platform))
+
+    @app.post("/api/analytics/{platform}")
     async def analytics_refresh(request: Request, platform: str):
         _no_query(request)
         return _no_store_json(

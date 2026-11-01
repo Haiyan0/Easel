@@ -195,7 +195,10 @@ _RULES: tuple[_Route, ...] = (
            WORKSPACE_READ, "platform", 1),
     _route("POST", r"^/api/logout/([^/]+)$", TASK, "platform", 1),
     _route("GET", r"^/api/analytics/platforms$", WORKSPACE_READ),
-    _route("GET", r"^/api/analytics/([^/]+)$", TASK, "platform", 1),
+    # GET 只读已完成的缓存；启动浏览器抓取必须是显式 POST。
+    _route("GET", r"^/api/analytics/([^/]+)$",
+           WORKSPACE_READ, "platform", 1),
+    _route("POST", r"^/api/analytics/([^/]+)$", TASK, "platform", 1),
     _route("GET", r"^/api/publishing-policy$", WORKSPACE_READ),
     _route("POST", r"^/api/manual-publish/([^/]+)/export$",
            TASK, "platform", 1),

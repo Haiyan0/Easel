@@ -38,6 +38,7 @@ class FakeRelay:
         self.stops: list[str] = []
         self.events_error: int | None = None
         self.submit_error: DomainError | None = None
+        self.status_events: dict[str, list[dict]] = {}
 
     async def submit_task(self, actor, task_type, payload):
         if self.submit_error is not None:
@@ -61,8 +62,20 @@ class FakeRelay:
         if self.events_error is not None:
             raise DomainError("worker_gateway_unavailable", self.events_error)
         state = self.states.get(run_id, "running")
-        return {"runId": run_id, "state": state, "events": [],
+        return {"runId": run_id, "state": state,
+                "events": list(self.status_events.get(run_id, [])),
                 "lastEventId": int(after)}
+
+    def status_event(self, run_id: str, state: str, message: str = "",
+                     qr: str = "", qrTs: int = 0) -> None:
+        """追加当前 Run 自己写下的 browser_status 事件。"""
+        self.status_events.setdefault(run_id, []).append({
+            "event": "activity",
+            "data": json.dumps({
+                "event": "browser_status", "state": state,
+                "message": message, "qr": qr, "qrTs": qrTs,
+            }, ensure_ascii=False),
+        })
 
     async def messages(self, actor, conversation_id, *, limit=100, offset=0):
         with Store.open(self.path) as store:
@@ -263,22 +276,47 @@ def test_explicit_restart_stops_old_run_before_dispatching_new_one(tmp_path):
         store.close()
 
 
-def test_login_status_syncs_terminal_success_and_releases_capacity(tmp_path):
-    store, _auth, _admin, member, _other, relay, workspace, accounts, _app = (
+def test_login_status_uses_run_terminal_state_and_releases_capacity(tmp_path):
+    store, _auth, _admin, member, _other, relay, _workspace, accounts, _app = (
         _fixture(tmp_path))
     try:
         async def scenario():
             started = await accounts.login_start(
                 member, PLATFORM, request_id="request-terminal")
-            workspace.status[PLATFORM] = {
-                "mode": "qr", "state": "success", "message": "登录成功",
-                "qr": "", "qrTs": 0}
+            # 只有 worker Run 自己的终态才能推进 control Run 与容量。
+            relay.finish(member, started["runId"], "done")
             status = await accounts.login_status(member, PLATFORM)
             assert status["state"] == "success"
             assert status["runId"] == started["runId"]
             with Store.open(store.path) as opened:
                 run = opened.get_run(member, started["runId"])
             assert run.status == "done"
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_shared_platform_success_does_not_finish_active_run(tmp_path):
+    """共享 status 没有 Run 归属，不能推进新 Run 或释放容量。"""
+    store, _auth, _admin, member, _other, relay, workspace, accounts, _app = (
+        _fixture(tmp_path))
+    try:
+        async def scenario():
+            started = await accounts.login_start(
+                member, PLATFORM, request_id="request-shared-success")
+            workspace.status[PLATFORM] = {
+                "mode": "qr", "state": "success", "message": "旧成功",
+                "qr": "", "qrTs": 0}
+            status = await accounts.login_status(member, PLATFORM)
+            assert status["state"] == "starting"
+            with Store.open(store.path) as opened:
+                run = opened.get_run(member, started["runId"])
+                active = opened.count_active_runs_for_workspace(
+                    member.workspace_id)
+            assert run.status == "running"
+            assert active == 1
+            assert len(relay.submissions) == 1
 
         asyncio.run(scenario())
     finally:
@@ -296,9 +334,8 @@ def test_sms_only_continues_own_current_pending_task(tmp_path):
             with pytest.raises(DomainError) as early:
                 await accounts.login_sms(member, PLATFORM, "1234")
             assert early.value.status == 409
-            workspace.status[PLATFORM] = {
-                "mode": "qr", "state": "sms_required", "message": "需短信",
-                "qr": "", "qrTs": 0}
+            relay.status_event(
+                started["runId"], "sms_required", "需短信")
             accepted = await accounts.login_sms(
                 member, PLATFORM, "123456", run_id=started["runId"])
             assert accepted["ok"] is True
@@ -499,6 +536,140 @@ def test_a_b_same_platform_task_and_result_are_isolated(tmp_path):
             assert status_b["runId"] == b["runId"]
             status_a = await accounts.login_status(member, PLATFORM)
             assert status_a["runId"] == a["runId"]
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def _analytics_payload():
+    return {
+        "platform": PLATFORM, "loggedIn": True,
+        "followers": 12, "likes": None, "following": None, "posts": None,
+        "metrics": [], "notes": [], "growth": {}, "fetched_at": 1234,
+    }
+
+
+def test_analytics_get_is_read_only_and_cross_site_navigation_cannot_start(
+        tmp_path):
+    """顶层跨站 GET 只能读缓存；没有明确动作时 executions 必须为 0。"""
+    store, auth, admin, member, _other, relay, _workspace, _accounts, app = (
+        _fixture(tmp_path))
+    try:
+        async def scenario():
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app),
+                        base_url=ORIGIN) as client:
+                    invite = auth.create_invite(admin, member.user_id)
+                    exchanged = await client.post(
+                        "/api/auth/exchange", json={"token": invite},
+                        headers={"Origin": ORIGIN})
+                    assert exchanged.status_code == 200, exchanged.text
+                    task = asyncio.create_task(client.get(
+                        f"/api/analytics/{PLATFORM}",
+                        headers={
+                            "Sec-Fetch-Site": "cross-site",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Dest": "document",
+                        }))
+                    await asyncio.sleep(0.2)
+                    if relay.submissions:
+                        # 旧实现会在这里启动任务；先收尾，让断言可读地失败。
+                        run_id = next(iter(relay.states))
+                        relay.finish(member, run_id, "done",
+                                     _analytics_payload())
+                    response = await asyncio.wait_for(task, 3)
+                    assert relay.submissions == [], (
+                        "cross-site GET must not start an analytics Run")
+                    assert response.status_code == 404, response.text
+                    assert response.json()["code"] == "analytics_cache_missing"
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_analytics_refresh_requires_explicit_csrf_post(tmp_path):
+    """启动刷新只允许带正确 Origin+CSRF 的显式 POST。"""
+    store, auth, admin, member, _other, relay, _workspace, _accounts, app = (
+        _fixture(tmp_path))
+    try:
+        async def scenario():
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app),
+                        base_url=ORIGIN) as client:
+                    invite = auth.create_invite(admin, member.user_id)
+                    exchanged = await client.post(
+                        "/api/auth/exchange", json={"token": invite},
+                        headers={"Origin": ORIGIN})
+                    csrf = exchanged.json()["csrfToken"]
+                    path = f"/api/analytics/{PLATFORM}"
+                    no_csrf = await client.post(path)
+                    assert no_csrf.status_code == 403, no_csrf.text
+                    wrong_origin = await client.post(path, headers={
+                        "Origin": "https://evil.test",
+                        "X-CSRF-Token": csrf})
+                    assert wrong_origin.status_code == 403, wrong_origin.text
+                    assert relay.submissions == []
+
+                    first = asyncio.create_task(client.post(path, headers={
+                        "Origin": ORIGIN, "X-CSRF-Token": csrf}))
+                    second = asyncio.create_task(client.post(path, headers={
+                        "Origin": ORIGIN, "X-CSRF-Token": csrf}))
+                    deadline = asyncio.get_running_loop().time() + 3
+                    while not relay.submissions:
+                        if asyncio.get_running_loop().time() > deadline:
+                            raise AssertionError("refresh did not start")
+                        await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.05)
+                    assert len(relay.submissions) == 1
+                    run_id = next(iter(relay.states))
+                    relay.finish(member, run_id, "done", _analytics_payload())
+                    one, two = await asyncio.gather(first, second)
+                    assert one.status_code == 200, one.text
+                    assert two.status_code == 200, two.text
+                    assert one.json() == two.json() == _analytics_payload()
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_analytics_get_reads_last_completed_cache_without_dispatch(tmp_path):
+    store, auth, admin, member, _other, relay, _workspace, _accounts, app = (
+        _fixture(tmp_path))
+    try:
+        async def scenario():
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app),
+                        base_url=ORIGIN) as client:
+                    invite = auth.create_invite(admin, member.user_id)
+                    exchanged = await client.post(
+                        "/api/auth/exchange", json={"token": invite},
+                        headers={"Origin": ORIGIN})
+                    headers = {
+                        "Origin": ORIGIN,
+                        "X-CSRF-Token": exchanged.json()["csrfToken"],
+                    }
+                    refresh = asyncio.create_task(client.post(
+                        f"/api/analytics/{PLATFORM}", headers=headers))
+                    deadline = asyncio.get_running_loop().time() + 3
+                    while not relay.submissions:
+                        if asyncio.get_running_loop().time() > deadline:
+                            raise AssertionError("refresh did not start")
+                        await asyncio.sleep(0.01)
+                    run_id = next(iter(relay.states))
+                    relay.finish(member, run_id, "done", _analytics_payload())
+                    assert (await refresh).status_code == 200
+                    submissions = len(relay.submissions)
+                    cached = await client.get(
+                        f"/api/analytics/{PLATFORM}")
+                    assert cached.status_code == 200, cached.text
+                    assert cached.json() == _analytics_payload()
+                    assert len(relay.submissions) == submissions
 
         asyncio.run(scenario())
     finally:

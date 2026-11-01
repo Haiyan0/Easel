@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import struct
 import sys
@@ -21,7 +22,9 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-04" / "browser"
+EVIDENCE = Path(os.environ.get(
+    "EASEL_BROWSER_EVIDENCE",
+    str(ROOT / "docs" / "evidence" / "original-web-task-04" / "browser")))
 BRAND_SOURCE = ROOT / "web" / "static" / "easel-icon-transparent.png"
 BRAND_DIST = DIST / "static" / "easel-icon-transparent.png"
 BRAND_SHA256 = (

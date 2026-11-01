@@ -589,7 +589,7 @@ def test_unwired_task_routes_remain_503(tmp_path):
                     ("post", "/api/profile/build", {"name": "p"}),
                     ("post", "/api/publish/xiaohongshu", {"title": "t"}),
                     ("post", "/api/login/xiaohongshu", {}),
-                    ("get", "/api/analytics/xiaohongshu", None)):
+                    ("post", "/api/analytics/xiaohongshu", {})):
                 if method == "get":
                     response = client.get(path, headers=headers)
                 else:

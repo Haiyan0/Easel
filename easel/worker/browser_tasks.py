@@ -120,6 +120,21 @@ async def _pause(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+def _clear_whoami_cache(web_app, platform: str) -> None:
+    """登录成功后清掉登录前的 whoami 假阴性缓存。
+
+    原 Web 由 ``GET /api/login/{platform}/status`` 的 success 分支完成；
+    受管链路不再用共享 status 推进新 Run，因此由真正见到 success 的执行器
+    在同一事件循环里完成同等副作用。
+    """
+    lock = getattr(web_app, "_WHOAMI_LOCK", None)
+    cache = getattr(web_app, "_WHOAMI_CACHE", None)
+    if lock is None or not isinstance(cache, dict):
+        return
+    with lock:
+        cache.pop(platform, None)
+
+
 async def _cancel(web_app, kind: str, platform: str) -> None:
     cancel = getattr(web_app, "cancel_browser_task", None)
     if callable(cancel):
@@ -150,6 +165,9 @@ async def _run_login(web_app, descriptor: dict, emit) -> dict:
             previous = view
         state = view["state"]
         if state == "success":
+            # 登录成功后清掉登录前缓存的「未登录」whoami 结果；受管链路
+            # 不再通过共享 status 的 GET 触发这个副作用。
+            _clear_whoami_cache(web_app, platform)
             settle = getattr(web_app, "settle_login_process", None)
             if callable(settle):
                 await settle(process_key)

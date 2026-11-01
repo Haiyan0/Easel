@@ -26,13 +26,16 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c2" / "browser"
+# R1 的浏览器证据写入本组子目录，不覆盖首轮已提交的历史截图。
+EVIDENCE = (ROOT / "docs" / "evidence" / "original-web-task-05c2"
+            / "r1" / "browser")
 SHOTS: list[Path] = []
 FAILURES: list[str] = []
 RESULTS: dict[str, bool] = {}
@@ -404,6 +407,19 @@ async def wait_for(predicate, timeout: float, message: str) -> None:
     raise AssertionError(message)
 
 
+def active_runs(server: "Server") -> int:
+    import sqlite3
+
+    connection = sqlite3.connect(server.root / "control.sqlite3")
+    try:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM runs WHERE workspace_id = ? AND status NOT IN"
+            " ('done', 'failed', 'interrupted', 'cancelled')",
+            (server.member.workspace_id,)).fetchone()[0])
+    finally:
+        connection.close()
+
+
 async def text_contains(locator, needle: str) -> bool:
     return needle in (await locator.inner_text())
 
@@ -559,6 +575,132 @@ async def scenario_wechat_states(browser, server: Server) -> None:
     await context.close()
 
 
+async def scenario_cross_site_analytics_get(browser, server: Server) -> None:
+    """SameSite=Lax 真实 Chromium：外站顶层 GET 可携 Cookie，但不得起任务。"""
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(15000)
+    await login(page, server)
+    before = list(server.fake.analytics_calls)
+
+    attacker = await context.new_page()
+    target = server.origin + "/api/analytics/xiaohongshu"
+    await attacker.goto(
+        "data:text/html,<a id='go' href='" + target + "'>open</a>")
+    async with attacker.expect_response(
+            lambda response: "/api/analytics/xiaohongshu" in response.url
+    ) as info:
+        await attacker.click("#go")
+    response = await info.value
+    # Cookie 必须仍随顶层 GET 发送（否则是 401）；但只能读缓存并 404。
+    assert response.status == 404, await response.text()
+    body = await response.json()
+    assert body.get("code") == "analytics_cache_missing", body
+    assert server.fake.analytics_calls == before, (
+        "cross-site navigation must not execute analytics")
+    await context.close()
+
+
+async def scenario_late_stop_modal(browser, server: Server) -> None:
+    """旧停止回包不能覆盖随后打开的新登录弹窗。"""
+    import sqlite3
+
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(15000)
+    await login(page, server)
+    await open_accounts(page)
+    # 前一场景可能还有 whoami 短任务在收尾；等容量释放后再开新登录。
+    await wait_for(lambda: active_runs(server) == 0, 20,
+                   "capacity was not released before late-stop scenario")
+
+    first = page.locator(".account-card", has_text="快手")
+    await first.get_by_role("button", name="登录", exact=True).click()
+    await page.locator(".modal .qr-img").wait_for(timeout=20000)
+
+    service = server.app.state.workspace_accounts
+    original_stop = service.stop_login
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def delayed_stop(actor, platform, *, mp=False, run_id=None):
+        result = await original_stop(
+            actor, platform, mp=mp, run_id=run_id)
+        entered.set()
+        await gate.wait()
+        return result
+
+    service.stop_login = delayed_stop
+    try:
+        await page.get_by_role("button", name="停止登录").click()
+        await wait_for(lambda: entered.is_set(), 15,
+                       "stop did not reach worker terminal state")
+        await wait_for(lambda: active_runs(server) == 0, 10,
+                       "stop did not release capacity before opening B")
+        await page.get_by_role("button", name="关闭").click()
+
+        douyin = page.locator(".account-card", has_text="抖音")
+        for _attempt in range(3):
+            # 关闭 A 触发的后台 whoami 可能短暂占用容量；等待空位再开 B。
+            await wait_for(lambda: active_runs(server) < 2, 20,
+                           "no capacity slot for the new login")
+            print("[5C2] late-stop attempt", _attempt,
+                  "active", active_runs(server),
+                  "starts", server.fake.login_starts, flush=True)
+            try:
+                async with page.expect_response(
+                        lambda response: "/api/login/douyin" in response.url,
+                        timeout=10000) as info:
+                    await douyin.get_by_role(
+                        "button", name="登录", exact=True).click()
+                response = await info.value
+                print("[5C2] douyin login HTTP", response.status,
+                      (await response.text())[:300], flush=True)
+            except PlaywrightTimeoutError:
+                print("[5C2] douyin login request did not fire", flush=True)
+            try:
+                await page.locator(".modal .qr-img").wait_for(timeout=10000)
+                break
+            except PlaywrightTimeoutError:
+                if await page.locator(".modal").count():
+                    print("[5C2] modal after failed B:",
+                          await page.locator(".modal").inner_text(),
+                          flush=True)
+                    await page.get_by_role("button", name="关闭").click()
+                await asyncio.sleep(1.0)
+        else:
+            raise AssertionError("could not open the new login modal")
+        assert await page.locator(".modal .qr-img").count() == 1
+        gate.set()
+        await asyncio.sleep(1.2)
+        text = await page.locator(".modal").inner_text()
+        assert "抖音" in text, text
+        assert "已停止登录" not in text, text
+        assert await page.locator(".modal .qr-img").count() == 1, text
+
+        connection = sqlite3.connect(server.root / "control.sqlite3")
+        try:
+            latest = connection.execute(
+                "SELECT status FROM runs ORDER BY created_at DESC, rowid DESC"
+                " LIMIT 1").fetchone()
+        finally:
+            connection.close()
+        assert latest is not None and latest[0] == "running", latest
+    finally:
+        service.stop_login = original_stop
+        if not gate.is_set():
+            gate.set()
+
+    await page.get_by_role("button", name="停止登录").click()
+    await wait_for(
+        lambda: page.evaluate(
+            "() => (document.querySelector('.modal')?.innerText || '')"
+            ".includes('已停止登录')"), 20000, "new modal stop should succeed")
+    await context.close()
+
+
 async def scenario_analytics(browser, server: Server) -> None:
     context = await browser.new_context(
         viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
@@ -705,6 +847,14 @@ async def main() -> int:
                     browser, server))
             if not only or only == "wechat_states":
                 await check("wechat_states", lambda: scenario_wechat_states(
+                    browser, server))
+            if not only or only == "cross_site_analytics":
+                await check(
+                    "cross_site_analytics",
+                    lambda: scenario_cross_site_analytics_get(
+                        browser, server))
+            if not only or only == "late_stop_modal":
+                await check("late_stop_modal", lambda: scenario_late_stop_modal(
                     browser, server))
             if not only or only == "analytics":
                 await check("analytics", lambda: scenario_analytics(

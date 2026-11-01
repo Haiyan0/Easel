@@ -148,6 +148,22 @@ def test_credentials_handoff_requires_active_run_and_masks_secret(
     monkeypatch.setattr(worker, "_write_login_marker", lambda *a, **k: None)
     monkeypatch.setattr(worker, "_WHOAMI_LOCK", worker._WHOAMI_LOCK)
 
+    class Manager:
+        def __init__(self):
+            self.committed = False
+
+        def begin_commit(self, run_id):
+            self.committed = True
+            return True
+
+        def end_commit(self, run_id):
+            self.committed = False
+
+        def state(self, run_id):
+            return "done"
+
+    monkeypatch.setattr(worker, "_RUNS", Manager())
+
     request = worker.WechatCredentials(
         appId="wx1234567890", appSecret="super-secret",
         name="公众号", author="", runId="run-cred")

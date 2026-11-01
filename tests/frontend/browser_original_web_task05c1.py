@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import ipaddress
+import os
 import re
 import shutil
 import socket
@@ -28,7 +29,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05c1" / "R2" / "browser"
+EVIDENCE = Path(os.environ.get(
+    "EASEL_BROWSER_EVIDENCE",
+    str(ROOT / "docs" / "evidence" / "original-web-task-05c1" / "R2" / "browser")))
 SCREENSHOTS: list[Path] = []
 
 

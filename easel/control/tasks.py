@@ -89,7 +89,7 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         label="创作数据抓取",
         kind=BROWSER,
         implemented=True,
-        routes=(TaskRoute("GET", r"/api/analytics/([^/]+)"),),
+        routes=(TaskRoute("POST", r"/api/analytics/([^/]+)"),),
     ),
     TaskEntry(
         task_type="publish",

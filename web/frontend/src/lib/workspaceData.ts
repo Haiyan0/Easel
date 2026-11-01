@@ -1188,8 +1188,11 @@ export function createControlWorkspaceData(
         '/api/analytics/platforms', { signal }));
     },
     async fetchAccountAnalytics(platform, signal) {
+      // control 只有显式 POST（自动带 Origin/CSRF）才允许启动浏览器抓取；
+      // GET 仅用于读缓存，不能在页面加载/跨站导航时起任务。
       return accountAnalytics(await call<unknown>(
-        `/api/analytics/${encodeURIComponent(platform)}`, { signal }));
+        `/api/analytics/${encodeURIComponent(platform)}`,
+        { method: 'POST', signal }));
     },
     accountQrUrl: qrUrlFor,
     whoami: whoamiStore,

@@ -24,7 +24,7 @@ from easel.control.gateway_client import GatewayClient
 from easel.control.proxy import PinnedRunConfig, WorkerRelay
 from easel.control.sessions import SessionService
 from easel.control.store import Store
-from easel.control.types import WorkerHandle, WorkspacePaths
+from easel.control.types import DomainError, WorkerHandle, WorkspacePaths
 from easel.control.workspace_api import WorkspaceApi
 from easel.gateway.app import GatewayConfig, create_gateway_app
 from easel.worker.runs import RunManager
@@ -372,18 +372,37 @@ def test_real_chain_login_sms_whoami_analytics_credentials_logout(chain):
         assert qr.headers["content-type"].startswith("image/png")
         assert qr.content == PNG
 
-        # 一次临时 503 不应终止任务
-        chain.fake.fail_status_once = True
-        transient = client.get(f"/api/login/{PLATFORM}/status")
-        assert transient.status_code == 503, transient.text
-        recovered = client.get(f"/api/login/{PLATFORM}/status")
+        # 一次临时 503（当前状态来源是 Run 事件）不应终止任务
+        relay = chain.app.state.relay
+        original_events = relay.events
+        failed = {"once": True}
+
+        async def flaky_events(actor, run_id, *, after=0):
+            if failed["once"]:
+                failed["once"] = False
+                raise DomainError("worker_gateway_unavailable", 503)
+            return await original_events(actor, run_id, after=after)
+
+        relay.events = flaky_events
+        try:
+            transient = client.get(f"/api/login/{PLATFORM}/status")
+            assert transient.status_code == 503, transient.text
+            recovered = client.get(f"/api/login/{PLATFORM}/status")
+        finally:
+            relay.events = original_events
         assert recovered.status_code == 200, recovered.text
         assert recovered.json()["state"] == "qr_ready"
 
         chain.fake.scanned = True
-        sms = client.get(f"/api/login/{PLATFORM}/status")
-        assert sms.status_code == 200
-        assert sms.json()["state"] == "sms_required"
+        sms = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            sms = client.get(f"/api/login/{PLATFORM}/status")
+            if sms.status_code == 200 and sms.json()["state"] == "sms_required":
+                break
+            time.sleep(0.02)
+        assert sms is not None and sms.status_code == 200, sms.text
+        assert sms.json()["state"] == "sms_required", sms.text
         wrong = client.post(
             f"/api/login/{PLATFORM}/sms",
             json={"code": "000000", "runId": run_id},
@@ -396,9 +415,15 @@ def test_real_chain_login_sms_whoami_analytics_credentials_logout(chain):
             json={"code": "123456", "runId": run_id},
             headers=_headers(csrf))
         assert right.status_code == 200, right.text
-        success = client.get(f"/api/login/{PLATFORM}/status")
-        assert success.status_code == 200, success.text
-        assert success.json()["state"] == "success"
+        success = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            success = client.get(f"/api/login/{PLATFORM}/status")
+            if success.status_code == 200 and success.json()["state"] == "success":
+                break
+            time.sleep(0.02)
+        assert success is not None and success.status_code == 200, success.text
+        assert success.json()["state"] == "success", success.text
         assert chain.fake.login_starts == [PLATFORM]
         assert chain.fake.whoami_calls == []
         # 控制库 Run 已终态，容量释放
@@ -415,8 +440,9 @@ def test_real_chain_login_sms_whoami_analytics_credentials_logout(chain):
         assert who.json()["name"] == "受控测试昵称"
         assert chain.fake.whoami_calls == [PLATFORM]
 
-        # 分析：受控 runner 写产物，返回原值（未知数字保持 null）
-        analytics = client.get(f"/api/analytics/{PLATFORM}")
+        # 分析：只有显式 POST 才启动刷新；受控 runner 写产物，返回原值。
+        analytics = client.post(
+            f"/api/analytics/{PLATFORM}", headers=_headers(csrf))
         assert analytics.status_code == 200, analytics.text
         payload = analytics.json()
         assert payload["followers"] == 12

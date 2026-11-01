@@ -10,6 +10,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import ipaddress
+import os
 import shutil
 import socket
 import sys
@@ -31,7 +32,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
 BRAND_SOURCE = ROOT / "web" / "static" / "easel-icon-transparent.png"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05a" / "browser"
+EVIDENCE = Path(os.environ.get(
+    "EASEL_BROWSER_EVIDENCE",
+    str(ROOT / "docs" / "evidence" / "original-web-task-05a" / "browser")))
 BRAND_SHA256 = "71c260f5a28e82aced0a513186ebdcf43782b068633e3a7ca5f159d3e3606132"
 SCREENSHOTS: list[Path] = []
 

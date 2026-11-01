@@ -1,0 +1,11 @@
+# Task 5C2 R1：在已验收的 execution 镜像上增量覆盖当前源码。
+# 不重建 Harness/Chromium 全栈；镜像内保留镜像原有 Playwright 与浏览器。
+ARG BASE_IMAGE=easel-worker-execution:a4
+FROM ${BASE_IMAGE}
+USER root
+# 凭证保存需要 PyYAML；已加入 deploy/multiuser/requirements-worker.txt。
+RUN pip install --no-cache-dir "PyYAML==6.0.3"
+COPY easel /opt/easel/easel
+COPY web/app.py /opt/easel/web/app.py
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+USER 10001:10001

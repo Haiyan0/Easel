@@ -462,6 +462,7 @@ CREATE TABLE IF NOT EXISTS run_admissions (
     state TEXT NOT NULL,
     reason TEXT,
     finalizing INTEGER NOT NULL DEFAULT 0,
+    committing INTEGER NOT NULL DEFAULT 0,
     snapshot_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -507,6 +508,10 @@ class RunRegistry:
             if "finalizing" not in columns:
                 connection.execute(
                     "ALTER TABLE run_admissions ADD COLUMN finalizing"
+                    " INTEGER NOT NULL DEFAULT 0")
+            if "committing" not in columns:
+                connection.execute(
+                    "ALTER TABLE run_admissions ADD COLUMN committing"
                     " INTEGER NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
@@ -649,7 +654,7 @@ class RunRegistry:
                     return False
                 connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?",
                     (state, reason, now, self.workspace_id, run_id))
                 data: dict[str, object] = {"state": state}
@@ -684,7 +689,7 @@ class RunRegistry:
             try:
                 cursor = connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?"
                     " AND finalizing = 0 AND state IN"
                     f" ({_placeholders(ACTIVE_STATES)})",
@@ -752,7 +757,7 @@ class RunRegistry:
                     return False
                 connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?",
                     (state, reason, now, self.workspace_id, run_id))
                 data: dict[str, object] = {"state": state}
@@ -778,6 +783,48 @@ class RunRegistry:
                 " WHERE workspace_id = ? AND finalizing = 1",
                 (self.workspace_id,)).fetchall()
         return [str(row["run_id"]) for row in rows]
+
+    # -- 外部副作用提交栅栏 ------------------------------------------------
+    #
+    # 凭证验证在受控线程里完成后才能落盘；停止必须先取得终态。用一个与
+    # finalizing 分离的短栅栏把「检查 Run 仍活跃 → 写 YAML/登录标记 → 放行
+    # 结果」变成一个停止可见的原子段：stop 在 committing=1 时等待，提交
+    # 结束后再读取真实终态，避免 cancelled 与迟到成功并存。
+
+    def begin_commit(self, run_id: str) -> bool:
+        """声明一次外部副作用提交；仅活跃且未收尾/未提交的 Run 可取得。"""
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE run_admissions SET committing = 1,"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND committing = 0 AND finalizing = 0 AND state IN"
+                    f" ({_placeholders(ACTIVE_STATES)})",
+                    (now, self.workspace_id, run_id, *ACTIVE_STATES))
+                connection.execute("COMMIT")
+                return cursor.rowcount == 1
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def end_commit(self, run_id: str) -> None:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "UPDATE run_admissions SET committing = 0, updated_at = ?"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (now, self.workspace_id, run_id))
+
+    def committing(self, run_id: str) -> bool:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT committing FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+        return bool(row is not None and row["committing"])
 
     def append_event(self, run_id: str, event: str, data: object) -> int | None:
         """终态后冻结业务事件；返回 None 表示被终态拦截。"""
@@ -1024,7 +1071,7 @@ class RunRegistry:
                     run_id = str(row["run_id"])
                     connection.execute(
                         "UPDATE run_admissions SET state = 'interrupted',"
-                        " reason = ?, updated_at = ?"
+                        " reason = ?, committing = 0, updated_at = ?"
                         " WHERE workspace_id = ? AND run_id = ?",
                         (reason, now, self.workspace_id, run_id))
                     self._append_locked(
@@ -1135,6 +1182,15 @@ class RunManager:
 
     def state(self, run_id: str) -> str | None:
         return self.registry.state(run_id)
+
+    def begin_commit(self, run_id: str) -> bool:
+        return self.registry.begin_commit(run_id)
+
+    def end_commit(self, run_id: str) -> None:
+        self.registry.end_commit(run_id)
+
+    def committing(self, run_id: str) -> bool:
+        return self.registry.committing(run_id)
 
     def admission(self, run_id: str) -> dict | None:
         return self.registry.admission(run_id)
@@ -1708,6 +1764,20 @@ class RunManager:
             raise DomainError("run_not_found", 404)
         if state in TERMINAL_STATES:
             return {"runId": run_id, "state": state}
+        if self.registry.committing(run_id):
+            # 外部副作用正在提交：等提交边界结束再决定停止，不能把已提交
+            # 的凭证 Run 事后标成 cancelled，也不能在提交中途取消执行器。
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while self.registry.committing(run_id):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.01, remaining))
+            state = self.registry.state(run_id)
+            if state is None:
+                raise DomainError("run_not_found", 404)
+            if state in TERMINAL_STATES:
+                return {"runId": run_id, "state": state}
         self.registry.finish_if_active(run_id, "cancelled", "stop_requested")
         task = self._tasks.get(run_id)
         if task is not None and not task.done():
