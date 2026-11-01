@@ -4,7 +4,7 @@
 
 - 父基线：`a7c8ce253905918987f2a35fc269a1936a93dd6f`
 - 修复提交：`7195efe3ef63bb2cc6fc7192347acffb1780832a`
-- 证据提交：见本文件所在提交；最终 tip 记录在后续 SHA 文档
+- 证据提交：`5e3c6e5bfd4a571a693a0ad9a4e935086ff00563`
 - 实施 worktree：`C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics`
 
 ## 1. 结论
