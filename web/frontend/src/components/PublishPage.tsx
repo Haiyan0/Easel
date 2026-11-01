@@ -6,6 +6,8 @@ import {
   clearPublishIntent, loadPublishDraft, loadPublishIntents,
   savePublishDraft, savePublishIntents,
 } from '../lib/store';
+import type { PublishIntentPayload } from '../lib/store';
+import { decidePublishIntent, publishFingerprint } from '../lib/publishIntent';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconPublish, IconCopy, IconCheck, IconCalendar, IconSkills, IconEdit, IconStop, IconTrash } from './icons';
 
@@ -42,42 +44,10 @@ function parseSections(text: string): Record<string, string> {
 
 type PubState = { status: 'publishing' | 'ok' | 'fail' | 'unknown'; msg: string };
 
-type PublishPayload = {
-  title: string; body: string; media: string[]; tags: string; persona: string;
-};
+type PublishPayload = PublishIntentPayload;
 
 function newPublishRequestId(platform: string): string {
   return `publish-${platform}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** 稿件版本指纹：同平台同内容才复用同一个请求号。 */
-function publishFingerprint(platform: string, payload: PublishPayload): string {
-  return JSON.stringify([
-    platform, payload.title, payload.body, payload.media, payload.tags,
-    payload.persona,
-  ]);
-}
-
-type PublishIntentMatch = { requestId: string; payload: PublishPayload };
-
-/** 找到仍对应当前可见稿件的意图；刷新丢失 media/persona 时复用原 payload。 */
-function findPublishIntent(
-  scope: string, platform: string, payload: PublishPayload,
-): PublishIntentMatch | null {
-  const prior = loadPublishIntents(scope)[platform];
-  if (!prior) return null;
-  if (prior.fingerprint === publishFingerprint(platform, payload)) {
-    return { requestId: prior.requestId, payload: prior.payload ?? payload };
-  }
-  // media/persona 不随草稿持久化；标题/正文/标签未变时仍视为同一可见
-  // 稿件，复用落盘 payload，避免刷新/切身份后生成第二次外部提交。
-  if (prior.payload
-      && prior.payload.title === payload.title
-      && prior.payload.body === payload.body
-      && prior.payload.tags === payload.tags) {
-    return { requestId: prior.requestId, payload: prior.payload };
-  }
-  return null;
 }
 
 /** 首次发送前固定意图并落盘；同稿重试/刷新复用，新稿才换新号。 */
@@ -98,6 +68,15 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const data = useWorkspaceData();
   const draftScope = data.publishDraftScope;
   const draft0 = loadPublishDraft(draftScope);
+  // 草稿是否真的保存过媒体/画像：旧版草稿没有字段，刷新后只能视为丢失。
+  const mediaPersisted = useRef(Array.isArray(draft0.media));
+  const personaPersisted = useRef(typeof draft0.persona === 'string');
+  // 本页生命周期内用户是否显式改过媒体/画像；只有丢失且没动过才恢复旧稿。
+  const mediaEdited = useRef(false);
+  const personaEdited = useRef(false);
+  const lastPersonaProp = useRef(persona);
+  const [publishPersona, setPublishPersona] = useState(
+    () => persona || draft0.persona || '');
   const [title, setTitle] = useState(draft0.title);
   const [body, setBody] = useState(draft0.body);
   const [platforms, setPlatforms] = useState<string[]>(draft0.platforms);
@@ -120,7 +99,9 @@ export default function PublishPage({ persona }: PublishPageProps) {
   // 发布相关
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [mediaFiles, setMediaFiles] = useState<OutputFile[]>([]);
-  const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
+  // 刷新后同时恢复可见选择，避免“页面显示空、实际提交旧图”。
+  const [selectedMedia, setSelectedMedia] = useState<string[]>(
+    () => draft0.media ?? []);
   const [showPicker, setShowPicker] = useState(false);
   const [pub, setPub] = useState<Record<string, PubState>>({});
   const [publishing, setPublishing] = useState(false);
@@ -129,11 +110,27 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const [pubSmsCode, setPubSmsCode] = useState('');
   const [pubSmsBusy, setPubSmsBusy] = useState(false);
 
-  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在
+  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在。
+  // 旧版草稿没有媒体/画像字段；用户没动过时不要抢先写空值，否则会
+  // 把“刷新丢失”误标成“用户主动清空”。
   useEffect(() => {
-    savePublishDraft(
-      { title, body, platforms, overrides, tags }, draftScope);
-  }, [title, body, platforms, overrides, tags, draftScope]);
+    savePublishDraft({
+      title, body, platforms, overrides, tags,
+      media: mediaPersisted.current || mediaEdited.current
+        ? selectedMedia : undefined,
+      persona: personaPersisted.current || personaEdited.current
+        ? publishPersona : undefined,
+    }, draftScope);
+  }, [title, body, platforms, overrides, tags, selectedMedia, publishPersona,
+    draftScope]);
+
+  // 画像来自应用级选择：挂载后发生的切换视为显式改稿，刷新恢复不算。
+  useEffect(() => {
+    if (persona === lastPersonaProp.current) return;
+    lastPersonaProp.current = persona;
+    personaEdited.current = true;
+    setPublishPersona(persona);
+  }, [persona]);
 
   const cleanupPublishActivity = useCallback(() => {
     // 卸载：中止流 + 停掉所有发布状态轮询（否则在后台空转最长 15 分钟）
@@ -173,13 +170,18 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const isVideoPath = (p: string) => /\.(mp4|mov|flv|mkv|avi|webm|m4v|wmv|ts|mpe?g)$/i.test(p);
   const toggleMedia = (path: string) =>
     setSelectedMedia((prev) => {
-      if (prev.includes(path)) return prev.filter((x) => x !== path);
+      if (prev.includes(path)) {
+        mediaEdited.current = true;
+        return prev.filter((x) => x !== path);
+      }
       // 通用规则：图片和视频不能同时；视频一次只发一个
       if (isVideoPath(path)) {
         if (prev.length && !prev.every(isVideoPath)) { showToast('图片和视频不能同时发布，请先取消已选图片'); return prev; }
+        mediaEdited.current = true;
         return [path]; // 视频单选
       }
       if (prev.some(isVideoPath)) { showToast('图片和视频不能同时发布，请先取消已选视频'); return prev; }
+      mediaEdited.current = true;
       return [...prev, path]; // 图片可多选（图文）
     });
 
@@ -272,31 +274,60 @@ export default function PublishPage({ persona }: PublishPageProps) {
     } finally {
       setChecking(false);
     }
+    // 先固定每个平台要提交的稿件。显式改过媒体/画像时按当前可见选择
+    // 新建请求；只有刷新/切身份丢失选择且用户没动过，才复用落盘旧稿。
+    const intentScope = data.publishDraftScope;
+    const provenance = {
+      mediaPersisted: mediaPersisted.current,
+      personaPersisted: personaPersisted.current,
+      mediaEdited: mediaEdited.current,
+      personaEdited: personaEdited.current,
+      appPersona: publishPersona,
+    };
+    const plans = targets.map((t) => {
+      const payload: PublishPayload = {
+        title, body: effective(t.key), media: selectedMedia, tags,
+        persona: publishPersona,
+      };
+      const prior = intentScope
+        ? loadPublishIntents(intentScope)[t.key] : undefined;
+      const decision = decidePublishIntent(
+        prior, t.key, payload, provenance);
+      return {
+        target: t,
+        payload: decision.payload,
+        reuse: decision.action === 'reuse',
+        requestId: decision.action === 'reuse'
+          ? decision.requestId : newPublishRequestId(t.key),
+        prior,
+      };
+    });
+    const unresolved = plans.filter((plan) => plan.prior && !plan.reuse);
+    const submitLines = plans.map((plan) =>
+      `- ${plan.target.label}：素材 ${
+        plan.payload.media.length ? plan.payload.media.join('、') : '无'}` +
+      `；画像 ${plan.payload.persona || '无'}`).join('\n');
     const okToSend = window.confirm(
       `发布前预检已执行，结果已显示在页面中。人设评分只做提醒，不会阻止发布。\n\n` +
-      `即将【真实发布】到：${targets.map((t) => t.label).join('、')}。\n` +
-      `这会公开发布到你的账号，确定继续？`);
+      `即将【真实发布】到：${targets.map((t) => t.label).join('、')}\n` +
+      `${submitLines}\n` +
+      (unresolved.length
+        ? `\n注意：${unresolved.map((plan) => plan.target.label).join('、')}` +
+          `有一笔旧发布请求结果尚未确认。本次将按当前页面显示的稿件` +
+          `新建请求；若旧请求已被平台接纳，可能造成重复发布。` +
+          `如不确定，请先取消并核对旧请求状态后再发布。\n`
+        : '') +
+      `\n这会公开发布到你的账号，确定继续？`);
     if (!okToSend) return;
 
     setPublishing(true);
-    for (const t of targets) {
+    for (const plan of plans) {
+      const { target: t, payload, requestId } = plan;
       if (!loginOf(t.key)) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '未登录 · 去账号页登录' } }));
         continue;
       }
-      const payload: PublishPayload = {
-        title, body: effective(t.key), media: selectedMedia, tags, persona,
-      };
-      // 首次发送前就固定意图并落盘；接纳结果不明时刷新/重试仍用同一个
-      // requestId 与落盘 payload，服务端据此返回同一个 Run，不会开启
-      // 第二次外部动作。
-      const intentScope = data.publishDraftScope;
-      const prior = intentScope
-        ? findPublishIntent(intentScope, t.key, payload) : null;
-      const pending = prior
-        ? { requestId: prior.requestId, payload: prior.payload }
-        : { requestId: newPublishRequestId(t.key), payload };
-      const pendingMedia = pending.payload.media;
+      const pendingMedia = payload.media;
       if (MEDIA_REQUIRED.has(t.key) && pendingMedia.length === 0) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '需附带图片/视频' } }));
         continue;
@@ -306,15 +337,16 @@ export default function PublishPage({ persona }: PublishPageProps) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: `${t.label}只能发视频，请从内容库选一个视频` } }));
         continue;
       }
-      if (intentScope && !prior) {
-        rememberPublishIntent(
-          intentScope, t.key, payload, pending.requestId);
+      // 首次发送前就固定意图并落盘；接纳结果不明时刷新/重试仍用同一个
+      // requestId 与落盘 payload，服务端据此返回同一个 Run，不会开启
+      // 第二次外部动作。显式改稿时替换旧意图，旧回包按 requestId 丢弃。
+      if (intentScope && !plan.reuse) {
+        rememberPublishIntent(intentScope, t.key, payload, requestId);
       }
-      const requestId = pending.requestId;
       setPub((r) => ({ ...r, [t.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
       try {
         const res = await data.publishNow(
-          t.key, pending.payload, { requestId });
+          t.key, payload, { requestId });
         publishRuns.current[t.key] = res.runId || '';
         if (res.async) {
           // 所有平台都先接纳后轮询；短信只绑定当前 Run。

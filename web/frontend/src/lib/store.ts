@@ -41,6 +41,10 @@ export interface PublishDraft {
   platforms: string[];
   overrides: Record<string, string>;
   tags: string;   // 话题标签，逗号分隔（小红书绑话题；其它平台按需写入）
+  // 媒体与画像也随草稿保存，刷新后才能看见上次的选择；旧版草稿没有
+  // 这两个字段，保留为 undefined 以区分“刷新丢失”和“用户主动清空”。
+  media?: string[];
+  persona?: string;
 }
 const PUBLISH_KEY = 'easel_publish_draft';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
@@ -64,22 +68,52 @@ function readMigratedLocalValue(key: string, suffix: string): string | null {
 const PUBLISH_DEFAULT: PublishDraft = {
   title: '', body: '', platforms: ['xiaohongshu', 'douyin'], overrides: {}, tags: '',
 };
+function readPublishDraftRaw(scope?: string): string | null {
+  // control 必须按 identity/workspace 分组，不能读取旧全局草稿；
+  // local 保持原全局键与历史迁移行为。
+  return scope
+    ? localStorage.getItem(publishKey(scope))
+    : readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+}
+
 export function loadPublishDraft(scope?: string): PublishDraft {
   try {
-    // control 必须按 identity/workspace 分组，不能读取旧全局草稿；
-    // local 保持原全局键与历史迁移行为。
-    const raw = scope
-      ? localStorage.getItem(publishKey(scope))
-      : readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+    const raw = readPublishDraftRaw(scope);
     if (!raw) return { ...PUBLISH_DEFAULT };
-    return { ...PUBLISH_DEFAULT, ...(JSON.parse(raw) as PublishDraft) };
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...PUBLISH_DEFAULT };
+    }
+    const draft = { ...PUBLISH_DEFAULT, ...(parsed as Partial<PublishDraft>) };
+    const fields = parsed as Record<string, unknown>;
+    if (!Array.isArray(fields.media)
+        || !(fields.media as unknown[]).every(
+          (item) => typeof item === 'string')) {
+      delete draft.media;
+    }
+    if (typeof fields.persona !== 'string') delete draft.persona;
+    return draft;
   } catch {
     return { ...PUBLISH_DEFAULT };
   }
 }
 export function savePublishDraft(d: PublishDraft, scope?: string): void {
   try {
-    localStorage.setItem(publishKey(scope), JSON.stringify(d));
+    // 人工审核页只保存文案字段；不能因此抹掉自动发布页已保存的
+    // 媒体/画像来源，否则刷新后的意图恢复会退化成“丢失选择”。
+    let previous: Partial<PublishDraft> = {};
+    try {
+      const raw = readPublishDraftRaw(scope);
+      const parsed = raw ? JSON.parse(raw) as unknown : null;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        previous = parsed as Partial<PublishDraft>;
+      }
+    } catch { /* 旧值损坏：按本次字段写入 */ }
+    localStorage.setItem(publishKey(scope), JSON.stringify({
+      ...d,
+      media: d.media !== undefined ? d.media : previous.media,
+      persona: d.persona !== undefined ? d.persona : previous.persona,
+    }));
   } catch { /* quota */ }
 }
 

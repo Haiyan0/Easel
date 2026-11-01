@@ -598,6 +598,16 @@ async def modal_open(page) -> int:
 _DIALOG_PAGES: "weakref.WeakSet" = weakref.WeakSet()
 
 
+async def _submit_publish_recording(page, messages: list[str]) -> None:
+    """提交并记录确认框文案；用于断言旧意图被显式提示而不是静默覆盖。"""
+    async def handler(dialog):
+        messages.append(dialog.message)
+        await dialog.accept()
+
+    page.once("dialog", handler)
+    await page.get_by_role("button", name="一键发布").click()
+
+
 async def _submit_publish(page) -> None:
     # 同一页面只注册一次确认框处理器；重复注册会让后一个处理器收到
     # “already handled” 噪声。
@@ -824,6 +834,47 @@ async def _lose_first_publish_ack(page) -> list[dict]:
     return posts
 
 
+async def _truncate_first_publish(page) -> list[dict]:
+    """首次 POST 在客户端截断且不转发；用于 R2 显式改稿复现。
+
+    与服务端已接纳但浏览器丢 ack 不同，这里后台执行次数必须保持 0，
+    才能证明第二次提交确实按用户当前选择新建了请求。
+    """
+    posts: list[dict] = []
+
+    async def handler(route):
+        if route.request.method != "POST":
+            await route.continue_()
+            return
+        posts.append(json.loads(route.request.post_data or "{}"))
+        if len(posts) == 1:
+            await route.abort("failed")
+        else:
+            await route.continue_()
+
+    await page.route("**/api/publish/xiaohongshu", handler)
+    return posts
+
+
+async def _record_publish_status(page) -> list[str]:
+    urls: list[str] = []
+
+    async def handler(route):
+        urls.append(route.request.url)
+        await route.continue_()
+
+    await page.route("**/api/publish/xiaohongshu/status**", handler)
+    return urls
+
+
+async def _visible_media(page) -> list[str]:
+    if await page.locator(".media-grid").count() == 0:
+        await page.get_by_role("button", name="选择媒体").click()
+    await page.locator(".media-grid").wait_for(timeout=20000)
+    return await page.locator(".media-cell.sel").evaluate_all(
+        "els => els.map(e => e.title)")
+
+
 async def _intent_storage(page) -> dict:
     return await page.evaluate(
         """() => {
@@ -976,6 +1027,123 @@ async def scenario_lost_ack_refresh_retry_stored_payload(browser,
     assert len(server.fake.calls) == calls_before + 1, server.fake.calls
     assert publish_done_count(server) == done_before + 1
     await screenshot(page, "13-lost-ack-refresh-stored-payload.png")
+    await context.close()
+
+
+async def _prepare_media_edit_fixture(server: Server) -> None:
+    # 补一张 B 图供显式改选；首次 POST 的截断由场景内路由控制。
+    (server.outputs / "project" / "other.png").write_bytes(PNG_1PX)
+
+
+async def scenario_explicit_media_edit_after_lost_ack(browser,
+                                                      server: Server) -> None:
+    await _prepare_media_edit_fixture(server)
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "显式改素材-R2")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    dialogs: list[str] = []
+    posts = await _truncate_first_publish(page)
+    await _submit_publish_recording(page, dialogs)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    assert len(posts) == 1, posts
+    assert posts[0]["media"] == ["project/cover.png"], posts
+    # 首次请求既未转发也未执行，后台执行次数必须为 0。
+    assert len(server.fake.calls) == calls_before, server.fake.calls
+    assert "旧发布请求" not in dialogs[-1], dialogs
+
+    cover = await media_cell_index(page, "project/cover.png")
+    other = await media_cell_index(page, "project/other.png")
+    assert cover is not None and other is not None
+
+    # 维度一：显式移除 A 后直接发布，不得偷偷补发旧 A；旧意图必须被
+    # 明示而不是静默覆盖。
+    await page.locator(".media-cell").nth(cover).click()
+    assert await _visible_media(page) == [], "cover still selected"
+    await _submit_publish_recording(page, dialogs)
+    await page.locator(".pv-pubstate.fail").wait_for(timeout=20000)
+    fail_text = await page.locator(".pv-pubstate.fail").inner_text()
+    assert "需附带图片/视频" in fail_text, fail_text
+    assert "旧发布请求" in dialogs[-1] and "重复发布" in dialogs[-1], dialogs
+    assert len(posts) == 1, posts
+    assert len(server.fake.calls) == calls_before, server.fake.calls
+
+    # 维度二：明确改选 B，第二次真实提交必须与可见选择一致。
+    await page.locator(".media-cell").nth(other).click()
+    selected = await _visible_media(page)
+    assert selected == ["project/other.png"], selected
+    status_urls = await _record_publish_status(page)
+    status_urls.clear()
+    await _submit_publish_recording(page, dialogs)
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=30000)
+    assert len(dialogs) == 3, dialogs
+    assert "旧发布请求" in dialogs[-1], dialogs
+    await wait_for(
+        lambda: len(server.fake.calls) == calls_before + 1, 20,
+        "改选后的稿件未被唯一一次执行")
+    assert len(posts) == 2, posts
+    assert posts[1]["media"] == selected, posts
+    assert posts[1]["requestId"] != posts[0]["requestId"], posts
+    assert any(posts[1]["requestId"] in url for url in status_urls), status_urls
+    assert not any(posts[0]["requestId"] in url for url in status_urls), status_urls
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "14-explicit-media-edit-after-lost-ack.png")
+    await context.close()
+
+
+async def scenario_explicit_media_edit_survives_refresh(browser,
+                                                        server: Server) -> None:
+    await _prepare_media_edit_fixture(server)
+    context = await browser.new_context(
+        viewport={"width": 1360, "height": 900}, ignore_https_errors=True)
+    page = await context.new_page()
+    page.set_default_timeout(20000)
+    await login(page, server)
+    await _open_auto_publish(page)
+    await _fill_xhs_draft(page, "改素材后刷新-R2")
+    calls_before = len(server.fake.calls)
+    done_before = publish_done_count(server)
+    dialogs: list[str] = []
+    posts = await _truncate_first_publish(page)
+    await _submit_publish_recording(page, dialogs)
+    await page.locator(".pv-pubstate.unknown").wait_for(timeout=20000)
+    assert len(posts) == 1, posts
+    assert len(server.fake.calls) == calls_before, server.fake.calls
+
+    cover = await media_cell_index(page, "project/cover.png")
+    other = await media_cell_index(page, "project/other.png")
+    await page.locator(".media-cell").nth(cover).click()
+    await page.locator(".media-cell").nth(other).click()
+    assert await _visible_media(page) == ["project/other.png"]
+
+    # 改稿后刷新：草稿要恢复 B，不能被旧意图 A 覆盖；再次发布仍用 B。
+    await page.reload(wait_until="domcontentloaded")
+    await page.locator(".sidebar").wait_for(timeout=20000)
+    await _open_auto_publish(page)
+    selected = await _visible_media(page)
+    assert selected == ["project/other.png"], selected
+
+    status_urls = await _record_publish_status(page)
+    status_urls.clear()
+    await _submit_publish_recording(page, dialogs)
+    await page.locator(".pv-pubstate.ok").wait_for(timeout=30000)
+    assert len(dialogs) == 2, dialogs
+    assert "旧发布请求" in dialogs[-1], dialogs
+    await wait_for(
+        lambda: len(server.fake.calls) == calls_before + 1, 20,
+        "refresh after media edit did not publish the edited media")
+    assert len(posts) == 2, posts
+    assert posts[1]["media"] == ["project/other.png"], posts
+    assert posts[1]["requestId"] != posts[0]["requestId"], posts
+    assert any(posts[1]["requestId"] in url for url in status_urls), status_urls
+    assert not any(posts[0]["requestId"] in url for url in status_urls), status_urls
+    assert publish_done_count(server) == done_before + 1
+    await screenshot(page, "15-explicit-media-edit-refresh.png")
     await context.close()
 
 
@@ -1133,6 +1301,14 @@ async def main() -> int:
                     await check(
                         "explicit-new-intent",
                         lambda: scenario_new_intent_after_success(
+                            browser, automated))
+                    await check(
+                        "explicit-media-edit-after-lost-ack",
+                        lambda: scenario_explicit_media_edit_after_lost_ack(
+                            browser, automated))
+                    await check(
+                        "explicit-media-edit-survives-refresh",
+                        lambda: scenario_explicit_media_edit_survives_refresh(
                             browser, automated))
                     await check(
                         "identity-switch-isolates-intent",

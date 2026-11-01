@@ -34,6 +34,51 @@ const draft = (title) => ({
   overrides: {}, tags: '',
 });
 
+test('draft media and persona survive a reload', () => {
+  const { store, storage } = load();
+  store.savePublishDraft({
+    ...draft('带素材'), media: ['project/cover.png'], persona: '画像A',
+  }, 'user-a:ws-a');
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.deepEqual(loaded.media, ['project/cover.png']);
+  assert.equal(loaded.persona, '画像A');
+  assert.equal(JSON.parse(
+    storage.get('easel_publish_draft:user-a:ws-a')).media[0],
+  'project/cover.png');
+});
+
+test('a legacy draft keeps media/persona absent instead of claiming empty', () => {
+  const { store, storage } = load();
+  // 旧版草稿没有 media/persona 字段：必须能区分“刷新丢失”和“用户清空”。
+  storage.set('easel_publish_draft:user-a:ws-a', JSON.stringify(draft('旧稿')));
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal('media' in loaded, false);
+  assert.equal('persona' in loaded, false);
+});
+
+test('saving a draft without media/persona preserves the earlier selection', () => {
+  const { store } = load();
+  store.savePublishDraft({
+    ...draft('自动页'), media: ['project/other.png'], persona: '画像A',
+  }, 'user-a:ws-a');
+  // 人工审核页只保存文案字段，不能把自动页的媒体/画像来源抹掉。
+  store.savePublishDraft(draft('人工页'), 'user-a:ws-a');
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal(loaded.title, '人工页');
+  assert.deepEqual(loaded.media, ['project/other.png']);
+  assert.equal(loaded.persona, '画像A');
+});
+
+test('corrupt media/persona fields are dropped on load', () => {
+  const { store, storage } = load();
+  storage.set('easel_publish_draft:user-a:ws-a', JSON.stringify({
+    ...draft('坏字段'), media: 'project/cover.png', persona: 42,
+  }));
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal('media' in loaded, false);
+  assert.equal('persona' in loaded, false);
+});
+
 test('local draft keeps the original global key', () => {
   const { store, storage } = load();
   store.savePublishDraft(draft('本机'));
