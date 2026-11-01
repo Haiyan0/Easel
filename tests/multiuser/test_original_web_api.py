@@ -191,6 +191,17 @@ def test_status_queries_ready_worker_without_starting(worker_fixture):
     assert worker_fixture.runtime.ensure_calls == []
 
 
+def test_status_reports_control_gateway_available(worker_fixture):
+    _ready_lease(worker_fixture, worker_fixture.a)
+
+    async def scenario():
+        return await worker_fixture.api.status(worker_fixture.a)
+
+    payload = asyncio.run(scenario())
+    assert payload["state"] == "ready"
+    assert payload["gateway"] is True
+
+
 def test_status_reports_unavailable_when_ready_worker_cannot_answer(worker_fixture):
     _ready_lease(worker_fixture, worker_fixture.a, port=7999)
 
@@ -1447,3 +1458,24 @@ def test_media_after_logout_is_unauthorized(tmp_path):
             headers={"Origin": ORIGIN, "X-CSRF-Token": body["csrfToken"]})
         assert logout.status_code == 204
         assert client.get("/api/media/a.png").status_code == 401
+
+
+def test_request_retries_transient_worker_start_superseded(worker_fixture):
+    """并发首次加载的 worker_start_superseded 503 应有限重试，而不是直接抛给页面。"""
+    from easel.control.runtime import RuntimeUnavailable
+
+    original = worker_fixture.runtime.ensure_ready
+    calls = {"count": 0}
+
+    async def flaky(workspace_id, config_version):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeUnavailable(
+                "worker_start_superseded", 503, retry_after=0)
+        return await original(workspace_id, config_version)
+
+    worker_fixture.runtime.ensure_ready = flaky
+    response = asyncio.run(worker_fixture.api.request(
+        worker_fixture.a, "GET", "/api/ideas"))
+    assert response.status_code == 200
+    assert calls["count"] == 2

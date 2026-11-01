@@ -318,17 +318,36 @@ class WorkspaceApi:
             pass
         return response
 
+    async def _ensure_handle_retry(
+            self, actor: Identity, attempts: int = 3) -> WorkerHandle:
+        """瞬时 worker 启动竞态重试。
+
+        多个首次页面读取会并发触发 ``ensure_ready``；runtime 用 CAS 防止
+        重复启动，落败方返回带 ``retry_after`` 的 ``worker_start_superseded``。
+        这是可重试的瞬时状态，不应直接把 503 抛给原页面。
+        """
+        for attempt in range(attempts):
+            try:
+                return await self._ensure_handle(actor)
+            except DomainError as error:
+                if (error.status != 503 or error.retry_after is None
+                        or attempt == attempts - 1):
+                    raise
+                delay = min(max(float(error.retry_after), 0.05), 2.0)
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
     async def request(self, actor: Identity, method: str, path: str, *,
                       query=None, payload=None, body=None,
                       content_type=None, headers=None):
-        handle = await self._ensure_handle(actor)
+        handle = await self._ensure_handle_retry(actor)
         return await self._request_with_handle(
             handle, method, path, query=query, payload=payload, body=body,
             content_type=content_type, headers=headers)
 
     async def open_stream(self, actor: Identity, method: str, path: str, *,
                           headers=None) -> WorkspaceStream:
-        handle = await self._ensure_handle(actor)
+        handle = await self._ensure_handle_retry(actor)
         # 流式文件可能下载超过 10 分钟；用允许的最大租约覆盖整个传输，
         # 关闭/断开时立即释放，异常退出则最迟 1 小时后自动解除。
         response, lease_id = await self._request_with_handle(
@@ -407,7 +426,9 @@ class WorkspaceApi:
         result.update({
             # 只暴露本 workspace 的可用性/目录；宿主安装的 runtime 名称不是
             # 用户配置，control 统一报告自己的传输层。
-            "gateway": payload.get("gateway") is True,
+            # gateway 可用性以 control 持有的租约/句柄为准；worker 自身
+            # 不知道 control 侧 gateway，不能把它的缺省 false 透传给页面。
+            "gateway": handle.gateway_state == "available",
             "transport": "control",
             "runtime": "control",
             "skills": payload.get("skills")
