@@ -192,6 +192,8 @@ node --test tests/frontend/*.test.mjs # 173 passed
 3. **策略大小写归一化**：Start/Restore 统一 `ToLowerInvariant()`，避免
    `-PublishMode Manual` 或登记文件混合大小写被 PowerShell 接受后被
    argparse 拒绝；新增 `test_start_normalizes_publish_mode_case`。
+4. **Compose 文件头手工检查命令**：补上 `EASEL_PUBLISH_MODE` 示例值，
+   避免诊断入口因新的必填变量直接失败。
 
 ## 3. 正式部署迁移说明
 

@@ -4,8 +4,9 @@
 # 不发布 worker/gateway 端口，不挂 Docker socket，不挂用户 workspace。
 # 初始化/启动/诊断请使用 deploy/desktop 下的 Workspace PowerShell 入口。
 #
-# 手工检查：
-#   docker compose -p <project> -f deploy/desktop/compose.workspace.yaml config --quiet
+# 手工检查（EASEL_PUBLISH_MODE 为必填；示例值应与 deployment.json 的
+# publish_mode 一致，不要用它改变正式部署策略）：
+#   EASEL_PUBLISH_MODE=automated docker compose -p <project> -f deploy/desktop/compose.workspace.yaml config --quiet
 
 name: ${EASEL_DESKTOP_PROJECT:?请设置专用 Compose 项目名}
 
