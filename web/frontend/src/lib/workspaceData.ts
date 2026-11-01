@@ -3,13 +3,15 @@
  * 调用 Task 5A 已接通的工作区路由。组件不感知 Cookie、路径或服务地址。
  */
 import type {
-  ChatQuestion, ChatQuestionItem, ChatQuestionOption,
-  Idea, IdeaInput, OutputContent, OutputNode, PersonaFile, PersonaItem,
-  ProfileBuildResponse, ProfileBuildStatus, ScheduleContext, ScheduleInput,
-  ScheduleItem, SkillDetail, SkillItem, SkillResponse, TrendGroup,
-  UploadedFile,
+  AccountAnalytics, AccountItem, AccountWhoami, AnalyticsPlatform,
+  ChatQuestion, ChatQuestionItem, ChatQuestionOption, CredentialStatus,
+  Idea, IdeaInput, LoginStart, LoginStatus, OutputContent, OutputNode,
+  PersonaFile, PersonaItem, ProfileBuildResponse, ProfileBuildStatus,
+  ScheduleContext, ScheduleInput, ScheduleItem, SkillDetail, SkillItem,
+  SkillResponse, TrendGroup, UploadedFile,
 } from './api';
 import {
+  accountWhoami as localAccountWhoami,
   adoptOversize as localAdoptOversize,
   createIdea as localCreateIdea,
   createSchedule as localCreateSchedule,
@@ -17,6 +19,9 @@ import {
   deleteOutput as localDeleteOutput,
   deletePersona as localDeletePersona,
   deleteSchedule as localDeleteSchedule,
+  fetchAccountAnalytics as localFetchAccountAnalytics,
+  fetchAccounts as localFetchAccounts,
+  fetchAnalyticsPlatforms as localFetchAnalyticsPlatforms,
   fetchArtifactArchive as localFetchArtifactArchive,
   buildProfile as localBuildProfile,
   executeSkill as localExecuteSkill,
@@ -31,13 +36,26 @@ import {
   fetchScheduleContext as localFetchScheduleContext,
   fetchStatus as localFetchStatus,
   fetchTrends as localFetchTrends,
+  getCredentials as localGetCredentials,
+  loginStatus as localLoginStatus,
+  logoutAccount as localLogoutAccount,
   mediaUrl as localMediaUrl,
+  mpLoginStatus as localMpLoginStatus,
   profileBuildStatus as localProfileBuildStatus,
+  saveCredentials as localSaveCredentials,
   savePersonaFile as localSavePersonaFile,
+  startLogin as localStartLogin,
+  startMpLogin as localStartMpLogin,
+  submitLoginSms as localSubmitLoginSms,
   updateIdea as localUpdateIdea,
   updateSchedule as localUpdateSchedule,
   uploadFiles as localUploadFiles,
 } from './api';
+import {
+  clearWhoamiCache, createWhoamiStore, getWhoamiCache, setWhoamiCache,
+  verifyStale,
+} from './whoami';
+import type { WhoamiEntry, WhoamiStore } from './whoami';
 
 export type OversizeMode = 'adopt' | 'reject';
 
@@ -52,6 +70,23 @@ export interface WorkspaceStatus {
 }
 
 export interface UploadLimits { max_mb: number }
+
+export interface LoginOptions { requestId?: string; restart?: boolean }
+export interface LoginStartView extends LoginStart {
+  runId?: string;
+  qrUrl?: string;
+}
+export interface LoginView extends LoginStatus {
+  runId?: string;
+  qrUrl?: string;
+}
+export interface StopLoginResult {
+  ok: boolean;
+  stopped?: boolean;
+  runId: string;
+  state: string;
+}
+export type AnalyticsCache = Record<string, AccountAnalytics>;
 
 export interface WorkspaceData {
   fetchStatus(): Promise<WorkspaceStatus>;
@@ -119,6 +154,49 @@ export interface WorkspaceData {
     runId: string, questionId: string,
     answers: Record<string, string[]>, signal?: AbortSignal,
   ): Promise<{ ok: boolean; error?: string }>;
+  fetchAccounts(signal?: AbortSignal): Promise<AccountItem[]>;
+  accountWhoami(
+    platform: string, force?: boolean, signal?: AbortSignal,
+  ): Promise<AccountWhoami>;
+  startLogin(
+    platform: string, options?: LoginOptions, signal?: AbortSignal,
+  ): Promise<LoginStartView>;
+  loginStatus(platform: string, signal?: AbortSignal): Promise<LoginView>;
+  submitLoginSms(
+    platform: string, code: string, options?: { runId?: string },
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean }>;
+  stopLogin(
+    platform: string, options?: { mp?: boolean; runId?: string },
+    signal?: AbortSignal,
+  ): Promise<StopLoginResult>;
+  startMpLogin(
+    platform: string, options?: LoginOptions, signal?: AbortSignal,
+  ): Promise<LoginStartView>;
+  mpLoginStatus(platform: string, signal?: AbortSignal): Promise<LoginView>;
+  logoutAccount(
+    platform: string, signal?: AbortSignal,
+  ): Promise<{ ok: boolean; deleted: string[] }>;
+  getCredentials(
+    platform: string, signal?: AbortSignal,
+  ): Promise<CredentialStatus>;
+  saveCredentials(
+    platform: string,
+    payload: { appId: string; appSecret: string; name?: string; author?: string },
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; message: string }>;
+  fetchAnalyticsPlatforms(signal?: AbortSignal): Promise<AnalyticsPlatform[]>;
+  fetchAccountAnalytics(
+    platform: string, signal?: AbortSignal,
+  ): Promise<AccountAnalytics>;
+  accountQrUrl(platform: string, mp?: boolean): string;
+  whoami: WhoamiStore;
+  getAnalyticsCache(): AnalyticsCache;
+  setAnalyticsCache(value: AnalyticsCache): void;
+  /** 401 撤销当前身份时通知认证边界卸载私人树；local 不设置。 */
+  expireIdentity?: () => void;
+  loginStopEnabled: boolean;
+  autoVerifyLimit: number;
   personasEnabled: boolean;
   outputsEnabled: boolean;
   workbenchEnabled: boolean;
@@ -383,6 +461,175 @@ function ideaList(value: unknown): Idea[] {
   return needArray(value, '选题响应无效').map(ideaItem);
 }
 
+function accountItem(value: unknown): AccountItem {
+  const row = needObject(value, '账号响应无效');
+  if (typeof row.platform !== 'string' || !row.platform
+      || typeof row.name !== 'string') {
+    throw new Error('账号响应无效');
+  }
+  return {
+    platform: row.platform,
+    name: row.name,
+    backend: typeof row.backend === 'string' ? row.backend : '',
+    supported: row.supported === true,
+    loggedIn: row.loggedIn === true,
+    note: typeof row.note === 'string' ? row.note : '',
+    ...(typeof row.mpLoggedIn === 'boolean'
+      ? { mpLoggedIn: row.mpLoggedIn } : {}),
+    ...(typeof row.credentialConfigured === 'boolean'
+      ? { credentialConfigured: row.credentialConfigured } : {}),
+  };
+}
+
+function accountList(value: unknown): AccountItem[] {
+  return needArray(value, '账号响应无效').map(accountItem);
+}
+
+function whoamiView(value: unknown): AccountWhoami {
+  const row = needObject(value, '账号校验响应无效');
+  if (typeof row.loggedIn !== 'boolean') {
+    throw new Error('账号校验响应无效');
+  }
+  return {
+    loggedIn: row.loggedIn,
+    name: typeof row.name === 'string' ? row.name : '',
+    avatar: typeof row.avatar === 'string' ? row.avatar : '',
+  };
+}
+
+function loginView(
+  value: unknown, platform: string, mp: boolean,
+  qrUrlFor: (platform: string, mp: boolean) => string,
+): LoginView {
+  const row = needObject(value, '登录响应无效');
+  if (row.mode !== undefined && row.mode !== 'qr') {
+    throw new Error('登录响应无效');
+  }
+  const state = typeof row.state === 'string' ? row.state : 'unknown';
+  const qr = typeof row.qr === 'string' ? row.qr : '';
+  const view: LoginView = {
+    mode: 'qr', state,
+    message: typeof row.message === 'string' ? row.message : '',
+    qr,
+    ...(typeof row.qrTs === 'number' ? { qrTs: row.qrTs } : {}),
+  };
+  if (typeof row.runId === 'string') view.runId = row.runId;
+  if (typeof row.qrUrl === 'string' && row.qrUrl) {
+    view.qrUrl = row.qrUrl;
+  } else if (qr) {
+    view.qrUrl = qrUrlFor(platform, mp);
+  }
+  return view;
+}
+
+function loginStartView(
+  value: unknown, platform: string, mp: boolean,
+  qrUrlFor: (platform: string, mp: boolean) => string,
+): LoginStartView {
+  const row = needObject(value, '登录响应无效');
+  if (row.mode === 'credentials') {
+    return {
+      mode: 'credentials',
+      configured: row.configured === true,
+      state: typeof row.state === 'string' ? row.state : 'unknown',
+      message: typeof row.message === 'string' ? row.message : '',
+      qr: '',
+    };
+  }
+  return loginView(row, platform, mp, qrUrlFor);
+}
+
+function analyticsPlatformItem(value: unknown): AnalyticsPlatform {
+  const row = needObject(value, '分析平台响应无效');
+  if (typeof row.platform !== 'string' || !row.platform) {
+    throw new Error('分析平台响应无效');
+  }
+  return {
+    platform: row.platform,
+    name: typeof row.name === 'string' ? row.name : row.platform,
+    loggedIn: row.loggedIn === true,
+  };
+}
+
+function analyticsPlatformList(value: unknown): AnalyticsPlatform[] {
+  return needArray(value, '分析平台响应无效').map(analyticsPlatformItem);
+}
+
+function optionalNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function accountAnalytics(value: unknown): AccountAnalytics {
+  const row = needObject(value, '分析响应无效');
+  if (typeof row.platform !== 'string' || !row.platform) {
+    throw new Error('分析响应无效');
+  }
+  const metrics = Array.isArray(row.metrics)
+    ? row.metrics.filter((item): item is {
+      label: string; value: string | number; vs: string;
+    } => {
+      if (!item || typeof item !== 'object') return false;
+      const metric = item as Record<string, unknown>;
+      return typeof metric.label === 'string'
+        && (typeof metric.value === 'string'
+            || typeof metric.value === 'number')
+        && typeof metric.vs === 'string';
+    }).map((item) => ({
+      label: item.label, value: item.value, vs: item.vs,
+    }))
+    : [];
+  const notes = Array.isArray(row.notes)
+    ? row.notes.filter((item): item is {
+      title: string; url: string; cover?: string; stat?: string;
+    } => {
+      if (!item || typeof item !== 'object') return false;
+      const note = item as Record<string, unknown>;
+      return typeof note.title === 'string' && typeof note.url === 'string';
+    }).map((item) => ({
+      title: item.title, url: item.url,
+      ...(typeof item.cover === 'string' ? { cover: item.cover } : {}),
+      ...(typeof item.stat === 'string' ? { stat: item.stat } : {}),
+    }))
+    : [];
+  const growth = row.growth && typeof row.growth === 'object'
+    ? row.growth as AccountAnalytics['growth'] : {
+      last: null, day: null, week: null, month: null, year: null,
+    };
+  return {
+    platform: row.platform,
+    name: typeof row.name === 'string' ? row.name : '',
+    nickname: typeof row.nickname === 'string' ? row.nickname : '',
+    loggedIn: row.loggedIn === true,
+    followers: optionalNumber(row.followers),
+    likes: optionalNumber(row.likes),
+    following: optionalNumber(row.following),
+    posts: optionalNumber(row.posts),
+    metrics,
+    notes,
+    growth,
+    fetched_at: optionalNumber(row.fetched_at) ?? 0,
+    ...(typeof row.warning === 'string' ? { warning: row.warning } : {}),
+  };
+}
+
+function credentialView(value: unknown): CredentialStatus {
+  const row = needObject(value, '凭证响应无效');
+  return {
+    configured: row.configured === true,
+    appIdMasked: typeof row.appIdMasked === 'string' ? row.appIdMasked : '',
+    name: typeof row.name === 'string' ? row.name : '',
+    author: typeof row.author === 'string' ? row.author : '',
+  };
+}
+
+function saveCredentialView(value: unknown): { ok: boolean; message: string } {
+  const row = needObject(value, '凭证保存响应无效');
+  return {
+    ok: row.ok === true,
+    message: typeof row.message === 'string' ? row.message : '',
+  };
+}
+
 function statusView(value: unknown): WorkspaceStatus {
   const row = needObject(value, '工作区状态响应无效');
   const states = new Set([
@@ -407,8 +654,13 @@ function statusOf(error: unknown): number | null {
   return typeof status === 'number' ? status : null;
 }
 
-export function workspaceErrorMessage(error: unknown, fallback: string): string {
-  const status = statusOf(error);
+/** 当前身份被 401 撤销（迟到旧 epoch 的 401 不卸载新身份）。 */
+export function isIdentityExpired(error: unknown): boolean {
+  return statusOf(error) === 401
+    && (error as { identityInvalidated?: unknown }).identityInvalidated === true;
+}
+
+export function workspaceErrorMessage(error: unknown, fallback: string): string {  const status = statusOf(error);
   if (status === 401) return '登录已失效，请重新登录。';
   if (status === 403) return '无权访问该内容（403）。';
   if (status === 404) return '内容不存在或已被删除（404）。';
@@ -448,6 +700,7 @@ export interface ControlWorkspaceOptions {
   runTask?(
     sessionId: string, runId: string, signal?: AbortSignal,
   ): Promise<{ state: string; response?: string }>;
+  onExpired?: () => void;
 }
 
 /** control 适配器：所有调用都带身份 epoch/CSRF，错误保留 HTTP 语义。 */
@@ -580,6 +833,27 @@ export function createControlWorkspaceData(
   options: ControlWorkspaceOptions,
 ): WorkspaceData {
   const call = options.call;
+  const analyticsCache: AnalyticsCache = {};
+  let whoamiMemory: Record<string, WhoamiEntry> = {};
+  const qrUrlFor = (platform: string, mp: boolean): string =>
+    `/api/accounts/${encodeURIComponent(platform)}${mp ? '/mp-login' : ''}/qr`;
+  const requestWhoami = async (
+    platform: string, force = false, signal?: AbortSignal,
+  ): Promise<AccountWhoami> => whoamiView(await call<unknown>(
+    `/api/accounts/${encodeURIComponent(platform)}/whoami`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force, requestId: makeTaskId() }),
+      signal,
+    }));
+  const whoamiStore = createWhoamiStore({
+    fetcher: (platform, force) => requestWhoami(platform, force === true),
+    storage: {
+      get: () => ({ ...whoamiMemory }),
+      set: (value) => { whoamiMemory = value; },
+    },
+    concurrency: 1,
+  });
   return {
     async fetchStatus() {
       return statusView(await call<unknown>('/api/status'));
@@ -810,10 +1084,129 @@ export function createControlWorkspaceData(
         return { ok: false, error: workspaceErrorMessage(error, '回答失败') };
       }
     },
+    async fetchAccounts(signal) {
+      return accountList(await call<unknown>('/api/accounts', { signal }));
+    },
+    accountWhoami(platform, force = false, signal) {
+      return requestWhoami(platform, force, signal);
+    },
+    async startLogin(platform, options: LoginOptions = {}, signal) {
+      const payload = await call<unknown>(
+        `/api/login/${encodeURIComponent(platform)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            requestId: options.requestId || makeTaskId(),
+            restart: options.restart === true,
+          }),
+          signal,
+        });
+      return loginStartView(payload, platform, false, qrUrlFor);
+    },
+    async loginStatus(platform, signal) {
+      const payload = await call<unknown>(
+        `/api/login/${encodeURIComponent(platform)}/status`, { signal });
+      return loginView(payload, platform, false, qrUrlFor);
+    },
+    async submitLoginSms(platform, code, options = {}, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/login/${encodeURIComponent(platform)}/sms`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code,
+            ...(options.runId ? { runId: options.runId } : {}),
+          }),
+          signal,
+        }), '短信回填响应无效');
+      return { ok: row.ok === true };
+    },
+    async stopLogin(platform, options = {}, signal) {
+      const path = options.mp
+        ? `/api/accounts/${encodeURIComponent(platform)}/mp-login/stop`
+        : `/api/login/${encodeURIComponent(platform)}/stop`;
+      const row = needObject(await call<unknown>(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(options.runId ? { runId: options.runId } : {}),
+        signal,
+      }), '停止登录响应无效');
+      return {
+        ok: row.ok === true,
+        ...(typeof row.stopped === 'boolean' ? { stopped: row.stopped } : {}),
+        runId: typeof row.runId === 'string' ? row.runId : '',
+        state: typeof row.state === 'string' ? row.state : 'unknown',
+      };
+    },
+    async startMpLogin(platform, options: LoginOptions = {}, signal) {
+      const payload = await call<unknown>(
+        `/api/accounts/${encodeURIComponent(platform)}/mp-login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            requestId: options.requestId || makeTaskId(),
+            restart: options.restart === true,
+          }),
+          signal,
+        });
+      return loginStartView(payload, platform, true, qrUrlFor);
+    },
+    async mpLoginStatus(platform, signal) {
+      const payload = await call<unknown>(
+        `/api/accounts/${encodeURIComponent(platform)}/mp-login/status`,
+        { signal });
+      return loginView(payload, platform, true, qrUrlFor);
+    },
+    async logoutAccount(platform, signal) {
+      const row = needObject(await call<unknown>(
+        `/api/logout/${encodeURIComponent(platform)}`,
+        { method: 'POST', signal }), '退出登录响应无效');
+      return {
+        ok: row.ok === true,
+        deleted: Array.isArray(row.deleted)
+          ? row.deleted.filter((item): item is string =>
+            typeof item === 'string')
+          : [],
+      };
+    },
+    async getCredentials(platform, signal) {
+      return credentialView(await call<unknown>(
+        `/api/accounts/${encodeURIComponent(platform)}/credentials`,
+        { signal }));
+    },
+    async saveCredentials(platform, payload, signal) {
+      return saveCredentialView(await call<unknown>(
+        `/api/accounts/${encodeURIComponent(platform)}/credentials`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal,
+        }));
+    },
+    async fetchAnalyticsPlatforms(signal) {
+      return analyticsPlatformList(await call<unknown>(
+        '/api/analytics/platforms', { signal }));
+    },
+    async fetchAccountAnalytics(platform, signal) {
+      return accountAnalytics(await call<unknown>(
+        `/api/analytics/${encodeURIComponent(platform)}`, { signal }));
+    },
+    accountQrUrl: qrUrlFor,
+    whoami: whoamiStore,
+    getAnalyticsCache() {
+      return { ...analyticsCache };
+    },
+    setAnalyticsCache(value) {
+      for (const key of Object.keys(analyticsCache)) delete analyticsCache[key];
+      Object.assign(analyticsCache, value);
+    },
+    loginStopEnabled: true,
+    expireIdentity: options.onExpired,
+    autoVerifyLimit: 2,
     personasEnabled: true,
     outputsEnabled: true,
     workbenchEnabled: true,
-    accountsEnabled: false,
+    accountsEnabled: true,
     skillsEnabled: true,
     skillEnvEnabled: false,
     attachmentsEnabled: true,
@@ -822,6 +1215,37 @@ export function createControlWorkspaceData(
     localSettingsEnabled: false,
     oversizeMode: 'reject',
   };
+}
+
+const LOCAL_ANALYTICS_KEY = 'easel_analytics';
+
+function readLocalAnalyticsCache(): AnalyticsCache {
+  try {
+    const raw = JSON.parse(
+      localStorage.getItem(LOCAL_ANALYTICS_KEY) || '{}') as unknown;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const result: AnalyticsCache = {};
+    for (const [platform, value] of Object.entries(
+      raw as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue;
+      const row = value as Record<string, unknown>;
+      if (row.platform !== platform
+          || typeof row.loggedIn !== 'boolean') continue;
+      result[platform] = row as unknown as AccountAnalytics;
+    }
+    return result;
+  } catch { return {}; }
+}
+
+function writeLocalAnalyticsCache(value: AnalyticsCache): void {
+  try {
+    localStorage.setItem(LOCAL_ANALYTICS_KEY, JSON.stringify(value));
+  } catch { /* 配额 / 隐私模式 */ }
+}
+
+function localQrUrl(platform: string, mp = false): string {
+  return localMediaUrl(
+    mp ? '_login/wechat-oa-mp.png' : `_login/${platform}.png`);
 }
 
 /** local 适配器：保持原单机行为，不改原 API/缓存语义。 */
@@ -878,6 +1302,44 @@ export const localWorkspaceData: WorkspaceData = {
   taskQuestionStatus: async () => ({}),
   answerTaskQuestion: async () => ({
     ok: false, error: '当前模式不支持任务问题回答。' }),
+  fetchAccounts: localFetchAccounts,
+  accountWhoami: (platform, force = false) => localAccountWhoami(platform, force),
+  async startLogin(platform) {
+    return loginStartView(
+      await localStartLogin(platform), platform, false, localQrUrl);
+  },
+  async loginStatus(platform) {
+    return loginView(
+      await localLoginStatus(platform), platform, false, localQrUrl);
+  },
+  submitLoginSms: (platform, code) => localSubmitLoginSms(platform, code),
+  stopLogin: async () => ({
+    ok: false, runId: '', state: 'unsupported',
+  }),
+  async startMpLogin(platform) {
+    return loginStartView(
+      await localStartMpLogin(platform), platform, true, localQrUrl);
+  },
+  async mpLoginStatus(platform) {
+    return loginView(
+      await localMpLoginStatus(platform), platform, true, localQrUrl);
+  },
+  logoutAccount: localLogoutAccount,
+  getCredentials: localGetCredentials,
+  saveCredentials: localSaveCredentials,
+  fetchAnalyticsPlatforms: localFetchAnalyticsPlatforms,
+  fetchAccountAnalytics: localFetchAccountAnalytics,
+  accountQrUrl: localQrUrl,
+  whoami: {
+    get: getWhoamiCache,
+    set: setWhoamiCache,
+    clear: clearWhoamiCache,
+    verifyStale,
+  },
+  getAnalyticsCache: readLocalAnalyticsCache,
+  setAnalyticsCache: writeLocalAnalyticsCache,
+  loginStopEnabled: false,
+  autoVerifyLimit: Number.MAX_SAFE_INTEGER,
   personasEnabled: true,
   outputsEnabled: true,
   workbenchEnabled: true,

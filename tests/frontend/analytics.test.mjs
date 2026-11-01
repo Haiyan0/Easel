@@ -21,17 +21,29 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 
 function setup() {
   let data = {}, errors = {};
-  const pending = [], storage = new Map(), exports = {};
+  let cache = {};
+  const pending = [], exports = {};
+  const workspace = {
+    fetchAccountAnalytics: platform => new Promise((resolve, reject) =>
+      pending.push({ platform, resolve, reject })),
+    getAnalyticsCache: () => ({ ...cache }),
+    setAnalyticsCache: value => { cache = { ...value }; },
+  };
   runInNewContext(outputText, {
     exports, Error,
     anaPending: { current: new Set() },
     setAnaSel: () => {},
     setAnaErrors: update => { errors = update(errors); },
     setAnaData: update => { data = update(data); },
-    fetchAccountAnalytics: platform => new Promise((resolve, reject) => pending.push({ platform, resolve, reject })),
-    localStorage: { setItem: (key, value) => storage.set(key, value) },
+    data: workspace,
+    expireIfNeeded: () => {},
+    workspaceErrorMessage: (error, fallback) =>
+      (error instanceof Error && error.message) || fallback,
   });
-  return { exports, pending, storage, get data() { return data; }, get errors() { return errors; } };
+  return { exports, pending,
+    get data() { return data; },
+    get errors() { return errors; },
+    get cache() { return cache; } };
 }
 
 test('repeated clicks share one fetch and refresh is possible afterwards', async () => {
@@ -52,9 +64,8 @@ test('a completed request does not persist another platforms loading state', asy
   view.exports.runAna('zhihu');
   view.pending[0].resolve({ platform: 'xiaohongshu', loggedIn: true });
   await settle();
-  const cache = JSON.parse(view.storage.get('easel_analytics'));
-  assert.equal(cache.xiaohongshu.loggedIn, true);
-  assert.equal(cache.zhihu, undefined);
+  assert.equal(view.cache.xiaohongshu.loggedIn, true);
+  assert.equal(view.cache.zhihu, undefined);
 });
 
 test('failed fetch displays the server reason and can retry', async () => {
@@ -67,6 +78,23 @@ test('failed fetch displays the server reason and can retry', async () => {
   view.exports.runAna('xiaohongshu');
   assert.equal(view.pending.length, 2);
   assert.equal(view.errors.xiaohongshu, '');
+});
+
+test('failed refresh keeps the real cached data marked stale', async () => {
+  const view = setup();
+  view.exports.runAna('xiaohongshu');
+  view.pending[0].resolve({
+    platform: 'xiaohongshu', loggedIn: true, followers: 7,
+    fetched_at: 1234,
+  });
+  await settle();
+  view.exports.runAna('xiaohongshu');
+  view.pending[1].reject(new Error('平台维护'));
+  await settle();
+  assert.equal(view.data.xiaohongshu.followers, 7);
+  assert.equal(view.data.xiaohongshu.fetched_at, 1234);
+  assert.equal(view.data.xiaohongshu.stale, true);
+  assert.match(view.errors.xiaohongshu, /平台维护/);
 });
 
 test('analytics requests have platform-specific bounded deadlines', async () => {

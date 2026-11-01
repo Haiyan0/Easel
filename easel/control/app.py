@@ -89,6 +89,9 @@ _IMPLEMENTED_EXACT = frozenset({
     ("GET", "/api/schedule/context"),
     ("GET", "/api/ideas"),
     ("POST", "/api/ideas"),
+    # Task 5C2：账号/登录/分析
+    ("GET", "/api/accounts"),
+    ("GET", "/api/analytics/platforms"),
 })
 _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/settings/models/overrides/[^/]+$")),
@@ -115,6 +118,21 @@ _IMPLEMENTED_PATTERNS = (
     ("DELETE", re.compile(r"^/api/schedule/[^/]+$")),
     ("PUT", re.compile(r"^/api/ideas/[^/]+$")),
     ("DELETE", re.compile(r"^/api/ideas/[^/]+$")),
+    # Task 5C2：账号/登录/分析（平台白名单在适配层再次校验）
+    ("POST", re.compile(r"^/api/accounts/[^/]+/whoami$")),
+    ("GET", re.compile(r"^/api/accounts/[^/]+/credentials$")),
+    ("POST", re.compile(r"^/api/accounts/[^/]+/credentials$")),
+    ("POST", re.compile(r"^/api/accounts/[^/]+/mp-login$")),
+    ("GET", re.compile(r"^/api/accounts/[^/]+/mp-login/status$")),
+    ("POST", re.compile(r"^/api/accounts/[^/]+/mp-login/stop$")),
+    ("GET", re.compile(r"^/api/accounts/[^/]+/mp-login/qr$")),
+    ("GET", re.compile(r"^/api/accounts/[^/]+/qr$")),
+    ("POST", re.compile(r"^/api/login/[^/]+$")),
+    ("GET", re.compile(r"^/api/login/[^/]+/status$")),
+    ("POST", re.compile(r"^/api/login/[^/]+/sms$")),
+    ("POST", re.compile(r"^/api/login/[^/]+/stop$")),
+    ("POST", re.compile(r"^/api/logout/[^/]+$")),
+    ("GET", re.compile(r"^/api/analytics/[^/]+$")),
     ("GET", re.compile(r"^/$")),
     ("GET", re.compile(r"^/onepage$")),
     ("GET", re.compile(r"^/assets/[^/].*$")),
@@ -728,6 +746,7 @@ def create_app(*, store: Store, auth: AuthService,
                relay_factory: Callable[..., object] | None = None,
                workspace_api=None,
                workspace_factory: Callable[..., object] | None = None,
+               workspace_accounts=None,
                harness_summary: dict | None = None) -> FastAPI:
     """装配最小 control API；未实现的路由保持 404，不回退 local。
 
@@ -838,6 +857,13 @@ def create_app(*, store: Store, auth: AuthService,
                 app.state.control_store, app.state.sessions,
                 app.state.relay, app.state.workspace_api,
                 control_db_runner)
+            if workspace_accounts is not None:
+                app.state.workspace_accounts = workspace_accounts
+            else:
+                from .workspace_accounts import WorkspaceAccounts
+                app.state.workspace_accounts = WorkspaceAccounts(
+                    app.state.control_store, app.state.relay,
+                    app.state.workspace_api, db_runner=control_db_runner)
             # 后台对账与 SSE/登录解耦：应用启动即恢复扫描，退出时先停止
             # 循环再关闭它使用的 HTTP 连接池。
             app.state.reconciler = None
@@ -1184,6 +1210,195 @@ def create_app(*, store: Store, auth: AuthService,
         service = request.app.state.workspace_tasks
         return _no_store_json(
             await service.profile_status(_identity(request), name))
+
+    # ------------------------------------------------------------------
+    # Task 5C2：账号、平台登录与分析
+    # ------------------------------------------------------------------
+
+    def _accounts_service(request: Request):
+        service = getattr(request.app.state, "workspace_accounts", None)
+        if service is None:
+            raise DomainError("capability_unavailable", 503)
+        return service
+
+    def _no_query(request: Request) -> None:
+        if request.query_params:
+            raise DomainError("invalid_request", 400)
+
+    async def _optional_object_body(request: Request,
+                                    limit: int = 4096) -> dict:
+        length = request.headers.get("content-length")
+        if length in (None, "", "0"):
+            return {}
+        return await _read_json_body(request, limit)
+
+    @app.get("/api/accounts")
+    async def accounts_list(request: Request):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).account_list(
+                _identity(request)))
+
+    @app.post("/api/accounts/{platform}/whoami")
+    async def accounts_whoami(request: Request, platform: str):
+        _no_query(request)
+        payload = await _optional_object_body(request)
+        if set(payload) - {"force", "requestId"}:
+            raise DomainError("invalid_argument", 400)
+        force = payload.get("force", False)
+        if type(force) is not bool:
+            raise DomainError("invalid_argument", 400)
+        request_id = payload.get("requestId")
+        return _no_store_json(
+            await _accounts_service(request).whoami(
+                _identity(request), platform, force=force,
+                request_id=request_id))
+
+    @app.get("/api/accounts/{platform}/credentials")
+    async def accounts_credentials_get(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).get_credentials(
+                _identity(request), platform))
+
+    @app.post("/api/accounts/{platform}/credentials")
+    async def accounts_credentials_save(request: Request, platform: str):
+        _no_query(request)
+        payload = await _read_json_body(request, limit=8192)
+        allowed = {"appId", "appSecret", "name", "author", "requestId"}
+        if set(payload) - allowed:
+            raise DomainError("invalid_argument", 400)
+        request_id = payload.pop("requestId", None)
+        result = await _accounts_service(request).save_credentials(
+            _identity(request), platform, payload,
+            request_id=request_id)
+        return _no_store_json(result)
+
+    @app.post("/api/accounts/{platform}/mp-login")
+    async def accounts_mp_login_start(request: Request, platform: str):
+        _no_query(request)
+        payload = await _optional_object_body(request)
+        if set(payload) - {"requestId", "restart"}:
+            raise DomainError("invalid_argument", 400)
+        restart = payload.get("restart", False)
+        if type(restart) is not bool:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _accounts_service(request).mp_login_start(
+                _identity(request), platform,
+                request_id=payload.get("requestId"), restart=restart))
+
+    @app.get("/api/accounts/{platform}/mp-login/status")
+    async def accounts_mp_login_status(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).mp_login_status(
+                _identity(request), platform))
+
+    @app.post("/api/accounts/{platform}/mp-login/stop")
+    async def accounts_mp_login_stop(request: Request, platform: str):
+        _no_query(request)
+        payload = await _optional_object_body(request)
+        if set(payload) - {"runId"}:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _accounts_service(request).stop_login(
+                _identity(request), platform, mp=True,
+                run_id=payload.get("runId")))
+
+    @app.post("/api/login/{platform}")
+    async def accounts_login_start(request: Request, platform: str):
+        _no_query(request)
+        payload = await _optional_object_body(request)
+        if set(payload) - {"requestId", "restart"}:
+            raise DomainError("invalid_argument", 400)
+        restart = payload.get("restart", False)
+        if type(restart) is not bool:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _accounts_service(request).login_start(
+                _identity(request), platform,
+                request_id=payload.get("requestId"), restart=restart))
+
+    @app.get("/api/login/{platform}/status")
+    async def accounts_login_status(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).login_status(
+                _identity(request), platform))
+
+    @app.post("/api/login/{platform}/sms")
+    async def accounts_login_sms(request: Request, platform: str):
+        _no_query(request)
+        payload = await _read_json_body(request, limit=4096)
+        if set(payload) - {"code", "runId"}:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _accounts_service(request).login_sms(
+                _identity(request), platform, payload.get("code"),
+                run_id=payload.get("runId")))
+
+    @app.post("/api/login/{platform}/stop")
+    async def accounts_login_stop(request: Request, platform: str):
+        _no_query(request)
+        payload = await _optional_object_body(request)
+        if set(payload) - {"runId"}:
+            raise DomainError("invalid_argument", 400)
+        return _no_store_json(
+            await _accounts_service(request).stop_login(
+                _identity(request), platform, mp=False,
+                run_id=payload.get("runId")))
+
+    @app.post("/api/logout/{platform}")
+    async def accounts_logout(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).logout(
+                _identity(request), platform))
+
+    @app.get("/api/analytics/platforms")
+    async def analytics_platforms(request: Request):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).analytics_platforms(
+                _identity(request)))
+
+    @app.get("/api/analytics/{platform}")
+    async def analytics_refresh(request: Request, platform: str):
+        _no_query(request)
+        return _no_store_json(
+            await _accounts_service(request).analytics(
+                _identity(request), platform))
+
+    async def _account_qr_response(request: Request, platform: str,
+                                   *, mp: bool):
+        # v 只作 img 缓存键，不进 worker；未知参数拒绝。
+        unknown = set(request.query_params) - {"v"}
+        if unknown:
+            raise DomainError("invalid_request", 400)
+        service = _accounts_service(request)
+        stream = await service.qr_stream(
+            _identity(request), platform, mp=mp)
+        if stream.status_code != 200:
+            status = stream.status_code
+            await stream.aclose()
+            raise DomainError("qr_unavailable", status)
+        content_type = stream.headers.get("content-type", "")
+        if not str(content_type).lower().startswith("image/"):
+            await stream.aclose()
+            raise DomainError("upstream_invalid", 502)
+        return StreamingResponse(
+            stream.chunks(), status_code=200,
+            headers={"Content-Type": "image/png",
+                     "Cache-Control": "no-store"})
+
+    @app.get("/api/accounts/{platform}/qr")
+    async def accounts_qr(request: Request, platform: str):
+        return await _account_qr_response(request, platform, mp=False)
+
+    @app.get("/api/accounts/{platform}/mp-login/qr")
+    async def accounts_mp_qr(request: Request, platform: str):
+        return await _account_qr_response(request, platform, mp=True)
 
     @app.post("/api/auth/exchange")
     async def exchange(request: Request):

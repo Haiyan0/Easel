@@ -58,12 +58,15 @@ test('manual account verification updates the card and identity from the same re
     aliveRef: { current: true },
     setWhoami: callback => { identity = callback(identity); },
     setAccounts: callback => { accounts = callback(accounts); },
-    setWhoamiCache: () => {},
-    accountWhoami: async (platform, force) => {
-      assert.equal(platform, 'wechat-oa');
-      assert.equal(force, true);
-      return { loggedIn: false, name: '', avatar: '' };
+    data: {
+      whoami: { set: () => {} },
+      accountWhoami: async (platform, force) => {
+        assert.equal(platform, 'wechat-oa');
+        assert.equal(force, true);
+        return { loggedIn: false, name: '', avatar: '' };
+      },
     },
+    expireIfNeeded: () => {},
   });
   verify('wechat-oa');
   await new Promise(resolve => setImmediate(resolve));
@@ -86,10 +89,12 @@ test('failed account verification preserves the last verified nickname and avata
     whoamiRequests: { current: {} },
     aliveRef: { current: true },
     setWhoami: callback => { identity = callback(identity); },
-    getWhoamiCache: () => ({ 'weixin-channels': cached }),
+    data: {
+      whoami: { get: () => ({ 'weixin-channels': cached }) },
+      accountWhoami: async () => { throw new Error('identity endpoint not ready'); },
+    },
+    expireIfNeeded: () => {},
     setAccounts: () => assert.fail('unknown identity cannot update login state'),
-    setWhoamiCache: () => assert.fail('unknown identity cannot be cached'),
-    accountWhoami: async () => { throw new Error('identity endpoint not ready'); },
   });
   verify('weixin-channels');
   assert.equal(identity['weixin-channels'], 'loading');
@@ -109,20 +114,31 @@ function setup() {
   const change = key => value => {
     state[key] = typeof value === 'function' ? value(state[key]) : value;
   };
+  const data = {
+    startLogin: start, startMpLogin: start,
+    loginStatus: () => statusRequest(), mpLoginStatus: () => statusRequest(),
+    whoami: { set: () => {} },
+  };
   const handlers = runInNewContext(outputText, {
     Error,
     useCallback: callback => callback,
     qrRequest, aliveRef, pollRef,
     whoamiRequests: { current: {} }, qrPlatformRef: { current: '' },
+    qrRunRef: { current: '' }, qrKindRef: { current: false },
     setQr: change('qr'), setBusy: change('busy'), setErr: change('err'),
     setAccounts: change('accounts'), setWhoami: () => {},
     setSmsCode: () => {}, setSmsErr: () => {}, setSmsBusy: () => {},
+    setStopBusy: () => {},
     setTerminalMsg: change('terminalMsg'), setQrNonce: () => {},
-    setWhoamiCache: () => {}, openCred: () => { state.credentials = true; },
+    openCred: () => { state.credentials = true; },
     load: () => {}, runWhoami: platform => state.verifies.push(platform),
     stopPoll: () => { pollRef.current = null; },
-    startLogin: start, startMpLogin: start,
-    loginStatus: () => statusRequest(), mpLoginStatus: () => statusRequest(),
+    data,
+    newRequestId: () => 'request-id',
+    expireIfNeeded: () => {},
+    loginPollError: () => '登录状态连接中断，请检查网络后重新登录',
+    workspaceErrorMessage: (error, fallback) =>
+      (error instanceof Error && error.message) || fallback,
     setInterval: (callback, delay) => {
       const interval = { callback, delay };
       state.intervals.push(interval);

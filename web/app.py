@@ -471,6 +471,12 @@ SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结�
 SYSTEM_TOPLEVEL_DIRS = {"analytics", "wechat"}
 LOGIN_TIMEOUT = 240
 LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
+# 受管浏览器任务实际启动的子进程（whoami/analytics）；取消或超时时按进程树
+# 终止，不能只取消 asyncio 任务而把 Chromium 留在后台。
+_BROWSER_PROCESSES: dict[tuple[str, str], subprocess.Popen] = {}
+_BROWSER_PROCESS_LOCK = threading.Lock()
+# 凭证校验的 Run 交接：AppSecret 只经一次短请求进入本进程，不写 Run 快照。
+_CREDENTIAL_JOBS: dict[tuple[str, str], asyncio.Future] = {}
 
 # whoami 真校验（起 headless 浏览器，数秒）的进程内缓存：避免账号页 + 工作台重复起浏览器。
 WHOAMI_TTL = 600  # 秒
@@ -543,6 +549,97 @@ async def _stop_login_process(proc) -> None:
         raise HTTPException(409, '登录进程仍在退出，请稍后重试注销') from None
     except OSError:
         pass
+
+
+def _kill_process_tree(proc, timeout: float = 5.0) -> None:
+    """终止整个进程树并等待退出；用于取消/超时，不删除 profile 或锁。"""
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+async def settle_login_process(process_key: str,
+                               timeout: float = 15.0) -> None:
+    """登录成功后等 runner 自行退出；超时则按进程树终止，避免遗留浏览器。"""
+    proc = LOGIN_PROCESSES.pop(process_key, None)
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        await asyncio.to_thread(proc.wait, timeout)
+    except subprocess.TimeoutExpired:
+        await asyncio.to_thread(_kill_process_tree, proc)
+
+
+async def cancel_browser_task(kind: str, platform: str) -> None:
+    """取消受管浏览器任务：终止正在运行的子进程树并等待退出。
+
+    只处理进程与内部交接，不删除 profile、不删除锁对象；注销仍走原
+    ``api_logout`` 的持锁删除边界。
+    """
+    with _BROWSER_PROCESS_LOCK:
+        proc = _BROWSER_PROCESSES.get((kind, platform))
+    if proc is not None:
+        await asyncio.to_thread(_kill_process_tree, proc)
+    if kind == "login":
+        process_key = platform
+    elif kind == "mp-login":
+        process_key = "wechat-oa-mp"
+    else:
+        process_key = ""
+    if process_key:
+        pending = LOGIN_PROCESSES.pop(process_key, None)
+        if pending is not None:
+            await asyncio.to_thread(_kill_process_tree, pending)
+
+
+async def _run_tracked_subprocess(kind: str, platform: str,
+                                  cmd: list[str], env: dict[str, str],
+                                  timeout: int) -> subprocess.CompletedProcess:
+    """运行有界子进程并登记；取消/超时按进程树终止。"""
+    proc = subprocess.Popen(
+        cmd, cwd=str(PROJECT_ROOT), env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", start_new_session=os.name != "nt")
+    key = (kind, platform)
+    with _BROWSER_PROCESS_LOCK:
+        _BROWSER_PROCESSES[key] = proc
+    try:
+        try:
+            stdout, stderr = await asyncio.to_thread(
+                proc.communicate, timeout=timeout)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(_kill_process_tree, proc)
+            raise
+        except subprocess.TimeoutExpired:
+            await asyncio.to_thread(_kill_process_tree, proc)
+            raise
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout or "", stderr or "")
+    finally:
+        with _BROWSER_PROCESS_LOCK:
+            if _BROWSER_PROCESSES.get(key) is proc:
+                _BROWSER_PROCESSES.pop(key, None)
 
 
 LOGIN_RUNNERS: dict[str, dict] = {
@@ -623,6 +720,11 @@ def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", autho
     tmp = config_path.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     os.replace(tmp, config_path)
+    try:
+        # 受管凭证文件只允许本人进程读取；worker 状态根本身已在私有 HOME。
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
 
 
 def _wechat_clear_credentials() -> None:
@@ -653,23 +755,34 @@ def _wechat_clear_credentials() -> None:
             pass
 
 
-def _wechat_verify_token() -> tuple[bool, str]:
-    """用当前 accounts.web 凭证调官方 token 接口验证。返回 (ok, message)。
-    在子进程里跑，避免把 skill 的 import 副作用带进 web 进程。"""
+def _wechat_verify_credentials(app_id: str, app_secret: str) -> tuple[bool, str]:
+    """用候选 AppID/AppSecret 调官方 token 接口验证；返回固定分类而非原始报错。
+
+    凭证经 stdin 传入子进程，不出现在 argv、日志或 Run 事件中。只有验证
+    通过后调用方才允许原子保存，失败不会覆盖原有有效配置。
+    """
     code = (
-        "import sys; sys.path.insert(0, %r)\n"
-        "from config import set_account\n"
-        "from wechat_token import get_access_token\n"
-        "set_account(%r)\n"
+        "import json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from wechat_token import _fetch_token_with_retry\n"
+        "data = json.load(sys.stdin)\n"
         "try:\n"
-        "    t = get_access_token(force_refresh=True)\n"
-        "    print('OK' if t else 'EMPTY')\n"
-        "except Exception as e:\n"
-        "    print('ERR:' + str(e))\n"
-    ) % (str(WECHAT_SKILL_SCRIPTS), WECHAT_WEB_ACCOUNT)
+        "    _fetch_token_with_retry(data['app_id'], data['app_secret'], 'web', retries=0)\n"
+        "    print('OK')\n"
+        "except Exception as error:\n"
+        "    text = str(error)\n"
+        "    code = ('ip_whitelist' if '40164' in text else\n"
+        "            'invalid_secret' if '40125' in text else\n"
+        "            'invalid_appid' if '40013' in text else\n"
+        "            'platform_or_network')\n"
+        "    print('ERR:' + code)\n"
+    )
     try:
-        proc = subprocess.run([sys.executable, "-c", code], cwd=str(WECHAT_SKILL_SCRIPTS),
-                              env=_wechat_env(), capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(WECHAT_SKILL_SCRIPTS)],
+            cwd=str(WECHAT_SKILL_SCRIPTS), env=_wechat_env(),
+            input=json.dumps({"app_id": app_id, "app_secret": app_secret}),
+            capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return False, "验证超时（网络或 IP 白名单问题）"
     out = (proc.stdout or "").strip().splitlines()
@@ -677,9 +790,66 @@ def _wechat_verify_token() -> tuple[bool, str]:
     if last == "OK":
         return True, ""
     if last.startswith("ERR:"):
-        return False, last[4:].strip()[:200]
-    err = (proc.stderr or "").strip().splitlines()[-1:] or ["验证失败"]
-    return False, err[0][:200]
+        category = last[4:].strip()
+        return False, {
+            "ip_whitelist": "服务器出口 IP 不在公众号 IP 白名单（40164）",
+            "invalid_secret": "AppSecret 无效（40125）",
+            "invalid_appid": "AppID 无效（40013）",
+            "platform_or_network": "微信平台拒绝或网络不可用",
+        }.get(category, "验证失败")
+    return False, "验证失败"
+
+
+def _credentials_job_key(platform: str, run_id: str) -> tuple[str, str]:
+    return (platform, run_id)
+
+
+async def wait_credentials_job(platform: str, run_id: str,
+                               timeout: float = 45.0) -> dict:
+    """受管凭证 Run 等待一次短请求交接；超时由 RunManager 收敛为失败。"""
+    key = _credentials_job_key(platform, run_id)
+    loop = asyncio.get_running_loop()
+    future = _CREDENTIAL_JOBS.get(key)
+    if future is None or future.done():
+        future = loop.create_future()
+        _CREDENTIAL_JOBS[key] = future
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout)
+    finally:
+        if _CREDENTIAL_JOBS.get(key) is future:
+            _CREDENTIAL_JOBS.pop(key, None)
+
+
+async def _await_credentials_job(platform: str, run_id: str,
+                                 timeout: float = 2.0):
+    """短请求可能略早于执行器登记；只等待这个短窗口，不接受无 Run 的凭证。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    key = _credentials_job_key(platform, run_id)
+    while True:
+        future = _CREDENTIAL_JOBS.get(key)
+        if future is not None and not future.done():
+            return future
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(0.02)
+
+
+def _verify_and_save_credentials(platform: str, app_id: str, app_secret: str,
+                                 name: str, author: str) -> dict:
+    ok, message = _wechat_verify_credentials(app_id, app_secret)
+    if not ok:
+        # 失败不写 YAML：旧的有效凭证继续可用，避免一次输错覆盖可工作配置。
+        return {"ok": False,
+                "message": f"凭证未保存，验证未通过：{message}。原有配置保持不变。"}
+    try:
+        _wechat_save_credentials(app_id, app_secret, name=name, author=author)
+    except OSError:
+        return {"ok": False, "message": "验证通过但凭证保存失败，请稍后重试。"}
+    with _WHOAMI_LOCK:
+        _WHOAMI_CACHE.pop(platform, None)
+    _write_login_marker(platform, 'success', name or '微信公众号')
+    return {"ok": True, "message": "公众号凭证已保存并验证通过"}
 
 
 def _k(env, label, required=True, secret=True, aliases=None):
@@ -4932,13 +5102,18 @@ def _login_status(platform: str) -> dict:
 
 @app.get("/api/accounts")
 async def api_accounts():
-    return [
-        {'platform': pf, 'name': cfg['name'], 'backend': cfg['backend'],
-         'supported': cfg['backend'] != 'unsupported',
-         'loggedIn': _account_logged_in(pf, cfg),
-         'note': cfg.get('note', '')}
-        for pf, cfg in LOGIN_RUNNERS.items()
-    ]
+    items = []
+    for pf, cfg in LOGIN_RUNNERS.items():
+        item = {'platform': pf, 'name': cfg['name'], 'backend': cfg['backend'],
+                'supported': cfg['backend'] != 'unsupported',
+                'loggedIn': _account_logged_in(pf, cfg),
+                'note': cfg.get('note', '')}
+        if cfg['backend'] == 'wechat-oa':
+            # 两种公众号登录态分开报告：后台扫码会话 vs AppID/AppSecret 凭证。
+            item['mpLoggedIn'] = _mp_login_status().get('state') == 'success'
+            item['credentialConfigured'] = _wechat_has_credentials()
+        items.append(item)
+    return items
 
 
 @app.post("/api/login/{platform}")
@@ -5012,7 +5187,8 @@ async def _start_login(platform: str, restart: bool = False):
     login_env['PYTHONUTF8'] = '1'
     try:
         proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=login_env,
-                                stdout=log_file, stderr=subprocess.STDOUT)
+                                stdout=log_file, stderr=subprocess.STDOUT,
+                                start_new_session=os.name != "nt")
     finally:
         log_file.close()
     LOGIN_PROCESSES[platform] = proc
@@ -5062,6 +5238,7 @@ class WechatCredentials(BaseModel):
     appSecret: str = ''
     name: str = ''
     author: str = ''
+    runId: str = ''
 
 
 @app.get("/api/accounts/{platform}/credentials")
@@ -5082,24 +5259,37 @@ async def api_get_credentials(platform: str):
 
 @app.post("/api/accounts/{platform}/credentials")
 async def api_save_credentials(platform: str, req: WechatCredentials):
-    """保存凭证式平台（公众号）的 AppID/AppSecret，写入 skill 配置并调官方接口验证。"""
+    """验证后原子保存公众号凭证；worker 必须绑定已接纳的凭证 Run。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get('backend') != 'wechat-oa':
         raise HTTPException(404, '该平台不使用凭证登录')
     app_id = (req.appId or '').strip()
     app_secret = (req.appSecret or '').strip()
+    name = (req.name or '').strip()
+    author = (req.author or '').strip()
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
-    _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    # 验证要真连微信接口（最长 30s）：丢线程池，避免卡住整个事件循环
-    ok, msg = await asyncio.to_thread(_wechat_verify_token)
-    with _WHOAMI_LOCK:
-        _WHOAMI_CACHE.pop(platform, None)
-    if ok:
-        _write_login_marker(platform, 'success', req.name.strip() or '微信公众号')
-        return {'ok': True, 'message': '公众号凭证已保存并验证通过'}
-    # 校验失败：凭证已存（下次改正后可直接重试），但明确告知失败原因（常见 40164 IP 白名单 / 40125 密钥错误）
-    return {'ok': False, 'message': f'凭证已保存但验证未通过：{msg}。若是 40164 请把服务器出口 IP 加入公众号 IP 白名单。'}
+    if (len(app_id) > 128 or len(app_secret) > 512
+            or len(name) > 200 or len(author) > 200
+            or any(ord(character) < 32 for character in
+                   app_id + app_secret + name + author)):
+        raise HTTPException(400, '凭证或名称格式非法')
+    run_id = (req.runId or '').strip()
+    future = None
+    if _SERVICE_MODE == "worker":
+        # 只接受 control 为本平台已接纳的凭证 Run；直接调用不会获得交接槽。
+        if (not run_id or len(run_id) > 128
+                or any(ord(character) < 32 for character in run_id)):
+            raise HTTPException(409, '凭证校验未获接纳')
+        future = await _await_credentials_job(platform, run_id)
+        if future is None:
+            raise HTTPException(409, '凭证校验未获接纳')
+    result = await asyncio.to_thread(
+        _verify_and_save_credentials, platform, app_id, app_secret,
+        name, author)
+    if future is not None and not future.done():
+        future.set_result(result)
+    return result
 
 
 def _mp_login_status() -> dict:
@@ -5166,7 +5356,8 @@ async def api_mp_login_start(platform: str):
     env = _proxy_env()
     env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env,
-                            stdout=log_file, stderr=subprocess.STDOUT)
+                            stdout=log_file, stderr=subprocess.STDOUT,
+                            start_new_session=os.name != "nt")
     log_file.close()
     LOGIN_PROCESSES["wechat-oa-mp"] = proc
     status = _mp_login_status()
@@ -5181,6 +5372,36 @@ async def api_mp_login_status(platform: str):
     if not cfg or cfg.get("backend") != "wechat-oa":
         raise HTTPException(404, "该平台不使用公众号后台登录")
     return {"mode": "qr", **_mp_login_status()}
+
+
+def _login_qr_response(path: Path):
+    """只返回固定登录二维码文件；resolve 后仍必须位于本人 _login 根。"""
+    try:
+        resolved = path.resolve()
+        root = LOGIN_DIR.resolve()
+    except OSError:
+        raise HTTPException(404, '二维码不存在') from None
+    if (resolved.parent != root or resolved.name != path.name
+            or not resolved.is_file()):
+        raise HTTPException(404, '二维码不存在')
+    return FileResponse(
+        resolved, media_type="image/png",
+        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/accounts/{platform}/qr")
+async def api_account_qr(platform: str):
+    """扫码登录二维码；只允许固定平台与固定文件名，不接受任意路径。"""
+    if platform not in LOGIN_RUNNERS:
+        raise HTTPException(404, '未知平台')
+    return _login_qr_response(LOGIN_DIR / f'{platform}.png')
+
+
+@app.get("/api/accounts/{platform}/mp-login/qr")
+async def api_mp_login_qr(platform: str):
+    if platform != "wechat-oa":
+        raise HTTPException(404, '该平台不使用公众号后台登录')
+    return _login_qr_response(LOGIN_DIR / 'wechat-oa-mp.png')
 
 
 @app.get("/api/accounts/{platform}/whoami")
@@ -5257,21 +5478,23 @@ async def _check_account_whoami(platform: str, force: bool = False):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
                '--platform', cfg['wp']]
     try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                                       capture_output=True, text=True, encoding='utf-8',
-                                       timeout=35 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
+        completed = await _run_tracked_subprocess(
+            "whoami", platform, cmd, _proxy_env(),
+            35 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '校验超时（浏览器起不来或网络慢）')
+    stdout = completed.stdout or ""
+    returncode = completed.returncode
     data = {'loggedIn': False, 'name': '', 'avatar': ''}
     confident = False
-    for line in reversed((proc.stdout or '').strip().splitlines()):
+    for line in reversed(stdout.strip().splitlines()):
         line = line.strip()
         if line.startswith('{'):
             try:
                 d = json.loads(line)
                 data = {'loggedIn': bool(d.get('loggedIn')), 'name': d.get('name') or '', 'avatar': d.get('avatar') or ''}
                 # 有 error 字段 = 校验本身失败（浏览器起不来/网络抖动/崩溃），不是可信的「未登录」结论
-                confident = proc.returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
+                confident = returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
                 break
             except Exception:
                 continue
@@ -5361,10 +5584,14 @@ ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-cha
 _analytics_inflight: dict[str, asyncio.Task] = {}
 
 
-def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
+def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int,
+                           track_key: tuple[str, str] | None = None):
     process = subprocess.Popen(
         cmd, cwd=str(PROJECT_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
+    if track_key is not None:
+        with _BROWSER_PROCESS_LOCK:
+            _BROWSER_PROCESSES[track_key] = process
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
@@ -5388,6 +5615,11 @@ def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
             process.stderr.close()
             process.wait(timeout=5)
         raise
+    finally:
+        if track_key is not None:
+            with _BROWSER_PROCESS_LOCK:
+                if _BROWSER_PROCESSES.get(track_key) is process:
+                    _BROWSER_PROCESSES.pop(track_key, None)
 
 
 @app.get("/api/analytics/platforms")
@@ -5439,7 +5671,9 @@ async def _fetch_analytics(platform: str):
     ana_env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
         proc = await asyncio.to_thread(
-            _run_analytics_command, cmd, ana_env, 180 if platform == "wechat-oa" else 90)
+            _run_analytics_command, cmd, ana_env,
+            180 if platform == "wechat-oa" else 90,
+            ("analytics", platform))
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "抓取超时，已停止浏览器；请检查网络，关闭正在进行的登录或校验后重试")
     for line in reversed((proc.stdout or "").strip().splitlines()):

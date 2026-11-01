@@ -11,6 +11,7 @@ import asyncio
 import datetime as dt
 import ipaddress
 import json
+import os
 import shutil
 import socket
 import sys
@@ -31,7 +32,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-05b" / "browser"
+EVIDENCE = Path(os.environ.get(
+    "EASEL_BROWSER_EVIDENCE",
+    str(ROOT / "docs" / "evidence" / "original-web-task-05b" / "browser")))
 SCREENSHOTS: list[Path] = []
 IDEA_ID = "a1b2c3d4e5f6"
 SCHEDULE_ID = "b1b2c3d4e5f6"
@@ -364,8 +367,7 @@ async def scenario_workbench_flow(browser, results, failures):
         await page.get_by_text("weibo测试热点").first.wait_for(timeout=20000)
         await page.get_by_text("A 初始选题").first.wait_for(timeout=20000)
         await page.get_by_text("A 初始排期").first.wait_for(timeout=20000)
-        assert "账号与创作数据将在 5C 接通" in (
-            await page.text_content("body") or "")
+        assert "已登录账号" in (await page.text_content("body") or "")
         await screenshot(page, "01-dashboard-light.png")
 
         await page.get_by_role("button", name="看热点", exact=True).click()
@@ -554,7 +556,8 @@ async def scenario_identity_isolation(browser, results, failures):
         await context.close()
 
 
-async def scenario_member_no_accounts(browser, results, failures):
+async def scenario_member_accounts_connected(browser, results, failures):
+    """5C2 后成员账号页已接通：允许账号/分析读，仍不得触管理员/发布/登录写。"""
     context = await browser.new_context(
         viewport={"width": 1280, "height": 800}, ignore_https_errors=True)
     page = await context.new_page()
@@ -563,21 +566,19 @@ async def scenario_member_no_accounts(browser, results, failures):
     try:
         await login(page, "a")
         await open_dashboard(page)
-        await page.get_by_text("账号与创作数据将在 5C 接通").first.wait_for(
-            timeout=20000)
-        forbidden = ("/api/accounts", "/api/analytics", "/api/admin",
-                     "/api/skills", "/api/profile/build", "/api/publish",
-                     "/api/login/", "/api/logout/")
-        assert not [url for url in requests
-                    if any(part in url for part in forbidden)], requests
         await page.get_by_role("button", name="账号", exact=True).click()
-        await page.get_by_text("账号暂未接通").first.wait_for(timeout=10000)
-        await screenshot(page, "07-accounts-unavailable.png")
+        await page.locator(".accounts-page").wait_for(timeout=20000)
+        forbidden = ("/api/admin", "/api/skills", "/api/profile/build",
+                     "/api/publish", "/api/login/", "/api/logout/")
         assert not [url for url in requests
                     if any(part in url for part in forbidden)], requests
-        results["member_no_accounts"] = True
+        assert any("/api/accounts" in url for url in requests), requests
+        await screenshot(page, "07-accounts-connected.png")
+        assert not [url for url in requests
+                    if any(part in url for part in forbidden)], requests
+        results["member_accounts_connected"] = True
     except Exception as error:  # noqa: BLE001
-        failures.append(f"member-no-accounts: {error!r}")
+        failures.append(f"member-accounts-connected: {error!r}")
     finally:
         await context.close()
 
@@ -677,7 +678,7 @@ async def main() -> int:
             print("BROWSER_VERSION", browser.version)
             await scenario_workbench_flow(browser, results, failures)
             await scenario_identity_isolation(browser, results, failures)
-            await scenario_member_no_accounts(browser, results, failures)
+            await scenario_member_accounts_connected(browser, results, failures)
             await scenario_stale_trends(browser, results, failures)
             await scenario_dark_and_mobile(browser, results, failures)
             await browser.close()

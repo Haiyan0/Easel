@@ -429,6 +429,9 @@ export interface AccountItem {
   supported: boolean;
   loggedIn: boolean;
   note: string;
+  // 公众号区分后台扫码会话与 AppID 凭证；其它平台不返回。
+  mpLoggedIn?: boolean;
+  credentialConfigured?: boolean;
 }
 
 export interface LoginStart {
@@ -594,6 +597,8 @@ export interface AccountAnalytics {
     { followers: number | null; likes: number | null; posts: number | null; since_days: number | null } | null>;
   fetched_at: number;
   warning?: string;
+  /** 前端缓存标记：本次刷新失败，显示的是上次真实取数结果。 */
+  stale?: boolean;
 }
 
 /** 支持抓数据的平台 + 各自登录态。 */

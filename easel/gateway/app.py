@@ -131,6 +131,14 @@ _ROUTES: dict[str, _Route] = {
 # 等未接组不在 gateway 放行，避免用前缀代理扩大边界。
 _WS_OUTPUT_INTERNAL = frozenset({"analytics", "wechat"})
 _WS_RECORD_ID = re.compile(r"^[0-9a-f]{12}$")
+_WS_ACCOUNT_PLATFORMS = frozenset({
+    "xiaohongshu", "kuaishou", "weixin-channels", "zhihu",
+    "bilibili", "douyin", "wechat-oa",
+})
+_WS_ANALYTICS_PLATFORMS = frozenset({
+    "xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels",
+    "bilibili", "wechat-oa",
+})
 _WS_TREND_PLATFORMS = re.compile(
     r"^(?:weibo|douyin|zhihu|bilibili|baidu|toutiao)"
     r"(?:,(?:weibo|douyin|zhihu|bilibili|baidu|toutiao))*$")
@@ -170,6 +178,12 @@ _WS_SIMPLE: dict[tuple[str, ...], _Route] = {
     ("api", "profile", "baseline"): _Route(
         "ws_profile_baseline", frozenset({"POST"}),
         "/api/profile/baseline", False, frozenset()),
+    ("api", "accounts"): _Route(
+        "ws_accounts", frozenset({"GET"}), "/api/accounts", False,
+        frozenset()),
+    ("api", "analytics", "platforms"): _Route(
+        "ws_analytics_platforms", frozenset({"GET"}),
+        "/api/analytics/platforms", False, frozenset()),
 }
 
 
@@ -510,6 +524,47 @@ def _workspace_route(parts: list[str],
                           f"/api/output/{path}", False, frozenset())
         return _Route("ws_media", frozenset({"GET", "HEAD"}),
                       f"/api/media/{path}", True, frozenset())
+    if len(parts) >= 3 and parts[1] == "login":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        if len(parts) == 4 and parts[3] == "status":
+            return _Route("ws_login_status", frozenset({"GET"}),
+                          f"/api/login/{platform}/status", False,
+                          frozenset())
+        if len(parts) == 4 and parts[3] == "sms":
+            return _Route("ws_login_sms", frozenset({"POST"}),
+                          f"/api/login/{platform}/sms", False,
+                          frozenset())
+        raise _not_found()
+    if len(parts) == 3 and parts[1] == "logout":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        return _Route("ws_logout", frozenset({"POST"}),
+                      f"/api/logout/{platform}", False, frozenset())
+    if len(parts) >= 4 and parts[1] == "accounts":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        tail = parts[3:]
+        if tail == ["credentials"]:
+            return _Route("ws_account_credentials",
+                          frozenset({"GET", "POST"}),
+                          f"/api/accounts/{platform}/credentials", False,
+                          frozenset())
+        if tail == ["qr"]:
+            return _Route("ws_account_qr", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/qr", True, frozenset())
+        if tail == ["mp-login", "status"]:
+            return _Route("ws_mp_login_status", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/mp-login/status",
+                          False, frozenset())
+        if tail == ["mp-login", "qr"]:
+            return _Route("ws_mp_login_qr", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/mp-login/qr",
+                          True, frozenset())
+        raise _not_found()
     return None
 
 

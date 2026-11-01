@@ -194,8 +194,9 @@ def test_task_table_covers_every_policy_task_route():
 def test_task_table_reports_missing_adapters():
     implemented = {entry.task_type for entry in TASK_ENTRIES
                    if entry.implemented}
-    assert implemented == {"chat", "skill", "profile"}, (
-        "5C1 只额外装配 skill/profile；其余必须明确 503")
+    assert implemented == {
+        "chat", "skill", "profile", "analytics", "browser"}, (
+        "5C2 额外装配 analytics/browser；publish 仍必须明确 503")
     assert {entry.task_type for entry in TASK_ENTRIES} == set(RUN_TASK_TYPES)
 
 

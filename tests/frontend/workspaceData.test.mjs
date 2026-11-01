@@ -60,6 +60,18 @@ runInNewContext(outputText, {
   module,
   require: (id) => {
     if (id === './api') return api;
+    if (id === './whoami') return {
+      getWhoamiCache: () => ({}),
+      setWhoamiCache: () => {},
+      clearWhoamiCache: () => {},
+      verifyStale: () => {},
+      createWhoamiStore: () => ({
+        get: () => ({}),
+        set: () => {},
+        clear: () => {},
+        verifyStale: () => {},
+      }),
+    };
     throw new Error(`unexpected require ${id}`);
   },
   FormData,
@@ -93,7 +105,8 @@ test('control workspace data exposes only implemented basic capabilities', () =>
   assert.equal(control.personasEnabled, true);
   assert.equal(control.outputsEnabled, true);
   assert.equal(control.workbenchEnabled, true);
-  assert.equal(control.accountsEnabled, false);
+  assert.equal(control.accountsEnabled, true);
+  assert.equal(control.loginStopEnabled, true);
   assert.equal(control.localSettingsEnabled, false);
 
   const local = data.localWorkspaceData;

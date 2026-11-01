@@ -916,11 +916,14 @@ def test_control_upload_forwards_bounded_multipart_and_requires_csrf(tmp_path):
 def test_remaining_groups_stay_explicitly_unavailable(tmp_path):
     fake = FakeWorkspace()
     with control_api(tmp_path, fake) as (client, store, auth, admin, member):
-        login(client, auth, admin, member)
+        body = login(client, auth, admin, member)
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": body["csrfToken"]}
+        # 5C2 已接通账号/登录/分析；发布/导出仍必须明确 503。
         for method, path in [
-            ("GET", "/api/accounts"),
+            ("POST", "/api/publish/xiaohongshu"),
+            ("POST", "/api/manual-publish/xiaohongshu/export"),
         ]:
-            response = client.request(method, path)
+            response = client.request(method, path, json={}, headers=headers)
             assert response.status_code == 503, (method, path)
             assert response.json()["code"] == "capability_unavailable"
 

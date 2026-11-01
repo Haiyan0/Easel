@@ -40,9 +40,14 @@
 | 前端分析缓存 | `localStorage['easel_analytics']` | control 跨身份复用 | control 改为适配器实例内存；local 保留 localStorage；撤销/换身份丢弃 |
 | `qr`/状态/二维码 mtime | `_login/<p>.json/.png` | 公开任意 `_` 文件会越界 | 仅允许白名单平台固定 QR 文件，经已审媒体入口 |
 
-## 3. `force` / `restart` / 未知参数语义
+## 2.1 control 新增显式动作（不改变 local 原 API）
 
-- `whoami?force=true`：仅此布尔查询；`force` 绕过 worker 进程内 whoami TTL 重新真校验。
+| `POST /api/login/{platform}/stop`（control 新增显式动作） | 适配层→`WorkerRelay.stop`；worker executor 取消并终止进程树 | 停止位置 | **否**（绑定现有 Run） | 需登录；POST CSRF；`TASK` | 绑定本人该平台 active Run | 取消 executor→`cancel_browser_task` | 已停止/已终态幂等 | 无 | `test_workspace_accounts` | 显式停止；与「关闭弹窗仅停止轮询」区分 |
+| `POST /api/accounts/{platform}/mp-login/stop` | 同上，mp 任务 | 停止位置 | **否** | 同上 | 同上 | 同上 | 同上 | 无 | `test_workspace_accounts` | 公众号后台扫码停止 |
+| `GET /api/accounts/{platform}/qr` / `mp-login/qr` | worker `api_account_qr` / `api_mp_login_qr` | PNG | 否 | 需登录；GET；`WORKSPACE_READ` | 快速读取 | 固定 `_login/<platform>.png` / `_login/wechat-oa-mp.png`；resolve 后必须在 `_login` 根 | 只读；`v` 仅 cache key | 无 | `test_task5c2_security.py` | 已审本人媒体入口；拒绝 symlink/junction 逃逸 |
+| `POST /api/accounts/{platform}/whoami`（control 显式动作） | 适配层提交 browser Run；worker executor 调 `_check_account_whoami` | `{loggedIn,name,avatar}` | **是**（详见 whoami 行） | 需登录；POST CSRF；`TASK` | browser Run；占容量 | 受管脚本/本人 profile | Run 终态映射；active 合并 | 仅昵称/头像 URL | `test_workspace_accounts`、`test_worker_browser_tasks` | GET whoami 在 control 不装配（避免 GET 副作用），由适配层转 POST |
+
+## 3. `force` / `restart` / 未知参数语义
   未知 query 键不转发；control 逐键校验后只转发 `force`。
 - `login/{platform}?restart=true`：原 `api_login_start` 对运行中进程执行 terminate+wait(8s)，再启动。
   本轮 control 不把浏览器传来的 `restart=true` 直接透传：适配层用 `requestId` 固定一次派发；

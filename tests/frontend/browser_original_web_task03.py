@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import mimetypes
+import os
 import re
 import sys
 import threading
@@ -21,7 +22,9 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 DIST = ROOT / "web" / "frontend" / "dist"
-EVIDENCE = ROOT / "docs" / "evidence" / "original-web-task-03" / "browser"
+EVIDENCE = Path(os.environ.get(
+    "EASEL_BROWSER_EVIDENCE",
+    str(ROOT / "docs" / "evidence" / "original-web-task-03" / "browser")))
 BRAND = DIST / "static" / "easel-icon-transparent.png"
 BRAND_SHA256 = (
     "71c260f5a28e82aced0a513186ebdcf43782b068633e3a7ca5f159d3e3606132"
@@ -1157,12 +1160,12 @@ async def scenario_control_layout(browser, server: Server,
         await page.screenshot(path=str(EVIDENCE / "01-control-layout.png"))
 
         await page.get_by_role("button", name="账号").click()
-        await page.get_by_text("暂未接通").first.wait_for(timeout=10000)
+        await page.locator(".accounts-page").wait_for(timeout=10000)
         paths = server.request_paths()
-        assert not any(path.startswith("/api/accounts") for path in paths), paths
-        results["control_unavailable_menu"] = True
+        assert any(path.startswith("/api/accounts") for path in paths), paths
+        results["control_accounts_connected"] = True
         await page.screenshot(path=str(
-            EVIDENCE / "02-control-unavailable.png"))
+            EVIDENCE / "02-control-accounts.png"))
 
         await page.get_by_role("button", name="设置").click()
         await page.get_by_role("heading", name="个人设置").wait_for(
@@ -2298,7 +2301,7 @@ async def main() -> int:
         [str(Path(item).relative_to(ROOT)) for item in EVIDENCE.iterdir()
          if item.suffix == ".png"], ensure_ascii=False))
     expected = {
-        "control_original_layout", "control_unavailable_menu",
+        "control_original_layout", "control_accounts_connected",
         "control_settings_bridge", "control_text_thinking_activity",
         "control_question_card", "control_stop",
         "control_continue_after_stop", "control_refresh_reconnect",

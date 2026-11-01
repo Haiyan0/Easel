@@ -53,6 +53,15 @@ _MAX_IDENTIFIER = 256
 _MAX_PERSONA = 200
 # 这些已启用任务实际走 chat broker 通道；签发路由也必须覆盖其 Agent 快照。
 BROKER_MODEL_TASK_TYPES = frozenset(("chat", "skill", "profile"))
+# 浏览器/分析任务不调用模型；不需要 broker token，但复用同一 Run 容量/终态。
+_BROWSER_TASK_TYPES = frozenset(("browser", "analytics"))
+_BROWSER_ACTION_TIMEOUTS = {
+    "login": 600,
+    "mp-login": 600,
+    "whoami": 90,
+    "analytics": 300,
+    "credentials": 90,
+}
 # 这些错误表示 gateway/worker 暂时不可用，不能作为“实例已消失”的结算依据。
 _GATEWAY_TRANSIENT = frozenset({
     "worker_not_ready", "worker_wiring_mismatch",
@@ -189,6 +198,16 @@ def _safe_code(value: object, fallback: str) -> str:
             for character in value):
         return value
     return fallback
+
+
+def _browser_action_timeout(message: str) -> int:
+    """按固定动作给 Run 时限；未知动作仍受默认上限约束。"""
+    try:
+        value = json.loads(message)
+    except (TypeError, ValueError):
+        return 300
+    action = value.get("action") if isinstance(value, dict) else None
+    return _BROWSER_ACTION_TIMEOUTS.get(action, 300)
 
 
 def _query_pairs(text: str) -> list[tuple[str, str]]:
@@ -423,6 +442,8 @@ class WorkerRelay:
             attachments=list(request["attachments"]),
             persona=request.get("persona"))
         agent = dict(config.agent)
+        if task_type in _BROWSER_TASK_TYPES:
+            agent["timeout"] = _browser_action_timeout(str(request["message"]))
         if route is not None and task_type in BROKER_MODEL_TASK_TYPES:
             # 实际经 chat 通道执行的受管任务共用同一份有效路由；签名
             # Agent 必须固定同一模型与允许目录，不能回退到静态默认值。
@@ -495,9 +516,12 @@ class WorkerRelay:
             return await self._duplicate(actor, existing)
 
         config = await self._pinned(actor)
-        # 能力检查先于启动 worker 与占用容量：缺受管 broker 路由时明确
-        # 503，不留下一个永远无法派发的 reserved Run。
-        await self._ensure_broker_capability(actor, config)
+        # 浏览器/分析任务不调用模型：跳过 broker 能力与逐 Run token，仍
+        # 使用同一 Store.reserve_run/容量/签名/终态收尾。
+        if task_type not in _BROWSER_TASK_TYPES:
+            # 能力检查先于启动 worker 与占用容量：缺受管 broker 路由时明确
+            # 503，不留下一个永远无法派发的 reserved Run。
+            await self._ensure_broker_capability(actor, config)
         handle = await self._ensure_workspace_ready(
             actor.workspace_id, config.revision)
         run = await self._db(
@@ -525,7 +549,11 @@ class WorkerRelay:
             return await self._duplicate(actor, run)
 
         try:
-            routes, route = await self._run_routes(actor, run, config)
+            if task_type in _BROWSER_TASK_TYPES:
+                # 不签发模型 token，也不把受管模型路由塞进浏览器任务快照。
+                routes, route = {}, None
+            else:
+                routes, route = await self._run_routes(actor, run, config)
         except DomainError:
             # 只有准备所有者、且尚未派发时才能补偿；非所有者不会走到这里
             await self._converge(actor, run, "interrupted")

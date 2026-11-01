@@ -38,6 +38,7 @@ from .config import (
     run_snapshot_fingerprint,
     verify_run_snapshot,
 )
+from .browser_tasks import BROWSER_TASK_TYPES, execute_browser_task
 from .fsutil import best_effort_fchmod, fsync_directory
 from .sessions import (
     MAX_ATTACHMENTS,
@@ -1068,6 +1069,7 @@ class RunManager:
     def __init__(self, *, workspace_id: str, paths: WorkspacePaths,
                  public_key, sessions: WorkspaceSessionStore | None = None,
                  executor: Executor | None = None,
+                 browser_executor: Executor | None = None,
                  base_env: Mapping[str, str] | None = None,
                  clock: Callable[[], float] = time.time,
                  native_binding_version: int = 1,
@@ -1092,6 +1094,8 @@ class RunManager:
             paths.state_root, workspace_id)
         self._custom_executor = executor is not None
         self._executor = executor or _harness_executor
+        # 浏览器/分析任务仍走同一 RunManager；只替换执行器，不另建账本。
+        self._browser_executor = browser_executor or execute_browser_task
         self._base_env = dict(base_env if base_env is not None else os.environ)
         self._clock = clock
         self._native_version = native_binding_version
@@ -1239,9 +1243,81 @@ class RunManager:
         task.add_done_callback(_cleanup)
         return {"runId": run_id, "state": "running", "duplicate": False}
 
+    def _prepare_browser(self, snapshot: RunSnapshot, request: dict
+                         ) -> tuple[RunContext, RunRequest]:
+        """浏览器/分析任务不启动 Agent，只固定本人路径与受管时限。
+
+        描述正文由 control 生成并已进入签名输入摘要；这里不读取 persona、
+        附件或 Agent 命令，避免把浏览器输入升级为任意进程调用。
+        """
+        if (request.get("persona") is not None
+                or request.get("attachments")):
+            raise _invalid("browser_task_input_invalid")
+        conversation_id = request["sessionId"]
+        if conversation_id in self._active_conversations:
+            holder = self._active_conversations[conversation_id]
+            holder_task = self._tasks.get(holder)
+            if holder_task is None or holder_task.done():
+                self._active_conversations.pop(conversation_id, None)
+            else:
+                raise DomainError("conversation_busy", 409)
+        agent = snapshot.agent
+        timeout = agent.get("timeout")
+        timeout = 300 if timeout is None else _timeout(timeout)
+        # 浏览器任务没有 Agent 原生会话，但结果仍要按既有会话快照落盘；
+        # 建立独立的 "browser" 绑定，不复用或改写任何 Agent native id。
+        binding = self._sessions.binding(conversation_id)
+        if not binding:
+            # "api" 是既有受支持绑定类型中唯一无原生 Agent 会话的标签；
+            # 浏览器任务会话只用于承载结果快照，不与聊天会话共享。
+            self._sessions.bind(
+                conversation_id, "api", "", self._native_version,
+                cwd=str(self._paths.workspace_root))
+        elif (binding.get("runtime") != "api"
+              or binding.get("native_id")):
+            raise DomainError("session_binding_conflict", 409)
+        config = WorkerConfigSnapshot(
+            workspace_id=snapshot.workspace_id,
+            run_id=snapshot.run_id,
+            revision=snapshot.revision,
+            routes=snapshot.routes,
+            agent=snapshot.agent,
+            nonce=snapshot.nonce,
+            expires_at=snapshot.expires_at,
+        )
+        env = build_run_env(self._paths, config, self._base_env)
+        run_request = RunRequest(
+            prompt=request["message"],
+            cwd=self._paths.workspace_root,
+            env=env,
+            native_id="",
+            model="",
+            sandbox="read-only",
+            timeout=timeout,
+            command=(),
+            session_key=conversation_id,
+            workspace_id=self.workspace_id,
+            code_root=self._paths.code_root,
+        )
+        context = RunContext(
+            workspace_id=self.workspace_id,
+            run_id=snapshot.run_id,
+            conversation_id=conversation_id,
+            task_type=snapshot.task_type,
+            snapshot=snapshot,
+            runtime="browser",
+            native_id="",
+            persona=None,
+            attachments=(),
+        )
+        self._active_conversations[conversation_id] = snapshot.run_id
+        return context, run_request
+
     def _prepare(self, snapshot: RunSnapshot, request: dict
                  ) -> tuple[RunContext, RunRequest]:
         agent = snapshot.agent
+        if snapshot.task_type in BROWSER_TASK_TYPES:
+            return self._prepare_browser(snapshot, request)
         runtime = agent.get("runtime")
         if runtime not in SUPPORTED_RUNTIMES:
             raise _invalid("agent_runtime_unsupported")
@@ -1429,8 +1505,11 @@ class RunManager:
         ask = self._ask_for(context)
 
         try:
+            executor = (self._browser_executor
+                        if context.task_type in BROWSER_TASK_TYPES
+                        else self._executor)
             result = await asyncio.wait_for(
-                self._executor(request, context, bind, emit, ask),
+                executor(request, context, bind, emit, ask),
                 timeout=request.timeout)
         except asyncio.CancelledError:
             self.registry.finish_if_active(run_id, "cancelled", "stopped")

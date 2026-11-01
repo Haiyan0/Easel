@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import ChatPage from './ChatPage';
+import AccountsPage from './AccountsPage';
 import ControlSettingsPage from './ControlSettingsPage';
 import AdminSettingsPage from './AdminSettingsPage';
 import DashboardPage from './DashboardPage';
@@ -95,7 +96,8 @@ export default function WorkspaceApp({
     fetchText: (url, signal) => workspaceFetchText(url, { signal }),
     runTask: (sessionId, runId, signal) =>
       workspaceRunTask(sessionId, runId, signal),
-  }), [workspaceCall, workspaceFetchText, workspaceRunTask]);
+    onExpired,
+  }), [workspaceCall, workspaceFetchText, workspaceRunTask, onExpired]);
 
   useEffect(() => {
     const onHash = () => {
@@ -254,6 +256,9 @@ export default function WorkspaceApp({
           onDeleted={personaDeleted}
         />
       );
+    }
+    if (currentPage === 'accounts') {
+      return <AccountsPage />;
     }
     if (currentPage !== 'chat') {
       return (
