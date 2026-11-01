@@ -1,0 +1,65 @@
+--- a/docs/windows-desktop-operations.zh-CN.md
++++ b/docs/windows-desktop-operations.zh-CN.md
+@@ -1,8 +1,8 @@
+ # Easel Windows 多用户部署与运维手册
+ 
+-适用：Windows 11 + Docker Desktop Linux containers + WSL2；命令在 PowerShell 执行。核对版本：`1a8811096c7c86bb9079a5c88b92cd225d1907b1`（2026-10-29）。
+-
+-本文以邀请登录、独立 workspace、Harness 聊天为主线，按首次部署→日常运维→备份恢复→更新上线阅读。Desktop 功能/运维已验收，真实 DeepSeek 仍需用你的受管配置验证；未装配的产物预览/下载/发布业务可能返回 503。[Linux 服务器手册](linux-docker-operations.zh-CN.md)。
++适用：Windows 11 + Docker Desktop Linux containers + WSL2；命令在 PowerShell 执行。核对版本：`51aacfb505d14e2e6b18498569ff8740bff6f51b`（2026-11-02）。
++
++本文以邀请登录、独立 workspace、Harness 聊天为主线，按首次部署→日常运维→备份恢复→更新上线阅读。Desktop 功能/运维已在隔离环境按组验收；真实 DeepSeek 与真实平台发布仍需用你的受管配置和授权验证。原 Web 的对话、内容库、画像、技能、账号与发布/导出入口已接通；服务未配置或上游不可用时返回明确原因，不再以“功能未接通”占位。[Linux 服务器手册](linux-docker-operations.zh-CN.md)。
+ 
+ <a id="9-完整-desktop-多人已装配的正式路线"></a>
+ <a id="9-windows-上的多人验证做到哪一步"></a>
+@@ -130,6 +130,7 @@
+   "agent": {
+     "runtime": "acp",
+     "command": ["node", "/opt/dsh/apps/cli/lib/bin.js", "--profile", "acp", "--patch", "/opt/easel/managed/acp.patch.yml"],
++    "models": ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"],
+     "sandbox": "workspace-write",
+     "timeout": 300
+   },
+@@ -147,6 +148,7 @@
+ - `managed-agent.json` 只允许 `revision/agent/broker`；含 `secret/api_key/token/password` 等字段会被拒绝。
+ - `egress-policy.json` 只允许 `approved_hosts/approved_cidrs`。
+ - 空列表仍允许默认策略认可的公网 HTTPS:443，不等于断网或域名白名单；私网供应商需审核精确例外。[策略说明](../deploy/multiuser/egress-policy.md)
++- `agent.models` 必须与 `deploy/multiuser/managed/acp-profile.json` 的 `provider.models` 一致；ACP patch 的默认模型是 `deepseek-chat`。该文件只声明运行时/broker，不代表真实供应商已验收；真实 Key/模型在管理员“全体默认 → 主聊天”中配置并单独验证。
+ - 使用企业/私有 CA 时，把 CA PEM 作为 `-EgressCaFile` 传给 Start；省略时使用 control 镜像内的系统 CA bundle。CA 会复制到 key 卷并随 v2 备份保存，不包含私钥。
+ 
+ ## 4. 初始化专用卷、网络与 key
+@@ -180,7 +182,7 @@
+ ngrok http http://127.0.0.1:7861 --inspect=false
+ ```
+ 
+-用途：为 Secure Cookie 提供 HTTPS。自定义 Port 时同步修改 ngrok 目标。把 HTTPS Forwarding 地址填入 `$PublicOrigin`，不带路径和末尾 `/`，然后：
++用途：为 Secure Cookie 提供 HTTPS。自定义 Port 时同步修改 ngrok 目标。把 HTTPS Forwarding 地址填入 `$PublicOrigin`，不带路径和末尾 `/`。全新部署默认 `automated`；需要人工审核策略时在 Start 显式加 `-PublishMode manual`。已有部署若登记缺 `publish_mode`，必须显式传 `-PublishMode` 迁移，否则 Start 拒绝。然后：
+ 
+ ```powershell
+ $StartArgs = @{
+@@ -244,7 +246,7 @@
+ 
+ ### 管理员在哪里配置聊天
+ 
+-登录后左侧显示“管理员”，点击 **全体默认 → 主聊天**，填写供应商、模型、API 地址、协议和 API Key，然后点 **保存全体默认**。这是受管 chat 通道，个人媒体设置或初始化的 managed-agent.json 都不能代替它。API Key 只填认证后的秘密输入框，不写入命令行/公开配置，不发给维护者。
++登录后左侧显示“管理员”，点击 **全体默认 → 主聊天**，填写供应商、模型、API 地址、协议和 API Key，然后点 **保存全体默认**。这是受管 chat 通道，个人媒体设置或初始化的 managed-agent.json 都不能代替它。模型必须来自受管 manifest 的 `provider.models`（当前 `deepseek-chat`、`deepseek-flash`、`deepseek-v4-pro`）；保存后生效的是服务端版本化路由，不是浏览器本地配置。API Key 只填认证后的秘密输入框，不写入命令行/公开配置，不发给维护者。
+ 
+ 首次部署还未保存全体默认时，聊天可能返回 503；先完成该配置再发送消息。若保存成功后仍 503，检查 Logs 中的具体错误，不能仅凭状态码认定仍是模型问题。
+ 
+@@ -299,7 +301,7 @@
+ if ($LASTEXITCODE -ne 0) { throw '启动失败' }
+ ```
+ 
+-`Status` 的 `status=ok` 才表示全部检查通过；`version_*` 是实际镜像/前端/配置/源码/Harness 摘要，`version_schema` 是数据库 schema。`Logs` 只输出日志路径和尾部，不打印 key/邀请/Cookie。
++`Status` 的 `status=ok` 才表示全部检查通过；`version_*` 是实际镜像/前端/配置/源码/Harness/发布策略摘要（含 `version_publish_mode`），`version_schema` 是数据库 schema。`Logs` 只输出日志路径和尾部，不打印 key/邀请/Cookie。
+ 
+ Stop 和 Start 是分开的操作，不要求每天连着执行。不要用 Force、直接 compose down 或删除 worker 替代成功 Stop。ngrok 在自己的窗口 Ctrl+C。Initialize 会复制受管配置，不是重启命令，日常和恢复后不重跑。
+ 
+@@ -485,5 +487,7 @@
+ | `upgrade_stop_completion_mismatch`                                      | 备份/旧屏障/旧摘要不一致                            | 重新 Stop+Backup，或换正确备份                         |
+ | `upgrade_deployment_identity_missing` / `upgrade_deployment_mismatch` | 缺旧 deployment.json 或备份与旧实例/项目/镜像不一致 | 用当前实例生成的备份与 deployment.json 重试            |
+ | `worker_or_gateway_image_mismatch`                                      | worker/gateway 摘要缺失或不匹配                     | 核验固定镜像；修复后重试                               |
++| `publish_mode_migration_required`                                        | 旧部署登记缺发布策略且未显式传 `-PublishMode`       | 用 `-PublishMode manual` 或 `-PublishMode automated` 显式迁移；不要删登记 |
++| `deployment_publish_mode_invalid`                                        | 登记值不是 manual/automated                         | 检查 deployment.json，不要写入未定义值                 |
+ | `control_port_in_use`                                                   | 无既有 control 时回环端口已被其它进程占用           | 停掉占用进程或换 `-Port`；不要杀未知进程             |
+ | `control_health_timeout` / `control_unhealthy`                        | control 未健康                                      | 看 `Logs` 和 `docker inspect`；不要自动换替代实例  |

@@ -1,0 +1,14 @@
+{
+  "image": "easel-worker:task6a-controlled-4382180",
+  "files_in_image": 247,
+  "checked": 247,
+  "mismatches": [
+    "skills/shared/scripts/account_stats.py",
+    "skills/shared/scripts/bili_login.py",
+    "skills/shared/scripts/douyin_publish.py",
+    "skills/shared/scripts/web_publisher.py",
+    "skills/shared/scripts/weixin_mp_stats.py",
+    "skills/shared/scripts/xhs_publish.py"
+  ],
+  "missing_in_worktree": []
+}

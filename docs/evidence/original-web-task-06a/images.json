@@ -1,0 +1,6 @@
+{
+  "control": "sha256:c6677fd8d1fc2dd3d69e8df1f698568f7b280990c2659558866629ac43c62308",
+  "worker": "sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612",
+  "gateway": "sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a",
+  "controlled_worker": "sha256:caf564cc0e0954741fc5aab9ee54f354001794896e806baf93d4b0c4fa6dc7d3"
+}

@@ -1,0 +1,285 @@
+[
+  {
+    "phase": "main",
+    "name": "main_status_ok",
+    "ok": true,
+    "detail": "network=easel-6a-main-6ce50b97-control state=present\r\nvolume=easel-6a-main-6ce50b97-control state=present\r\nvolume=easel-6a-main-6ce50b97-keys state=present\r\nvolume=easel-6a-main-6ce50b97-egress state=present\r\ncontrol=running healthy\r\ncontrol_port=60194 published=True\r\ncontrol_mounts=checked\r\nworkspace_keys=valid\r\nworkspace_config=valid\r\nworker_leases=\r\napi_health=ok\r\nadmission_barrier=barrier=none\r\negress=running healthy\r\negress_policy_mount=valid\r\nprovisioner_socket=present\r\nprovisioner_engine=default/4c5b9122-bd30-42bd-af1e-019c5053a914\r\nprovisioner_identity=ok\r\nversion_control_image=sha256:c6677fd8d1fc2dd3d69e8df1f698568f7b280990c2659558866629ac43c62308\r\nversion_worker_image=sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612\r\nversion_gateway_image=sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a\r\nversion_frontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1\r\nversion_config_sha256=f395ac6bbd19bb5f861fdd3c269a2ee11df71b7c44c1dd0e3856b4ba8f614d4b\r\nversion_source_commit=4382180862e28d43f2974e32a618093c847ec262\r\nversion_harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317\r\nversion_project=easel-6a-main-6ce50b97\r\nversion_publish_mode=automated\r\nlogs=C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-0cbe360c\\main\\data\\logs\r\nversion_schema=14\r\nstatus=ok\r\n"
+  },
+  {
+    "phase": "main",
+    "name": "main_publish_mode_automated",
+    "ok": true,
+    "detail": "network=easel-6a-main-6ce50b97-control state=present\r\nvolume=easel-6a-main-6ce50b97-control state=present\r\nvolume=easel-6a-main-6ce50b97-keys state=present\r\nvolume=easel-6a-main-6ce50b97-egress state=present\r\ncontrol=running healthy\r\ncontrol_port=60194 published=True\r\ncontrol_mounts=checked\r\nworkspace_keys=valid\r\nworkspace_config=valid\r\nworker_leases=\r\napi_health=ok\r\nadmission_barrier=barrier=none\r\negress=running healthy\r\negress_policy_mount=valid\r\nprovisioner_socket=present\r\nprovisioner_engine=default/4c5b9122-bd30-42bd-af1e-019c5053a914\r\nprovisioner_identity=ok\r\nversion_control_image=sha256:c6677fd8d1fc2dd3d69e8df1f698568f7b280990c2659558866629ac43c62308\r\nversion_worker_image=sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612\r\nversion_gateway_image=sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a\r\nversion_frontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1\r\nversion_config_sha256=f395ac6bbd19bb5f861fdd3c269a2ee11df71b7c44c1dd0e3856b4ba8f614d4b\r\nversion_source_commit=4382180862e28d43f2974e32a618093c847ec262\r\nversion_harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317\r\nversion_project=easel-6a-main-6ce50b97\r\nversion_publish_mode=automated\r\nlogs=C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-0cbe360c\\main\\data\\logs\r\nversion_schema=14\r\nstatus=ok\r\n"
+  },
+  {
+    "phase": "main",
+    "name": "http_chat_two_users",
+    "ok": true,
+    "detail": {
+      "a": 1,
+      "b": 1
+    }
+  },
+  {
+    "phase": "main",
+    "name": "chat_permission_card",
+    "ok": true,
+    "detail": "执行授权\nAgent 请求工具权限（仅本次）：\n1. Allow once\n2. Reject\n自行输入…\n提交"
+  },
+  {
+    "phase": "main",
+    "name": "chat_stop_terminal",
+    "ok": true,
+    "detail": "cancelled"
+  },
+  {
+    "phase": "main",
+    "name": "chat_refresh_same_session",
+    "ok": true,
+    "detail": "same session resumed"
+  },
+  {
+    "phase": "main",
+    "name": "stage:chat",
+    "ok": true,
+    "detail": null
+  },
+  {
+    "phase": "main",
+    "name": "stage:workspace_api_after_chat",
+    "ok": true,
+    "detail": null
+  },
+  {
+    "phase": "main",
+    "name": "workbench_dashboard_entry",
+    "ok": true,
+    "detail": "原工作台概览入口已渲染"
+  },
+  {
+    "phase": "main",
+    "name": "workbench_trends_entry",
+    "ok": true,
+    "detail": "热点页面已渲染；外部热点源按 not-run 记录"
+  },
+  {
+    "phase": "main",
+    "name": "workbench_seeded_idea",
+    "ok": true,
+    "detail": "[{\"id\":\"6a-idea-a\",\"title\":\"6A 初始选题\",\"note\":\"初始备注\",\"source\":\"manual\",\"status\":\"pending\",\"created\":1}]"
+  },
+  {
+    "phase": "main",
+    "name": "workbench_seeded_schedule",
+    "ok": true,
+    "detail": "[{\"id\":\"6a-schedule-a\",\"title\":\"6A 初始排期\",\"date\":\"2026-11-07\",\"platform\":\"微博\",\"time\":\"10:00\",\"status\":\"scheduled\",\"note\":\"\",\"kind\":\"content\",\"url\":\"\",\"source\":\"manual\",\"event_type\":\"\",\"end_date\":\"\"}]"
+  },
+  {
+    "phase": "main",
+    "name": "media_preview_download",
+    "ok": true,
+    "detail": "[{\"name\":\"项目\",\"type\":\"dir\",\"path\":\"项目\",\"mtime\":1793557970,\"children\":[{\"name\":\"clip.mp4\",\"path\":\"项目/clip.mp4\",\"kind\":\"video\",\"mtime\":1793557970,\"size\":31,\"type\":\"file\"},{\"name\":\"封面.png\",\"path\":\"项目/封面.png\",\"kind\":\"image\",\"mtime\":1793557970,\"size\":69,\"type\":\"file\"}],\"fileCount\":2}]"
+  },
+  {
+    "phase": "main",
+    "name": "media_bytes",
+    "ok": true,
+    "detail": 200
+  },
+  {
+    "phase": "main",
+    "name": "material_upload",
+    "ok": true,
+    "detail": [
+      200,
+      "{\"ok\":true,\"files\":[{\"id\":\"90671b7f9b7601d5d8d57ddf\",\"name\":\"6a-upload.txt\",\"path\":\"_inbox/55391c3b62f69e1c3bb7/20261101-9a19f0/6a-upload.txt\"}]}"
+    ]
+  },
+  {
+    "phase": "main",
+    "name": "stage:pages",
+    "ok": false,
+    "detail": "TimeoutError: Locator.wait_for: Timeout 20000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"测试画像\").first to be visible\n    43 × locator resolved to hidden <option value=\"测试画像\">测试画像</option>\n"
+  },
+  {
+    "phase": "main",
+    "name": "manual_export_zip",
+    "ok": true,
+    "detail": {
+      "names": [
+        "body.txt",
+        "manifest.json",
+        "media/01_封面.png",
+        "tags.txt",
+        "title.txt",
+        "使用说明.txt"
+      ],
+      "manifest": {
+        "platform": "xiaohongshu",
+        "title": "6A 人工稿件",
+        "tags": "6A,集成",
+        "reviewed": true,
+        "exportedAt": "2026-11-01T18:34:51.383013+00:00",
+        "status": "ready_for_manual_submission",
+        "officialUrl": "https://creator.xiaohongshu.com/publish/publish?source=official",
+        "media": [
+          "media/01_封面.png"
+        ]
+      }
+    }
+  },
+  {
+    "phase": "main",
+    "name": "stage:manual_export",
+    "ok": true,
+    "detail": null
+  },
+  {
+    "phase": "main",
+    "name": "identity_b_no_a_cache",
+    "ok": true,
+    "detail": "\n    Easel通用模式+ 新建画像…成员账户退出工作台对话技能库内容库账号画像对话 新对话6A B base工作区连接中… 设置Easel夜深了，想创作点什么？从选题到发布，一站式帮你把想法做成能发的内容。看看能做什么 素材Enter 发送 · Shift+Enter 换行🔥蹭个热点看看现在微博和抖音有什么热搜，挑几个适合我做二创的选题✍️写小红书文案帮我写一条小红书种草文案，主题先问我🎴做金句卡片把一句走心的话做成一张适合发朋友圈的金句卡片🎬口播脚本帮我写一条 60 秒的口播短视频脚本，主题先问我\n\n  \n\n"
+  },
+  {
+    "phase": "main",
+    "name": "identity_b_own_session",
+    "ok": true,
+    "detail": "\n    Easel通用模式测试画像+ 新建画像…成员账户退出工作台对话技能库内容库账号画像对话 新对话新对话6A B base已登录 · 服务端会话 设置6A-B-private复制fake-provider-ok\n复制看看能做什么 素材Enter 发送 · Shift+Enter 换行\n\n  \n\n"
+  },
+  {
+    "phase": "main",
+    "name": "identity_server_isolation",
+    "ok": true,
+    "detail": {
+      "a": 2,
+      "b": 2
+    }
+  },
+  {
+    "phase": "main",
+    "name": "identity_two_workers",
+    "ok": true,
+    "detail": {
+      "worker_a": "3b63a4eb858d541ed9f3ca20cdeee9458e1bd7338d935858c50f31db9d71687f",
+      "worker_b": "ed1967501a0424d7c16403408f38cccf9236f8c6ce71978e8eba8e8fef3d232d"
+    }
+  },
+  {
+    "phase": "main",
+    "name": "identity_home",
+    "ok": true,
+    "detail": [
+      "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-0cbe360c\\main\\workspaces\\118b2539f80f4e3a999cfeb5647ece81\\home",
+      "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-0cbe360c\\main\\workspaces\\46c257e5d2e54fd1942542382c79bd4e\\home"
+    ]
+  },
+  {
+    "phase": "main",
+    "name": "identity_same_name_storage",
+    "ok": true,
+    "detail": {
+      "a": "118b2539f80f4e3a999cfeb5647ece81",
+      "b": "46c257e5d2e54fd1942542382c79bd4e"
+    }
+  },
+  {
+    "phase": "main",
+    "name": "identity_a_relogin",
+    "ok": true,
+    "detail": "\n    Easel通用模式+ 新建画像…成员账户退出工作台对话技能库内容库账号画像对话 新对话新对话导出稿件：xiaohongshu新对话新对话6A A base工作区连接中… 设置Easel夜深了，想创作点什么？从选题到发布，一站式帮你把想法做成能发的内容。看看能做什么 素材Enter 发送 · Shift+Enter 换行🔥蹭个热点看看现在微博和抖音有什么热搜，挑几个适合我做二创的选题✍️写小红书文案帮我写一条小红书种草文案，主题先问我🎴做金句卡片把一句走心的话做成一张适合发朋友圈的金句卡片🎬口播脚本帮我写一条 60 秒的口播短视频脚本，主题先问我\n\n  \n\n"
+  },
+  {
+    "phase": "main",
+    "name": "stage:identity",
+    "ok": true,
+    "detail": "6R1vr1iDHL-xe5YypP1hD8VvzhT7j6dA0siF9oa_qiw"
+  },
+  {
+    "phase": "main",
+    "name": "worker_restart_no_replay",
+    "ok": true,
+    "detail": {
+      "old": "3b63a4eb858d541ed9f3ca20cdeee9458e1bd7338d935858c50f31db9d71687f",
+      "new": "a36d6a7a68cf294d074261f91a6e7c49edfd7d83cdacd9c89f99998d98a55941",
+      "hang": "interrupted"
+    }
+  },
+  {
+    "phase": "main",
+    "name": "worker_restart_session_resume",
+    "ok": true,
+    "detail": "n\": \"Existing directory to enter. Omit to read the current directory.\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"write\", \"description\": \"Create or fully replace a UTF-8 text file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_path\": {\"type\": \"string\", \"description\": \"Path to write, resolved by the filesystem backend. Provide `file_path` before `content` in the arguments.\"}, \"content\": {\"type\": \"string\", \"description\": \"Full UTF-8 text content to write.\"}, \"sandbox_permissions\": {\"type\": \"string\", \"description\": \"The narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.\", \"enum\": [\"workspace-write\", \"danger-full-access\"]}, \"justification\": {\"type\": \"string\", \"description\": \"Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user’s current request.\"}}, \"required\": [\"file_path\", \"content\"]}}}]}"
+  },
+  {
+    "phase": "main",
+    "name": "worker_restart_files",
+    "ok": true,
+    "detail": "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-0cbe360c\\main\\workspaces\\118b2539f80f4e3a999cfeb5647ece81\\workspace\\workspace-6a-sentinel.txt"
+  },
+  {
+    "phase": "main",
+    "name": "stage:worker_restart",
+    "ok": true,
+    "detail": null
+  },
+  {
+    "phase": "main",
+    "name": "invite_one_time",
+    "ok": true,
+    "detail": 401
+  },
+  {
+    "phase": "main",
+    "name": "logout_relogin",
+    "ok": true,
+    "detail": "fresh invite accepted"
+  },
+  {
+    "phase": "main",
+    "name": "stage:logout_invite",
+    "ok": true,
+    "detail": null
+  },
+  {
+    "phase": "main",
+    "name": "main_cleanup",
+    "ok": true,
+    "detail": []
+  },
+  {
+    "phase": "manual",
+    "name": "manual_policy_mode",
+    "ok": true,
+    "detail": "{\"mode\":\"manual\",\"automaticSubmission\":false}"
+  },
+  {
+    "phase": "manual",
+    "name": "manual_publish_rejected",
+    "ok": true,
+    "detail": "{\"code\":\"publishing_manual_only\",\"detail\":\"publishing_manual_only\",\"request_id\":\"3883aa391a8041ed835992675f7b730c\"}"
+  },
+  {
+    "phase": "manual",
+    "name": "manual_no_run",
+    "ok": true,
+    "detail": "0"
+  },
+  {
+    "phase": "manual",
+    "name": "manual_registered_restart",
+    "ok": true,
+    "detail": "network=easel-6a-manual-95c7cf02-control state=present\r\nvolume=easel-6a-manual-95c7cf02-control state=present\r\nvolume=easel-6a-manual-95c7cf02-keys state=present\r\nvolume=easel-6a-manual-95c7cf02-egress state=present\r\ncontrol=running healthy\r\ncontrol_port=50923 published=True\r\ncontrol_mounts=checked\r\nworkspace_keys=valid\r\nworkspace_config=valid\r\nworker_leases=\r\napi_health=ok\r\nadmission_barrier=barrier=none\r\negress=running healthy\r\negress_policy_mount=valid\r\nprovisioner_socket=present\r\nprovisioner_engine=default/4c5b9122-bd30-42bd-af1e-019c5053a914\r\nprovisioner_identity=ok\r\nversion_control_image=sha256:c6677fd8d1fc2dd3d69e8df1f698568f7b280990c2659558866629ac43c62308\r\nversion_worker_image=sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612\r\nversion_gateway_image=sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a\r\nversion_frontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1\r\nversion_config_sha256=53b310022e3ad7a928c260da8a4ef4f82b033fa40e898196a405aca309c06688\r\nversion_source_commit=4382180862e28d43f2974e32a618093c847ec262\r\nversion_harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317\r\nversion_project=easel-6a-manual-95c7cf02\r\nversion_publish_mode=manual\r\nlogs=C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\.test-tmp\\task6a-8f56fd24\\manual\\data\\logs\r\nversion_schema=14\r\nstatus=ok\r\n"
+  },
+  {
+    "phase": "manual",
+    "name": "manual_migration_required",
+    "ok": true,
+    "detail": "����publish_mode_migration_required\r\n"
+  },
+  {
+    "phase": "manual",
+    "name": "manual_cleanup",
+    "ok": true,
+    "detail": []
+  }
+]

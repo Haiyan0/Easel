@@ -1,0 +1,26 @@
+--- a/docs/linux-docker-operations.zh-CN.md
++++ b/docs/linux-docker-operations.zh-CN.md
+@@ -1,13 +1,13 @@
+ # Easel Linux Docker 部署与运维手册
+ 
+-适用：Ubuntu 24.04 LTS、Bash、Docker Engine。核对版本：`1a8811096c7c86bb9079a5c88b92cd225d1907b1`，2026-10-29。[Windows 多用户手册](windows-desktop-operations.zh-CN.md)。
++适用：Ubuntu 24.04 LTS、Bash、Docker Engine。核对版本：`51aacfb505d14e2e6b18498569ff8740bff6f51b`，2026-11-02。[Windows 多用户手册](windows-desktop-operations.zh-CN.md)。
+ 
+ ## 1. 先确认部署目标
+ 
+ - **单人自用**：第 2–7 节给出从新机到镜像、启动、SSH 访问、备份、升级与回滚的命令。local 模式没有多人认证，只监听回环地址，不直接开放公网。
+ - **多人服务器**：第 8 节起给出同一 control/provisioner/worker/gateway 架构的原生 Linux 装配与维护顺序。现有完整自动化入口是 Windows PowerShell + WSL；Linux 原生启停、身份登记、升级联锁还没有等价的已验收脚本。下文将可直接执行的准备命令与需要目标机工程接线的步骤分开，不把模板称为可直接生产上线。
+ 
+-Windows Desktop 功能验收不覆盖目标 Linux 的 XFS 配额、防火墙、IPv6、Chromium 沙箱、systemd 及真实 DeepSeek。正式 production-release 仍 blocked。若现在要自己完整验收多人功能，先用 Windows 路线；服务器上线前须补齐第 8–11 节的环境验证与生命周期装配，不能只运行参考 compose.yaml。
++Windows Desktop 功能验收不覆盖目标 Linux 的 XFS 配额、防火墙、IPv6、Chromium 沙箱、systemd 及真实 DeepSeek。正式 production-release 仍 blocked。本文不因 Windows 隔离演练改变 Linux 结论：XFS 配额、防火墙、IPv6、Chromium 默认 seccomp、systemd 与真实供应商仍为 not-run。若现在要自己完整验收多人功能，先用 Windows 路线；服务器上线前须补齐第 8–11 节的环境验证与生命周期装配，不能只运行参考 compose.yaml。
+ 
+ ## 2. 准备 Linux 主机和代码
+ 
+@@ -460,6 +460,7 @@
+ | EASEL_PROVISIONER_SOCKET | SOCKET |
+ | EASEL_PROVISIONER_GID | 10001，与宿主组一致 |
+ | EASEL_CONTROL_PORT | 7861，Compose 仅发布 127.0.0.1 |
++| EASEL_PUBLISH_MODE | `automated` 或 `manual`，必须与部署登记一致；缺失时 Compose 拒绝启动 |
+ 
+ 这些值保存为 `$OPS/multiuser.env`（不含 Key），完成初始化及身份检查后才执行：
+ 
