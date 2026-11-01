@@ -309,11 +309,11 @@ def test_chain_publish_success_records_calendar_once(chain):
             headers=_headers(csrf))
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["ok"] is True
-        assert body["state"] == "success"
-        assert body["calendarRecorded"] is True
+        assert body["async"] is True
+        assert body["state"] == "starting"
         status = _wait_status(client, PLATFORM, ("success",))
         assert status["runId"] == body["runId"]
+        assert status["calendarRecorded"] is True
         schedule = json.loads(
             (chain.outputs / "_schedule.json").read_text(encoding="utf-8"))
         assert len(schedule) == 1
@@ -385,12 +385,13 @@ def test_chain_unknown_result_is_not_success_or_calendar(chain):
             headers=_headers(csrf))
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["ok"] is False
-        assert body["state"] == "unknown"
+        assert body["async"] is True
+        status = _wait_status(client, PLATFORM, ("unknown",))
+        assert status["runId"] == body["runId"]
         assert not (chain.outputs / "_schedule.json").exists()
-        status = client.get(f"/api/publish/{PLATFORM}/status")
-        assert status.status_code == 200, status.text
-        assert status.json()["state"] == "unknown"
+        again = client.get(f"/api/publish/{PLATFORM}/status")
+        assert again.status_code == 200, again.text
+        assert again.json()["state"] == "unknown"
 
 
 def test_chain_stop_marks_unknown_and_does_not_replay(chain):

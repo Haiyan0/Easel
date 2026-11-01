@@ -32,14 +32,22 @@ def _archive_media_name(name: str) -> str:
 
 
 def _safe_destination(root: Path) -> Path:
-    """_publish/manual 必须是 outputs 内的真实目录，不能是根外链接。"""
-    destination = (root / "_publish" / "manual").resolve()
+    """_publish/manual 必须是 outputs 内的真实目录，不能是链接目录。"""
+    raw_publish = root / "_publish"
+    destination = (raw_publish / "manual").resolve()
     if destination == root or root not in destination.parents:
         raise ValueError("导出目录超出内容库")
-    destination.mkdir(parents=True, exist_ok=True)
-    resolved = destination.resolve()
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        resolved = destination.resolve()
+    except OSError:
+        raise ValueError("导出目录不可用") from None
     if resolved == root or root not in resolved.parents:
         raise ValueError("导出目录超出内容库")
+    # 链接/junction 即使在 outputs 内也会让返回的 _publish/... 路径与实际
+    # 文件不一致；首次创建时直接失败，避免生成不可下载的包。
+    if resolved.parent != raw_publish or resolved.name != "manual":
+        raise ValueError("导出目录不可用")
     if not resolved.is_dir():
         raise ValueError("导出目录不可用")
     return resolved

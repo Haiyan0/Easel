@@ -23,6 +23,7 @@ from easel.control.workspace_publishing import (
     canonical_export_path,
     canonical_media_path,
     canonical_platform,
+    export_task_key,
     publish_task_key,
 )
 
@@ -43,6 +44,7 @@ class FakeRelay:
         self.events_error: int | None = None
         self.submit_error: DomainError | None = None
         self.status_events: dict[str, list[dict]] = {}
+        self.message_log: list[dict] | None = None
         # 测试驱动：submit 时是否立即完成，以及完成内容。
         self.auto_state: str | None = None
         self.auto_result: object = None
@@ -95,6 +97,9 @@ class FakeRelay:
         })
 
     async def messages(self, actor, conversation_id, *, limit=100, offset=0):
+        if self.message_log is not None:
+            page = self.message_log[offset:offset + limit]
+            return {"messages": page, "total": len(self.message_log)}
         with Store.open(self.path) as store:
             run = store.latest_run_for_conversation(actor, conversation_id)
         if run is None:
@@ -340,11 +345,13 @@ def test_status_reads_only_current_run_events_and_never_legacy_state(tmp_path):
             assert cancelled.status_code == 200, cancelled.text
             assert cancelled.json()["state"] == "unknown"
             assert cancelled.json()["state"] != "success"
+            # 状态读取只走 Run 事件，不读取 worker 共享平台 status 文件。
+            assert _workspace.calls == []
     finally:
         store.close()
 
 
-def test_sync_publish_maps_success_unknown_and_error_without_resubmit(tmp_path):
+def test_async_publish_status_maps_success_unknown_and_error(tmp_path):
     store, _auth, _admin, member, _other, relay, workspace, app = _fixture(
         tmp_path)
     try:
@@ -356,26 +363,26 @@ def test_sync_publish_maps_success_unknown_and_error_without_resubmit(tmp_path):
                 "message": "发布成功", "calendarRecorded": True}
             success = await service.publish(
                 member, "zhihu", _publish_payload(), request_id="sync-1")
-            assert success["ok"] is True
-            assert success["state"] == "success"
-            assert success["calendarRecorded"] is True
+            assert success["async"] is True
+            assert success["state"] == "starting"
+            status = await service.status(member, "zhihu")
+            assert status["state"] == "success"
+            assert status["calendarRecorded"] is True
             assert len(relay.submissions) == 1
 
             relay.auto_result = {
                 "state": "unknown", "ok": False,
                 "message": "发布未确认，请到平台核对"}
-            unknown = await service.publish(
+            await service.publish(
                 member, "zhihu", _publish_payload(), request_id="sync-2")
-            assert unknown["ok"] is False
-            assert unknown["state"] == "unknown"
+            assert (await service.status(member, "zhihu"))["state"] == "unknown"
             assert len(relay.submissions) == 2
 
             relay.auto_result = {
                 "state": "error", "ok": False, "message": "发布失败"}
-            failed = await service.publish(
+            await service.publish(
                 member, "zhihu", _publish_payload(), request_id="sync-3")
-            assert failed["ok"] is False
-            assert failed["state"] == "error"
+            assert (await service.status(member, "zhihu"))["state"] == "error"
             assert len(relay.submissions) == 3
 
         asyncio.run(scenario())
@@ -417,6 +424,34 @@ def test_publish_sms_only_continues_own_current_pending_run(tmp_path):
         store.close()
 
 
+def test_result_reads_latest_page_of_long_task_conversation(tmp_path):
+    store, _auth, _admin, member, _other, relay, workspace, _app = _fixture(
+        tmp_path)
+    try:
+        async def scenario():
+            service = _service(store, relay, workspace)
+            conversation = store.get_or_create_task_conversation(
+                member, publish_task_key("zhihu"), "发布：zhihu")
+            run = store.reserve_run(
+                member, conversation.id, "long-run", "digest-long", 0)
+            store.finish_run(member, run.id, "done")
+            relay.message_log = [
+                {"role": "user", "content": f"old-{index}"}
+                for index in range(600)]
+            relay.message_log.append({
+                "role": "assistant", "runId": run.id,
+                "content": json.dumps({
+                    "state": "success", "ok": True, "message": "ok",
+                }, ensure_ascii=False),
+            })
+            value = await service._result(member, run)
+            assert value["state"] == "success"
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
 def test_manual_export_uses_owned_run_and_returns_unpublished_package(tmp_path):
     store, _auth, _admin, member, _other, relay, workspace, app = _fixture(
         tmp_path, publish_mode="manual")
@@ -443,6 +478,41 @@ def test_manual_export_uses_owned_run_and_returns_unpublished_package(tmp_path):
             assert descriptor["action"] == "manual-export"
             assert descriptor["platform"] == PLATFORM
             assert descriptor["reviewed"] is True
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_concurrent_export_for_same_platform_is_controlled(tmp_path):
+    store, _auth, _admin, member, _other, relay, workspace, _app = _fixture(
+        tmp_path)
+    try:
+        async def scenario():
+            service = _service(store, relay, workspace)
+            path = "_publish/manual/easel-xiaohongshu-0123456789ab.zip"
+            payload = {"title": "标题", "body": "正文", "tags": "",
+                       "media": [], "reviewed": True}
+            first = asyncio.create_task(service.manual_export(
+                member, PLATFORM, payload, request_id="export-a"))
+            while not relay.submissions:
+                await asyncio.sleep(0.005)
+            with pytest.raises(DomainError) as busy:
+                await service.manual_export(
+                    member, PLATFORM, payload, request_id="export-b")
+            assert busy.value.status == 409
+            assert busy.value.code == "export_busy"
+            with Store.open(store.path) as opened:
+                conversation = opened.get_task_conversation(
+                    member, export_task_key(PLATFORM))
+                run = opened.latest_run_for_conversation(
+                    member, conversation.id)
+            relay.finish(member, run.id, "done", {
+                "path": path, "filename": path.rsplit("/", 1)[-1],
+                "published": False})
+            result = await first
+            assert result["path"] == path
+            assert len(relay.submissions) == 1
 
         asyncio.run(scenario())
     finally:

@@ -489,10 +489,15 @@ def main() -> int:
                       "tags": "工具", "media": ["project/cover.png"],
                       "persona": "", "requestId": "container-publish-1"},
                 headers=headers)
-            assert published.status_code == 200, published.text
+            assert published.status_code == 200, (
+                published.status_code, published.text)
             result = published.json()
-            assert result["ok"] is True and result["state"] == "success", result
+            assert result["async"] is True and result["state"] == "starting", result
             run_id_1 = result["runId"]
+            published_status = wait_status(
+                client, "xiaohongshu", ("success",), headers)
+            assert published_status["runId"] == run_id_1, published_status
+            assert published_status["calendarRecorded"] is True
             assert wait_state(control_name, run_id_1, ("done",)) == "done"
             assert worker_counter(worker_name) == [run_id_1]
             proof = run([
@@ -501,6 +506,7 @@ def main() -> int:
             ]).stdout
             proof = json.loads(proof)
             assert proof["profile_used"] is True, proof
+            assert proof["profile_lock"] is True, proof
             assert proof["media"][0]["sha256"] == hashlib.sha256(PNG).hexdigest()
             schedule = run([
                 "docker", "exec", worker_name, "cat",
@@ -585,8 +591,12 @@ def main() -> int:
                       "requestId": "container-timeout"},
                 headers=headers)
             assert timed.status_code == 200, timed.text
-            assert timed.json()["state"] == "unknown", timed.text
-            assert timed.json()["message"].startswith("发布超时"), timed.text
+            timed_body = timed.json()
+            assert timed_body["async"] is True, timed_body
+            timed_status = wait_status(
+                client, "kuaishou", ("unknown",), headers, timeout=40)
+            assert timed_status["runId"] == timed_body["runId"], timed_status
+            assert timed_status["message"].startswith("发布超时"), timed_status
             assert active_runs(control_name) == 0
             assert "task5c3_controlled_publisher" not in top(worker_name)
             assert len(worker_counter(worker_name)) == 4
@@ -648,7 +658,7 @@ def main() -> int:
             "calendar_once": True, "douyin_sms_owner": True,
             "stop_release": True, "timeout_release": True,
             "status_recovery": True, "restart_no_replay": True,
-            "controlled_runner_executed": True,
+            "controlled_runner_executed": True, "profile_lock": True,
             "original_platform_scripts_executed": [],
             "substituted_entries": [
                 "xhs_publish.py", "douyin_publish.py", "web_publisher.py",

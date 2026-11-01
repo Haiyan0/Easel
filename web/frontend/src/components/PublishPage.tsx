@@ -331,9 +331,12 @@ export default function PublishPage({ persona }: PublishPageProps) {
     const restore = async () => {
       for (const key of draft0.platforms) {
         if (!PUBLISHABLE.has(key)) continue;
+        const runBefore = publishRuns.current[key] || '';
         try {
           const s = await data.publishStatus(key);
           if (!active) return;
+          // 恢复期间用户已开始新发布：旧状态不能覆盖新任务。
+          if ((publishRuns.current[key] || '') !== runBefore) continue;
           const runId = s.runId || '';
           if (runId) publishRuns.current[key] = runId;
           const label = PLATFORMS.find((p) => p.key === key)?.label || key;

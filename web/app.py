@@ -6105,16 +6105,34 @@ def _clean_publish_message(value: object, maximum: int = 2000) -> str:
     return text[:maximum]
 
 
+def _managed_public_status(state: object, message: object) -> str:
+    """只公开固定状态文案或受控短信提示，不把脚本路径/上游原文带给页面。"""
+    value = state if isinstance(state, str) and state else "unknown"
+    text = _clean_publish_message(message)
+    if value in ("sms_required", "verifying"):
+        return text or ("请输入验证码" if value == "sms_required"
+                        else "正在验证验证码…")
+    if value == "success":
+        return "发布成功"
+    if value == "error":
+        if any(word in text for word in
+               ("未确认", "未核验", "未知", "核对", "读回")):
+            return "发布未确认，请到平台核对。"
+        return "发布失败"
+    return "发布中…"
+
+
 def _managed_publish_result(platform: str, outcome: dict) -> dict:
     del platform
     status = outcome.get("status")
     status = status if isinstance(status, dict) else {}
-    message = _clean_publish_message(status.get("message"))
+    message = _managed_public_status(
+        status.get("state"), status.get("message"))
     state = status.get("state")
     if outcome.get("timed_out"):
         return {"state": "unknown", "ok": False,
                 "message": "发布超时，平台结果未知，请到平台核对，勿自动重发。"}
-    if outcome.get("returncode") == 0 or state == "success":
+    if state == "success":
         return {"state": "success", "ok": True,
                 "message": message or "发布成功"}
     if state == "error":
@@ -6124,6 +6142,12 @@ def _managed_publish_result(platform: str, outcome: dict) -> dict:
                     "message": message or "发布未确认，请到平台核对。"}
         return {"state": "error", "ok": False,
                 "message": message or "发布失败"}
+    if state in ("sms_required", "verifying"):
+        return {"state": "unknown", "ok": False,
+                "message": "发布未完成，平台结果未知，请到平台核对。"}
+    if outcome.get("returncode") == 0:
+        return {"state": "success", "ok": True,
+                "message": message or "发布成功"}
     if outcome.get("returncode") in (3, 5):
         return {"state": "unknown", "ok": False,
                 "message": message or "发布未确认，请到平台核对，勿自动重发。"}
@@ -6152,6 +6176,12 @@ async def _execute_managed_publish(
         deadline = time.monotonic() + timeout
         while True:
             current = _read_managed_status(status_file)
+            if current is not None:
+                current = {
+                    "state": current["state"],
+                    "message": _managed_public_status(
+                        current["state"], current["message"]),
+                }
             if current is not None and current != latest:
                 latest = current
                 emit("activity", json.dumps(
@@ -6248,6 +6278,8 @@ async def run_managed_manual_export(descriptor: dict, run_id: str,
             list(descriptor["media"]), descriptor.get("reviewed"))
     except ValueError as error:
         raise HTTPException(400, str(error)) from None
+    except OSError:
+        raise HTTPException(500, "导出包生成失败") from None
     try:
         relative = package.resolve().relative_to(
             OUTPUTS_DIR.resolve()).as_posix()

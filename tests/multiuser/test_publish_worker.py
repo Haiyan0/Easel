@@ -165,6 +165,18 @@ def test_managed_publish_success_records_calendar_once_and_hides_raw_output(
     assert calls and calls[0][0] == PLATFORM
 
 
+def test_managed_status_messages_do_not_leak_paths_or_upstream_text():
+    success = web._managed_public_status(
+        "success", "C:\\secret\\path upstream-raw")
+    unknown = web._managed_public_status(
+        "error", "C:\\secret\\path 发布未确认 upstream-raw")
+    assert success == "发布成功"
+    assert "secret" not in unknown and "upstream" not in unknown
+    assert "未确认" in unknown
+    assert web._managed_public_status(
+        "sms_required", "验证码不正确") == "验证码不正确"
+
+
 def test_managed_publish_rejects_unknown_or_unsafe_persona(outputs):
     _write(outputs, "project/cover.png", b"image")
     for persona in ("missing-profile", "../outside"):
@@ -189,6 +201,38 @@ def test_managed_publish_unverified_is_unknown_not_success(
     assert result["state"] == "unknown"
     assert result["ok"] is False
     assert result.get("calendarRecorded") is not True
+    assert not (outputs / "_schedule.json").exists()
+
+
+def test_managed_publish_status_error_is_not_success_even_if_rc_zero(
+        outputs, monkeypatch):
+    _write(outputs, "project/cover.png", b"image")
+
+    async def fake_process(*args, **kwargs):
+        return {"returncode": 0, "status": {
+            "state": "error", "message": "发布未确认成功"}}
+
+    monkeypatch.setattr(web, "_execute_managed_publish", fake_process)
+    result = json.loads(_run(web.run_managed_publish(
+        _publish_descriptor(), "run-status-error", lambda *args: None)))
+    assert result["state"] == "unknown"
+    assert result["ok"] is False
+    assert not (outputs / "_schedule.json").exists()
+
+
+def test_managed_publish_unfinished_sms_status_is_unknown(
+        outputs, monkeypatch):
+    _write(outputs, "project/cover.png", b"image")
+
+    async def fake_process(*args, **kwargs):
+        return {"returncode": 0, "status": {
+            "state": "sms_required", "message": "请输入验证码"}}
+
+    monkeypatch.setattr(web, "_execute_managed_publish", fake_process)
+    result = json.loads(_run(web.run_managed_publish(
+        _publish_descriptor(), "run-sms-open", lambda *args: None)))
+    assert result["state"] == "unknown"
+    assert result["ok"] is False
     assert not (outputs / "_schedule.json").exists()
 
 
@@ -267,7 +311,11 @@ def test_managed_publish_cancellation_cleans_staging_and_code_file(
     assert not (outputs / "_publish" / "runs" / "run-cancel").exists()
 
 
-def test_managed_export_writes_only_owned_package(outputs):
+def test_managed_export_writes_only_owned_package(outputs, monkeypatch):
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("export must not start a publisher/browser")
+
+    monkeypatch.setattr(web, "_execute_managed_publish", unexpected)
     _write(outputs, "project/cover.png", b"image-bytes")
     result = json.loads(_run(web.run_managed_manual_export(
         _export_descriptor(), "run-export", lambda *args: None)))
@@ -287,6 +335,21 @@ def test_managed_export_writes_only_owned_package(outputs):
         assert "secret-key" not in " ".join(names).lower()
 
 
+def test_managed_export_failure_preserves_previous_package(outputs):
+    _write(outputs, "project/cover.png", b"image")
+    first = json.loads(_run(web.run_managed_manual_export(
+        _export_descriptor(), "run-export-a", lambda *args: None)))
+    with pytest.raises(web.HTTPException):
+        _run(web.run_managed_manual_export(
+            _export_descriptor(media=["project/missing.png"]),
+            "run-export-b", lambda *args: None))
+    assert (outputs / first["path"]).is_file()
+    third = json.loads(_run(web.run_managed_manual_export(
+        _export_descriptor(), "run-export-c", lambda *args: None)))
+    assert third["path"] != first["path"]
+    assert (outputs / third["path"]).is_file()
+
+
 def test_managed_export_failure_leaves_no_partial_package(outputs):
     _write(outputs, "project/cover.png", b"image")
     with pytest.raises(web.HTTPException):
@@ -294,6 +357,15 @@ def test_managed_export_failure_leaves_no_partial_package(outputs):
             _export_descriptor(media=["project/missing.png"]),
             "run-missing", lambda *args: None))
     assert not list((outputs / "_publish" / "manual").glob("*.zip"))
+
+
+def test_managed_export_bad_storage_fails_controlled(outputs):
+    _write(outputs, "project/cover.png", b"image")
+    (outputs / "_publish").write_bytes(b"not-a-directory")
+    with pytest.raises(web.HTTPException) as error:
+        _run(web.run_managed_manual_export(
+            _export_descriptor(), "run-bad-storage", lambda *args: None))
+    assert error.value.status_code in (400, 500)
 
 
 def test_manifest_and_media_do_not_leak_absolute_paths(outputs):
@@ -320,6 +392,19 @@ def test_export_package_download_is_a_narrow_media_exception(outputs):
         other.write_bytes(b"private")
         blocked = client.get("/api/media/_publish/manual/other.zip")
         assert blocked.status_code == 403, blocked.text
+
+
+def test_build_package_rejects_linked_export_directory_inside_outputs(outputs):
+    target = outputs / "other"
+    target.mkdir()
+    if not _directory_link(outputs / "_publish", target):
+        pytest.skip("当前环境不允许创建目录链接")
+    _write(outputs, "project/cover.png", b"image")
+    with pytest.raises(ValueError):
+        web.build_package(
+            outputs, PLATFORM, "标题", "正文", "", ["project/cover.png"],
+            True)
+    assert not list(target.rglob("*.zip"))
 
 
 def test_build_package_rejects_export_directory_escaping(outputs):

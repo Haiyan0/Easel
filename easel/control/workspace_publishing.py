@@ -62,7 +62,6 @@ EXPORT_PATH = _EXPORT_PATH
 
 _TERMINAL = frozenset({"done", "failed", "interrupted", "cancelled"})
 _ACTIVE = frozenset({"reserved", "running", "awaiting_permission"})
-_PUBLISH_TIMEOUT = 930.0
 _EXPORT_TIMEOUT = 600.0
 _POLL_GRACE = 0.2
 _MAX_TRANSIENT = 5
@@ -374,6 +373,12 @@ class WorkspacePublishing:
         try:
             data = await relay.messages(
                 actor, run.conversation_id, limit=500, offset=0)
+            # 任务会话是长期累积的；结果可能在最新一页，不能只读最旧 500 条。
+            total = data.get("total") if isinstance(data, dict) else None
+            if type(total) is int and total > 500:
+                data = await relay.messages(
+                    actor, run.conversation_id, limit=500,
+                    offset=total - 500)
         except DomainError:
             raise DomainError("publish_result_unavailable", 502) from None
         messages = data.get("messages") if isinstance(data, dict) else None
@@ -392,10 +397,8 @@ class WorkspacePublishing:
                     "publish_result_invalid", 502) from None
         raise DomainError("publish_result_unavailable", 502)
 
-    async def _wait_result(self, actor: Identity, run, action: str):
-        timeout = _EXPORT_TIMEOUT if action == "manual-export" \
-            else _PUBLISH_TIMEOUT
-        deadline = self._clock() + timeout
+    async def _wait_result(self, actor: Identity, run):
+        deadline = self._clock() + _EXPORT_TIMEOUT
         transient = 0
         while True:
             try:
@@ -440,10 +443,6 @@ class WorkspacePublishing:
             result["calendarError"] = _clean_message(value["calendarError"])
         return result
 
-    def _unknown(self, run_id: str, message: str) -> dict:
-        return {"ok": False, "state": "unknown", "message": message,
-                "runId": run_id}
-
     # ------------------------------------------------------------------
     # 自动发布
     # ------------------------------------------------------------------
@@ -461,19 +460,13 @@ class WorkspacePublishing:
         _admission, run = await self._join_or_submit(
             actor, key, f"发布：{platform}", "publish", descriptor,
             request_id, busy_code="publish_busy")
-        if platform == "douyin":
-            # 异步发布：接纳成功只表示“已启动”，真正结果由轮询当前 Run。
-            return {
-                "async": True, "pending": True,
-                "message": "发布已启动，请稍候…",
-                "state": "starting", "runId": run.id,
-            }
-        value = await self._wait_result(actor, run, "publish")
-        if value is None:
-            return self._unknown(
-                run.id, "发布任务已结束但未返回结果；平台结果未知，"
-                        "请到平台核对，勿自动重发。")
-        return self._result_view(value, run.id)
+        # 所有平台统一“先接纳、后轮询”：HTTP 断连/超时不会让客户端失去
+        # 当前离线 Run，刷新或状态查询仍能定位原任务，避免重复外部动作。
+        return {
+            "async": True, "pending": True,
+            "message": "发布已启动，请稍候…",
+            "state": "starting", "runId": run.id,
+        }
 
     async def _terminal_status(self, actor: Identity, run,
                                status: str) -> dict:
@@ -485,16 +478,8 @@ class WorkspacePublishing:
                 value = None
             if isinstance(value, dict) and value.get(
                     "state") in _TERMINAL_PUBLISH_STATES:
-                view = {"mode": "publish",
-                        "state": str(value["state"]),
-                        "message": _clean_message(value.get("message")),
-                        "runId": run.id}
-                if isinstance(value.get("calendarRecorded"), bool):
-                    view["calendarRecorded"] = value["calendarRecorded"]
-                if isinstance(value.get("calendarError"), str):
-                    view["calendarError"] = _clean_message(
-                        value["calendarError"])
-                return view
+                return {"mode": "publish",
+                        **self._result_view(value, run.id)}
         message = {
             "cancelled": "发布任务已停止，平台结果未知，请到平台核对。",
             "interrupted": "发布任务中断，平台结果未知，请到平台核对。",
@@ -570,7 +555,7 @@ class WorkspacePublishing:
         _admission, run = await self._join_or_submit(
             actor, key, f"导出稿件：{platform}", "publish", descriptor,
             request_id, busy_code="export_busy")
-        value = await self._wait_result(actor, run, "manual-export")
+        value = await self._wait_result(actor, run)
         if value is None:
             raise DomainError("export_failed", 502)
         if not isinstance(value, dict) or value.get("published") is not False:

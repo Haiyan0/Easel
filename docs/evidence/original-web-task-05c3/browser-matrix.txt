@@ -65,14 +65,6 @@ Traceback (most recent call last):
   File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
     raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
 playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
-Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
-handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
-Traceback (most recent call last):
-  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
-    self._context.run(self._callback, *self._args)
-  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
-    self._sock.shutdown(socket.SHUT_RDWR)
-ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
 Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
 handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
 Traceback (most recent call last):

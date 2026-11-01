@@ -43,6 +43,8 @@ def _count(path: Path, run: str) -> int:
 
 def _publish(args: argparse.Namespace) -> int:
     from playwright.sync_api import sync_playwright
+    sys.path.insert(0, "/opt/easel/skills/shared/scripts")
+    from browser_state import ProfileLock
 
     media = [Path(item) for item in args.media]
     for path in media:
@@ -55,7 +57,7 @@ def _publish(args: argparse.Namespace) -> int:
     counter_file = Path(args.counter_file)
     count = _count(counter_file, proof_file.stem)
     profile = _profile(args.profile_name)
-    with sync_playwright() as playwright:
+    with ProfileLock(profile), sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             str(profile),
             headless=True,
@@ -78,6 +80,7 @@ def _publish(args: argparse.Namespace) -> int:
                 } for path in media],
                 "profile": str(profile),
                 "profile_used": ready == "ready",
+                "profile_lock": True,
                 "published": False,
                 "run": proof_file.stem,
             })

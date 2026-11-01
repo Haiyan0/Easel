@@ -1,14 +1,14 @@
 ........................................................................ [ 16%]
-..................s..................................................... [ 33%]
-........................................................................ [ 49%]
-........................................................................ [ 66%]
-........................................................................ [ 82%]
-........................................................................ [ 99%]
-....                                                                     [100%]
+..........................s............................................. [ 32%]
+........................................................................ [ 48%]
+........................................................................ [ 64%]
+........................................................................ [ 81%]
+........................................................................ [ 97%]
+............                                                             [100%]
 ============================== warnings summary ===============================
 tests/multiuser/test_publish_worker.py::test_media_staging_copies_into_run_dir_and_rejects_escape
   C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-8 (_readerthread)
-  
+
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
       self.run()
@@ -19,86 +19,14 @@ tests/multiuser/test_publish_worker.py::test_media_staging_copies_into_run_dir_a
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
       (result, consumed) = self._buffer_decode(data, self.errors, final)
   UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 214: invalid start byte
-  
+
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
-tests/multiuser/test_publish_worker.py::test_build_package_rejects_export_directory_escaping
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-23 (_readerthread)
-  
-  Traceback (most recent call last):
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
-      self.run()
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
-      self._target(*self._args, **self._kwargs)
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
-      buffer.append(fh.read())
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
-      (result, consumed) = self._buffer_decode(data, self.errors, final)
-  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 216: invalid start byte
-  
-  Enable tracemalloc to get traceback where the object was allocated.
-  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
-    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+tests/multiuser/test_publish_worker.py::test_build_package_rejects_linked_export_directory_inside_outputs
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-29 (_readerthread)
 
-tests/multiuser/test_original_web_api.py::test_persona_links_cannot_read_or_mutate_outside_profiles
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-47 (_readerthread)
-  
-  Traceback (most recent call last):
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
-      self.run()
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
-      self._target(*self._args, **self._kwargs)
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
-      buffer.append(fh.read())
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
-      (result, consumed) = self._buffer_decode(data, self.errors, final)
-  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xcd in position 104: invalid continuation byte
-  
-  Enable tracemalloc to get traceback where the object was allocated.
-  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
-    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
-
-tests/multiuser/test_original_web_api.py::test_symlink_or_junction_inside_outputs_is_rejected
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-49 (_readerthread)
-  
-  Traceback (most recent call last):
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
-      self.run()
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
-      self._target(*self._args, **self._kwargs)
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
-      buffer.append(fh.read())
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
-      (result, consumed) = self._buffer_decode(data, self.errors, final)
-  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xcf in position 103: invalid continuation byte
-  
-  Enable tracemalloc to get traceback where the object was allocated.
-  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
-    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
-
-tests/multiuser/test_original_web_api.py::test_workbench_outputs_junction_is_rejected_before_first_write
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-61 (_readerthread)
-  
-  Traceback (most recent call last):
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
-      self.run()
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
-      self._target(*self._args, **self._kwargs)
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
-      buffer.append(fh.read())
-    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
-      (result, consumed) = self._buffer_decode(data, self.errors, final)
-  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 213: invalid start byte
-  
-  Enable tracemalloc to get traceback where the object was allocated.
-  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
-    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
-
-tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-71 (_readerthread)
-  
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
       self.run()
@@ -109,13 +37,103 @@ tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
       (result, consumed) = self._buffer_decode(data, self.errors, final)
   UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 222: invalid start byte
-  
+
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/multiuser/test_publish_worker.py::test_build_package_rejects_export_directory_escaping
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-31 (_readerthread)
+
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
+      buffer.append(fh.read())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
+      (result, consumed) = self._buffer_decode(data, self.errors, final)
+  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 216: invalid start byte
+
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/multiuser/test_original_web_api.py::test_persona_links_cannot_read_or_mutate_outside_profiles
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-55 (_readerthread)
+
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
+      buffer.append(fh.read())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
+      (result, consumed) = self._buffer_decode(data, self.errors, final)
+  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xcd in position 104: invalid continuation byte
+
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/multiuser/test_original_web_api.py::test_symlink_or_junction_inside_outputs_is_rejected
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-57 (_readerthread)
+
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
+      buffer.append(fh.read())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
+      (result, consumed) = self._buffer_decode(data, self.errors, final)
+  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xcf in position 103: invalid continuation byte
+
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/multiuser/test_original_web_api.py::test_workbench_outputs_junction_is_rejected_before_first_write
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-69 (_readerthread)
+
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
+      buffer.append(fh.read())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
+      (result, consumed) = self._buffer_decode(data, self.errors, final)
+  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 213: invalid start byte
+
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-79 (_readerthread)
+
+  Traceback (most recent call last):
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
+      self.run()
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 953, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\subprocess.py", line 1515, in _readerthread
+      buffer.append(fh.read())
+    File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
+      (result, consumed) = self._buffer_decode(data, self.errors, final)
+  UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 222: invalid start byte
+
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-435 passed, 1 skipped, 6 warnings in 30.89s
+443 passed, 1 skipped, 7 warnings in 28.43s
 ..........................................................s............. [ 21%]
 ........................................................................ [ 43%]
 ........................................................................ [ 64%]
@@ -124,7 +142,7 @@ tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
 ============================== warnings summary ===============================
 tests/multiuser/test_worker_skills_profile.py::test_profile_baseline_rejects_link_target_before_write
   C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-31 (_readerthread)
-  
+
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
       self.run()
@@ -135,10 +153,10 @@ tests/multiuser/test_worker_skills_profile.py::test_profile_baseline_rejects_lin
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\codecs.py", line 322, in decode
       (result, consumed) = self._buffer_decode(data, self.errors, final)
   UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 215: invalid start byte
-  
+
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-333 passed, 1 skipped, 1 warning in 16.27s
+333 passed, 1 skipped, 1 warning in 14.75s

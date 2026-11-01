@@ -24,6 +24,7 @@
   - 策略来自 `ControlConfig.publish_mode`（CLI `--publish-mode`，默认 `automated`），不从 worker/宿主 `.env` 读取；成员无写入口。
   - 发布/导出统一走 `Store.reserve_run`、WorkerRelay、签名快照、RunManager、容量与终态。
   - 同平台在途 Run 只允许同 `requestId` 加入；不同请求 409，不开启第二次外部动作。
+  - 所有平台统一“先接纳、后轮询状态”：HTTP 断连/超时/刷新仍能定位当前 Run，避免重复外部动作。
   - 状态只读取当前 Run 自己的 `browser_status` 事件；done 才读结果，取消/中断/失败/未知明确返回 `unknown`，不伪造 success。
   - 短信验证码只交给当前本人平台 Run 且该 Run 处于 `sms_required`。
   - 导出结果必须是 `published=false` 的精确包路径。
@@ -39,7 +40,7 @@
   - `_execute_managed_publish` 轮询本次 Run 自己的状态文件，取消/超时按进程树终止；
   - 成功后才记录一次日历；日历失败与平台成功分别返回；
   - 日志只写 platform/run/state，不写标题/正文/路径/凭证/上游原文；
-  - 抖音验证码文件按 Run 注册，共享 `_publish/<platform>.code` 不再承载受管新任务。
+  - 抖音验证码文件按 Run 注册，共享 `_publish/<platform>.code` 不再承载受管新任务；发布状态/短信只读当前 Run。
 - `easel/manual_publish.py`：导出目录必须 resolve 在 outputs 内；ZIP 内媒体名净化；失败只清理本次包。
 
 ### 前端
@@ -72,11 +73,11 @@ node --test tests/frontend/publishWorkspaceData.test.mjs tests/frontend/publishi
 # tests/multiuser/test_publish_worker.py
 # tests/multiuser/test_task5c3_chain.py
 # 以及 5A/5B/5C1/5C2 受影响后端回归
-435 passed, 1 skipped
+443 passed, 1 skipped
 333 passed, 1 skipped
 ```
 
-原始输出：[backend-tests.txt](backend-tests.txt)。两批文件不重叠，共 **768 passed、2 skipped**。
+原始输出：[backend-tests.txt](backend-tests.txt)。两批文件不重叠，共 **776 passed、2 skipped**。
 
 ```powershell
 node --test tests/frontend/*.test.mjs
@@ -86,7 +87,7 @@ node --test tests/frontend/*.test.mjs
 原始输出：[node-tests.txt](node-tests.txt)。
 
 ```powershell
-npm --prefix web/frontend run build   # 退出 0，index-CQL1AorK.js
+npm --prefix web/frontend run build   # 退出 0，index-DXvNQgIN.js
 npm --prefix web/frontend run lint    # 退出 0
 ```
 
@@ -121,11 +122,11 @@ npm --prefix web/frontend run lint    # 退出 0
 原始输出：[container-chain.txt](container-chain.txt)。
 
 - 增量构建三个镜像（基于 5C2 已验收镜像，不无缓存重建全栈）：
-  - control `sha256:63b454bde6a46700b7e668ee658883ec72e9aea712a147c2c44f96cd13ed1529`
-  - gateway `sha256:a26875d694d00a75e44162f11950157b27b47fff01eb50e62edb849c2beac63f`
-  - worker `sha256:eb6c8f8de303654c1a39e5997a0af93f0bd0da0f3f2913991745b9816406e7ef`
+  - control `sha256:bd5cbcce5b4dbbedd87d1e11efa25dd57ac79422a22f8c2ebf9faa2be9d2368d`
+  - gateway `sha256:1f0dcc60feecb816d492dd685b9b85bd353add28d16d30293ab89737da7ded06`
+  - worker `sha256:55c9482fbb21107fefb2b0829053f7dc8c133535779114a48dc3c7b8faadbd2b`
 - 镜像内源码/前端哈希与当前源码一致（见 container-chain.txt 的 `SOURCE_HASH`）。
-- 真实层：固定身份/签名、control/gateway/worker、Gateway、WorkspaceApi、WorkerRelay、RunManager、受管发布执行器、镜像内受控发布子进程 + Playwright Chromium、真实 ZIP 导出/下载、进程树取消、worker 重启。
+- 真实层：固定身份/签名、control/gateway/worker、Gateway、WorkspaceApi、WorkerRelay、RunManager、受管发布执行器、镜像内受控发布子进程 + Playwright Chromium + `browser_state.ProfileLock`、真实 ZIP 导出/下载、进程树取消、worker 重启。
 - 替身层：原平台脚本未执行；`xhs_publish.py`、`douyin_publish.py`、`web_publisher.py`、`weixin_mp_stats.py`、`biliup` 单项列为 substituted，不声称真实平台通过。
 - 检查项全部 true：导出下载/解包、一次提交、日历一次、抖音短信归属、停止释放、超时释放、查询失败恢复、重启不重放、受控 runner 实际执行。
 - 清理按标签归属删除容器/网络/卷，`CLEANUP_ERRORS []`；未操作运行中用户实例。
@@ -141,7 +142,11 @@ npm --prefix web/frontend run lint    # 退出 0
 - Task3：33/33 通过。
 - Task4：8/8 通过。
 
-## 7. 未执行/边界
+## 7. 部署迁移注意
+
+原策略来自 worker/宿主 `.env` 的 `EASEL_PUBLISH_MODE`；5C3 明确不读取它代替受管策略。control 新增 `--publish-mode automated|manual`（默认 `automated`，保留原默认）。**曾把 worker `EASEL_PUBLISH_MODE` 配成 `manual` 的现有部署，升级时必须显式给 control 传 `--publish-mode manual`**，否则 control 会按默认自动策略工作。成员没有修改策略的入口；策略变更由管理员重新部署/配置 control。
+
+## 8. 未执行/边界
 
 - 未执行真实平台发布、真实短信、真实账号扫码/凭证、真实付费模型；只使用受控本地平台/受控发布 runner。
 - 受控平台成功不等于真实平台通过；真实发布/收费/账号状态变化需用户另行授权。
@@ -150,11 +155,11 @@ npm --prefix web/frontend run lint    # 退出 0
 - 未操作/复制用户运行容器、卷、socket、Key、Cookie、邀请、HOME 或真实账号状态；未合并、未推送、未部署。
 - Playwright Windows 关闭回调 `WinError 10054` 为既有运行噪声；前端 chunk >500kB 为既有构建警告。
 
-## 8. 测试调整记录
+## 9. 测试调整记录
 
 `tests/multiuser/test_task5c2_chain.py` 在批量顺序下会出现“浏览器状态事件已 success，但 control 账本尚未落 done”的短窗口。测试改为有界等待终态（最多 5s），不改变产品逻辑；单独复跑原测试仍通过。此调整属于测试时序健壮性，不改变 5C2 验收结论。
 
-## 9. 文件职责
+## 10. 文件职责
 
 | 文件 | 职责 |
 |---|---|

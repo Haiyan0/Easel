@@ -1,26 +1,26 @@
 BUILD control
 BUILD gateway
 BUILD worker
-CONTAINER_IMAGE control sha256:63b454bde6a46700b7e668ee658883ec72e9aea712a147c2c44f96cd13ed1529
-CONTAINER_IMAGE gateway sha256:a26875d694d00a75e44162f11950157b27b47fff01eb50e62edb849c2beac63f
-CONTAINER_IMAGE worker sha256:eb6c8f8de303654c1a39e5997a0af93f0bd0da0f3f2913991745b9816406e7ef
-SOURCE_HASH control easel/control/workspace_publishing.py b6b62869dc89fe53df59da6754650dc79d75792e71308adae3fd7ffd30ca3752
+CONTAINER_IMAGE control sha256:bd5cbcce5b4dbbedd87d1e11efa25dd57ac79422a22f8c2ebf9faa2be9d2368d
+CONTAINER_IMAGE gateway sha256:1f0dcc60feecb816d492dd685b9b85bd353add28d16d30293ab89737da7ded06
+CONTAINER_IMAGE worker sha256:55c9482fbb21107fefb2b0829053f7dc8c133535779114a48dc3c7b8faadbd2b
+SOURCE_HASH control easel/control/workspace_publishing.py c62a94c2ebe3ca9076714f354fd4e434c69e00356720f70b5499666231394f32
 SOURCE_HASH control easel/control/app.py 312c36810b68a30da3e2ff7d798c6e10dae5b8658447a9c13b1cec59948222e0
 SOURCE_HASH control easel/control/tasks.py ce65dfa19a30ad7a707acd66e9ee61bd68c0a4cb95b26f9a97971c662f5dacfd
 SOURCE_HASH control easel/control/proxy.py 75badc104569868840835057277f0ac315af76f7be5e30a44395afcb6c10319c
-SOURCE_HASH control easel/manual_publish.py bd250f5d066932252cfc5270f91bf26d98897ef3a7274beed1fc1d87ef816df4
+SOURCE_HASH control easel/manual_publish.py 6c8648d7299e1dad33ec7a0fcee71a4dce0048aa8901c8874f44e7a980d6937e
 SOURCE_HASH gateway easel/gateway/app.py 96f71488fd8332441452fb4d16142a674004e360bf1eabef575232e8c1b9a464
 SOURCE_HASH worker easel/worker/browser_tasks.py 007ff68315e4eacb98e531fb66998280dfa7a28b85d0c8a428b55403020e1109
-SOURCE_HASH worker easel/manual_publish.py bd250f5d066932252cfc5270f91bf26d98897ef3a7274beed1fc1d87ef816df4
-SOURCE_HASH worker web/app.py bdbc78dce9eb893124effa7a2076f9896ffd264ba045c2d6628150ca2b5413af
-SOURCE_HASH control web/frontend/dist/assets/index-CQL1AorK.js eb4fa3d0a83d2c26dae96c55e838e2e3d5d7f6a7591680244e7eb70faf13e381
-EXPORT _publish/manual/easel-xiaohongshu-90f8f652f986.zip
-PUBLISH_ONCE 8948014195a34c639bd8df0b0582df55
-DOUYIN_SMS b1b6fc5881a94d00a6c948fec02300bf
-STOP_RELEASE 08fad8c1d4b340769d86383348a07b0b
+SOURCE_HASH worker easel/manual_publish.py 6c8648d7299e1dad33ec7a0fcee71a4dce0048aa8901c8874f44e7a980d6937e
+SOURCE_HASH worker web/app.py d0a1e5c4b40818317b9eac3d1291dc5d831c00e06a521063834d5b4fd53ca82a
+SOURCE_HASH control web/frontend/dist/assets/index-DXvNQgIN.js 50e38c3b83ab6ef9856e1d2f18637be1b78a45089555140939e9b6c401020a28
+EXPORT _publish/manual/easel-xiaohongshu-57f70959d02c.zip
+PUBLISH_ONCE 69c370b3c7e24627acb9d755f79ab7da
+DOUYIN_SMS 0804d88e8a544b2cae72fc1302d03828
+STOP_RELEASE 1e68ae1c22ef43649e3a104dfe3bf97e
 TIMEOUT_RELEASE True
-STATUS_RECOVERY b9f4a0b194c24bf99d47bdc69a13a2bf
+STATUS_RECOVERY 7b80635816fc42ff925dc24e23260ee0
 RESTART_NO_REPLAY True
-CONTAINER_CHECKS {"export_download_unpack": true, "publish_once": true, "calendar_once": true, "douyin_sms_owner": true, "stop_release": true, "timeout_release": true, "status_recovery": true, "restart_no_replay": true, "controlled_runner_executed": true, "original_platform_scripts_executed": [], "substituted_entries": ["xhs_publish.py", "douyin_publish.py", "web_publisher.py", "weixin_mp_stats.py", "biliup"]}
+CONTAINER_CHECKS {"export_download_unpack": true, "publish_once": true, "calendar_once": true, "douyin_sms_owner": true, "stop_release": true, "timeout_release": true, "status_recovery": true, "restart_no_replay": true, "controlled_runner_executed": true, "profile_lock": true, "original_platform_scripts_executed": [], "substituted_entries": ["xhs_publish.py", "douyin_publish.py", "web_publisher.py", "weixin_mp_stats.py", "biliup"]}
 TASK5C3_CONTAINER_OK True
 CLEANUP_ERRORS []
