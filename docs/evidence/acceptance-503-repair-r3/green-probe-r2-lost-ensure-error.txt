@@ -1,0 +1,13 @@
+temporary_resources_removed=true
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r2_lost_ensure_error.py", line 165, in <module>
+    main()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r2_lost_ensure_error.py", line 157, in main
+    result = asyncio.run(run_probe(fixtures, temporary_root))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r2_lost_ensure_error.py", line 140, in run_probe
+    assert first_state == {"state": "ready", "gateway_is_old": True,
+AssertionError: {'first_error': 'provisioner_timeout', 'after_failure': {'state': 'starting', 'gateway_is_old': True, 'pending_attempt_id': ''}, 'reopened_retry_errors': [None, 'provisioner_timeout'], 'reopened_states': [{'state': 'ready', 'gateway_is_old': False, 'pending_attempt_id': ''}, {'state': 'ready', 'gateway_is_old': False, 'pending_attempt_id': ''}], 'attempt_status': 'pending', 'attempt_gateway_is_replacement': True, 'physical_gateway_ensure_calls': 2, 'resolve_calls': 1}

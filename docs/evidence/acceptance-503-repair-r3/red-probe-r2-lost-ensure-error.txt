@@ -1,0 +1,31 @@
+attempt 收口失败，保留 ready 并等待下次重试 workspace=7ae979a1a2f3452e8e98541f8eef9658
+attempt 收口失败，保留 ready 并等待下次重试 workspace=7ae979a1a2f3452e8e98541f8eef9658
+{
+  "first_error": "provisioner_timeout",
+  "after_failure": {
+    "state": "ready",
+    "gateway_is_old": true,
+    "pending_attempt_id": ""
+  },
+  "reopened_retry_errors": [
+    "gateway_cleanup_pending",
+    "gateway_cleanup_pending"
+  ],
+  "reopened_states": [
+    {
+      "state": "ready",
+      "gateway_is_old": true,
+      "pending_attempt_id": ""
+    },
+    {
+      "state": "ready",
+      "gateway_is_old": true,
+      "pending_attempt_id": ""
+    }
+  ],
+  "attempt_status": "pending",
+  "attempt_gateway_is_replacement": true,
+  "physical_gateway_ensure_calls": 1,
+  "resolve_calls": 0
+}
+temporary_resources_removed=true

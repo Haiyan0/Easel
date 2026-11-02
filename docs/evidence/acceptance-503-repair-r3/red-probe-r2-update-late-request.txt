@@ -1,0 +1,4 @@
+before_update_start={"activeLeases": [{"state": "ready", "workspaceId": "247bf7059d854606bc7708e2c6e450f4"}], "activeRequests": 0, "activeRuns": 0, "settled": false}
+after_update_start={"activeLeases": [{"state": "ready", "workspaceId": "247bf7059d854606bc7708e2c6e450f4"}], "activeRequests": 1, "activeRuns": 0, "settled": false}
+upstream_started_after_barrier=true
+temporary_resources_cleaned=true
