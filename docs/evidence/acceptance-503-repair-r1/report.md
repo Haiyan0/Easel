@@ -14,7 +14,7 @@ Cookie 或容器；未执行真实模型/平台；未合并、未推送。
 | 项 | 处置 | 关闭依据 |
 |---|---|---|
 | R1-01 P1 接管前关闭清理承诺 | 交接 CAS 前禁止任何 attempt 收口；新增 `pending_attempt_id` 持久 fencing；`committed`/`completed` 状态拆分；空 attempt 一律拒绝 | `probe-pre-takeover.txt`；`test_attempt_ownership_503.py`；隔离旧→新恢复 |
-| R1-02 P1 新 provisioner 不生效 | Start 身份加入实际源码摘要与动作能力；新增受控 `Update-WorkspaceEasel.ps1`：屏障→精确 PID 重启→新 control→核验→resume | `e2e-run.log` 的复用复现、进程身份、首屏/聊天/Stop→Backup→Verify |
+| R1-02 P1 新 provisioner 不生效 | Start 身份加入实际源码摘要与动作能力；新增受控 `Update-WorkspaceEasel.ps1`：屏障→精确 PID 重启→新 control→核验→resume | `e2e-run.txt` 的复用复现、进程身份、首屏/聊天/Stop→Backup→Verify |
 | R1-03 P2 Stop 模板参数 | `commands.md` 删除 `-WorkspaceRoot`；Stop GID 从登记身份读取；全部正式命令使用实际 Distro/GID 与显式执行策略；参数契约测试 | `probe-rollout-parameters.txt`；`test_desktop_command_contract.py` |
 | R1-04 P2 commit 超预算 | commit 接收本次 deadline；剩余预算不足时延后到下一次 ready；接管恢复的 commit 失败关闭；缓存按 attempt | `probe-commit-budget.txt`；`test_runtime_gateway.py` 预算/重试用例 |
 
@@ -176,7 +176,7 @@ R1_VERIFY verified=/backup version=2 schema_version=15
 R1_UPDATE_E2E_PASS
 ```
 
-完整原始输出见 `e2e-run.log`，机器可读摘要见 `e2e-result.json`。
+完整原始输出见 `e2e-run.txt`，机器可读摘要见 `e2e-result.json`。
 更新前后 worker ID 相同、gateway 已替换、managed 实例集合与 attempt 文件
 哈希未变、Key/policy 指纹未变；屏障只在全部核验后 resume。
 
