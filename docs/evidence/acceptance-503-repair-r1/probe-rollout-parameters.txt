@@ -1,0 +1,1 @@
+﻿{"stop_parameters": ["ProjectName", "Distro", "WslRepo", "DataRoot", "LockTimeoutSeconds", "Force"], "report_stop_workspace_root_supported": false}
