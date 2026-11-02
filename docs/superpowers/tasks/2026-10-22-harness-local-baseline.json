@@ -1,0 +1,51 @@
+{
+  "recorded_date": "2026-10-22",
+  "easel_baseline_commit": "8ad817af072710333a52d1b669cb9a65f65a8d70",
+  "status": "local-existing-baseline-linux-candidate-not-release-approved",
+  "release_approved": false,
+  "acp_config_path": "C:/Code/Easel/outputs/_harness/acp.json",
+  "harness": {
+    "local_repository": "C:/Users/hyh/Desktop/deepseek-harness",
+    "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
+    "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+    "working_tree_clean": true,
+    "package_version": "0.2.1-rc.2",
+    "node_engines": "^22.19.0 || >=24.0.0",
+    "local_node_version": "24.13.0",
+    "package_manager": "pnpm@11.28.5",
+    "lockfile": "pnpm-lock.yaml",
+    "local_command": [
+      "C:/Program Files/nodejs/node.exe",
+      "C:/Users/hyh/Desktop/deepseek-harness/apps/cli/lib/bin.js",
+      "--profile",
+      "acp"
+    ],
+    "linux_candidate_command": [
+      "node",
+      "/opt/dsh/apps/cli/lib/bin.js",
+      "--profile",
+      "acp"
+    ],
+    "public_profile_bundles": [
+      "@deepseek-ai/dsh-base",
+      "@deepseek-ai/dsh-acp-app"
+    ],
+    "copy_local_home_or_secrets": false,
+    "linux_harness_validated": false
+  },
+  "docker": {
+    "context": "desktop-linux",
+    "engine_version": "29.2.1",
+    "os_type": "linux",
+    "architecture": "x86_64",
+    "storage_driver": "overlayfs"
+  },
+  "evidence": {
+    "local_config_read": true,
+    "git_revision_and_clean_state_checked": true,
+    "profile_manifest_bundle_names_checked": true,
+    "model_request_performed_this_turn": false,
+    "linux_image_built_this_turn": false,
+    "secrets_included": false
+  }
+}

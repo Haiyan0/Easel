@@ -1,0 +1,17 @@
+{
+  "recorded_date": "2026-10-29",
+  "timezone": "Asia/Shanghai",
+  "source_head": "1a8811096c7c86bb9079a5c88b92cd225d1907b1",
+  "project": "easel-desktop-multi",
+  "purpose": "用户当前运行实例的只读盘点；作为保护对象和后续对照，不是本轮测试资源",
+  "containers": [
+    {"role":"control","name":"easel-desktop-multi-control-1","id":"d9dd2e1d438472a1b0581dc7f0b68525d0d56fe891b0d8f8e445cd0f67dabf62","image":"sha256:3ff28825693142c2c93c04622b65cca528d44944ad8023cddb59111281c0b8b7","state":"running","health":"healthy"},
+    {"role":"worker","name":"easel-worker-740511d5cab945018fb1527b1e190b8f","id":"1dcb9a3ac5e740d9760c664257315b6736abf4ea025d0d371bea742b072c2e40","image":"sha256:81d2c85e3f7262a4202f1b9b21bb6a4815a1b41336440a601e0386abd6666d36","state":"running"},
+    {"role":"gateway","name":"easel-gateway-740511d5cab945018fb1527b1e190b8f","id":"ddaa97ce7372a62997fbb82902e75da8be948cf01552953f59bd8897ab78dcc8","image":"sha256:385512f5b66fcfc3b04616b541be1bd3ddf122b2914f9959c8649df20a504f20","state":"running"},
+    {"role":"sidecar","name":"easel-sidecar-740511d5cab945018fb1527b1e190b8f","id":"ef51d1399aa7753df3920a4218dc5bba0b990c34e10e8af240a57034a9a6dbb9","image":"sha256:81d2c85e3f7262a4202f1b9b21bb6a4815a1b41336440a601e0386abd6666d36","state":"running","health":"healthy"}
+  ],
+  "current_public_chat": {"version":1,"provider":"deepseek","model":"deepseek-flash","protocol":"openai","allowed_models":["deepseek-flash","deepseek-v4-pro"]},
+  "known_observations": ["既有失败 Run 已终态，原 stderr 被排空，不能承诺事后还原完整异常", "受管 ACP patch 静态模型仍是 deepseek-chat，配置分叉尚未修复", "ControlApp 独立界面尚未迁回原 Web"],
+  "runtime_policy": {"keep_running":true,"replace_images":false,"replay_user_prompt":false,"read_or_copy_real_secrets":false,"share_user_volumes_with_tests":false},
+  "excluded": ["environment values", "credentials", "request bodies", "conversation contents", "cookies", "invite tokens", "native session contents"]
+}
