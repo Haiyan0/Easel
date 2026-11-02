@@ -33,6 +33,9 @@ CONFIG_VERSION_LABEL = "easel.config-version"
 
 READY_TIMEOUT_SECONDS = 60.0
 CONFIRM_STOP_TIMEOUT_SECONDS = 15.0
+# 非必要成功后收口的最小剩余预算；低于该值时直接留给下一次 ready 重试，
+# 不用一次注定超时的远程等待把当前响应拖到 deadline 之外。
+MIN_COMMIT_BUDGET_SECONDS = 0.02
 IDLE_SECONDS = 900
 LEASE_SECONDS = 120
 DRAIN_TIMEOUT_SECONDS = 60.0
@@ -485,10 +488,14 @@ class RuntimeManager:
                     "worker_not_ready", 503, retry_after=5)
             # 成功启动后若 control 在提交前崩溃，ready 读取会补收口；
             # 只有精确 worker/gateway 身份才发送 commit。
-            if (lease.container_id and lease.gateway_instance_id):
+            if (lease.container_id and lease.gateway_instance_id
+                    and lease.attempt_id):
+                # 只按租约自己的精确 attempt 收口；空 attempt 不得按目标
+                # 猜测归属，提前关闭其他 owner 仍有效的清理承诺。
                 await self._commit_attempt(
                     workspace_id, lease.container_id,
-                    lease.gateway_instance_id, "")
+                    lease.gateway_instance_id, lease.attempt_id,
+                    deadline=deadline)
             if self._report_gateway_matches(
                     report, workspace_id, config_version, lease):
                 if lease.gateway_state != "available":
@@ -511,10 +518,12 @@ class RuntimeManager:
         """重新配置/激活 gateway；CAS 后失败只标 unavailable，不中断 Run。"""
         # 旧 attempt 若已成功但未收口，先按精确身份收口，避免新 gateway
         # 创建被 pending 记录阻断；失败则留待下一次 ready 重试。
-        if lease.container_id and lease.gateway_instance_id:
+        if (lease.container_id and lease.gateway_instance_id
+                and lease.attempt_id):
             await self._commit_attempt(
                 workspace_id, lease.container_id,
-                lease.gateway_instance_id, "")
+                lease.gateway_instance_id, lease.attempt_id,
+                deadline=deadline)
         attempt_id = uuid.uuid4().hex
         try:
             candidate = await self._ensure_candidate(
@@ -555,8 +564,6 @@ class RuntimeManager:
                 or lease.config_version != config_version):
             return None
         now = self._now()
-        takeover_owner: str | None = None
-        takeover_attempt: str | None = None
         takeover_starting = False
         if lease.state == "starting":
             if lease.lease_expires_at > now:
@@ -568,8 +575,6 @@ class RuntimeManager:
             # 用 owner/generation/attempt + 过期时间 CAS 接管。物理恢复仍只
             # 走 provisioner.restore_gateway，绝不冷启动或替换 worker。
             takeover_starting = True
-            takeover_owner = lease.owner_id or None
-            takeover_attempt = lease.attempt_id or None
         elif lease.state == "stopping":
             if (lease.cleanup_purpose == "start_abort"
                     and lease.cleanup_scope == "gateway"):
@@ -603,13 +608,30 @@ class RuntimeManager:
             raise RuntimeUnavailable(
                 "worker_draining", 503, retry_after=1)
         deadline = self._clock() + self._ready_timeout
-        # 接管旧 starting/ready 前先收口其 attempt；旧清理承诺若仍存在
-        # 会在 provisioner 侧阻止新 gateway 创建，不会被静默覆盖。
-        if lease.container_id and lease.gateway_instance_id:
-            await self._commit_attempt(
-                workspace_id, lease.container_id,
-                lease.gateway_instance_id, "")
         attempt_id = uuid.uuid4().hex
+        if takeover_starting:
+            # 必须先完成 owner/generation/attempt 交接并持久 fencing 旧
+            # attempt，之后才允许按精确 attempt 收口。绝不使用空 attempt
+            # 在交接前关闭旧 owner 仍有权执行的清理。
+            taken = await self._takeover_for_restore(
+                workspace_id, lease, attempt_id, deadline)
+            if taken is None:
+                raise RuntimeUnavailable(
+                    "worker_start_superseded", 503, retry_after=1)
+            lease = taken
+        else:
+            if lease.pending_attempt_id:
+                # ready/draining 上出现未收口接管槽位属于异常状态，失败
+                # 关闭，等待下一次显式恢复。
+                raise RuntimeUnavailable(
+                    "gateway_recovery_pending", 503, retry_after=1)
+            if (lease.container_id and lease.gateway_instance_id
+                    and lease.attempt_id):
+                # 只收口当前 ready 租约自己的精确 attempt。
+                await self._commit_attempt(
+                    workspace_id, lease.container_id,
+                    lease.gateway_instance_id, lease.attempt_id,
+                    deadline=deadline, required=True)
         candidate = await self._restore_candidate(
             workspace_id, container_id, config_version, deadline, attempt_id)
         if candidate.container_id != lease.container_id:
@@ -617,9 +639,7 @@ class RuntimeManager:
                                      retry_after=5)
         return await self._commit_gateway_candidate(
             workspace_id, config_version, lease, candidate, attempt_id,
-            deadline, expected_owner=takeover_owner,
-            expected_attempt=takeover_attempt,
-            expires_at_or_before=(now if takeover_starting else None))
+            deadline)
 
     async def _restore_candidate(self, workspace_id: str, container_id: str,
                                  config_version: int, deadline: float,
@@ -654,20 +674,80 @@ class RuntimeManager:
             raise RuntimeUnavailable(problem, 503, retry_after=5)
         return handle
 
+    async def _takeover_for_restore(
+            self, workspace_id: str, lease: WorkerLease, attempt_id: str,
+            deadline: float) -> WorkerLease | None:
+        """过期 starting 的受限接管：先 fencing，再按精确 attempt 收口。
+
+        顺序是安全边界：
+        1. 已持久 fencing 的旧 attempt 先按精确 ID 提交；它已被上一轮
+           交接 CAS 剥夺 abort 权，提交只表示新代次接管其物理资源。
+        2. owner/generation/attempt + 过期时间 CAS 把当前代次转给本
+           manager，并把旧 attempt 写入 ``pending_attempt_id``。
+        3. 再次按精确 ID 收口旧 attempt，然后才允许 staging 新候选。
+        CAS 成功前任何 abort 承诺都仍然有效，旧 owner 的 cleanup 不会被
+        提前报告成功。
+        """
+        current = lease
+        for _ in range(2):
+            if current.pending_attempt_id:
+                current = await self._resolve_fenced_attempt(
+                    workspace_id, current, deadline)
+                continue
+            taken = await self._db(
+                self._store.takeover_worker_gateway_refresh,
+                workspace_id, current.generation, self.owner_id, attempt_id,
+                self._now(), self._lease_seconds,
+                expected_owner=current.owner_id,
+                expected_attempt=current.attempt_id,
+                expires_at_or_before=self._now())
+            if taken is None:
+                return None
+            current = await self._resolve_fenced_attempt(
+                workspace_id, taken, deadline)
+            return current
+        raise RuntimeUnavailable(
+            "gateway_recovery_pending", 503, retry_after=1)
+
+    async def _resolve_fenced_attempt(
+            self, workspace_id: str, lease: WorkerLease,
+            deadline: float) -> WorkerLease:
+        """按已 fencing 的精确 attempt 收口，成功后清空槽位。
+
+        失败必须失败关闭：此时旧 owner 已被 CAS 剥夺 abort 权，若这里
+        继续创建新 gateway，旧资源就失去唯一可执行的清理归属。
+        """
+        pending = lease.pending_attempt_id
+        if not pending:
+            return lease
+        if not lease.container_id or not lease.gateway_instance_id:
+            raise RuntimeUnavailable(
+                "gateway_recovery_pending", 503, retry_after=1)
+        committed = await self._commit_attempt(
+            workspace_id, lease.container_id, lease.gateway_instance_id,
+            pending, deadline=deadline, required=True)
+        if not committed:
+            raise RuntimeUnavailable(
+                "gateway_recovery_pending", 503, retry_after=1)
+        # 槽位绑定当前租约身份，而不是调用者：上一轮接管崩溃后，下一
+        # owner 必须先收口已被 fencing 的旧 attempt，此时它尚未取得租约。
+        if not await self._db(
+                self._store.clear_pending_attempt, workspace_id,
+                lease.generation, lease.owner_id, lease.attempt_id,
+                self._now()):
+            raise RuntimeUnavailable(
+                "worker_start_superseded", 503, retry_after=1)
+        return replace(lease, pending_attempt_id="")
+
     async def _commit_gateway_candidate(
             self, workspace_id: str, config_version: int, lease: WorkerLease,
             candidate: WorkerHandle, attempt_id: str,
-            deadline: float, *, expected_owner: str | None = None,
-            expected_attempt: str | None = None,
-            expires_at_or_before: int | None = None) -> WorkerHandle:
+            deadline: float) -> WorkerHandle:
         """在受保护 CAS 中保存候选、激活并收口；refresh/restore 共用。"""
         staged = await self._db(
             self._store.begin_worker_gateway_refresh,
             workspace_id, lease.generation, self.owner_id, candidate,
-            attempt_id, self._now(), self._lease_seconds,
-            expected_owner=expected_owner,
-            expected_attempt=expected_attempt,
-            expires_at_or_before=expires_at_or_before)
+            attempt_id, self._now(), self._lease_seconds)
         if staged is None:
             raise RuntimeUnavailable("worker_start_superseded", 503,
                                      retry_after=1)
@@ -710,7 +790,7 @@ class RuntimeManager:
                                      retry_after=1)
         await self._commit_attempt(
             workspace_id, final.container_id, final.gateway_instance_id,
-            attempt_id)
+            attempt_id, deadline=deadline)
         return final
 
     async def _ensure_candidate(self, workspace_id: str, config_version: int,
@@ -876,7 +956,7 @@ class RuntimeManager:
                                      retry_after=1)
         await self._commit_attempt(
             workspace_id, handle.container_id, handle.gateway_instance_id,
-            attempt_id)
+            attempt_id, deadline=deadline)
         return handle
 
     async def _reconcile(self, workspace_id: str, config_version: int,
@@ -1270,42 +1350,79 @@ class RuntimeManager:
             await self._provisioner.stop(workspace_id, container_id)
 
     async def _commit_attempt(self, workspace_id: str, container_id: str,
-                              gateway_instance_id: str,
-                              attempt_id: str) -> None:
-        """成功启动提交后收口 provisioner attempt；失败留待 ready 重试。
+                              gateway_instance_id: str, attempt_id: str,
+                              *, deadline: float | None = None,
+                              required: bool = False) -> bool:
+        """按精确 attempt 收口 provisioner 记录。
 
-        收口失败不能让已经提交的启动返回 503；下一次 ready 读取会按同一
-        精确目标重试。记录未收口时，后续创建型尝试会在 provisioner 侧
-        失败关闭，不会静默丢失清理归属。
+        普通启动/refresh 的成功收口是非必要附加操作：等待时间受本次
+        ready deadline 约束，超时或失败只保留 ready 并等待下一次 ready
+        重试，绝不把已提交的启动改成失败。``required=True`` 用于接管
+        恢复：旧 owner 已被 CAS 剥夺 abort 权，收口失败必须失败关闭。
+
+        空 attempt 一律拒绝发送，防止 control 按目标猜测归属。
         """
         if not self._gateway_required or not container_id:
-            return
+            return True
         if not gateway_instance_id:
-            return
-        target_key = (workspace_id, f"{container_id}:{gateway_instance_id}")
-        attempt_key = ((workspace_id, attempt_id) if attempt_id else None)
-        if target_key in self._committed_attempts:
-            return
-        if attempt_key is not None and attempt_key in self._committed_attempts:
-            return
+            return True
+        if not attempt_id:
+            if required:
+                raise RuntimeUnavailable(
+                    "gateway_commit_attempt_missing", 503, retry_after=1)
+            return False
+        # 只按精确 attempt 缓存。不能用 worker:gateway 目标做键：同一物理
+        # gateway 会被后续 attempt 复用，目标命中会跳过新 attempt 的收口。
+        attempt_key = (workspace_id, attempt_id)
+        if attempt_key in self._committed_attempts:
+            return True
         commit = getattr(self._provisioner, "commit_attempt", None)
         if not callable(commit):
-            return
+            if required:
+                raise RuntimeUnavailable(
+                    "gateway_commit_unavailable", 503, retry_after=5)
+            return False
+        timeout = CONFIRM_STOP_TIMEOUT_SECONDS
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                if required:
+                    raise RuntimeUnavailable(
+                        "gateway_commit_timeout", 503, retry_after=5)
+                return False
+            if not required and remaining < MIN_COMMIT_BUDGET_SECONDS:
+                LOGGER.info(
+                    "剩余预算不足，延后 attempt 收口 workspace=%s",
+                    workspace_id)
+                return False
+            timeout = min(timeout, remaining)
         try:
             await asyncio.wait_for(
                 commit(workspace_id, container_id, gateway_instance_id,
                        attempt_id=attempt_id),
-                timeout=CONFIRM_STOP_TIMEOUT_SECONDS)
+                timeout=max(0.001, timeout))
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except asyncio.TimeoutError as error:
+            if required:
+                raise RuntimeUnavailable(
+                    "gateway_commit_timeout", 503,
+                    retry_after=5) from error
+            LOGGER.warning(
+                "attempt 收口超出本次就绪预算，保留 ready 等待重试 "
+                "workspace=%s", workspace_id)
+            return False
+        except Exception as error:
+            if required:
+                raise RuntimeUnavailable(
+                    getattr(error, "code", "gateway_commit_failed"), 503,
+                    retry_after=5) from error
             LOGGER.warning(
                 "attempt 收口失败，保留 ready 并等待下次重试 workspace=%s",
                 workspace_id)
-            return
-        self._committed_attempts.add(target_key)
-        if attempt_key is not None:
-            self._committed_attempts.add(attempt_key)
+            return False
+        self._committed_attempts.add(attempt_key)
+        return True
 
     async def _cleanup_candidate(self, workspace_id: str,
                                  handle: WorkerHandle, lease: WorkerLease,

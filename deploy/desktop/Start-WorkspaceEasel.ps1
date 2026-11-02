@@ -37,6 +37,19 @@
 
 .PARAMETER DataRoot
     非秘密公共文件根，默认 C:\Easel\desktop。
+
+.PARAMETER UpdateBarrierId
+    受控更新专用：确认调用方已在控制库写入该接纳屏障后，保留屏障完成
+    启动，不尝试自动重开。更新脚本在核验新版 control/provisioner 后
+    再显式 resume。
+
+.PARAMETER RestartProvisionerIfStale
+    受控更新专用：仅当现有 provisioner 配置身份一致、但源码摘要或动作
+    能力落后时，按精确 socket/进程重启它。必须同时提供 UpdateBarrierId。
+    配置漂移仍然失败关闭。
+
+.PARAMETER LifecycleLockHeld
+    受控更新专用：调用方已持有本项目生命周期锁，本脚本不再重复获取。
 #>
 [CmdletBinding()]
 param(
@@ -56,7 +69,10 @@ param(
     [string]$UpgradeFromBackup = '',
     [int]$ProvisionerGid = 1000,
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 180,
-    [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60
+    [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60,
+    [string]$UpdateBarrierId = '',
+    [switch]$RestartProvisionerIfStale,
+    [switch]$LifecycleLockHeld
 )
 
 $ErrorActionPreference = 'Stop'
@@ -176,6 +192,101 @@ function Invoke-ProvisionerIdentityCheck {
         '--expected', '/expected.json')
 }
 
+function Get-WslFileSha256 {
+    param(
+        [Parameter(Mandatory)][string]$Distro,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $result = Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'sha256sum', $Path)
+    $digest = (($result.Output -join '') -split '\s+')[0]
+    if ($result.ExitCode -ne 0 -or
+        $digest -notmatch '^[0-9a-f]{64}$') {
+        throw 'provisioner_source_unavailable'
+    }
+    return $digest
+}
+
+function Get-EaselControlContainerId {
+    param([Parameter(Mandatory)][string]$ProjectName)
+    $lookup = Invoke-EaselDocker -Arguments @(
+        'ps', '-q',
+        '--filter', "label=com.docker.compose.project=$ProjectName",
+        '--filter', 'label=com.docker.compose.service=control')
+    if ($lookup.ExitCode -ne 0) {
+        return ''
+    }
+    return (($lookup.Output -join '').Trim())
+}
+
+function Assert-UpdateBarrier {
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$BarrierId
+    )
+    $controlId = Get-EaselControlContainerId -ProjectName $ProjectName
+    if (-not $controlId) {
+        throw 'update_barrier_control_unavailable'
+    }
+    $status = Invoke-EaselDocker -Arguments @(
+        'exec', $controlId, 'python', '-m', 'easel', 'admin',
+        'barrier-status', '--control-dir', '/srv/easel/control')
+    $text = (($status.Output -join '').Trim())
+    if ($status.ExitCode -ne 0 -or $text -ne "barrier=$BarrierId") {
+        throw "update_barrier_mismatch:$text"
+    }
+}
+
+function Stop-EaselProvisionerProcess {
+    param(
+        [Parameter(Mandatory)][string]$Distro,
+        [Parameter(Mandatory)][string]$SocketPath,
+        [Parameter(Mandatory)][string]$ScriptDir
+    )
+    $script = @'
+set -e
+socket="$1"
+pattern="deploy/multiuser/provisioner.py --socket $socket"
+pids=$(pgrep -f -- "$pattern" || true)
+if [ -z "$pids" ]; then
+    echo provisioner_process_missing
+    exit 3
+fi
+count=$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l)
+if [ "$count" -ne 1 ]; then
+    echo "provisioner_pid_ambiguous:$count"
+    exit 4
+fi
+pid=$pids
+tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fx -- "$socket" >/dev/null \
+    || { echo "provisioner_cmdline_mismatch:$pid"; exit 5; }
+tr '\0' '\n' < "/proc/$pid/cmdline" \
+    | grep -Fx -- "deploy/multiuser/provisioner.py" >/dev/null \
+    || { echo "provisioner_cmdline_mismatch:$pid"; exit 5; }
+kill -TERM "$pid"
+for _ in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "stopped_pid=$pid"
+        exit 0
+    fi
+    sleep 0.2
+done
+echo "provisioner_stop_timeout:$pid"
+exit 6
+'@
+    # 通过脚本文件执行：内联多行参数含双引号时，PowerShell 5.1 传给
+    # 原生 wsl.exe 的引号转义不可靠。
+    $null = New-Item -ItemType Directory -Path $ScriptDir -Force
+    $scriptFile = Join-Path $ScriptDir 'provisioner-stop.sh'
+    $normalized = ($script -replace "`r`n", "`n")
+    [IO.File]::WriteAllText(
+        $scriptFile, ($normalized + "`n"),
+        (New-Object System.Text.UTF8Encoding($false)))
+    $wslScript = ConvertTo-EaselWslPath -Path $scriptFile
+    return Invoke-Wsl -Arguments @(
+        '-d', $Distro, '--', 'bash', $wslScript, $SocketPath)
+}
+
 $lifecycleLock = $null
 $upgradeBackup = $null
 try {
@@ -186,8 +297,10 @@ try {
     $ProjectName = Resolve-EaselProject -ProjectName $ProjectName
     $Port = Resolve-EaselPort -Port $Port
     Assert-EaselDocker
-    $lifecycleLock = Enter-EaselLifecycleLock `
-        -ProjectName $ProjectName -TimeoutSeconds $LockTimeoutSeconds
+    if (-not $LifecycleLockHeld) {
+        $lifecycleLock = Enter-EaselLifecycleLock `
+            -ProjectName $ProjectName -TimeoutSeconds $LockTimeoutSeconds
+    }
     $volumes = Get-EaselVolumeNames -ProjectName $ProjectName
     $network = Get-EaselWorkspaceNetworkName -ProjectName $ProjectName
     $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
@@ -357,9 +470,18 @@ try {
         throw 'wsl_python_dependencies_missing'
     }
 
+    if ($RestartProvisionerIfStale -and -not $UpdateBarrierId) {
+        # 没有接纳屏障时不得替换运行中的 provisioner。
+        throw 'provisioner_restart_requires_barrier'
+    }
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
     $wslWorkspace = ConvertTo-EaselWslPath -Path $WorkspaceRoot
     $wslPublic = ConvertTo-EaselWslPath -Path $publicDir
+    $provisionerSourceSha256 = Get-WslFileSha256 -Distro $Distro `
+        -Path "$WslRepo/deploy/multiuser/provisioner.py"
+    $requiredProvisionerActions = @(
+        'ensure', 'stop', 'inspect', 'activate', 'abort', 'restore_gateway',
+        'commit_attempt', 'recover_abort', 'identity')
     $expectedIdentity = [ordered]@{
         workerImage = $WorkerImage
         gatewayImage = $GatewayImage
@@ -376,6 +498,8 @@ try {
         socketGid = $socketIdentity.Gid
         socketMode = '660'
         allowedUid = 10001
+        provisionerSourceSha256 = $provisionerSourceSha256
+        provisionerActions = $requiredProvisionerActions
     }
     $null = New-Item -ItemType Directory -Path $logDir -Force
     $identityExpectedPath = Join-Path $logDir 'provisioner-expected.json'
@@ -396,9 +520,39 @@ try {
                 $alreadyRunning = $true
             }
             elseif ($identity.ExitCode -eq 3) {
-                # 配置漂移明确拒绝；不杀活跃实例，由操作员 drain/受控重启。
-                throw ("provisioner_config_mismatch:" +
-                    (($identity.Output -join ',').Trim()))
+                $mismatchText = (($identity.Output -join ',')).Trim()
+                $mismatchFields = @(
+                    ($mismatchText -replace '^identity_mismatch=', '') -split ',')
+                $staleOnly = @(
+                    $mismatchFields | Where-Object {
+                        $_ -notin @('provisionerSourceSha256',
+                                    'provisionerActions')
+                    }).Count -eq 0
+                if ($RestartProvisionerIfStale -and $staleOnly) {
+                    # 只替换“配置相同、代码落后”的本项目 provisioner；
+                    # 必须先确认控制库已建立本次更新的接纳屏障。
+                    Assert-UpdateBarrier -ProjectName $ProjectName `
+                        -BarrierId $UpdateBarrierId
+                    $stop = Stop-EaselProvisionerProcess `
+                        -Distro $Distro -SocketPath $socket `
+                        -ScriptDir $logDir
+                    if ($stop.ExitCode -ne 0) {
+                        throw ("provisioner_restart_failed:" +
+                            (($stop.Output -join ',').Trim()))
+                    }
+                    $removed = Invoke-Wsl -Arguments @(
+                        '-d', $Distro, '--', 'rm', '-f', $socket)
+                    if ($removed.ExitCode -ne 0) {
+                        throw 'provisioner_socket_stale'
+                    }
+                    $provisionerRestarted = (($stop.Output -join ',').Trim())
+                    Write-Output ("provisioner_restart=" +
+                        $provisionerRestarted)
+                }
+                else {
+                    # 配置漂移明确拒绝；不杀活跃实例，由操作员显式更新。
+                    throw ("provisioner_config_mismatch:" + $mismatchText)
+                }
             }
             else {
                 throw 'provisioner_identity_unavailable'
@@ -541,7 +695,22 @@ try {
     if ($barrier.ExitCode -ne 0) {
         throw 'admission_barrier_status_failed'
     }
-    if ($barrierText -and $barrierText -ne 'barrier=none') {
+    if ($UpdateBarrierId) {
+        if ($barrierText -eq 'barrier=none') {
+            throw 'update_barrier_missing'
+        }
+        if (-not $barrierText.StartsWith('barrier=')) {
+            throw "admission_barrier_status_invalid:$barrierText"
+        }
+        $barrierId = $barrierText.Substring(8)
+        if ($barrierId -ne $UpdateBarrierId) {
+            throw ("admission_barrier_mismatch:" +
+                "$barrierId/$UpdateBarrierId")
+        }
+        # 受控更新：更新脚本负责在核验新版两端后显式 resume。
+        Write-Output "admission_barrier_retained=$barrierId"
+    }
+    elseif ($barrierText -and $barrierText -ne 'barrier=none') {
         if (-not $barrierText.StartsWith('barrier=')) {
             throw "admission_barrier_status_invalid:$barrierText"
         }
@@ -668,5 +837,7 @@ catch {
     exit 1
 }
 finally {
-    Exit-EaselLifecycleLock -Lock $lifecycleLock
+    if (-not $LifecycleLockHeld) {
+        Exit-EaselLifecycleLock -Lock $lifecycleLock
+    }
 }

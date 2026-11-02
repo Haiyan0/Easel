@@ -62,6 +62,28 @@ try {
     $barrierId = ''
     $controlImage = ''
     $configSha256 = ''
+    # GID 来自实际登记的 provisioner 身份，不假定永远 1000。Force 且登记
+    # 文件缺失时只用 0 作为 compose down 的插值占位；该值绝不用于启动。
+    $expectedFile = Join-Path (Join-Path $DataRoot 'logs') `
+        'provisioner-expected.json'
+    $registeredGid = 0
+    if (Test-Path -LiteralPath $expectedFile -PathType Leaf) {
+        try {
+            $expectedIdentity = Get-Content -LiteralPath $expectedFile -Raw |
+                ConvertFrom-Json
+            if ($expectedIdentity.PSObject.Properties.Name -notcontains
+                'socketGid') {
+                throw 'missing_socket_gid'
+            }
+            $registeredGid = [int]$expectedIdentity.socketGid
+        }
+        catch {
+            throw 'stop_identity_config_invalid'
+        }
+        if ($registeredGid -lt 0 -or $registeredGid -gt 65535) {
+            throw 'stop_identity_config_invalid'
+        }
+    }
     if (-not $Force -and $socketCheck.ExitCode -eq 0 -and $controlId) {
         $drain = Invoke-EaselDocker -Arguments @(
             'exec', $controlId, 'python', '-m', 'easel', 'admin', 'drain',
@@ -86,8 +108,6 @@ try {
         if (-not $barrierId) {
             throw 'stop_barrier_missing'
         }
-        $expectedFile = Join-Path (Join-Path $DataRoot 'logs') `
-            'provisioner-expected.json'
         if (-not (Test-Path -LiteralPath $expectedFile -PathType Leaf)) {
             throw 'stop_identity_config_missing'
         }
@@ -117,7 +137,7 @@ try {
         "EASEL_EGRESS_VOLUME=$($volumes.Egress)",
         "EASEL_CONTROL_PORT=7861",
         "EASEL_CONTROL_NETWORK=$network",
-        "EASEL_PROVISIONER_GID=1000",
+        "EASEL_PROVISIONER_GID=$registeredGid",
         "EASEL_PROVISIONER_SOCKET=$socket",
         # down 不启动 control；该必填变量只为 compose 插值成功，使用
         # 非法的保守占位值，绝不用于启动。

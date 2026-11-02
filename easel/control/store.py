@@ -31,7 +31,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -64,8 +64,8 @@ _WORKER_LEASE_COLUMNS = (
     " started_at, owner_id, generation, lease_expires_at, updated_at,"
     " last_activity_at, active_requests, upstream, service_token,"
     " gateway_instance_id, gateway_generation, gateway_upstream,"
-    " gateway_state, attempt_id, cleanup_purpose, cleanup_scope,"
-    " cleanup_worker_created, cleanup_gateway_created")
+    " gateway_state, attempt_id, pending_attempt_id, cleanup_purpose,"
+    " cleanup_scope, cleanup_worker_created, cleanup_gateway_created")
 
 
 def _now() -> int:
@@ -402,6 +402,12 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             updated_at INTEGER NOT NULL
         )
         """,
+    ),
+    # 版本 15：接管时先把旧 attempt 持久 fencing。交接 CAS 完成后旧 owner
+    # 已无权 abort；新 owner 必须按该精确 attempt 在 provisioner 收口后，
+    # 才能 staging 新候选。进程崩溃也不会丢失待收口归属。
+    (
+        "ALTER TABLE worker_leases ADD COLUMN pending_attempt_id TEXT NOT NULL DEFAULT ''",
     ),
 )
 
@@ -1272,6 +1278,7 @@ class Store:
         attempt_id = _text(attempt_id)
         now = int(now)
         where = (" WHERE workspace_id = ? AND generation = ?"
+                 " AND pending_attempt_id = ''"
                  " AND (state = 'ready'"
                  "      OR (state = 'starting' AND container_id <> ''))")
         values: list[object] = [
@@ -1302,6 +1309,55 @@ class Store:
             if cursor.rowcount != 1:
                 return None
             return self._worker_lease_row(_text(workspace_id))
+
+    def takeover_worker_gateway_refresh(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, now: int, lease_seconds: int, *,
+            expected_owner: str, expected_attempt: str,
+            expires_at_or_before: int) -> WorkerLease | None:
+        """过期 starting 的 owner/generation/attempt 交接 CAS。
+
+        只有旧 owner/attempt 与过期时间全部匹配且没有待收口旧 attempt 时
+        才成功。成功后旧 owner 的 abort CAS 必然失败；旧 attempt 被持久
+        记录到 ``pending_attempt_id``，由新 owner 按其精确 ID 在
+        provisioner 收口后才能 staging 新候选。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'starting', owner_id = ?,"
+                " generation = generation + 1, heartbeat_at = ?,"
+                " lease_expires_at = ?, updated_at = ?, attempt_id = ?,"
+                " pending_attempt_id = attempt_id"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND state = 'starting' AND container_id <> ''"
+                " AND gateway_instance_id <> '' AND upstream <> ''"
+                " AND service_token <> '' AND pending_attempt_id = ''"
+                " AND owner_id = ? AND attempt_id = ?"
+                " AND lease_expires_at <= ?",
+                (_text(owner_id), now, now + lease_seconds, now,
+                 _text(attempt_id), _text(workspace_id), int(generation),
+                 _text(expected_owner), _text(expected_attempt),
+                 int(expires_at_or_before)))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
+    def clear_pending_attempt(self, workspace_id: str, generation: int,
+                              owner_id: str, attempt_id: str,
+                              now: int) -> bool:
+        """旧 attempt 已在 provisioner 精确收口后清空 fencing 槽位。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET pending_attempt_id = '',"
+                " updated_at = ? WHERE workspace_id = ? AND generation = ?"
+                " AND owner_id = ? AND attempt_id = ? AND state = 'starting'"
+                " AND pending_attempt_id <> ''",
+                (int(now), _text(workspace_id), int(generation),
+                 _text(owner_id), _text(attempt_id)))
+        return cursor.rowcount == 1
 
     def complete_worker_gateway_refresh(
             self, workspace_id: str, owner_id: str, generation: int,
@@ -1374,7 +1430,8 @@ class Store:
                 "UPDATE worker_leases SET state = 'ready',"
                 " gateway_state = 'unavailable', gateway_instance_id = '',"
                 " gateway_generation = '', gateway_upstream = '',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " heartbeat_at = ?, lease_expires_at = ?, updated_at = ?"
                 " WHERE workspace_id = ? AND generation = ?"
@@ -1434,7 +1491,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ?"
                 " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
@@ -1469,7 +1527,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ? WHERE "
                 + where,
@@ -1551,7 +1610,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ? WHERE "
                 + where,
@@ -1715,10 +1775,11 @@ class Store:
             "  started_at, owner_id, generation, lease_expires_at, updated_at,"
             "  last_activity_at, active_requests, upstream, service_token,"
             "  gateway_instance_id, gateway_generation, gateway_upstream,"
-            "  gateway_state, attempt_id, cleanup_purpose, cleanup_scope,"
+            "  gateway_state, attempt_id, pending_attempt_id,"
+            "  cleanup_purpose, cleanup_scope,"
             "  cleanup_worker_created, cleanup_gateway_created)"
             " VALUES (?, '', ?, 'starting', ?, ?, ?, 1, ?, ?, ?, 0, '', '',"
-            "         '', '', '', 'disabled', '', '', '', 0, 0)"
+            "         '', '', '', 'disabled', '', '', '', '', 0, 0)"
             " ON CONFLICT(workspace_id) DO UPDATE SET"
             "  container_id = '', config_version = excluded.config_version,"
             "  state = 'starting', heartbeat_at = excluded.heartbeat_at,"
@@ -1730,7 +1791,8 @@ class Store:
             "  active_requests = 0, upstream = '', service_token = '',"
             "  gateway_instance_id = '', gateway_generation = '',"
             "  gateway_upstream = '', gateway_state = 'disabled',"
-            "  attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+            "  attempt_id = '', pending_attempt_id = '',"
+            "  cleanup_purpose = '', cleanup_scope = '',"
             "  cleanup_worker_created = 0, cleanup_gateway_created = 0",
             (workspace_id, int(config_version), now, now, owner_id,
              now + lease_seconds, now, now))
@@ -3197,6 +3259,7 @@ def _worker_lease(row: sqlite3.Row | None) -> WorkerLease | None:
         gateway_upstream=row["gateway_upstream"],
         gateway_state=row["gateway_state"],
         attempt_id=row["attempt_id"],
+        pending_attempt_id=row["pending_attempt_id"],
         cleanup_purpose=row["cleanup_purpose"],
         cleanup_scope=row["cleanup_scope"],
         cleanup_worker_created=bool(row["cleanup_worker_created"]),

@@ -223,7 +223,7 @@ def test_stop_does_not_touch_topology_while_lock_is_held(tmp_path):
     logs = data_root / "logs"
     logs.mkdir(parents=True)
     (logs / "provisioner-expected.json").write_text(
-        '{"engineId":"engine-test"}', encoding="utf-8")
+        '{"engineId":"engine-test","socketGid":1000}', encoding="utf-8")
     log = tmp_path / "stop-calls.log"
     held = tmp_path / "held"
     release = tmp_path / "release"

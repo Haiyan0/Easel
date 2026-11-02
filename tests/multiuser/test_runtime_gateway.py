@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 
 import pytest
 
@@ -55,6 +56,7 @@ class GatewayFake:
         self.ensure_orphan_takeovers: list[bool] = []
         self.commit_calls: list[dict] = []
         self.fail_commit: Exception | None = None
+        self.commit_delay = 0.0
         self.recover_calls: list[dict] = []
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
@@ -186,6 +188,8 @@ class GatewayFake:
             "gateway": gateway_instance_id,
             "attempt_id": attempt_id,
         })
+        if self.commit_delay:
+            await asyncio.sleep(self.commit_delay)
         if self.fail_commit is not None:
             raise self.fail_commit
 
@@ -828,6 +832,72 @@ def test_commit_failure_is_retried_on_ready_path(tmp_path):
             assert len(fake.commit_calls) == 1
 
             fake.fail_commit = None
+            await manager.ensure_ready(user.workspace_id, 1)
+            assert len(fake.commit_calls) == 2
+    _run(scenario())
+
+
+def test_commit_never_sends_empty_attempt(tmp_path):
+    """control 不能任何路径用空 attempt 猜测归属。"""
+
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            assert await manager._commit_attempt(
+                user.workspace_id, WORKER, GATEWAY, "") is False
+            assert fake.commit_calls == []
+            with pytest.raises(RuntimeUnavailable) as refused:
+                await manager._commit_attempt(
+                    user.workspace_id, WORKER, GATEWAY, "", required=True)
+            assert refused.value.code == "gateway_commit_attempt_missing"
+            assert fake.commit_calls == []
+    _run(scenario())
+
+
+def test_commit_cache_is_per_attempt_not_physical_target(tmp_path):
+    """同一 worker/gateway 被后续 attempt 复用时，新 attempt 仍须收口。"""
+
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager._commit_attempt(
+                user.workspace_id, WORKER, GATEWAY, "a" * 32)
+            await manager._commit_attempt(
+                user.workspace_id, WORKER, GATEWAY, "b" * 32)
+            assert [call["attempt_id"] for call in fake.commit_calls] == [
+                "a" * 32, "b" * 32]
+    _run(scenario())
+
+
+def test_ready_commit_uses_remaining_budget_and_retries_later(tmp_path):
+    """新增 commit 不得在 ready deadline 之外再占完整 15 秒。"""
+
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            fake.commit_delay = 0.3
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, ready_timeout=0.1,
+                poll_interval=0.001)
+            started = time.monotonic()
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            elapsed = time.monotonic() - started
+
+            assert handle.workspace_id == user.workspace_id
+            assert elapsed < 0.2
+            assert len(fake.commit_calls) == 1
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease.state == "ready"
+
+            # 本次 commit 超时没有把 ready 改成失败；下一次 ready 继续重试。
+            fake.commit_delay = 0
             await manager.ensure_ready(user.workspace_id, 1)
             assert len(fake.commit_calls) == 2
     _run(scenario())

@@ -272,6 +272,10 @@ class FakeWsl {
             Console.WriteLine("1000");
             return 0;
         }
+        if (joined.Contains("sha256sum")) {
+            Console.WriteLine(new string('a', 64) + "  source.py");
+            return 0;
+        }
         if (joined.Contains("compose") && joined.Contains("up")) {
             File.WriteAllText(Path.Combine(state, "compose-up"), "1");
             return 0;

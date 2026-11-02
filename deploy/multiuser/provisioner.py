@@ -84,6 +84,9 @@ DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
 
 ACTIONS = ("ensure", "stop", "inspect", "activate", "abort",
            "restore_gateway", "commit_attempt", "recover_abort", "identity")
+# 进程启动时加载源码的摘要；身份核验用它区分“同一配置但仍在跑旧代码”。
+# 必须在 import 时读取，运行中磁盘源码被替换不能改变已加载进程的身份。
+SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PINNED_IMAGE = re.compile(
@@ -2157,7 +2160,7 @@ class Provisioner:
         existing = self._load_attempt(workspace_id)
         if existing is not None:
             if existing["attempt_id"] == attempt_id:
-                if existing["status"] == "completed":
+                if existing["status"] in ("committed", "completed"):
                     if self._attempt_matches(
                             existing, attempt_id, handle,
                             worker_created=worker_created,
@@ -2165,7 +2168,8 @@ class Provisioner:
                         return
                     raise ProvisionerError(
                         "gateway_attempt_record_unreadable")
-            elif existing["status"] != "completed" and not allow_supersede:
+            elif (existing["status"] not in ("committed", "completed")
+                  and not allow_supersede):
                 raise ProvisionerError("gateway_cleanup_pending")
         elif self._attempt_path(workspace_id).exists():
             raise ProvisionerError("gateway_attempt_record_unreadable")
@@ -2190,7 +2194,8 @@ class Provisioner:
             # 同一 attempt 的纯复用重试不能把已创建的清理承诺降级成
             # no-op；保留原 pending 记录。
             return
-        if (existing is not None and existing["status"] == "pending"
+        if (existing is not None
+                and existing["status"] not in ("committed", "completed")
                 and not allow_supersede):
             raise ProvisionerError("gateway_cleanup_pending")
         if existing is None and self._attempt_path(workspace_id).exists():
@@ -2227,7 +2232,7 @@ class Provisioner:
         record = self._load_attempt(workspace_id)
         if record is not None:
             if (record["attempt_id"] == attempt_id
-                    or record["status"] == "completed"
+                    or record["status"] in ("committed", "completed")
                     or allow_supersede):
                 return
             raise ProvisionerError("gateway_cleanup_pending")
@@ -2294,7 +2299,7 @@ class Provisioner:
                     and (wc != (scope in ("worker", "worker_gateway"))
                          or gc != (scope in ("gateway",
                                              "worker_gateway"))))
-                or status not in ("pending", "completed")):
+                or status not in ("pending", "committed", "completed")):
             return None
         record = {
             "attempt_id": attempt_id,
@@ -2573,6 +2578,10 @@ class Provisioner:
             # 物理清理已完成、control 可能尚未提交 DB；同 attempt/ID/
             # scope 的重试直接幂等成功，不再次执行破坏操作。
             return
+        if record["status"] == "committed":
+            # 成功启动已收口，资源归成功代次所有；abort 不能把它当作
+            # “已清理完成”而静默成功，否则会丢掉真正的停止动作。
+            raise ProvisionerError("gateway_abort_superseded")
         scope = record["scope"]
         if scope in ("gateway", "worker_gateway"):
             assert self._gateway is not None
@@ -2653,19 +2662,23 @@ class Provisioner:
                 "status": "completed",
             })
             return
-        if attempt_id and record["attempt_id"] != attempt_id:
-            if record["status"] == "completed":
-                return
+        if not attempt_id and record["status"] == "pending":
+            # 空 attempt 只能做已完成 tombstone 的幂等复核；不能按目标
+            # 猜测归属，提前消解其他 owner 仍在执行的清理承诺。
             raise ProvisionerError("gateway_commit_superseded")
-        if (record["worker_container_id"] != worker_container_id
+        if (attempt_id and record["attempt_id"] != attempt_id) or (
+                record["worker_container_id"] != worker_container_id
                 or record["gateway_instance_id"] != gateway_instance_id):
-            if record["status"] == "completed":
+            if record["status"] in ("committed", "completed"):
+                # 当前记录已无 pending 清理承诺。请求的 attempt 可能因
+                # 上一轮进程在写记录前崩溃而根本不存在；精确 commit 只能
+                # 证明“它没有可收口的 pending”，不能因此失败。
                 return
             raise ProvisionerError("gateway_commit_superseded")
         if record["status"] == "pending":
-            completed = dict(record)
-            completed["status"] = "completed"
-            self._persist_attempt(workspace_id, completed)
+            committed = dict(record)
+            committed["status"] = "committed"
+            self._persist_attempt(workspace_id, committed)
 
     async def recover_abort(self, workspace_id: str,
                             worker_container_id: str,
@@ -2953,6 +2966,8 @@ class Provisioner:
         policy = digest(self.settings.sidecar_policy)
         return {
             "protocol": PROTOCOL_VERSION,
+            "sourceSha256": SOURCE_SHA256,
+            "actions": list(ACTIONS),
             "engine": {"context": context_name, "id": engine_id},
             "images": {
                 "worker": self.settings.image,
