@@ -661,6 +661,242 @@ def test_restore_takeover_fences_old_cleanup_before_commit(tmp_path):
     asyncio.run(scenario())
 
 
+def _seed_expired_ensure(tmp_path):
+    """构造过期 starting：owner-a 已 stage 候选并写入 A 的清理承诺。"""
+    store = Store.connect(tmp_path / "control.sqlite3")
+    workspace = store.create_user("A").workspace_id
+    lease = store.claim_worker_start(
+        workspace, 1, "owner-a", 1000, 60)[1]
+    assert lease is not None
+    handle = WorkerHandle(
+        workspace, WORKER, "http://172.32.0.2:7860", "token", 1,
+        gateway_instance_id=GATEWAY,
+        gateway_generation="d" * 32,
+        gateway_upstream="http://172.31.0.2:8897",
+        gateway_state="staged", gateway_created=True)
+    original_attempt = "a" * 32
+    assert store.stage_worker_gateway_start(
+        workspace, "owner-a", lease.generation, handle,
+        original_attempt, 1001) is True
+    gateway = FakeGateway(config_version=1)
+    service = _service(tmp_path, gateway)
+    service._record_attempt(
+        workspace, original_attempt, handle,
+        worker_created=False, gateway_created=True)
+    return store, service, gateway, workspace, lease, handle, original_attempt
+
+
+def _ready_handle(handle: WorkerHandle) -> WorkerHandle:
+    return dataclasses.replace(
+        handle, gateway_state="available", attempt_id="")
+
+
+def test_ensure_ready_takeover_fences_old_cleanup_before_commit(tmp_path):
+    """普通首屏 refresh 必须先交接 owner/generation，再收口旧 attempt。"""
+
+    async def scenario() -> None:
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class Adapter:
+            async def commit_attempt(self, *args, **kwargs):
+                return await service.commit_attempt(*args, **kwargs)
+
+            async def abort(self, *args, **kwargs):
+                return await service.abort(*args, **kwargs)
+
+            async def ensure(self, *args, **kwargs):
+                # 模拟 B 已越过交接并进入远程 ensure，但尚未 staging。
+                entered.set()
+                await release.wait()
+                return _ready_handle(handle)
+
+        with store:
+            adapter = Adapter()
+            first = RuntimeManager(
+                store, adapter, owner_id="owner-a", gateway_required=True,
+                clock=lambda: 1200)
+            second = RuntimeManager(
+                store, adapter, owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            pending = asyncio.create_task(second.ensure_ready(workspace, 1))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                handed = store.get_worker_lease(workspace)
+                assert handed is not None
+                assert handed.owner_id == "owner-b"
+                assert handed.state == "starting"
+                assert handed.attempt_id != original
+                record = service._load_attempt(workspace)
+                assert record is not None
+                assert record["status"] == "committed"
+
+                cleaned = await first._cleanup_candidate(
+                    workspace, handle, lease, original)
+                assert cleaned is False
+                assert gateway.stops == []
+                after_cleanup = store.get_worker_lease(workspace)
+                # 旧 cleanup 不能把新 owner 的代次改成 stopping 后滞留。
+                assert after_cleanup is not None
+                assert after_cleanup.state == "starting"
+                assert after_cleanup.owner_id == "owner-b"
+
+                release.set()
+                final = await asyncio.wait_for(pending, 2)
+                assert final.container_id == WORKER
+                ready = store.get_worker_lease(workspace)
+                assert ready is not None
+                assert ready.state == "ready"
+                assert ready.owner_id == "owner-b"
+            finally:
+                release.set()
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_ensure_ready_old_cleanup_wins_then_next_claim_recovers(tmp_path):
+    """旧 cleanup 先完成时，B 的下一次 ensure_ready 从 ready/unavailable 恢复。"""
+
+    async def scenario() -> None:
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+
+        class Adapter:
+            async def commit_attempt(self, *args, **kwargs):
+                return await service.commit_attempt(*args, **kwargs)
+
+            async def abort(self, *args, **kwargs):
+                return await service.abort(*args, **kwargs)
+
+            async def ensure(self, *args, **kwargs):
+                return _ready_handle(handle)
+
+        with store:
+            adapter = Adapter()
+            first = RuntimeManager(
+                store, adapter, owner_id="owner-a", gateway_required=True,
+                clock=lambda: 1200)
+            second = RuntimeManager(
+                store, adapter, owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            cleaned = await first._cleanup_candidate(
+                workspace, handle, lease, original)
+            assert cleaned is True
+            after_cleanup = store.get_worker_lease(workspace)
+            assert after_cleanup is not None
+            assert after_cleanup.state == "ready"
+            assert after_cleanup.gateway_state == "unavailable"
+            assert after_cleanup.attempt_id == ""
+            assert gateway.stops == [(workspace, WORKER, GATEWAY)]
+
+            final = await second.ensure_ready(workspace, 1)
+            assert final.gateway_instance_id == GATEWAY
+            ready = store.get_worker_lease(workspace)
+            assert ready is not None
+            assert ready.state == "ready"
+            assert ready.owner_id == "owner-b"
+
+    asyncio.run(scenario())
+
+
+def test_ensure_ready_takeover_remote_failure_fails_closed_to_ready(tmp_path):
+    """交接后远程 ensure 失败：保留 worker/ready，绝不滞留 stopping。"""
+
+    async def scenario() -> None:
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+
+        class Adapter:
+            async def commit_attempt(self, *args, **kwargs):
+                return await service.commit_attempt(*args, **kwargs)
+
+            async def abort(self, *args, **kwargs):
+                return await service.abort(*args, **kwargs)
+
+            async def ensure(self, *args, **kwargs):
+                raise RuntimeUnavailable(
+                    "worker_start_failed", 503, retry_after=5)
+
+        with store:
+            adapter = Adapter()
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(RuntimeUnavailable):
+                await manager.ensure_ready(workspace, 1)
+            failed = store.get_worker_lease(workspace)
+            assert failed is not None
+            assert failed.state == "ready"
+            assert failed.gateway_state == "unavailable"
+            assert failed.container_id == WORKER
+            assert failed.owner_id == "owner-b"
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["status"] == "committed"
+            assert gateway.stops == []
+
+    asyncio.run(scenario())
+
+
+def test_ensure_ready_takeover_cancel_leaves_recoverable_starting(tmp_path):
+    """B 在远程 ensure 中被取消：保留可接管的 starting，后续 owner 可恢复。"""
+
+    async def scenario() -> None:
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        class Adapter:
+            async def commit_attempt(self, *args, **kwargs):
+                return await service.commit_attempt(*args, **kwargs)
+
+            async def abort(self, *args, **kwargs):
+                return await service.abort(*args, **kwargs)
+
+            async def ensure(self, *args, **kwargs):
+                entered.set()
+                await never.wait()
+                return _ready_handle(handle)
+
+        with store:
+            adapter = Adapter()
+            second = RuntimeManager(
+                store, adapter, owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            pending = asyncio.create_task(second.ensure_ready(workspace, 1))
+            await asyncio.wait_for(entered.wait(), 2)
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            never.set()
+            cancelled = store.get_worker_lease(workspace)
+            assert cancelled is not None
+            assert cancelled.state == "starting"
+            assert cancelled.owner_id == "owner-b"
+            assert cancelled.pending_attempt_id == ""
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["status"] == "committed"
+            assert gateway.stops == []
+
+            recovered = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: cancelled.lease_expires_at + 1)
+            final = await recovered.ensure_ready(workspace, 1)
+            assert final.container_id == WORKER
+            ready = store.get_worker_lease(workspace)
+            assert ready is not None
+            assert ready.state == "ready"
+            assert ready.owner_id == "owner-c"
+
+    asyncio.run(scenario())
+
+
 def test_commit_of_unknown_attempt_is_noop_after_promise_resolved(tmp_path):
     """接管进程可能在写新记录前崩溃；已无 pending 时精确 commit 可无操作。"""
     service = _service(tmp_path)

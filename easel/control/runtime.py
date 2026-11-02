@@ -516,15 +516,35 @@ class RuntimeManager:
                                lease: WorkerLease,
                                deadline: float) -> WorkerHandle:
         """重新配置/激活 gateway；CAS 后失败只标 unavailable，不中断 Run。"""
-        # 旧 attempt 若已成功但未收口，先按精确身份收口，避免新 gateway
-        # 创建被 pending 记录阻断；失败则留待下一次 ready 重试。
-        if (lease.container_id and lease.gateway_instance_id
-                and lease.attempt_id):
-            await self._commit_attempt(
-                workspace_id, lease.container_id,
-                lease.gateway_instance_id, lease.attempt_id,
-                deadline=deadline)
         attempt_id = uuid.uuid4().hex
+        if lease.state == "starting":
+            # 过期 starting 与 restore_gateway 共用同一安全顺序：先完成
+            # owner/generation/attempt 交接并把旧 attempt 写入 fencing
+            # 槽位，让旧 owner 的 abort 立即失效；再按精确 attempt 收口。
+            # 交接前绝不能提交旧 attempt，否则旧 owner 仍持有的清理承诺
+            # 会被提前关闭，物理 gateway 停止失败并留下 stopping 503。
+            taken = await self._takeover_for_restore(
+                workspace_id, lease, attempt_id, deadline)
+            if taken is None:
+                raise RuntimeUnavailable(
+                    "worker_start_superseded", 503, retry_after=1)
+            lease = taken
+        else:
+            if lease.pending_attempt_id:
+                # ready/draining 上出现未收口接管槽位属于异常状态，失败
+                # 关闭，等待下一次显式恢复。
+                raise RuntimeUnavailable(
+                    "gateway_recovery_pending", 503, retry_after=1)
+            # 旧 attempt 若已成功但未收口，先按精确身份收口，避免新
+            # gateway 创建被 pending 记录阻断；失败则留待下一次 ready
+            # 重试。这里 lease 已归本 manager 所有，不存在提前关闭其他
+            # owner 清理承诺的问题。
+            if (lease.container_id and lease.gateway_instance_id
+                    and lease.attempt_id):
+                await self._commit_attempt(
+                    workspace_id, lease.container_id,
+                    lease.gateway_instance_id, lease.attempt_id,
+                    deadline=deadline)
         try:
             candidate = await self._ensure_candidate(
                 workspace_id, config_version, deadline, lease,
