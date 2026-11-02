@@ -1,4 +1,4 @@
-TREE: 6ae4b84
+TREE: 75d6912
 COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe docs\evidence\acceptance-503-repair-r4-r3\probe_r4r3_diagnostic.py C:\Code\Easel-acceptance
 ----
 {"after_stop": {"attempt_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "fenced_attempts": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], "gateway_created": false, "scope": "none", "status": "completed", "worker_created": false}, "before_stop": {"attempt_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "fenced_attempts": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "status": "committed"}, "fresh_attempt": "cccccccccccccccccccccccccccccccc", "fresh_record": {"attempt_id": "cccccccccccccccccccccccccccccccc", "fenced_attempts": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], "status": "completed"}, "gateway_ensure_calls_after_fresh": 1, "gateway_ensure_calls_before_fresh": 0, "late_ensure": "gateway_attempt_fenced", "late_gateway": "gateway_attempt_fenced", "prepare_workspace_called": false}

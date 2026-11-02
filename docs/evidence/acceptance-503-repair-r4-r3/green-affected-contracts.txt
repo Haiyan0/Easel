@@ -1,4 +1,4 @@
-TREE: 6ae4b84
+TREE: 75d6912
 COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_503.py tests/multiuser/test_attempt_ownership_r4r1_503.py tests/multiuser/test_attempt_ownership_r4r2_503.py tests/multiuser/test_attempt_ownership_r4r3_503.py tests/multiuser/test_runtime.py tests/multiuser/test_runtime_gateway.py tests/multiuser/test_original_web_api.py tests/multiuser/test_artifact_access.py tests/multiuser/test_gateway_client_errors.py tests/multiuser/test_task_leases.py tests/multiuser/test_stop_barrier.py tests/multiuser/test_desktop_update_r2.py tests/multiuser/test_workspace_start_identity.py tests/multiuser/test_proxy.py tests/multiuser/test_messages_relay.py -q
 ----
 ........................................................................ [ 25%]
@@ -61,5 +61,5 @@ tests/multiuser/test_original_web_api.py::test_workbench_outputs_junction_is_rej
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-278 passed, 4 skipped, 3 warnings in 56.80s
+278 passed, 4 skipped, 3 warnings in 56.94s
 EXIT=0

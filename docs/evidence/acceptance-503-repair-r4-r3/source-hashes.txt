@@ -1,20 +1,22 @@
-TREE: 6ae4b84
+TREE: 75d6912
 
 WORKTREE BYTES (core.autocrlf=true, CRLF where applicable):
-6b495357c4cd0cb5a34b97adda68b053ba236020499e5debd77b142a06e85e5e *deploy/multiuser/provisioner.py
+7164c0c0066a5f477530c8350ae4b655ef4aa10055c18ceb77b586e282d95bee *deploy/multiuser/provisioner.py
 04a9f8be595160c3df99ef727349365024eb035e7ae63620bf3543d4ede35196 *easel/control/runtime.py
 0f9a2fa00c327a38340af3928514a17be9d941f567f79066175668dd595d34ae *easel/control/store.py
 
 LF-NORMALIZED (git blob content):
-e69debfc9ba039389bc19b6df67d2b93f0be37224ecb77d9faab6639c91ccb76 deploy/multiuser/provisioner.py
+860a3f148a7365cb3ec12bb5b860e9a68256ee6071cc1573abf8760f19901b03 deploy/multiuser/provisioner.py
 0499a2035d5ec77ea1bfa711ad1fbf06032856e19846e8831393b7d55245ae9a easel/control/runtime.py
 560065e47cc00d58fa698b8334d652f66d9807302719dfe77126cc1eba6271d6 easel/control/store.py
 
 GIT DIFF STAT 4dd3550..HEAD:
- deploy/multiuser/provisioner.py | 41 +++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 41 insertions(+)
+ deploy/multiuser/provisioner.py | 45 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
 GIT DIFF CHECK:
 clean
 
 COMMITS:
+75d6912 fix: 过滤并去重旧记录围栏 ID（R4-R3-01）
+64c6122 docs: 补齐 R4-R3 验收证据
 6ae4b84 fix: Stop 清理保留旧请求执行围栏（R4-R3-01）

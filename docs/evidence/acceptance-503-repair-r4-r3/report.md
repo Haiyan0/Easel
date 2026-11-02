@@ -11,6 +11,7 @@
 | 提交 | 内容 |
 |---|---|
 | `6ae4b84` | R4-R3-01：Stop 清理保留旧请求执行围栏 |
+| `75d6912` | R4-R3-01：过滤并去重旧记录围栏 ID |
 
 本轮只修主审第 7 轮下发的 R4-R3-01。未重开 R4-R1/R4-R2 已审行为；
 未修改前端、worker/gateway、部署脚本或平台功能；未合并、未推送、未更新
@@ -42,7 +43,8 @@
   携带围栏），因此 Stop 不影响后续重新启动。
 - **`recover_abort`** 旧坏记录分支：重建记录时携带原始
   `fenced_attempts`，abort 收口为 completed 时不丢失围栏。
-- 新增 `_valid_fenced_attempts` 提取/过滤原始围栏 ID。
+- 新增 `_valid_fenced_attempts` 提取、过滤并去重原始围栏 ID，避免旧坏
+  记录中的重复/非法项写出不可读记录。
 
 审计结论（所有 `_clear_attempt`、删除、覆盖、旧坏记录、物理 abort 路径）：
 
@@ -74,7 +76,8 @@ EXIT=0
 
 ## 4. 绿态证据
 
-所有绿色命令均在提交 `6ae4b84` 的树上执行（证据文件首行 `TREE: 6ae4b84`）。
+所有绿色命令均在最终树 `75d6912` 上执行（证据文件首行
+`TREE: 75d6912`）。
 
 | 证据文件 | 范围 | 结果 | 退出码 |
 |---|---|---|---|
@@ -114,7 +117,7 @@ fresh C     : admitted; record C/completed; fenced=[A,B];
 | Stop 围栏记录幂等 | `test_stop_fence_record_is_idempotent`：连续两次 Stop 记录逐字段一致 |
 | 精确实例错配拒绝 | `test_stop_instance_mismatch_keeps_fence_record`：worker ID 不匹配时不改写记录，围栏保留 |
 | 物理 abort 路径携带围栏 | `test_abort_completion_preserves_fence`：abort completed 后 `[A]` 仍在，A 被拒 |
-| 旧坏记录恢复携带围栏 | `test_recover_abort_preserves_fence`：recover_abort completed 后 `[A]` 仍在，A 被拒 |
+| 旧坏记录恢复携带围栏 | `test_recover_abort_preserves_fence`：原始记录含重复/非法围栏项时仍写出可读记录，recover_abort completed 后 `[A]` 仍在，A 被拒 |
 | 记录覆盖不丢围栏 | R4-R2 `test_fence_survives_new_attempt_record` 及本轮新 attempt 测试，新记录始终携带旧围栏 |
 | R4-R2 活跃/迟到 Event 矩阵 | `test_attempt_ownership_r4r2_503.py` 11 项全部通过 |
 | R4-R1 真实子进程退出 | `test_attempt_ownership_r4r1_503.py` 3 项通过；恢复阶段 `ensure=0、restore=0、resolve=1` |
@@ -167,13 +170,13 @@ UNIX_CONTRACT_OK
   镜像内不存在 `/opt/easel/deploy/multiuser/provisioner.py`（`ABSENT`）。
 - 生产源码摘要（`source-hashes.txt`）：
   - `deploy/multiuser/provisioner.py` 工作树字节（CRLF）：
-    `6b495357c4cd0cb5a34b97adda68b053ba236020499e5debd77b142a06e85e5e`
+    `7164c0c0066a5f477530c8350ae4b655ef4aa10055c18ceb77b586e282d95bee`
   - 同文件 LF 规范化（git blob 内容）：
-    `e69debfc9ba039389bc19b6df67d2b93f0be37224ecb77d9faab6639c91ccb76`
+    `860a3f148a7365cb3ec12bb5b860e9a68256ee6071cc1573abf8760f19901b03`
   - 本机 `core.autocrlf=true`；WSL 部署身份（`Get-WslFileSha256`）按实际
     WSL 仓库文件字节计算。本轮未更新 WSL 部署副本，未重启 provisioner。
 - `git diff 4dd3550..HEAD --check` 无输出；生产 diff 仅
-  `deploy/multiuser/provisioner.py`（+41）。
+  `deploy/multiuser/provisioner.py`（+45）。
 
 ## 8. 未执行项与临时资源
 
@@ -189,7 +192,7 @@ UNIX_CONTRACT_OK
 
 ## 9. 交付状态
 
-- 生产提交：`6ae4b84`
+- 生产提交：`6ae4b84`、`75d6912`
 - 证据目录：`docs/evidence/acceptance-503-repair-r4-r3/`
 - 分支：`fix/acceptance-503-r3`（未合并、未推送）；交付 tip 为本分支 HEAD
 - 工作树干净；等待主审独立验证，不自动推进其他组。

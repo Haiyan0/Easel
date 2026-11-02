@@ -1,4 +1,4 @@
-TREE: 6ae4b84
+TREE: 75d6912
 COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_r4r3_503.py -v
 ----
 ============================= test session starts =============================
@@ -18,5 +18,5 @@ tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_instance_mismatch_
 tests/multiuser/test_attempt_ownership_r4r3_503.py::test_abort_completion_preserves_fence PASSED [ 85%]
 tests/multiuser/test_attempt_ownership_r4r3_503.py::test_recover_abort_preserves_fence PASSED [100%]
 
-============================== 7 passed in 0.54s ==============================
+============================== 7 passed in 0.39s ==============================
 EXIT=0

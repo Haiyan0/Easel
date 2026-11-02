@@ -1,4 +1,4 @@
-TREE: 6ae4b84
+TREE: 75d6912
 COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r2_stop_fence.py C:\Code\Easel-acceptance
 ----
 Traceback (most recent call last):
