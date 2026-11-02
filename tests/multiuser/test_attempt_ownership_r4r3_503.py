@@ -201,7 +201,8 @@ def test_recover_abort_preserves_fence(tmp_path):
         "gateway_created": False,
         "scope": "gateway",
         "status": "pending",
-        "fenced_attempts": [old],
+        # 坏项/重复项丢弃，但不能因此写出不可读或丢围栏的记录。
+        "fenced_attempts": [old, old, "not-an-attempt"],
     })
     async def worker_inspect(instance_id):
         return h._worker_inspect() if instance_id == WORKER else None

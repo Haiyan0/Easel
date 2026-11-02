@@ -2244,12 +2244,16 @@ class Provisioner:
 
     @staticmethod
     def _valid_fenced_attempts(value: object) -> list[str]:
-        """提取原始记录中的合法围栏 ID；坏项丢弃但不恢复执行权。"""
+        """提取原始记录中的合法围栏 ID；坏项/重复项丢弃但不恢复执行权。"""
         if not isinstance(value, list):
             return []
-        return [item for item in value
-                if isinstance(item, str)
-                and re.fullmatch(r"[0-9a-f]{32}", item) is not None]
+        result: list[str] = []
+        for item in value:
+            if (isinstance(item, str)
+                    and re.fullmatch(r"[0-9a-f]{32}", item) is not None
+                    and item not in result):
+                result.append(item)
+        return result
 
     @staticmethod
     def _attempt_matches(record: dict, attempt_id: str,
