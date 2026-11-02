@@ -1359,6 +1359,36 @@ class Store:
                  _text(owner_id), _text(attempt_id)))
         return cursor.rowcount == 1
 
+    def adopt_fenced_attempt(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, pending_attempt_id: str,
+            gateway_instance_id: str, gateway_generation: str,
+            gateway_upstream: str, gateway_state: str,
+            now: int) -> WorkerLease | None:
+        """恢复响应丢失：把 provisioner 持久化的真实候选写入 fencing 租约。
+
+        只允许当前 owner/generation/attempt 与 pending 槽位全部匹配时
+        替换 gateway 身份；CAS 失败说明另一管理者已接管，调用方必须
+        失败关闭而不是覆盖新代次。
+        """
+        if gateway_state not in ("staged", "available"):
+            raise DomainError("invalid_gateway_state", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET gateway_instance_id = ?,"
+                " gateway_generation = ?, gateway_upstream = ?,"
+                " gateway_state = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND owner_id = ? AND attempt_id = ?"
+                " AND pending_attempt_id = ? AND state = 'starting'",
+                (_text(gateway_instance_id), _text(gateway_generation),
+                 _text(gateway_upstream), gateway_state, int(now),
+                 _text(workspace_id), int(generation), _text(owner_id),
+                 _text(attempt_id), _text(pending_attempt_id)))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
     def complete_worker_gateway_refresh(
             self, workspace_id: str, owner_id: str, generation: int,
             handle: WorkerHandle, now: int, lease_seconds: int) -> bool:

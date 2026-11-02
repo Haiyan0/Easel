@@ -91,6 +91,12 @@ class FakeGateway:
             "gateway_instance_id": gateway_instance_id or self.gateway,
             "worker_container_id": self.worker,
             "config_version": self.config_version,
+            "boot_generation": "e" * 32,
+            "gateway_upstream": "http://172.31.0.9:8897",
+            "worker_origin": "http://172.32.0.2:7860",
+            "active": True,
+            "available": True,
+            "configured": True,
         }
 
     async def ensure(self, **kwargs):
@@ -208,10 +214,13 @@ def test_pure_reuse_writes_self_consistent_completed_tombstone(tmp_path):
         "attempt_id": "e" * 32,
         "worker_container_id": WORKER,
         "gateway_instance_id": GATEWAY,
+        "gateway_generation": "d" * 32,
+        "gateway_upstream": "http://172.31.0.2:8897",
         "worker_created": False,
         "gateway_created": False,
         "scope": "none",
         "status": "completed",
+        "config_version": CONFIG_VERSION,
     }
 
     restarted = _service(tmp_path)
@@ -895,6 +904,332 @@ def test_ensure_ready_takeover_cancel_leaves_recoverable_starting(tmp_path):
             assert ready.owner_id == "owner-c"
 
     asyncio.run(scenario())
+
+
+def _lost_response_adapter(service, handle, replacement, lost):
+    """模拟 provisioner 已持久化候选、control 在接收/落盘前中断。"""
+
+    class Adapter:
+        async def commit_attempt(self, *args, **kwargs):
+            return await service.commit_attempt(*args, **kwargs)
+
+        async def abort(self, *args, **kwargs):
+            return await service.abort(*args, **kwargs)
+
+        def _candidate(self, attempt_id, *, created):
+            return dataclasses.replace(
+                handle, gateway_instance_id=replacement,
+                gateway_generation="e" * 32,
+                gateway_upstream="http://172.31.0.9:8897",
+                gateway_state="available", attempt_id=attempt_id,
+                worker_created=False, gateway_created=created)
+
+        async def restore_gateway(self, workspace_id, worker_container_id,
+                                  config_version, *, attempt_id=""):
+            if lost["count"] > 0:
+                lost["count"] -= 1
+                candidate = self._candidate(attempt_id, created=True)
+                service._record_attempt(
+                    workspace_id, attempt_id, candidate,
+                    worker_created=False, gateway_created=True)
+                raise asyncio.CancelledError()
+            candidate = self._candidate(attempt_id, created=False)
+            service._record_attempt(
+                workspace_id, attempt_id, candidate,
+                worker_created=False, gateway_created=False)
+            return candidate
+
+        async def ensure(self, workspace_id, config_version, *,
+                         attempt_id="", orphan_takeover=False):
+            if lost["count"] > 0:
+                lost["count"] -= 1
+                candidate = self._candidate(attempt_id, created=True)
+                service._record_attempt(
+                    workspace_id, attempt_id, candidate,
+                    worker_created=False, gateway_created=True)
+                raise asyncio.CancelledError()
+            candidate = self._candidate(attempt_id, created=False)
+            service._record_attempt(
+                workspace_id, attempt_id, candidate,
+                worker_created=False, gateway_created=False)
+            return candidate
+
+    return Adapter()
+
+
+def test_lost_restore_response_recovers_exact_attempt_candidate(tmp_path):
+    """restore 响应丢失：重开 DB 后按精确 attempt 找到真实候选并继续接管。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        lost = {"count": 1}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(
+                    service, handle, replacement, lost),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.restore_gateway(workspace, WORKER, 1)
+            before = store.get_worker_lease(workspace)
+            assert before is not None
+            assert before.gateway_instance_id == GATEWAY
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["gateway_instance_id"] == replacement
+            assert record["status"] == "pending"
+            expires = before.lease_expires_at
+        return workspace, expires, lost, handle
+
+    workspace, expires, lost, handle = asyncio.run(first_loss())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        gateway = FakeGateway(config_version=1)
+        service = _service(tmp_path, gateway)
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-c", gateway_required=True,
+            clock=lambda: expires + 1)
+        final = asyncio.run(manager.restore_gateway(workspace, WORKER, 1))
+        assert final is not None
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
+        assert ready.attempt_id == final.attempt_id
+        record = service._load_attempt(workspace)
+        assert record is not None
+        assert record["status"] in ("committed", "completed")
+
+
+def test_lost_ensure_response_recovers_through_first_screen_entry(tmp_path):
+    """普通首屏 ensure_ready 的响应丢失同样必须恢复真实候选。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        lost = {"count": 1}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(
+                    service, handle, replacement, lost),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.ensure_ready(workspace, 1)
+            before = store.get_worker_lease(workspace)
+            assert before is not None
+            assert before.gateway_instance_id == GATEWAY
+            assert service._load_attempt(workspace)["status"] == "pending"
+            expires = before.lease_expires_at
+        return workspace, expires, lost, handle
+
+    workspace, expires, lost, handle = asyncio.run(first_loss())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        service = _service(tmp_path, FakeGateway(config_version=1))
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-c", gateway_required=True,
+            clock=lambda: expires + 1)
+        final = asyncio.run(manager.ensure_ready(workspace, 1))
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
+
+
+def test_repeated_lost_responses_keep_advancing_without_commit_loop(tmp_path):
+    """恢复在建 ready 前再次中断后仍能前进，不出现无限 commit 失败。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        lost = {"count": 1}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(
+                    service, handle, replacement, lost),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.restore_gateway(workspace, WORKER, 1)
+            first_expiry = store.get_worker_lease(workspace).lease_expires_at
+        return workspace, first_expiry, lost, handle
+
+    workspace, expiry, lost, handle = asyncio.run(first_loss())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        service = _service(tmp_path, FakeGateway(config_version=1))
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-c", gateway_required=True,
+            clock=lambda: expiry + 1)
+        original_complete = store.complete_worker_gateway_refresh
+        state = {"cancel": True}
+
+        def cancel_once(*args, **kwargs):
+            if state["cancel"]:
+                state["cancel"] = False
+                raise asyncio.CancelledError()
+            return original_complete(*args, **kwargs)
+
+        store.complete_worker_gateway_refresh = cancel_once
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(manager.restore_gateway(workspace, WORKER, 1))
+        second = store.get_worker_lease(workspace)
+        assert second is not None
+        assert second.gateway_instance_id == replacement
+        assert second.state == "starting"
+        assert second.pending_attempt_id == ""
+        expiry = second.lease_expires_at
+        store.complete_worker_gateway_refresh = original_complete
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        service = _service(tmp_path, FakeGateway(config_version=1))
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-d", gateway_required=True,
+            clock=lambda: expiry + 1)
+        final = asyncio.run(manager.restore_gateway(workspace, WORKER, 1))
+        assert final is not None
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
+
+
+def test_recovered_gateway_is_used_by_normal_stop(tmp_path):
+    """恢复后的租约指向真实替换候选；正常 Stop 必须按该实例收口。"""
+    replacement = "f" * 64
+
+    async def recover():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        lost = {"count": 1}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(
+                    service, handle, replacement, lost),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.restore_gateway(workspace, WORKER, 1)
+            expires = store.get_worker_lease(workspace).lease_expires_at
+        return workspace, expires, lost, handle
+
+    workspace, expires, lost, handle = asyncio.run(recover())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        gateway = FakeGateway(config_version=1)
+        service = _service(tmp_path, gateway)
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-c", gateway_required=True,
+            clock=lambda: expires + 1)
+        asyncio.run(manager.restore_gateway(workspace, WORKER, 1))
+
+        async def no_worker(workspace_id: str):
+            return None
+
+        async def no_sidecar(workspace_id: str):
+            return None
+
+        service._inspect_raw = no_worker
+        service._stop_sidecar = no_sidecar
+        asyncio.run(service.stop(
+            workspace, WORKER, replacement, protocol_version=2))
+        assert gateway.stops == [(workspace, WORKER, replacement)]
+        assert service._load_attempt(workspace) is None
+
+
+def test_pure_reuse_refresh_keeps_same_gateway_without_adoption(tmp_path):
+    """未替换的纯复用不写 pending 资源承诺，也不改写 gateway 身份。"""
+    async def scenario():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        # A 的 attempt 是纯复用：completed/no-op tombstone。
+        _write_attempt(tmp_path, {
+            "attempt_id": original,
+            "worker_container_id": WORKER,
+            "gateway_instance_id": GATEWAY,
+            "worker_created": False,
+            "gateway_created": False,
+            "scope": "none",
+            "status": "completed",
+        }, workspace=workspace)
+        pure = _service(tmp_path, gateway)
+        lost = {"count": 0}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(pure, handle, GATEWAY, lost),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            final = await manager.ensure_ready(workspace, 1)
+            assert final.gateway_instance_id == GATEWAY
+            ready = store.get_worker_lease(workspace)
+            assert ready is not None
+            assert ready.state == "ready"
+            assert ready.gateway_instance_id == GATEWAY
+            assert gateway.stops == []
+            record = pure._load_attempt(workspace)
+            assert record is not None
+            assert record["scope"] == "none"
+            assert record["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_resolve_attempt_rejects_target_config_and_gateway_mismatch(tmp_path):
+    """按 attempt 解析真实候选时必须复核 worker/config/gateway 归属。"""
+    gateway = FakeGateway()
+    service = _service(tmp_path, gateway)
+    _record(service, "a" * 32, worker_created=False, gateway_created=True)
+
+    resolved = asyncio.run(service.commit_attempt(
+        WORKSPACE, WORKER, "", attempt_id="a" * 32, resolve=True,
+        config_version=CONFIG_VERSION))
+    assert resolved is not None
+    assert resolved["found"] is True
+    assert resolved["attempt_id"] == "a" * 32
+    assert resolved["gateway_instance_id"] == GATEWAY
+    assert resolved["status"] == "pending"
+
+    with pytest.raises(provisioner.ProvisionerError) as wrong_worker:
+        asyncio.run(service.commit_attempt(
+            WORKSPACE, "d" * 64, "", attempt_id="a" * 32, resolve=True,
+            config_version=CONFIG_VERSION))
+    assert wrong_worker.value.code == "gateway_commit_superseded"
+
+    with pytest.raises(provisioner.ProvisionerError) as wrong_config:
+        asyncio.run(service.commit_attempt(
+            WORKSPACE, WORKER, "", attempt_id="a" * 32, resolve=True,
+            config_version=CONFIG_VERSION + 1))
+    assert wrong_config.value.code == "gateway_recovery_config_mismatch"
+
+    class UnmanagedGateway(FakeGateway):
+        async def inspect(self, *, workspace_id: str,
+                          gateway_instance_id: str = "") -> dict:
+            return {
+                "managed": False,
+                "workspace_id": workspace_id,
+                "gateway_instance_id": gateway_instance_id,
+                "worker_container_id": WORKER,
+                "config_version": CONFIG_VERSION,
+            }
+
+    (tmp_path / "unmanaged").mkdir()
+    unmanaged = _service(tmp_path / "unmanaged", UnmanagedGateway())
+    unmanaged._record_attempt(
+        WORKSPACE, "b" * 32, _handle(), worker_created=False,
+        gateway_created=True)
+    with pytest.raises(provisioner.ProvisionerError) as bad_gateway:
+        asyncio.run(unmanaged.commit_attempt(
+            WORKSPACE, WORKER, "", attempt_id="b" * 32, resolve=True,
+            config_version=CONFIG_VERSION))
+    assert bad_gateway.value.code == "gateway_recovery_target_mismatch"
 
 
 def test_commit_of_unknown_attempt_is_noop_after_promise_resolved(tmp_path):
