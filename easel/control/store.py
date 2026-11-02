@@ -1486,13 +1486,15 @@ class Store:
     def fence_unknown_gateway_refresh(
             self, workspace_id: str, generation: int, expected_owner: str,
             previous_attempt_id: str, owner_id: str, attempt_id: str,
-            now: int) -> bool:
-        """远程 ensure/restore 结果未知：持久本轮精确 attempt 并立即冻结。
+            now: int) -> WorkerLease | None:
+        """远程 ensure/restore 前或结果未知：持久本轮精确 attempt 并冻结。
 
-        ready 与 starting 共用同一归属语义：只把本轮已发出的 attempt 写入
-        租约并转为立即到期的 ``starting``，不按目标猜测候选、不结算 Run。
-        下一所有者随后按 ``pending_attempt_id`` 槽位解析 provisioner 持久
-        的真实候选。代次递增使旧 owner 的迟到写回与清理 CAS 全部失效。
+        ready 与 starting 共用同一归属语义：只把本轮将要发出/已发出的
+        attempt 写入租约并转为立即到期的 ``starting``，不按目标猜测候选、
+        不结算 Run。远程调用前先调用本方法；控制进程随后在任意时刻退出，
+        下一所有者都能按 ``pending_attempt_id`` 槽位解析 provisioner 持久
+        的真实候选。代次递增使旧 owner 的迟到写回与清理 CAS 全部失效，
+        CAS 失败返回 None，调用方不得覆盖已接管的新代次。
         """
         if not isinstance(previous_attempt_id, str):
             raise DomainError("invalid_argument", 400)
@@ -1507,6 +1509,34 @@ class Store:
                 (_text(owner_id), _text(attempt_id), int(now), int(now),
                  _text(workspace_id), int(generation),
                  _text(expected_owner), previous_attempt_id))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
+    def rollback_gateway_refresh_attempt(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, previous_attempt_id: str, now: int,
+            lease_seconds: int) -> bool:
+        """远程调用确定失败：撤销发出前的 attempt 预占并恢复 ready。
+
+        只匹配本次预占的 generation/owner/attempt 且没有待收口槽位；
+        CAS 失败说明已被其他管理者接管，调用方不得覆盖。恢复后旧 gateway
+        标记 unavailable，下一次首屏重新刷新；在途 Run 与实例身份不动。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready', attempt_id = ?,"
+                " gateway_state = 'unavailable', lease_expires_at = ?,"
+                " updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ? AND owner_id = ?"
+                " AND attempt_id = ? AND state = 'starting'"
+                " AND pending_attempt_id = ''",
+                (_text(previous_attempt_id),
+                 int(now) + int(lease_seconds), int(now),
+                 _text(workspace_id), int(generation), _text(owner_id),
+                 _text(attempt_id)))
         return cursor.rowcount == 1
 
     def mark_worker_gateway_available(
