@@ -2173,6 +2173,8 @@ class Provisioner:
             scope = "gateway"
         existing = self._load_attempt(workspace_id)
         if existing is not None:
+            if attempt_id in existing.get("fenced_attempts", ()):
+                raise ProvisionerError("gateway_attempt_fenced")
             if existing["attempt_id"] == attempt_id:
                 if existing["status"] in ("committed", "completed"):
                     if self._attempt_matches(
@@ -2199,6 +2201,10 @@ class Provisioner:
             "status": "pending",
             "config_version": int(handle.config_version),
         }
+        if existing is not None and existing.get("fenced_attempts"):
+            # 新 attempt 的正常记录必须携带既有围栏；被围栏的旧 attempt
+            # 仍可能在途，不能因为记录被覆盖而重新获得执行权。
+            record["fenced_attempts"] = list(existing["fenced_attempts"])
         self._persist_attempt(workspace_id, record)
 
     def _record_noop_attempt(self, workspace_id: str, attempt_id: str,
@@ -2206,6 +2212,9 @@ class Provisioner:
                              allow_supersede: bool = False) -> None:
         """纯复用写 completed/no-op tombstone，作为迟到 abort 的代次围栏。"""
         existing = self._load_attempt(workspace_id)
+        if (existing is not None
+                and attempt_id in existing.get("fenced_attempts", ())):
+            raise ProvisionerError("gateway_attempt_fenced")
         if (existing is not None and existing["status"] == "pending"
                 and existing["attempt_id"] == attempt_id):
             # 同一 attempt 的纯复用重试不能把已创建的清理承诺降级成
@@ -2229,6 +2238,8 @@ class Provisioner:
             "status": "completed",
             "config_version": int(handle.config_version),
         }
+        if existing is not None and existing.get("fenced_attempts"):
+            record["fenced_attempts"] = list(existing["fenced_attempts"])
         self._persist_attempt(workspace_id, record)
 
     @staticmethod
@@ -2246,11 +2257,18 @@ class Provisioner:
     def _ensure_attempt_available(self, workspace_id: str,
                                   attempt_id: str, *,
                                   allow_supersede: bool = False) -> None:
-        """在创建任何资源前拒绝未消解的清理承诺或不可读坏记录。"""
+        """在创建任何资源前拒绝未消解的清理承诺或不可读坏记录。
+
+        ``fenced_attempts`` 是接管方对“尚未抵达本服务”的旧 attempt 的
+        精确执行权围栏：它可能仍在途，之后到达时必须在这里失败关闭，
+        不能因为当前记录已 committed/completed 就放行并写出无主 pending。
+        """
         if not attempt_id:
             return
         record = self._load_attempt(workspace_id)
         if record is not None:
+            if attempt_id in record.get("fenced_attempts", ()):
+                raise ProvisionerError("gateway_attempt_fenced")
             if (record["attempt_id"] == attempt_id
                     or record["status"] in ("committed", "completed")
                     or allow_supersede):
@@ -2307,6 +2325,13 @@ class Provisioner:
         config_version = payload.get("config_version", 0)
         gateway_generation = payload.get("gateway_generation", "")
         gateway_upstream = payload.get("gateway_upstream", "")
+        fenced_attempts = payload.get("fenced_attempts", [])
+        if (not isinstance(fenced_attempts, list)
+                or any(not isinstance(item, str)
+                       or re.fullmatch(r"[0-9a-f]{32}", item) is None
+                       for item in fenced_attempts)
+                or len(set(fenced_attempts)) != len(fenced_attempts)):
+            return None
         if (not isinstance(attempt_id, str)
                 or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
                 or not isinstance(worker, str)
@@ -2339,6 +2364,8 @@ class Provisioner:
             "status": status,
             "config_version": config_version,
         }
+        if fenced_attempts:
+            record["fenced_attempts"] = list(fenced_attempts)
         self._attempts[workspace_id] = record
         return record
 
@@ -2749,6 +2776,14 @@ class Provisioner:
         path = self._attempt_path(workspace_id)
         if record is None:
             if not path.exists():
+                if attempt_id:
+                    # 本服务没有该 attempt 的执行记录：控制面正在收口一个
+                    # 可能尚未抵达工作区锁的请求。必须持久围栏它的执行
+                    # 权，之后它迟到时才能在创建任何资源前被拒绝，而不是
+                    # 把无主 pending 写回本 workspace。
+                    self._persist_fenced_attempt(
+                        workspace_id, worker_container_id,
+                        gateway_instance_id, attempt_id)
                 return
             # 旧版纯复用覆盖产生的不可读记录：只有在它明确声明未创建
             # 任何资源、且目标完全一致时，才允许用 completed/no-op 收口。
@@ -2776,6 +2811,9 @@ class Provisioner:
                 "status": "completed",
             })
             return
+        if attempt_id and attempt_id in record.get("fenced_attempts", ()):
+            # 已围栏 attempt 的重复收口幂等成功，不再改写当前记录。
+            return
         if not attempt_id and record["status"] == "pending":
             # 空 attempt 只能做已完成 tombstone 的幂等复核；不能按目标
             # 猜测归属，提前消解其他 owner 仍在执行的清理承诺。
@@ -2784,15 +2822,50 @@ class Provisioner:
                 record["worker_container_id"] != worker_container_id
                 or record["gateway_instance_id"] != gateway_instance_id):
             if record["status"] in ("committed", "completed"):
-                # 当前记录已无 pending 清理承诺。请求的 attempt 可能因
-                # 上一轮进程在写记录前崩溃而根本不存在；精确 commit 只能
-                # 证明“它没有可收口的 pending”，不能因此失败。
+                # 当前记录已无 pending 清理承诺。请求的 attempt 也可能因
+                # 上一轮进程在写记录前崩溃而根本不存在；精确 commit 不能
+                # 证明它不会迟到执行，必须把它持久围栏后才能返回成功。
+                if attempt_id and record["attempt_id"] != attempt_id:
+                    self._remember_fenced_attempt(
+                        workspace_id, record, attempt_id)
                 return
             raise ProvisionerError("gateway_commit_superseded")
         if record["status"] == "pending":
             committed = dict(record)
             committed["status"] = "committed"
             self._persist_attempt(workspace_id, committed)
+
+    def _persist_fenced_attempt(self, workspace_id: str,
+                                worker_container_id: str,
+                                gateway_instance_id: str,
+                                attempt_id: str) -> None:
+        """持久“该 attempt 永不得再执行”的已完成语义记录。
+
+        记录本身无资源可清理；``fenced_attempts`` 保存被收口的精确 ID。
+        后续任何 attempt 的正常记录都会携带该列表，避免记录被覆盖后旧
+        请求重新获得执行权。
+        """
+        self._persist_attempt(workspace_id, {
+            "attempt_id": attempt_id,
+            "worker_container_id": worker_container_id,
+            "gateway_instance_id": gateway_instance_id,
+            "worker_created": False,
+            "gateway_created": False,
+            "scope": "none",
+            "status": "completed",
+            "config_version": 0,
+            "fenced_attempts": [attempt_id],
+        })
+
+    def _remember_fenced_attempt(self, workspace_id: str, record: dict,
+                                 attempt_id: str) -> None:
+        fenced = list(record.get("fenced_attempts", ()))
+        if attempt_id in fenced:
+            return
+        fenced.append(attempt_id)
+        updated = dict(record)
+        updated["fenced_attempts"] = fenced
+        self._persist_attempt(workspace_id, updated)
 
     async def recover_abort(self, workspace_id: str,
                             worker_container_id: str,

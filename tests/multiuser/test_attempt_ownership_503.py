@@ -302,11 +302,18 @@ def test_empty_attempt_commit_cannot_close_pending_cleanup(tmp_path):
     assert record["status"] == "pending"
 
 
-def test_commit_without_record_is_a_noop(tmp_path):
+def test_commit_without_record_persists_execution_fence(tmp_path):
+    """R4-R2：无记录的精确 commit 必须围栏该 attempt，不能无操作放行。"""
     service = _service(tmp_path)
     asyncio.run(service.commit_attempt(
         WORKSPACE, WORKER, GATEWAY, attempt_id="a" * 32))
-    assert service._load_attempt(WORKSPACE) is None
+    record = service._load_attempt(WORKSPACE)
+    assert record is not None
+    assert record["status"] == "completed"
+    assert record["fenced_attempts"] == ["a" * 32]
+    with pytest.raises(provisioner.ProvisionerError) as refused:
+        service._ensure_attempt_available(WORKSPACE, "a" * 32)
+    assert refused.value.code == "gateway_attempt_fenced"
 
 
 def test_legacy_no_resource_record_requires_verified_recovery(tmp_path):
@@ -1475,8 +1482,8 @@ def test_resolve_attempt_requires_available_before_skipping_activation(
     assert resolved["gateway_state"] == "staged"
 
 
-def test_commit_of_unknown_attempt_is_noop_after_promise_resolved(tmp_path):
-    """接管进程可能在写新记录前崩溃；已无 pending 时精确 commit 可无操作。"""
+def test_commit_of_unknown_attempt_fences_after_promise_resolved(tmp_path):
+    """已无 pending 时精确 commit 保留原记录，并围栏未知 attempt。"""
     service = _service(tmp_path)
     _record(service, "a" * 32, worker_created=False, gateway_created=True)
     asyncio.run(service.commit_attempt(
@@ -1489,6 +1496,10 @@ def test_commit_of_unknown_attempt_is_noop_after_promise_resolved(tmp_path):
     assert record is not None
     assert record["attempt_id"] == "a" * 32
     assert record["status"] == "committed"
+    assert record["fenced_attempts"] == ["b" * 32]
+    with pytest.raises(provisioner.ProvisionerError) as refused:
+        service._ensure_attempt_available(WORKSPACE, "b" * 32)
+    assert refused.value.code == "gateway_attempt_fenced"
 
 
 def test_takeover_commit_failure_keeps_fence_and_later_owner_recovers(
