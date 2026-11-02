@@ -9,21 +9,21 @@
 ........................................................................ [ 35%]
 ........................................................................ [ 39%]
 ........................................................................ [ 43%]
-s......................................................................s [ 47%]
-........................................................................ [ 51%]
-..................................................................s..... [ 55%]
+..s..................................................................... [ 47%]
+.s...................................................................... [ 51%]
+....................................................................s... [ 55%]
 ........................................................................ [ 59%]
 ........................................................................ [ 63%]
 ........................................................................ [ 67%]
 ........................................................................ [ 71%]
-.......................................s................................ [ 75%]
+.........................................s.............................. [ 75%]
 ........................................................................ [ 79%]
 ........................................................................ [ 83%]
-...............................................s........................ [ 87%]
+.................................................s...................... [ 87%]
 ........................................................................ [ 91%]
 ........................................................................ [ 95%]
 ........................................................................ [ 99%]
-.                                                                        [100%]
+...                                                                      [100%]
 ============================== warnings summary ===============================
 tests/multiuser/test_gateway_tcp.py::test_real_tcp_gateway_forwards_to_guarded_worker_and_rejects_outer_scope
   C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
@@ -34,7 +34,7 @@ tests/multiuser/test_gateway_tcp.py::test_real_tcp_gateway_forwards_to_guarded_w
     from websockets.server import WebSocketServerProtocol
 
 tests/multiuser/test_original_web_api.py::test_persona_links_cannot_read_or_mutate_outside_profiles
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-693 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-703 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -52,7 +52,7 @@ tests/multiuser/test_original_web_api.py::test_persona_links_cannot_read_or_muta
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_original_web_api.py::test_symlink_or_junction_inside_outputs_is_rejected
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-695 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-705 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -70,7 +70,7 @@ tests/multiuser/test_original_web_api.py::test_symlink_or_junction_inside_output
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_original_web_api.py::test_workbench_outputs_junction_is_rejected_before_first_write
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-707 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-717 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -88,7 +88,7 @@ tests/multiuser/test_original_web_api.py::test_workbench_outputs_junction_is_rej
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_publish_worker.py::test_media_staging_copies_into_run_dir_and_rejects_escape
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-803 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-813 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -106,7 +106,7 @@ tests/multiuser/test_publish_worker.py::test_media_staging_copies_into_run_dir_a
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_publish_worker.py::test_build_package_rejects_linked_export_directory_inside_outputs
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-824 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-834 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -124,7 +124,7 @@ tests/multiuser/test_publish_worker.py::test_build_package_rejects_linked_export
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_publish_worker.py::test_build_package_rejects_export_directory_escaping
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-826 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-836 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -142,7 +142,7 @@ tests/multiuser/test_publish_worker.py::test_build_package_rejects_export_direct
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-1068 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-1078 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -160,7 +160,7 @@ tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 tests/multiuser/test_worker_skills_profile.py::test_profile_baseline_rejects_link_target_before_write
-  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-1143 (_readerthread)
+  C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-1153 (_readerthread)
 
   Traceback (most recent call last):
     File "C:\Users\hyh\anaconda3\envs\Agent\lib\threading.py", line 1016, in _bootstrap_inner
@@ -178,5 +178,5 @@ tests/multiuser/test_worker_skills_profile.py::test_profile_baseline_rejects_lin
     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-1794 passed, 7 skipped, 10 warnings in 294.66s (0:04:54)
+1796 passed, 7 skipped, 10 warnings in 285.50s (0:04:45)
 pytest_exit=0

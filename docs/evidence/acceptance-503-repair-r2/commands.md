@@ -26,6 +26,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy/desktop/Update-Wo
 
 - 失败输出会包含 `update_barrier_retained=<id>`。**修复原因后直接重跑
   同一条 Update 命令**；脚本会沿用该 `desktop-update` 屏障进入恢复阶段。
+- 首次 managed 基线写在
+  `<DataRoot>\logs\update-baseline-<barrierId>.json`；恢复阶段沿用该
+  文件，持续漂移会继续失败。不要删除或改写该文件；缺失时更新会以
+  `update_baseline_missing` 失败关闭，不会重新打基线掩盖实例替换。
 - 禁止手工 `admin resume`、SQL 改状态、删卷、按进程名泛杀或放宽所有
   镜像/PID 校验来“修好”更新。若控制库完全不可读，Update 报
   `update_control_facts_unavailable`，应先恢复控制面而不是绕过。

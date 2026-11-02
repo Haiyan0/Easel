@@ -330,7 +330,7 @@ def main() -> int:
     succeeded = False
 
     old_image = _image_id("easel-control:4382180862e2")
-    new_image = _image_id("easel-control:503-r2")
+    new_image = _image_id("easel-control:503-r2-final")
     worker_image = _image_id("easel-worker:4382180862e2")
     gateway_image = _image_id("easel-gateway:4382180862e2")
     runtime_hash = subprocess.run(

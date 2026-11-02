@@ -1,51 +1,52 @@
-R2_IMAGES {"gateway": "sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac", "new_control": "sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3", "new_provisioner_sha256": "0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f", "new_runtime_sha256": "dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23", "old_control": "sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2", "worker": "sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57"}
-R2_PROJECT {"data_root": "C:\\Easel\\r2-fc0ebfac-data", "gid": 1000, "new_source": "/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair", "old_source": "/mnt/c/Code/Easel-acceptance", "port": 49210, "project": "easel-r2-fc0ebfac", "workspace_root": "C:\\Easel\\r2-fc0ebfac-workspaces"}
+R2_IMAGES {"gateway": "sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac", "new_control": "sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964", "new_provisioner_sha256": "f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103", "new_runtime_sha256": "73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab", "old_control": "sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2", "worker": "sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57"}
+R2_PROJECT {"data_root": "C:\\Easel\\r2-15aacce1-data", "gid": 1000, "new_source": "/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair", "old_source": "/mnt/c/Code/Easel-acceptance", "port": 58802, "project": "easel-r2-15aacce1", "workspace_root": "C:\\Easel\\r2-15aacce1-workspaces"}
 R2_STAGE init
-R2_INIT_OLD initialized project=easel-r2-fc0ebfac control_volume=easel-r2-fc0ebfac-control key_volume=easel-r2-fc0ebfac-keys egress_volume=easel-r2-fc0ebfac-egress network=easel-r2-fc0ebfac-control key=created,signing_key=created
+R2_INIT_OLD initialized project=easel-r2-15aacce1 control_volume=easel-r2-15aacce1-control key_volume=easel-r2-15aacce1-keys egress_volume=easel-r2-15aacce1-egress network=easel-r2-15aacce1-control key=created,signing_key=created
 R2_STAGE start_old
-R2_START_OLD started project=easel-r2-fc0ebfac origin=https://easel.test port=49210 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-fc0ebfac-control provisioner_socket=/tmp/easel-runtime/easel-r2-fc0ebfac/provisioner.sock publish_mode=manual
-deployment_file=C:\Easel\r2-fc0ebfac-data\logs\deployment.json
-config_sha256=64990550e64e2e3e68d528b8337c6d8b0f5ab8ab94a5885f0dd708e16d92a1e9
+R2_START_OLD started project=easel-r2-15aacce1 origin=https://easel.test port=58802 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-15aacce1-control provisioner_socket=/tmp/easel-runtime/easel-r2-15aacce1/provisioner.sock publish_mode=manual
+deployment_file=C:\Easel\r2-15aacce1-data\logs\deployment.json
+config_sha256=4ff59d8cb9aecc8c33d1ccf17e59bea526302e2db4736d12f2c79f3e6f7d2734
 frontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1
 R2_STAGE provider
 R2_STAGE first_screen_before
 R2_STAGE chat_before
-R2_BEFORE {"chat": {"assistant_has_marker": true, "elapsed": 3.537, "run": "c446de1fc0744362aed42f54ed62f073", "session": "7409399ac2ee40ab9bd56fbe9d5d2004", "state": "done"}, "first_screen": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}, "lease": {"attempt": "2586b2a4262e4524a4c3db324c233ff8", "gateway": "2c4e544594b145c786e00388fe2ea3e578e12df9d8dad7c1d337c2f8ad42a8fd", "gateway_state": "available", "generation": 1, "owner": "e252d91021c8479d91908df3f6e6911e", "state": "ready", "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"}, "provider_requests": 2}
-R2_REUSE_REPRO {"cwd_after": "/Code/Easel-acceptance", "pid_after": "44132", "pid_before": "44132", "returncode": 0, "stdout": "started project=easel-r2-fc0ebfac origin=https://easel.test port=49210 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-fc0ebfac-control provisioner_socket=/tmp/easel-runtime/easel-r2-fc0ebfac/provisioner.sock publish_mode=manual\ndeployment_file=C:\\Easel\\r2-fc0ebfac-data\\logs\\deployment.json\nconfig_sha256=64990550e64e2e3e68d528b8337c6d8b0f5ab8ab94a5885f0dd708e16d92a1e9\nfrontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1"}
+R2_BEFORE {"chat": {"assistant_has_marker": true, "elapsed": 4.167, "run": "74f6f125680b448ca635e713ad8c44da", "session": "42eb99c9b7cd4cc39168d323b691cff1", "state": "done"}, "first_screen": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}, "lease": {"attempt": "05589440da2c44ebb2d01582429fe052", "gateway": "dbfa1ef2f57d85ac75ff517d9b9e4597795dce5a2b14dcae9e79d85ff438939f", "gateway_state": "available", "generation": 1, "owner": "fd9831f6216844f3a73c09cbab892640", "state": "ready", "worker": "04acc48526df681c8ab6444be3f6b741a6efad6003b2cb4f6ef414650fa10bfd"}, "provider_requests": 2}
+R2_REUSE_REPRO {"cwd_after": "/Code/Easel-acceptance", "pid_after": "55704", "pid_before": "55704", "returncode": 0, "stdout": "started project=easel-r2-15aacce1 origin=https://easel.test port=58802 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-15aacce1-control provisioner_socket=/tmp/easel-runtime/easel-r2-15aacce1/provisioner.sock publish_mode=manual\ndeployment_file=C:\\Easel\\r2-15aacce1-data\\logs\\deployment.json\nconfig_sha256=4ff59d8cb9aecc8c33d1ccf17e59bea526302e2db4736d12f2c79f3e6f7d2734\nfrontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1"}
 R2_STAGE field_shape
-R2_FIELD_SHAPE {"attempt_a": "1dbb81c18bfb4eb9bd6876fc7b53b432", "attempt_b": "6d88941d56d147679fcf9169e115ed05", "attempt_file": "C:\\Easel\\r2-fc0ebfac-workspaces\\.gateway\\attempt-4fd5f1fe78154f4b854c290fc2886689.json", "db": {"gateway": "2c4e544594b145c786e00388fe2ea3e578e12df9d8dad7c1d337c2f8ad42a8fd", "generation": 2, "scope": "gateway", "state": "stopping", "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"}}
+R2_FIELD_SHAPE {"attempt_a": "908fc0efcfd04c4cb71b90a5253b88ee", "attempt_b": "7fbfd664d3b64aa3b0ecfeca9099d540", "attempt_file": "C:\\Easel\\r2-15aacce1-workspaces\\.gateway\\attempt-f12fac2fff9d438fb426e46f4418f550.json", "db": {"gateway": "dbfa1ef2f57d85ac75ff517d9b9e4597795dce5a2b14dcae9e79d85ff438939f", "generation": 2, "scope": "gateway", "state": "stopping", "worker": "04acc48526df681c8ab6444be3f6b741a6efad6003b2cb4f6ef414650fa10bfd"}}
 R2_STAGE update
 R2_UPDATE_BEGIN
+update_managed_baseline=fresh
 update_active_work=0/0
-update_barrier=update-1455f7408bf5
+update_barrier=update-091a52043dc9
 update_start_exit=0
-update_control_image=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2->sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3
-update_control_runtime_sha256=dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23
-update_provisioner_source=->0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f
-update_provisioner_pid=provisioner_pid=44132->provisioner_pid=46362
+update_control_image=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2->sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964
+update_control_runtime_sha256=73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab
+update_provisioner_source=->f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103
+update_provisioner_pid=provisioner_pid=55704->provisioner_pid=57912
 update_managed_instances=3
 update_attempt_records=1
-update_barrier_resumed=update-1455f7408bf5
-update_evidence=C:\Easel\r2-fc0ebfac-data\logs\update-last.json
-update_completed project=easel-r2-fc0ebfac
+update_barrier_resumed=update-091a52043dc9
+update_evidence=C:\Easel\r2-15aacce1-data\logs\update-last.json
+update_completed project=easel-r2-15aacce1
 R2_UPDATE_END code=0
-R2_POST_UPDATE {"barrier": "barrier=none", "control_image": "sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3", "control_runtime_sha256": "dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23", "provisioner_actions": ["ensure", "stop", "inspect", "activate", "abort", "restore_gateway", "commit_attempt", "recover_abort", "identity"], "provisioner_protocol": 2, "provisioner_source_sha256": "0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f"}
+R2_POST_UPDATE {"barrier": "barrier=none", "control_image": "sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964", "control_runtime_sha256": "73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab", "provisioner_actions": ["ensure", "stop", "inspect", "activate", "abort", "restore_gateway", "commit_attempt", "recover_abort", "identity"], "provisioner_protocol": 2, "provisioner_source_sha256": "f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103"}
 R2_STAGE first_screen_after
 R2_STAGE chat_after
-R2_AFTER {"attempt": {"attempt_file_id": "c63de05fc62a4794880bcac8e93df714", "attempt_file_status": "committed"}, "chat": {"assistant_has_marker": true, "elapsed": 3.479, "run": "ce277fb4ca5d4520a413cd192ceaab15", "session": "56fc2e7cdb0f46249127a097e965eb9b", "state": "done"}, "first_screen": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}, "lease": {"attempt": "c63de05fc62a4794880bcac8e93df714", "gateway": "f4cafe0aac2fa8aaa8aae7d69f3451d14a904a8a839ea622e932cf58de8595d2", "gateway_state": "available", "generation": 3, "owner": "a743884d928b4b61b734aef127e91ad0", "state": "ready", "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"}, "provider_requests": 3}
+R2_AFTER {"attempt": {"attempt_file_id": "ace7d81efdab49e0b7824755c302923c", "attempt_file_status": "committed"}, "chat": {"assistant_has_marker": true, "elapsed": 3.409, "run": "514d254088e44360a963267b3dc1cdc9", "session": "bc5c8b1b10cf47b9a7d9e9766284a691", "state": "done"}, "first_screen": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}, "lease": {"attempt": "ace7d81efdab49e0b7824755c302923c", "gateway": "29c7b8c00fbcbb1ea3e5173b98022f1b33b90ad0dcd0d5712e4351cbf7541bb0", "gateway_state": "available", "generation": 3, "owner": "95ea407c2b1b4cbfa10d561f3b4bccd5", "state": "ready", "worker": "04acc48526df681c8ab6444be3f6b741a6efad6003b2cb4f6ef414650fa10bfd"}, "provider_requests": 3}
 R2_STAGE stop
-R2_STOP admission_barrier=stop-1a3a9870c75f422db9c1b58f468083f9
+R2_STOP admission_barrier=stop-bc2444425b6f436fb63f34cadcd881ff
 drain_verified=settled
-stop_completed=stop-1a3a9870c75f422db9c1b58f468083f9
-stopped project=easel-r2-fc0ebfac drained=True network=easel-r2-fc0ebfac-control
+stop_completed=stop-bc2444425b6f436fb63f34cadcd881ff
+stopped project=easel-r2-15aacce1 drained=True network=easel-r2-15aacce1-control
 R2_STAGE backup
-R2_BACKUP backup=C:\Easel\r2-fc0ebfac-data\backups\desktop-20261102-170957
-manifest_sha256=b04e0c0d69aa9c9bf12f8ad0df4362220ea120faf42dd496c65436258c507cb6
+R2_BACKUP backup=C:\Easel\r2-15aacce1-data\backups\desktop-20261102-175424
+manifest_sha256=1a02561cff69d2b38a787974a9b6e1c7ef80ebf5eea027c15b07e554189bfca5
 version=2
 schema_version=15
 workspaces=2
 clean_stop=true
-control_image=sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3
+control_image=sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964
 worker_image=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57
 gateway_image=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac
 R2_STAGE verify
@@ -55,14 +56,14 @@ schema_version=15
 files=28
 workspaces=2
 clean_stop=true
-project=easel-r2-fc0ebfac
-config_sha256=96ac5b3471ef999c8872164fc3e9fa6efc50b9e0f47d1a610bee3f1c48dd59d7
+project=easel-r2-15aacce1
+config_sha256=6767edfffce346ff69186424385042a5c1ac1993a957e6c324e4a999c82e5016
 worker_image=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57
 gateway_image=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac
-control_image=sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3
+control_image=sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964
 harness_revision=687f282e8625c6b8d11ff58211a90524be2e4317
-backup_manifest_sha256=b04e0c0d69aa9c9bf12f8ad0df4362220ea120faf42dd496c65436258c507cb6
-verified_backup=C:\Easel\r2-fc0ebfac-data\backups\desktop-20261102-170957
+backup_manifest_sha256=1a02561cff69d2b38a787974a9b6e1c7ef80ebf5eea027c15b07e554189bfca5
+verified_backup=C:\Easel\r2-15aacce1-data\backups\desktop-20261102-175424
 R2_EVIDENCE=C:\Code\Easel\.claude\worktrees\acceptance-503-repair\docs\evidence\acceptance-503-repair-r2\e2e-result.json
 R2_UPDATE_E2E_PASS
 R2_CLEANUP done

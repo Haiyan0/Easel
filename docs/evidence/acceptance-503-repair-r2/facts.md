@@ -8,10 +8,10 @@
 | R2-01 提交 | `a2f8ed1` |
 | R2-02 提交 | `528e41c` |
 | R2-03/04/05 提交 | `5f5be50` |
-| 新版 control 镜像 | `easel-control:503-r2` = `sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3` |
-| 镜像内 `easel/control/runtime.py` SHA-256 | `dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23` |
-| 工作树 `easel/control/runtime.py` SHA-256 | `dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23` |
-| 工作树 `deploy/multiuser/provisioner.py` SHA-256 | `0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f` |
+| 新版 control 镜像（最终） | `easel-control:503-r2-final` = `sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964` |
+| 镜像内 `easel/control/runtime.py` SHA-256 | `73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab` |
+| 工作树 `easel/control/runtime.py` SHA-256 | `73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab` |
+| 工作树 `deploy/multiuser/provisioner.py` SHA-256 | `f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103` |
 | 工作树 `easel/control/store.py` SHA-256 | `36641f704fffcf32314ffc4539843e1785ecba6eb62365667cc81232f16676dc` |
 | 工作树 `easel/control/cli.py` SHA-256 | `6efe05ddb72f404ac9752ebd1213ae72c361b7b15a61c46ebda0f988f62e6e90` |
 | 用户实际旧版本源码 | `C:\Code\Easel-acceptance`（4382180，detached） |
@@ -22,15 +22,16 @@
 
 ## 构建
 
-- 命令：`docker build --progress=plain -f deploy/desktop/Dockerfile.control -t easel-control:503-r2 --build-arg HTTP_PROXY=http://host.docker.internal:7897 --build-arg HTTPS_PROXY=http://host.docker.internal:7897 .`
-- 退出码：0；完整日志见 `control-build.txt`。
-- 构建只替换本地 `easel-control:503-r2`，未推送、未覆盖用户镜像。
+- 命令：`docker build --progress=plain -f deploy/desktop/Dockerfile.control -t easel-control:503-r2-final --build-arg HTTP_PROXY=http://host.docker.internal:7897 --build-arg HTTPS_PROXY=http://host.docker.internal:7897 .`
+- 退出码：0；完整日志见 `control-build-final.txt`。
+- 构建只替换本地 `easel-control:503-r2-final`，未推送、未覆盖用户镜像。
 
 ## 本机验证
 
-- 全量 `pytest tests/multiuser`：1794 passed, 7 skipped（见 `full-multiuser.txt`）。
-- 隔离真实更新：项目 `easel-r2-fc0ebfac`，退出 0；旧 control
-  `9272b556…` → 新 control `9d18ec91…`；旧 provisioner PID 44132 →
-  新 PID 46362；首屏 6/6、短聊天、Stop→Backup→Verify 通过。
+- 全量 `pytest tests/multiuser`：1796 passed, 7 skipped（见 `full-multiuser.txt`）。
+- desktop/update 专项：10 passed；连契约测试共 13 passed（`desktop-update-tests.txt`）。
+- 隔离真实更新：项目 `easel-r2-15aacce1`，退出 0；旧 control
+  `9272b556…` → 新 control `fabe6b75…`；旧 provisioner PID 55704 →
+  新 PID 57912；首屏 6/6、短聊天、Stop→Backup→Verify 通过。
 - 真实故障重试：见 `fault-retry-run.txt` / `fault-retry-result.json`。
 - 清理：随机项目容器/卷/网络已删除；备份目录已手工清理。

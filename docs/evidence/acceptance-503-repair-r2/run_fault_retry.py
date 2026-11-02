@@ -48,7 +48,7 @@ def main() -> int:
     cleanup_workspaces: list[str] = []
 
     old_image = e2e._image_id("easel-control:4382180862e2")
-    new_image = e2e._image_id("easel-control:503-r2")
+    new_image = e2e._image_id("easel-control:503-r2-final")
     worker_image = e2e._image_id("easel-worker:4382180862e2")
     gateway_image = e2e._image_id("easel-gateway:4382180862e2")
     gid = int(e2e._wsl("id", "-g").stdout.strip())
@@ -145,6 +145,39 @@ def main() -> int:
         barrier = e2e._control_exec(
             old_control, code, barrier_id, str(int(time.time())))
         print("R2F_BARRIER " + barrier.strip())
+        # 真实首次 Update 会在屏障后写 managed 基线；故障夹具补同一文件，
+        # 否则 Important 2 的“缺失首次基线失败关闭”会正确拒绝重跑。
+        workspaces_code = (
+            "import json\n"
+            "from easel.control.store import Store\n"
+            "with Store.open('/srv/easel/control/control.sqlite3') as s:\n"
+            "    print(json.dumps(s.list_workspace_ids()))\n")
+        workspaces = json.loads(e2e._control_exec(
+            old_control, workspaces_code).strip())
+        container_ids: list[str] = []
+        for workspace in workspaces:
+            found = e2e._docker(
+                "ps", "-a", "-q",
+                "--filter", "label=easel.managed=true",
+                "--filter", f"label=easel.workspace-id={workspace}")
+            container_ids.extend(
+                item.strip() for item in found.stdout.split()
+                if item.strip())
+        baseline: list[str] = []
+        if container_ids:
+            inspected = e2e._docker(
+                "inspect", "--format", "{{.Id}}|{{.State.Running}}",
+                *sorted(set(container_ids)))
+            baseline = sorted(
+                line.strip() for line in inspected.stdout.splitlines()
+                if line.strip())
+        baseline_file = (data_root / "logs" /
+                         f"update-baseline-{barrier_id}.json")
+        baseline_file.write_text(
+            json.dumps(baseline), encoding="utf-8")
+        print("R2F_BASELINE " + json.dumps(
+            {"count": len(baseline), "file": str(baseline_file)},
+            sort_keys=True))
         process = e2e._provisioner_process(project)
         pid = process.get("pid", "")
         if not pid:

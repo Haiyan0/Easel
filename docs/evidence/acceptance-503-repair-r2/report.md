@@ -24,8 +24,8 @@ Cookie 或容器；未执行真实模型/平台；未合并、未推送。
 | R2-01 P1 普通首屏接管前提交旧 attempt | `ensure_ready` refresh 的过期 starting 与 restore 共用 `_takeover_for_restore`：先 owner/generation/attempt CAS，再按精确 attempt 收口 | `probe-r1-ensure-takeover.txt`；`test_ensure_ready_*` 四例；真实隔离更新链路 |
 | R2-02 P1 替换响应丢失无法恢复 | provisioner 持久化 attempt 的 config/gateway 身份；`commit_attempt` 增加受限 resolve；runtime 在 `gateway_commit_superseded` 时取回真实候选、CAS adopt 后直接接管 | `probe-r1-lost-response.txt`（原探针）；`probe-r1-lost-response-once-variant.txt`；`test_lost_*` / `test_repeated_*` |
 | R2-03 P1 Update 不保护活动 Run | 屏障建立后、Start 前用 `update-status` 事实有界等待 `activeRuns`/`activeRequests`；超时保留屏障、绝不替换 | `test_update_waits_for_active_run_and_does_not_start`；`test_admin_update_status_*` |
-| R2-04 P1 部分更新失败不能重跑 | 先读控制库事实识别 `desktop-update` 未完成阶段；恢复阶段允许目标 control/停止的旧 provisioner，跳过旧 identity/PID；Start 后核验失败保留屏障，同命令重跑 | `test_update_resumes_*`；`test_update_failed_post_verification_can_rerun_same_command`；真实隔离更新链路 |
-| R2-05 P2 快照包含其他部署 | 快照只查询本项目控制库 workspaceIds（或本项目持久根目录），按 `easel.workspace-id` 过滤 | `test_update_ignores_other_project_instance_changes`；`test_update_snapshot_is_scoped_to_project_workspaces`；`git diff --check` |
+| R2-04 P1 部分更新失败不能重跑 | 先读控制库事实识别 `desktop-update` 未完成阶段；恢复阶段允许目标 control/停止的旧 provisioner，跳过旧 identity/PID；Start 后核验失败保留屏障，同命令重跑且沿用首次 managed 基线 | `test_update_resumes_*`；`test_update_failed_post_verification_can_rerun_same_command`（漂移持续仍拒绝）；真实隔离更新链路 |
+| R2-05 P2 快照包含其他部署 | 快照只查询本项目控制库 workspaceIds（或本项目持久根目录），按 `easel.workspace-id` 过滤；重跑沿用首次基线，不重新打基线 | `test_update_ignores_other_project_instance_changes`；`test_update_snapshot_is_scoped_to_project_workspaces`；`test_update_failed_post_verification_can_rerun_same_command`；`git diff --check` |
 
 ## 1. R2-01 普通首屏接管屏障
 
@@ -83,7 +83,8 @@ TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
 候选 F 被 adopt/commit、DB 转 ready。第二次恢复调用探针 Adapter 的
 `restore_gateway`；该 Adapter 每次固定抛 `CancelledError`，而探针只捕获
 `Exception`，因此 CancelledError 逃逸、探针在打印 JSON 前退出。这是探针
-Adapter 的固有限制，不是恢复失败。
+Adapter 的固有限制，不是恢复失败。原探针输出本身只有该 traceback；
+最终终态证据来自下述变体与正式测试，不把原探针输出当作终态证明。
 
 只丢失第一次响应的展示变体（文件头注明为变体，原探针未修改）得到：
 
@@ -98,7 +99,9 @@ TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
 无 `gateway_commit_superseded` 循环、DB ready、无 pending 槽位。
 
 正式回归覆盖：restore 入口、ensure_ready 入口、连续恢复中断、正常 Stop、
-未替换纯复用、resolve 对 worker/config/gateway 错配的拒绝。
+未替换纯复用、resolve 对 worker/config/gateway 错配的拒绝；另验证
+`active=true, available=false` 的 gateway 只能返回 staged，强制重新
+activate 与完整复核（`test_resolve_attempt_requires_available_before_skipping_activation`）。
 
 ## 3. R2-03 Update 的活动工作边界
 
@@ -109,8 +112,9 @@ TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
   超过 `-TimeoutSeconds` 报 `update_active_work_timeout:<runs>/<requests>`
   并保留屏障，绝不进入 Start/compose。
 - 只等待活动 Run 与在途请求；`activeLeaseCount` 仅输出诊断，静态坏
-  lease 交给 Start 的恢复路径，避免现场 drain 死锁。控制面完全不在时
-  明确输出 `update_active_work=unobservable`（没有可替换的服务）。
+  lease 交给 Start 的恢复路径，避免现场 drain 死锁。控制容器不在时仍用
+  只读 SQLite 事实继续等待；offline 事实也不可读则失败关闭，绝不以
+  “不可观察”为由在存在活动工作时替换服务。
 
 证据（真实 PowerShell 控制流 + 临时 Docker/WSL 桩）：
 
@@ -121,6 +125,8 @@ update_barrier_retained=update-...
 ```
 
 断言未调用 `compose up`、未进入 Start（`test_update_waits_for_active_run_and_does_not_start`）。
+控制容器不在时仍用 offline facts 等待；有活动工作时同样拒绝并保留屏障
+（`test_update_rejects_active_work_when_control_container_is_absent`）。
 
 ## 4. R2-04 部分更新失败的安全重试
 
@@ -161,6 +167,12 @@ update_barrier_retained=update-...
   `label=easel.managed=true` 集合。
 - 其他部署正常增删 worker/gateway 不进入本项目快照；本项目实例被替换
   仍会触发 `update_managed_instances_changed`。
+- 重跑不重新打基线：首次 managed 快照在屏障建立后写入
+  `update-baseline-<barrierId>.json`；恢复阶段沿用该文件，漂移持续时
+  第二次仍拒绝，只有恢复原实例后才完成。缺失首次基线的恢复阶段失败
+  关闭（`update_baseline_missing`）。
+- attempt 文件快照仍扫描本项目 `$WorkspaceRoot\.gateway`；部署模型假定
+  WorkspaceRoot 为本项目独占，共享根不在支持范围。
 - `control-build.txt` 六处尾随空白已清理，内容与来源不变；
   `git diff --check` 在 `966d650..HEAD` 与工作树均通过。
 
@@ -171,45 +183,48 @@ update_barrier_retained=update-...
 ## 6. 隔离真实资源验收
 
 使用用户实际旧版本组合 `4382180`（源码 `C:\Code\Easel-acceptance`、
-`easel-control:4382180…` / `easel-worker:…` / `easel-gateway:…` 旧镜像）
-与新版 control 镜像 `easel-control:503-r2`，随机项目
-`easel-r2-fc0ebfac`、随机端口、随机数据/工作区目录；不访问用户 `easel`
-实例。受控 TLS fake provider 只在本隔离网络内。
+旧 control/worker/gateway 镜像）与最终新版 control 镜像
+`easel-control:503-r2-final`，随机项目 `easel-r2-15aacce1`、随机端口、
+随机数据/工作区目录；不访问用户 `easel` 实例。受控 TLS fake provider
+只在本隔离网络内。本节数据来自复审修复后的最终代码/镜像重跑。
 
 ### 6.1 正常旧→新更新（`run_e2e.py`，退出 0）
 
 - 旧部署首屏 6/6 200，短聊天 `state=done`、`assistant_has_marker=true`。
 - 复用复现：仅把旧 Start 的 `WslRepo` 指向新源码，旧 provisioner
-  PID `44132` 与 cwd `/Code/Easel-acceptance` 均未变化，证明“改磁盘源码”
+  PID `55704` 与 cwd `/Code/Easel-acceptance` 均未变化，证明“改磁盘源码”
   不会升级运行中的旧进程。
 - 构造现场同构坏状态：真实旧 Store 把租约置为 `stopping/gateway`，
   新 generation 2；磁盘写入旧版无资源 attempt 记录。
 - 正式 Update 退出 0：
 
 ```text
+update_managed_baseline=fresh
 update_active_work=0/0
-update_barrier=update-1455f7408bf5
+update_barrier=update-091a52043dc9
 update_start_exit=0
-update_control_image=sha256:9272b556…->sha256:9d18ec91…
-update_control_runtime_sha256=dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23
-update_provisioner_source=->0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f
-update_provisioner_pid=provisioner_pid=44132->provisioner_pid=46362
+update_control_image=sha256:9272b556…->sha256:fabe6b75…
+update_control_runtime_sha256=73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab
+update_provisioner_source=->f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103
+update_provisioner_pid=provisioner_pid=55704->provisioner_pid=57912
 update_managed_instances=3
 update_attempt_records=1
-update_barrier_resumed=update-1455f7408bf5
-update_completed project=easel-r2-fc0ebfac
+update_barrier_resumed=update-091a52043dc9
+update_completed project=easel-r2-15aacce1
 ```
 
+- 首次 managed 基线（3 个实例）写入
+  `update-baseline-update-091a52043dc9.json`；post-check 与基线一致。
 - 更新后：control 镜像/源码摘要匹配新镜像；provisioner protocol 2、
-  源码摘要匹配新源码、actions 完整；屏障 `barrier=none`。
-- 恢复与业务：worker ID `ca807e15…` 与更新前相同；gateway 由
-  `2c4e5445…` 替换为 `f4cafe0a…`；attempt 记录 `committed`；首屏
+  源码摘要 `f229ec30…`、actions 完整；屏障 `barrier=none`。
+- 恢复与业务：worker ID `04acc485…` 与更新前相同；gateway 由
+  `dbfa1ef2…` 替换为 `29c7b8c0…`；attempt 记录 `committed`；首屏
   6/6 200；短聊天 `state=done`、marker 存在；provider 请求 2→3。
 - 正常 Stop（`drain_verified=settled`）→ Backup →
   Verify：备份 `schema_version=15`、`clean_stop=true`、28 文件、
-  2 workspaces；manifest `b04e0c0d…`。完整输出见 `e2e-run.txt`、
+  2 workspaces；manifest `1a02561c…`。完整输出见 `e2e-run.txt`、
   机器摘要见 `e2e-result.json`。
-- 清理：随机项目容器/卷/网络已删除；遗留备份目录已手工删除。
+- 清理：随机项目容器/卷/网络已删除；遗留目录已手工删除。
   未操作用户实例、Key、Cookie、DB、attempt。
 
 ### 6.2 故障重试边界
@@ -226,32 +241,37 @@ update_completed project=easel-r2-fc0ebfac
 
 ### 6.3 真实故障重试（`run_fault_retry.py`）
 
-随机项目 `easel-r2f-80f27abd`：先用 4382180 旧版本启动并完成首屏/聊天；
+随机项目 `easel-r2f-beb9954d`：先用 4382180 旧版本启动并完成首屏/聊天；
 用旧 control 的真实 Store 写入 `update-abcdef123456`（reason
-`desktop-update`，模拟首次 Update 已建立屏障），再只按精确 socket/PID
-停止旧 provisioner（PID 50710，确认 `pid=""`）。随后运行同一条 Update：
+`desktop-update`，模拟首次 Update 已建立屏障），按真实更新格式写入
+3 个实例的 managed 基线，再只按精确 socket/PID 停止旧 provisioner
+（PID 59918，确认 `pid=""`）。随后运行同一条 Update：
 
-> 说明：屏障写入属于故障注入夹具，不是恢复手段；恢复本身只执行正式
-> Update 命令，没有手工 resume、SQL 改 ready、删卷或泛杀。
+> 说明：屏障与基线写入属于故障注入夹具，不是恢复手段；恢复本身只执行
+> 正式 Update 命令，没有手工 resume、SQL 改 ready、删卷或泛杀。
 
 ```text
 update_resumed_phase=update-abcdef123456
 update_resume_control_image=sha256:9272b556…（旧镜像，允许）
+update_managed_baseline=existing
 update_active_work=0/0
 update_start_exit=0
-update_provisioner_pid=unavailable->provisioner_pid=52035
-update_control_image=sha256:9272b556…->sha256:9d18ec91…
+update_provisioner_pid=unavailable->provisioner_pid=61274
+update_control_image=sha256:9272b556…->sha256:fabe6b75…
+update_control_runtime_sha256=73702e19…
+update_provisioner_source=->f229ec30…
 update_barrier_resumed=update-abcdef123456
-update_completed project=easel-r2f-80f27abd
+update_completed project=easel-r2f-beb9954d
 R2F_AFTER first_screen 6/6 200
  chat={state:"done", assistant_has_marker:true}
- provisioner={pid:"52035", cwd:"/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair"}
+ provisioner={pid:"61274", cwd:"/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair"}
 R2F_FAULT_RETRY_PASS
 R2F_STOP drain_verified=settled
 ```
 
-恢复阶段没有要求旧 identity/PID（输出 `unavailable`），Start 启动了新
-provisioner（PID 52035、cwd 新源码），首屏/聊天仍通过，最后正常 Stop。
+恢复阶段没有要求旧 identity/PID（输出 `unavailable`），沿用首次 managed
+基线（3 个实例，post-check 一致），Start 启动了新 provisioner
+（PID 61274、cwd 新源码），首屏/聊天仍通过，最后正常 Stop。
 项目容器/卷/网络/目录已清理。原始输出见 `fault-retry-run.txt`。
 
 未对真实容器注入“新 control 健康失败”和“Start 后核验失败”两种状态；
@@ -260,12 +280,13 @@ provisioner（PID 52035、cwd 新源码），首屏/聊天仍通过，最后正�
 
 ## 7. 回归与探针
 
-- `pytest tests/multiuser`：1794 passed, 7 skipped。
-- desktop/update 专项：9 passed。
+- `pytest tests/multiuser`：1796 passed, 7 skipped。
+- desktop/update 专项：`test_desktop_update_r2.py` 10 passed；连
+  `test_desktop_command_contract.py` 共 13 passed。
 - 本轮新增红绿：
-  - `tests/multiuser/test_attempt_ownership_503.py`（31 passed）；
+  - `tests/multiuser/test_attempt_ownership_503.py`（32 passed）；
   - `tests/multiuser/test_stop_barrier.py`（12 passed）；
-  - `tests/multiuser/test_desktop_update_r2.py`（9 passed）。
+  - `tests/multiuser/test_desktop_update_r2.py`（10 passed）。
 - 主审原三条探针原样运行：`probe_pre_takeover_commit.py`、`probe_commit_budget.py`、
   `probe_rollout_parameters.py`，输出见同目录同名 `-*.txt`。
 - 本轮三条：ensure/update barrier 原样通过；lost-response 原探针结果与
@@ -275,7 +296,45 @@ provisioner（PID 52035、cwd 新源码），首屏/聊天仍通过，最后正�
 - 前端本轮未改；沿用 R1 首轮 193 Node tests、tsc/vite build、oxlint
   通过的结论，不重复已关闭页面矩阵。
 
-## 8. 安全边界、未执行与回退
+## 8. 独立整分支复审修复
+
+独立整分支复审（fresh reviewer，范围 `43e4cd0..7c57777`）确认并已修复
+三项：
+
+- **Critical：控制容器不在时跳过 offline 活动工作事实。** 修复后控制
+  容器不在时仍用只读 SQLite 事实做有界等待；offline 也不可读则
+  `update_work_status_unavailable` 失败关闭。新增
+  `test_update_rejects_active_work_when_control_container_is_absent`
+  （RED→GREEN）。
+- **Important 1：resolve 用 `active` 而非 `available` 判定可接管。**
+  修复后只有 `available is True` 才返回 available，否则返回 staged 强制
+  重新 activate。新增
+  `test_resolve_attempt_requires_available_before_skipping_activation`
+  （RED→GREEN）。
+- **Important 2：重跑重新基线化 managed 快照，持续漂移可被掩盖。**
+  首次 managed 快照在屏障建立后写入
+  `update-baseline-<barrierId>.json`；恢复阶段沿用该基线，缺失时
+  `update_baseline_missing` 失败关闭。新增三阶段测试
+  `test_update_failed_post_verification_can_rerun_same_command`
+  （首次失败 → 漂移持续仍失败 → 恢复原实例后完成）。
+
+复审其余 Minor 的处置：
+
+- 报告与证据口径不一致：已修正并在本轮提交。
+- `Provisioner` 协议缺少 `resolve/config_version`：已同步类型声明。
+- offline facts 回退：新增的 control-absent 测试覆盖 offline 分支；
+  手工证据仍用 bind mount + root，交付代码的 volume + 10001 未单独注入。
+- 候选消失后的永久 fencing：失败关闭行为保留，人工核验边界已写入 §9。
+- 原 lost-response 探针输出归属：§2 已明确终态证据来自变体与正式测试。
+- `Get-AttemptSnapshot` 项目范围：按 WorkspaceRoot 独占前提记录。
+- 单次 Docker 事实读取超时：记录为未注入边界（§9）。
+
+复审 “Declined to judge” 各行按任务边界保留：前端未改、不调用真实平台、
+不声称旧镜像回退、不手工 resume/SQL/删卷/泛杀、Start 进程逻辑未改、
+WorkspaceRoot 按项目独占、旧屏障不绑定 target digest、未登记 workspace
+不在快照范围、原探针 Adapter 限制如实记录、更远版本组合不验证。
+
+## 9. 安全边界、未执行与回退
 
 - 未操作用户实例 `C:\Easel\acceptance-data` /
   `C:\Easel\acceptance-workspaces`；未动用户 bf8e… 工作区容器。
@@ -288,3 +347,10 @@ provisioner（PID 52035、cwd 新源码），首屏/聊天仍通过，最后正�
   不覆盖原实例。
 - 真实 Linux 生产部署、其他旧版本组合未在本轮验证；Update 对缺少
   barrier/identity 能力的旧版本失败关闭。
+- 候选消失的边界：若丢失响应窗口内记录中的 gateway 已被删除或
+  inspect 不符，resolve 失败关闭（`gateway_recovery_target_mismatch` /
+  503），不会猜测清理；需要人工核验精确实例与 attempt，未提供自动
+  “标记 completed”的清理路径。
+- 单次 Docker 事实读取没有独立进程级超时；`Wait-UpdateWorkload` 在
+  轮询之间检查 deadline。控制容器挂起且 docker 调用本身不返回时，
+  有界等待可能被单次调用拖长；该场景未在本轮注入。
