@@ -1,0 +1,17 @@
+TREE: 6ae4b84
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r2_stop_fence.py C:\Code\Easel-acceptance
+----
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r2_stop_fence.py", line 58, in <module>
+    asyncio.run(main(pathlib.Path(temp)))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r2_stop_fence.py", line 31, in main
+    assert service._load_attempt(h.WORKSPACE) is None
+AssertionError
+EXIT=1
+
+说明: 探针在旧缺陷断言 'stop 后 _load_attempt is None' 处失败，
+      证明记录未被删除；实际安全终态由下方诊断与正式正向测试给出。
