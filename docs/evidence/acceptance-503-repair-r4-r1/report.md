@@ -130,6 +130,10 @@ ready、未持久预占 attempt”的断言；2 项为确定失败不得滞留�
 | `easel/control/runtime.py` | `04a9f8be595160c3df99ef727349365024eb035e7ae63620bf3543d4ede35196` | 同左 |
 | `easel/control/store.py` | `0f9a2fa00c327a38340af3928514a17be9d941f567f79066175668dd595d34ae` | 同左 |
 
+注：本机 `core.autocrlf=true`，上表摘要按工作树构建上下文字节（CRLF）计算；
+Git blob 为 LF 规范化内容，摘要不同但不参与镜像构建。镜像核对的是
+`docker build` 实际送出的工作树字节。
+
 本轮未改 worker/gateway 源码，未重建对应镜像。镜像仅本地构建，未推送、
 未覆盖用户镜像。
 
