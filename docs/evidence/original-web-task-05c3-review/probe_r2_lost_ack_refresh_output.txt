@@ -1,0 +1,10 @@
+{
+  "first_ui_is_unknown": true,
+  "first_run_completed_before_refresh": true,
+  "publish_posts_after_refresh": 1,
+  "publisher_executions_after_refresh": 1,
+  "completed_publish_runs": 1,
+  "refresh_restored_visible_media": true,
+  "refresh_recovered_success_without_post": true,
+  "temporary_directory_cleaned": true
+}

@@ -1,0 +1,16 @@
+{
+  "first_request_never_forwarded": true,
+  "first_request_media": [
+    "project/cover.png"
+  ],
+  "visible_media_before_second_submit": [
+    "project/other.png"
+  ],
+  "second_request_media": [
+    "project/cover.png"
+  ],
+  "same_request_id": true,
+  "second_request_matches_visible_selection": false,
+  "fake_publisher_executions": 1,
+  "temporary_directory_cleaned": true
+}

@@ -1,0 +1,32 @@
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] open accounts
+[5C2] accounts open
+{
+  "analytics": {
+    "cross_site": "cross-site",
+    "cookie_sent": true,
+    "csrf_present": false,
+    "cross_get_status": 404,
+    "cross_get_execution_delta": 0,
+    "post_without_source_status": 403,
+    "post_wrong_origin_status": 403,
+    "proper_post_status": 200,
+    "proper_post_execution_delta": 1,
+    "cached_get_status": 200,
+    "cached_get_extra_executions": 0
+  },
+  "late_stop": {
+    "new_heading": "\u767b\u5f55 \u6296\u97f3",
+    "old_reply_released": true,
+    "qr_count": 1,
+    "false_stopped_message": false,
+    "new_backend_state": "qr_ready",
+    "new_run_state": "running",
+    "new_stop_button_enabled": true,
+    "new_stop_succeeds": true
+  },
+  "temporary_directory_cleaned": true
+}

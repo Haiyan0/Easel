@@ -1,0 +1,15 @@
+{
+  "reviewed_head": "654305a69c1d68d6b157b608dbd2c7d5f96d6298",
+  "review_date": "2026-10-31",
+  "injected_503_count": 1,
+  "polls_at_failure": 1,
+  "polls_after_4_seconds": 3,
+  "backend_recovered_status": 200,
+  "backend_question_pending": false,
+  "backend_state": "awaiting_permission",
+  "visible_question_cards": 1,
+  "ui_still_pending": false,
+  "submit_still_disabled": false,
+  "executions": 1,
+  "temporary_directory_cleaned": true
+}

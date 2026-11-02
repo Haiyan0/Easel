@@ -1,0 +1,13 @@
+HEAD=e8376753d63eb681560ae868aa2d1528b2756c85
+Command: C:\Users\hyh\anaconda3\envs\Agent\python.exe docs/evidence/desktop-a7-r2-review/probe.py
+ExitCode=0
+TAMPER_VERIFY=backup_integrity_failed
+MATERIALIZED_NAME=CORRUPTED-STAGING
+FIRST_VERIFY_ADDED=["control/control.sqlite3-shm", "control/control.sqlite3-wal"]
+SECOND_VERIFY=backup_integrity_failed
+OLD_BACKUP_REAL_VERIFY=True
+OLD_BACKUP_PRECHECK_ACCEPTED=True
+BACKUP_STOP=old-stop
+CURRENT_STOP=new-stop
+UPGRADE_WITH_OLD_BACKUP_ACCEPTED=True
+TEMP_CLEANUP=ok

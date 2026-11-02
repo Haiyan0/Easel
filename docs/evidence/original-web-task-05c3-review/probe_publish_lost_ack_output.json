@@ -1,0 +1,10 @@
+{
+  "first_ui_status": "\u26a0\ufe0f \u7f51\u7edc\u4e0d\u53ef\u7528\uff0c\u8bf7\u68c0\u67e5\u8fde\u63a5\u3002",
+  "first_run_completed_before_retry": true,
+  "first_publisher_executions": 1,
+  "retry_same_payload": true,
+  "retry_request_id_changed": true,
+  "publisher_executions_after_retry": 2,
+  "completed_publish_runs": 2,
+  "temporary_directory_cleaned": true
+}

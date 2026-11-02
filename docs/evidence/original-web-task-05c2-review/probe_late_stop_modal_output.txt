@@ -1,0 +1,21 @@
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] open accounts
+[5C2] accounts open
+{
+  "new_modal_heading": "\u767b\u5f55 \u6296\u97f3",
+  "new_modal_had_qr": true,
+  "before_claimed_stopped": false,
+  "after_claims_stopped": true,
+  "new_qr_after_late_old_stop": 0,
+  "new_backend_login_state": "qr_ready",
+  "new_backend_run_state": "running",
+  "login_starts": [
+    "xiaohongshu",
+    "douyin"
+  ],
+  "cleanup_stop_status": 200,
+  "temporary_directory_cleaned": true
+}

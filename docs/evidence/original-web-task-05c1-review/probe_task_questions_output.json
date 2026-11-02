@@ -1,0 +1,25 @@
+{
+  "skill": {
+    "worker_state": "awaiting_permission",
+    "worker_question_events": 1,
+    "drawer_visible": 1,
+    "question_cards": 0,
+    "allow_buttons": 0,
+    "public_status": "running",
+    "public_status_has_question": false,
+    "question_api_requests": 0
+  },
+  "profile": {
+    "worker_state": "awaiting_permission",
+    "worker_question_events": 1,
+    "wizard_visible": 1,
+    "question_cards": 0,
+    "allow_buttons": 0,
+    "stop_buttons": 0,
+    "public_status": "running",
+    "public_status_has_question": false,
+    "cleanup_stop_status": 200
+  },
+  "execution_count": 2,
+  "temporary_directory_cleaned": true
+}

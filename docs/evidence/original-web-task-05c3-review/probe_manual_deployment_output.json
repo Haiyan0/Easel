@@ -1,0 +1,17 @@
+{
+  "compose_passes_publish_mode": false,
+  "start_accepts_publish_mode": false,
+  "formal_cli_resolved_publish_mode": "automated",
+  "old_worker_policy": {
+    "mode": "manual",
+    "automaticSubmission": false
+  },
+  "control_policy": {
+    "mode": "automated",
+    "automaticSubmission": true
+  },
+  "publish_admission_status": 200,
+  "fake_publisher_executions": 1,
+  "final_state": "success",
+  "temporary_directory_cleaned": true
+}

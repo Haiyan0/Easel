@@ -1,0 +1,19 @@
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+{
+  "session_cookie_attributes": {
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  "navigation_status": "completed",
+  "cross_site_header": "cross-site",
+  "fetch_mode": "navigate",
+  "origin_present": false,
+  "csrf_present": false,
+  "session_cookie_sent": true,
+  "analytics_executions": 1,
+  "temporary_directory_cleaned": true
+}
