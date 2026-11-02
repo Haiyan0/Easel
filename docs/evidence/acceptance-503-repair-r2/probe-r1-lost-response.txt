@@ -1,0 +1,28 @@
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r1_lost_restore_response.py", line 51, in restore_gateway
+    raise asyncio.CancelledError()
+asyncio.exceptions.CancelledError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r1_lost_restore_response.py", line 72, in scenario
+    await recovered.restore_gateway(workspace, helpers.WORKER, 1)
+  File "C:\Code\Easel\.claude\worktrees\acceptance-503-repair\easel\control\runtime.py", line 675, in restore_gateway
+    candidate = await self._restore_candidate(
+  File "C:\Code\Easel\.claude\worktrees\acceptance-503-repair\easel\control\runtime.py", line 696, in _restore_candidate
+    handle = await asyncio.wait_for(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\tasks.py", line 445, in wait_for
+    return fut.result()
+asyncio.exceptions.CancelledError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r1_lost_restore_response.py", line 87, in <module>
+    asyncio.run(scenario(Path(sys.argv[1]).resolve(), Path(temp)))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+asyncio.exceptions.CancelledError

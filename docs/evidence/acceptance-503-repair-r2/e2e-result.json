@@ -1,0 +1,121 @@
+{
+  "after": {
+    "attempt": {
+      "attempt_file_id": "c63de05fc62a4794880bcac8e93df714",
+      "attempt_file_status": "committed"
+    },
+    "chat": {
+      "assistant_has_marker": true,
+      "elapsed": 3.479,
+      "run": "ce277fb4ca5d4520a413cd192ceaab15",
+      "session": "56fc2e7cdb0f46249127a097e965eb9b",
+      "state": "done"
+    },
+    "first_screen": {
+      "/api/accounts": 200,
+      "/api/ideas": 200,
+      "/api/outputs": 200,
+      "/api/personas": 200,
+      "/api/schedule": 200,
+      "/api/status": 200
+    },
+    "lease": {
+      "attempt": "c63de05fc62a4794880bcac8e93df714",
+      "gateway": "f4cafe0aac2fa8aaa8aae7d69f3451d14a904a8a839ea622e932cf58de8595d2",
+      "gateway_state": "available",
+      "generation": 3,
+      "owner": "a743884d928b4b61b734aef127e91ad0",
+      "state": "ready",
+      "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"
+    },
+    "provider_requests": 3
+  },
+  "backup": "backup=C:\\Easel\\r2-fc0ebfac-data\\backups\\desktop-20261102-170957\nmanifest_sha256=b04e0c0d69aa9c9bf12f8ad0df4362220ea120faf42dd496c65436258c507cb6\nversion=2\nschema_version=15\nworkspaces=2\nclean_stop=true\ncontrol_image=sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3\nworker_image=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57\ngateway_image=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac\n",
+  "before": {
+    "chat": {
+      "assistant_has_marker": true,
+      "elapsed": 3.537,
+      "run": "c446de1fc0744362aed42f54ed62f073",
+      "session": "7409399ac2ee40ab9bd56fbe9d5d2004",
+      "state": "done"
+    },
+    "first_screen": {
+      "/api/accounts": 200,
+      "/api/ideas": 200,
+      "/api/outputs": 200,
+      "/api/personas": 200,
+      "/api/schedule": 200,
+      "/api/status": 200
+    },
+    "lease": {
+      "attempt": "2586b2a4262e4524a4c3db324c233ff8",
+      "gateway": "2c4e544594b145c786e00388fe2ea3e578e12df9d8dad7c1d337c2f8ad42a8fd",
+      "gateway_state": "available",
+      "generation": 1,
+      "owner": "e252d91021c8479d91908df3f6e6911e",
+      "state": "ready",
+      "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"
+    }
+  },
+  "field_shape": {
+    "gateway": "2c4e544594b145c786e00388fe2ea3e578e12df9d8dad7c1d337c2f8ad42a8fd",
+    "generation": 2,
+    "scope": "gateway",
+    "state": "stopping",
+    "worker": "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088"
+  },
+  "old_start": "started project=easel-r2-fc0ebfac origin=https://easel.test port=49210 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-fc0ebfac-control provisioner_socket=/tmp/easel-runtime/easel-r2-fc0ebfac/provisioner.sock publish_mode=manual\ndeployment_file=C:\\Easel\\r2-fc0ebfac-data\\logs\\deployment.json\nconfig_sha256=64990550e64e2e3e68d528b8337c6d8b0f5ab8ab94a5885f0dd708e16d92a1e9\nfrontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1\n",
+  "post_update": {
+    "control_image": "sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3",
+    "control_runtime_sha256": "dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23",
+    "provisioner_actions": [
+      "ensure",
+      "stop",
+      "inspect",
+      "activate",
+      "abort",
+      "restore_gateway",
+      "commit_attempt",
+      "recover_abort",
+      "identity"
+    ],
+    "provisioner_protocol": 2,
+    "provisioner_source_sha256": "0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f"
+  },
+  "result": "R2_UPDATE_E2E_PASS",
+  "reuse_repro": {
+    "cwd": "/Code/Easel-acceptance",
+    "pid": "44132",
+    "stdout": "started project=easel-r2-fc0ebfac origin=https://easel.test port=49210 control=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 worker=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 gateway=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac network=easel-r2-fc0ebfac-control provisioner_socket=/tmp/easel-runtime/easel-r2-fc0ebfac/provisioner.sock publish_mode=manual\ndeployment_file=C:\\Easel\\r2-fc0ebfac-data\\logs\\deployment.json\nconfig_sha256=64990550e64e2e3e68d528b8337c6d8b0f5ab8ab94a5885f0dd708e16d92a1e9\nfrontend_sha256=a91fc58445ec6698880e9438cf1da97db1a96027557d5c622a5cdcdec3ae49c1\n"
+  },
+  "stop": "admission_barrier=stop-1a3a9870c75f422db9c1b58f468083f9\ndrain_verified=settled\nstop_completed=stop-1a3a9870c75f422db9c1b58f468083f9\nstopped project=easel-r2-fc0ebfac drained=True network=easel-r2-fc0ebfac-control\n",
+  "update": "update_active_work=0/0\nupdate_barrier=update-1455f7408bf5\nupdate_start_exit=0\nupdate_control_image=sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2->sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3\nupdate_control_runtime_sha256=dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23\nupdate_provisioner_source=->0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f\nupdate_provisioner_pid=provisioner_pid=44132->provisioner_pid=46362\nupdate_managed_instances=3\nupdate_attempt_records=1\nupdate_barrier_resumed=update-1455f7408bf5\nupdate_evidence=C:\\Easel\\r2-fc0ebfac-data\\logs\\update-last.json\nupdate_completed project=easel-r2-fc0ebfac\n",
+  "update_summary": {
+    "attempt_records": [
+      "attempt-4fd5f1fe78154f4b854c290fc2886689.json:629f52e6b08ced135b77ea4662ee6a2598bf9e351dfbaefd428ceb15154287b5"
+    ],
+    "barrier_id": "update-1455f7408bf5",
+    "completed_at": "2026-11-02T09:09:17.0885586+00:00",
+    "control_image_after": "sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3",
+    "control_image_before": "sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2",
+    "control_runtime_sha256": "dba29bb1445ff974bc43553284240de3e13ca13f212e0faaa5f97f6f4b92de23",
+    "managed_instances": [
+      "2c4e544594b145c786e00388fe2ea3e578e12df9d8dad7c1d337c2f8ad42a8fd|true",
+      "744b04189b5479986a8b63cb204b9e56f07ec4d9811fbc39d9abc5c9539bbb79|true",
+      "ca807e152f2c6aab2e9dd9f15f3cadc2f4e24f43247b46daa125e77f74ce4088|true"
+    ],
+    "network": "easel-r2-fc0ebfac-control",
+    "project": "easel-r2-fc0ebfac",
+    "provisioner_pid_after": "provisioner_pid=46362",
+    "provisioner_pid_before": "provisioner_pid=44132",
+    "provisioner_source_after": "0d89fc73cdc15007d3315b4adfd66337b4043526dd2e7f07085dcdb8de62c89f",
+    "provisioner_source_before": "",
+    "resumed": true,
+    "volumes": [
+      "easel-r2-fc0ebfac-control",
+      "easel-r2-fc0ebfac-keys",
+      "easel-r2-fc0ebfac-egress"
+    ]
+  },
+  "verify": "verified=/backup\nversion=2\nschema_version=15\nfiles=28\nworkspaces=2\nclean_stop=true\nproject=easel-r2-fc0ebfac\nconfig_sha256=96ac5b3471ef999c8872164fc3e9fa6efc50b9e0f47d1a610bee3f1c48dd59d7\nworker_image=sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57\ngateway_image=sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac\ncontrol_image=sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3\nharness_revision=687f282e8625c6b8d11ff58211a90524be2e4317\nbackup_manifest_sha256=b04e0c0d69aa9c9bf12f8ad0df4362220ea120faf42dd496c65436258c507cb6\nverified_backup=C:\\Easel\\r2-fc0ebfac-data\\backups\\desktop-20261102-170957\n"
+}

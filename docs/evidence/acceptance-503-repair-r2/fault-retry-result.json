@@ -1,0 +1,26 @@
+{
+  "result": "R2_FAULT_RETRY_PASS",
+  "project": "easel-r2f-80f27abd",
+  "barrier_id": "update-abcdef123456",
+  "old_provisioner_pid": "50710",
+  "old_provisioner_stopped": true,
+  "update_exit": 0,
+  "resume_phase": true,
+  "old_identity_required": false,
+  "new_provisioner_pid": "52035",
+  "new_provisioner_cwd": "/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair",
+  "control_image_before": "sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2",
+  "control_image_after": "sha256:9d18ec91326e4d2500fdb5cbec52abc56e04ae5b50765050cec46b8cdfeb03c3",
+  "first_screen_status": {
+    "/api/accounts": 200,
+    "/api/ideas": 200,
+    "/api/outputs": 200,
+    "/api/personas": 200,
+    "/api/schedule": 200,
+    "/api/status": 200
+  },
+  "chat_state": "done",
+  "chat_marker": true,
+  "stop": "drain_verified=settled",
+  "cleanup": "containers/volumes/network/directories removed"
+}

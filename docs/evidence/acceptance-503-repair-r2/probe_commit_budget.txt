@@ -1,0 +1,2 @@
+{"ready_budget_seconds": 0.02, "elapsed_seconds": 0.0, "outcome": "success"}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false

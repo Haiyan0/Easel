@@ -1,0 +1,2 @@
+{"before_owner": "owner-b", "cleanup_reported_success": false, "cleanup_error": "", "gateway_stop_count": 0, "database_state": "starting", "attempt_status": "committed"}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
