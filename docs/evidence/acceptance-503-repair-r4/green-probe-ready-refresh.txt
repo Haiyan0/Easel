@@ -1,0 +1,32 @@
+1 provisioner_timeout DB starting bbbbbbbb 56eaaf4bb0ce487f8bf25466e53f739f remote pending ffffffff 56eaaf4bb0ce487f8bf25466e53f739f
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r3_ready_refresh_loss.py", line 44, in scenario
+    await manager.ensure_ready(workspace, 1)
+  File "C:\Code\Easel-acceptance\easel\control\runtime.py", line 202, in ensure_ready
+    return await self._ensure_ready(
+  File "C:\Code\Easel-acceptance\easel\control\runtime.py", line 218, in _ensure_ready
+    return await self._ready_gateway(
+  File "C:\Code\Easel-acceptance\easel\control\runtime.py", line 535, in _ready_gateway
+    return await self._refresh_gateway(
+  File "C:\Code\Easel-acceptance\easel\control\runtime.py", line 583, in _refresh_gateway
+    candidate = await self._ensure_candidate(
+  File "C:\Code\Easel-acceptance\easel\control\runtime.py", line 1055, in _ensure_candidate
+    handle = await asyncio.wait_for(awaitable, timeout=remaining)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\tasks.py", line 445, in wait_for
+    return fut.result()
+  File "C:\Code\Easel-acceptance\tests\multiuser\test_attempt_ownership_503.py", line 985, in ensure
+    raise failure
+easel.control.runtime.RuntimeUnavailable: provisioner_timeout
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r3_ready_refresh_loss.py", line 65, in <module>
+    asyncio.run(scenario(pathlib.Path(directory)))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r3_ready_refresh_loss.py", line 53, in scenario
+    assert current.state == "ready"
+AssertionError

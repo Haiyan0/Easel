@@ -1,0 +1,7 @@
+attempt 收口失败，保留 ready 并等待下次重试 workspace=11bc62fbe87f44a99f6025648b5d1264
+attempt 收口失败，保留 ready 并等待下次重试 workspace=11bc62fbe87f44a99f6025648b5d1264
+attempt 收口失败，保留 ready 并等待下次重试 workspace=11bc62fbe87f44a99f6025648b5d1264
+1 provisioner_timeout DB ready bbbbbbbb 00e2270d23c74a21ac659d5e329cd60b remote pending ffffffff 3a48f2afd7484c508158084b9c268535
+2 worker_start_failed DB ready bbbbbbbb 00e2270d23c74a21ac659d5e329cd60b remote pending ffffffff 3a48f2afd7484c508158084b9c268535
+3 worker_start_failed DB ready bbbbbbbb 00e2270d23c74a21ac659d5e329cd60b remote pending ffffffff 3a48f2afd7484c508158084b9c268535
+CONFIRMED: 普通 ready 首屏丢回复后，重试与跨租约期限重试均仍 503
