@@ -1232,6 +1232,32 @@ def test_resolve_attempt_rejects_target_config_and_gateway_mismatch(tmp_path):
     assert bad_gateway.value.code == "gateway_recovery_target_mismatch"
 
 
+def test_resolve_attempt_requires_available_before_skipping_activation(
+        tmp_path):
+    """active 但不可用的 gateway 必须返回 staged，强制重新 activate/复核。"""
+    class ActiveUnavailableGateway(FakeGateway):
+        async def inspect(self, *, workspace_id: str,
+                          gateway_instance_id: str = "") -> dict:
+            report = await super().inspect(
+                workspace_id=workspace_id,
+                gateway_instance_id=gateway_instance_id)
+            report["active"] = True
+            report["available"] = False
+            return report
+
+    (tmp_path / "active-unavailable").mkdir()
+    service = _service(tmp_path / "active-unavailable",
+                       ActiveUnavailableGateway())
+    _record(service, "a" * 32, worker_created=False, gateway_created=True)
+
+    resolved = asyncio.run(service.commit_attempt(
+        WORKSPACE, WORKER, "", attempt_id="a" * 32, resolve=True,
+        config_version=CONFIG_VERSION))
+    assert resolved is not None
+    assert resolved["found"] is True
+    assert resolved["gateway_state"] == "staged"
+
+
 def test_commit_of_unknown_attempt_is_noop_after_promise_resolved(tmp_path):
     """接管进程可能在写新记录前崩溃；已无 pending 时精确 commit 可无操作。"""
     service = _service(tmp_path)

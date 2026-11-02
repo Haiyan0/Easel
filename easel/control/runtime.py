@@ -92,8 +92,14 @@ class Provisioner(Protocol):
     async def commit_attempt(self, workspace_id: str,
                              worker_container_id: str,
                              gateway_instance_id: str, *,
-                             attempt_id: str = "") -> None:
-        """成功启动提交后收口 attempt，允许后续尝试接管。"""
+                             attempt_id: str = "",
+                             resolve: bool = False,
+                             config_version: int = 0
+                             ) -> dict | None:
+        """成功启动提交后收口 attempt，允许后续尝试接管。
+
+        ``resolve=True`` 时只读返回精确 attempt 的持久候选，不执行收口。
+        """
 
     async def recover_abort(self, workspace_id: str,
                             worker_container_id: str,

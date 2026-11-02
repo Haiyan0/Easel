@@ -2732,8 +2732,11 @@ class Provisioner:
         result.update({
             "gateway_generation": generation,
             "gateway_upstream": upstream,
+            # active 只表示 gateway 进程仍在；available 才表示网络/挂载/
+            # 安全配置与状态核验通过。只有 available 才能跳过 activate；
+            # 否则必须返回 staged，让 control 重新执行完整验证与激活。
             "gateway_state": ("available"
-                              if gateway.get("active") is True
+                              if gateway.get("available") is True
                               else "staged"),
         })
         return result

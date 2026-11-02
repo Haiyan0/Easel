@@ -70,6 +70,28 @@ def _docker_source() -> str:
     assert marker in source
     source = source.replace(
         marker, _custom_exec_handler() + "\n" + marker, 1)
+    old_run = 'if args[0] == "run":\n    joined = " ".join(args)\n'
+    offline_run = (
+        '    if "sqlite3" in joined:\n'
+        '        barrier_path = state / "barrier.txt"\n'
+        '        barrier_id = (barrier_path.read_text().strip()\n'
+        '                      if barrier_path.exists() else "")\n'
+        '        out(json.dumps({\n'
+        '            "barrier": ({"id": barrier_id,'
+        ' "reason": "desktop-update", "setAt": 1}'
+        ' if barrier_id else None),\n'
+        '            "activeRuns": int(os.environ.get('
+        '"FAKE_ACTIVE_RUNS", "0")),\n'
+        '            "activeRequests": int(os.environ.get('
+        '"FAKE_ACTIVE_REQUESTS", "0")),\n'
+        '            "activeLeaseCount": int(os.environ.get('
+        '"FAKE_ACTIVE_LEASES", "0")),\n'
+        '            "workspaceIds": [os.environ.get('
+        '"FAKE_WORKSPACE", "a" * 32)],\n'
+        '        }))\n'
+        '        raise SystemExit(0)\n')
+    assert old_run in source
+    source = source.replace(old_run, old_run + offline_run, 1)
     old_ps = (
         'if args[0] == "ps":\n'
         '    out("fake-control-id")\n'
@@ -85,11 +107,14 @@ def _docker_source() -> str:
         '                  else 0) + 1\n'
         '        counter.write_text(str(number))\n'
         '        other = os.environ.get("FAKE_OTHER_WORKSPACE", "")\n'
-        '        if (workspace_id == other\n'
-        '                or os.environ.get("FAKE_MANAGED_DRIFT") == "1"):\n'
+        '        drift = os.environ.get("FAKE_MANAGED_DRIFT", "")\n'
+        '        if (workspace_id == other or drift == "1"\n'
+        '                or (drift == "after" and number > 1)):\n'
         '            out(format(number, "064x"))\n'
         '        else:\n'
         '            out("b" * 64)\n'
+        '    elif os.environ.get("FAKE_CONTROL_ABSENT") == "1":\n'
+        '        pass\n'
         '    else:\n'
         '        out("fake-control-id")\n'
         '    raise SystemExit(0)')
@@ -225,6 +250,10 @@ def _prepare(tmp_path: pathlib.Path, *, control_image: str,
     if barrier:
         (pathlib.Path(env["FAKE_DOCKER_STATE"]) / "barrier.txt").write_text(
             BARRIER_ID, encoding="utf-8")
+        # 真实中断阶段一定已有首次 managed 基线；手工夹具补同一文件。
+        (data_root / "logs" /
+         f"update-baseline-{BARRIER_ID}.json").write_text(
+            json.dumps(["b" * 64 + "|true"]), encoding="utf-8")
     _fake_docker(tmp_path, env)
     _fake_wsl(tmp_path, env)
     return data_root, workspace_root, env
@@ -290,13 +319,14 @@ def test_update_resumes_replaced_control_without_old_identity(tmp_path):
 
 
 def test_update_failed_post_verification_can_rerun_same_command(tmp_path):
-    """Start 后核验失败保留屏障；修复后同一条 Update 命令可完成。"""
+    """首次基线持久化：漂移持续时重跑仍拒绝，恢复原实例后才完成。"""
     data_root, workspace_root, env = _prepare(
         tmp_path, control_image=r1.IMAGE, deployment_image=r1.IMAGE,
         barrier=False)
     env["FAKE_ACTIVE_RUNS"] = "0"
     env["FAKE_ACTIVE_REQUESTS"] = "0"
-    env["FAKE_MANAGED_DRIFT"] = "1"
+    # 第一次 before 快照返回 BASE，after 与后续重跑返回漂移 ID。
+    env["FAKE_MANAGED_DRIFT"] = "after"
     first = r1._run_ps(
         UPDATE, *_args(data_root, workspace_root, timeout=2), env=env)
     first_output = first.stdout + first.stderr
@@ -304,14 +334,32 @@ def test_update_failed_post_verification_can_rerun_same_command(tmp_path):
     assert "update_managed_instances_changed" in first_output
     assert "update_barrier_retained=update-" in first_output
     assert "update_start_exit=0" in first_output
+    barrier_line = next(
+        line for line in first_output.splitlines()
+        if line.startswith("update_barrier_retained="))
+    barrier_id = barrier_line.split("=", 1)[1].strip()
+    baseline = data_root / "logs" / f"update-baseline-{barrier_id}.json"
+    assert baseline.is_file()
+    assert json.loads(baseline.read_text(encoding="utf-8")) == ["b" * 64 + "|true"]
 
-    env["FAKE_MANAGED_DRIFT"] = "0"
     second = r1._run_ps(
         UPDATE, *_args(data_root, workspace_root, timeout=2), env=env)
     second_output = second.stdout + second.stderr
-    assert "update_resumed_phase=update-" in second_output
-    assert second.returncode == 0, second_output
-    assert "update_completed" in second_output
+    assert second.returncode != 0
+    assert "update_managed_instances_changed" in second_output
+    assert "update_barrier_retained=update-" in second_output
+    assert "update_managed_baseline=existing" in second_output
+    # 重跑不得把已漂移实例重新写成基线。
+    assert json.loads(baseline.read_text(encoding="utf-8")) == ["b" * 64 + "|true"]
+
+    env.pop("FAKE_MANAGED_DRIFT", None)
+    third = r1._run_ps(
+        UPDATE, *_args(data_root, workspace_root, timeout=2), env=env)
+    third_output = third.stdout + third.stderr
+    assert "update_resumed_phase=update-" in third_output
+    assert "update_managed_baseline=existing" in third_output
+    assert third.returncode == 0, third_output
+    assert "update_completed" in third_output
 
 
 def test_update_resume_allows_stopped_old_provisioner(tmp_path):
@@ -360,6 +408,26 @@ def test_update_ignores_other_project_instance_changes(tmp_path):
     for call in snapshot_calls:
         assert f"label=easel.workspace-id={project_workspace}" in call
         assert other_workspace not in call
+
+
+def test_update_rejects_active_work_when_control_container_is_absent(
+        tmp_path):
+    """控制容器退出但 offline facts 仍可读：有活动工作必须拒绝，不得 Start。"""
+    data_root, workspace_root, env = _prepare(
+        tmp_path, control_image=r1.IMAGE, deployment_image=OLD_IMAGE,
+        barrier=True)
+    env["FAKE_CONTROL_ABSENT"] = "1"
+    env["FAKE_ACTIVE_RUNS"] = "1"
+    env["FAKE_ACTIVE_REQUESTS"] = "0"
+    result = r1._run_ps(
+        UPDATE, *_args(data_root, workspace_root, timeout=1), env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "update_active_work_timeout:1/0" in output
+    assert "update_active_work=1/0" in output
+    assert "update_barrier_retained=update-" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+    assert "update_start_exit" not in output
 
 
 def test_update_snapshot_is_scoped_to_project_workspaces():

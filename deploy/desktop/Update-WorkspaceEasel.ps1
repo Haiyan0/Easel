@@ -398,12 +398,9 @@ function Wait-UpdateWorkload {
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     # 只等待已接纳的 Run 与在途请求；静态坏 worker lease 由 Start 的
-    # 恢复流程处理，不能在这里 drain，否则现场会死锁。控制面已经不在
-    # 运行时没有可替换的服务，明确记录 unobservable 后继续。
-    if (-not $ControlId) {
-        Write-Output 'update_active_work=unobservable'
-        return
-    }
+    # 恢复流程处理，不能在这里 drain，否则现场会死锁。控制容器不在时
+    # 仍用只读 SQLite 事实等待；offline 事实也不可读则失败关闭，绝不
+    # 以“不可观察”为由在存在活动工作时替换服务。
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
         $facts = Get-ControlFacts -ControlId $ControlId -Image $Image `
@@ -585,14 +582,6 @@ try {
             ForEach-Object { $_.Name.ToLowerInvariant() } |
             Sort-Object -Unique)
     }
-    $managedBefore = @(Get-ManagedSnapshot -Root $WorkspaceRoot `
-        -WorkspaceIds $workspaceIds)
-    $attemptBefore = @(Get-AttemptSnapshot -Root $WorkspaceRoot)
-    $keyBefore = (Get-EaselKeyFingerprints -Image $Image `
-        -KeyVolume $volumes.Keys | ConvertTo-Json -Compress)
-    $policyBefore = (Get-EaselPolicyDigests -Image $Image `
-        -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress |
-        ConvertTo-Json -Compress)
 
     if (-not $resuming) {
         # 屏障必须在本轮写入；已有 desktop-stop 等屏障时失败关闭，绝不
@@ -648,6 +637,41 @@ try {
             throw "update_barrier_lost:$($barrierCheck.Text)"
         }
     }
+
+    # 首次基线必须在屏障建立后、替换前落盘；重跑沿用同一基线，不能
+    # 从已经漂移的实例重新打基线来掩盖本应阻断的替换。
+    $baselineFile = Join-Path $logDir "update-baseline-$barrierId.json"
+    $baselineSource = 'fresh'
+    if (Test-Path -LiteralPath $baselineFile -PathType Leaf) {
+        try {
+            $baselineRaw = Get-Content -LiteralPath $baselineFile -Raw |
+                ConvertFrom-Json
+        }
+        catch {
+            throw "update_baseline_invalid:$barrierId"
+        }
+        $managedBefore = @($baselineRaw | ForEach-Object { "$_" } |
+            Where-Object { $_ })
+        $baselineSource = 'existing'
+    }
+    elseif ($resuming) {
+        throw "update_baseline_missing:$barrierId"
+    }
+    else {
+        $managedBefore = @(Get-ManagedSnapshot -Root $WorkspaceRoot `
+            -WorkspaceIds $workspaceIds)
+        $baselineJson = ConvertTo-Json -InputObject @($managedBefore) -Compress
+        [IO.File]::WriteAllText(
+            $baselineFile, $baselineJson,
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    $attemptBefore = @(Get-AttemptSnapshot -Root $WorkspaceRoot)
+    $keyBefore = (Get-EaselKeyFingerprints -Image $Image `
+        -KeyVolume $volumes.Keys | ConvertTo-Json -Compress)
+    $policyBefore = (Get-EaselPolicyDigests -Image $Image `
+        -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress |
+        ConvertTo-Json -Compress)
+    Write-Output ("update_managed_baseline={0}" -f $baselineSource)
 
     # 活动工作边界：只等待已接纳 Run 与在途请求；静态坏 lease 交给
     # Start 的恢复路径，避免在现场坏状态上 drain 死锁。
@@ -823,6 +847,9 @@ try {
         provisioner_pid_before = $oldPidText
         provisioner_pid_after = "$($newProvisionerPid.Output -join '')"
         managed_instances = $managedAfter
+        managed_baseline = $managedBefore
+        managed_baseline_source = $baselineSource
+        managed_baseline_file = $baselineFile
         attempt_records = $attemptAfter
         volumes = @($volumes.Control, $volumes.Keys, $volumes.Egress)
         network = $network
