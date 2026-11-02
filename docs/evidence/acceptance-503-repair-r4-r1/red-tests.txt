@@ -1,0 +1,231 @@
+FFFFF                                                                    [100%]
+================================== FAILURES ===================================
+____________ test_ready_refresh_process_exit_after_remote_recovers ____________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4398/test_ready_refresh_process_exi0')
+
+    def test_ready_refresh_process_exit_after_remote_recovers(tmp_path):
+        """正常 ready 刷新在远端写 G2/pending 后进程直接退出，重启接回 G2。"""
+        meta = _run_child(tmp_path, "ensure-crash")
+        workspace = meta["workspace"]
+        replacement = "f" * 64
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            crashed = store.get_worker_lease(workspace)
+            assert crashed is not None
+            # 远程调用前已持久本轮精确 attempt，而不是残留旧 ready/旧 attempt。
+>           assert crashed.state == "starting"
+E           AssertionError: assert 'ready' == 'starting'
+E             
+E             - starting
+E             + ready
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:145: AssertionError
+____________ test_ready_restore_process_exit_after_remote_recovers ____________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4398/test_ready_restore_process_exi0')
+
+    def test_ready_restore_process_exit_after_remote_recovers(tmp_path):
+        """显式 restore 同一崩溃窗口：两入口按同一精确 attempt 归属恢复。"""
+        meta = _run_child(tmp_path, "restore-crash")
+        workspace = meta["workspace"]
+        replacement = "f" * 64
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            crashed = store.get_worker_lease(workspace)
+            assert crashed is not None
+>           assert crashed.state == "starting"
+E           AssertionError: assert 'ready' == 'starting'
+E             
+E             - starting
+E             + ready
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:190: AssertionError
+__________ test_ready_refresh_process_exit_before_remote_recovers_g1 __________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4398/test_ready_refresh_process_exi1')
+
+    def test_ready_refresh_process_exit_before_remote_recovers_g1(tmp_path):
+        """本轮 attempt 已持久但远程尚未执行即退出：可恢复且不误删可信 G1。"""
+        meta = _run_child(tmp_path, "ensure-before-remote")
+        workspace = meta["workspace"]
+        with Store.open(tmp_path / "control.sqlite3") as store:
+            crashed = store.get_worker_lease(workspace)
+            assert crashed is not None
+            # 远程未执行，但预占已持久；不能永久停留在 starting。
+>           assert crashed.state == "starting"
+E           AssertionError: assert 'ready' == 'starting'
+E             
+E             - starting
+E             + ready
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:229: AssertionError
+_________ test_ready_refresh_definite_failure_rolls_back_reservation __________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4398/test_ready_refresh_definite_fa0')
+
+    def test_ready_refresh_definite_failure_rolls_back_reservation(tmp_path):
+        """确定失败撤销预占：恢复 ready/旧 attempt，不把刷新滞留在 starting。"""
+        replacement = "f" * 64
+    
+        async def scenario():
+            store, service, gateway, workspace, lease, handle, original = \
+                helpers._seed_expired_ensure(tmp_path)
+            with store:
+                ready = await helpers._make_normal_ready(
+                    store, service, workspace, handle)
+                old_attempt = ready.attempt_id
+                old_generation = ready.generation
+                adapter = helpers._lost_response_adapter(
+                    service, handle, replacement, {"count": 0})
+                adapter.inspect = helpers._ready_inspect
+    
+                async def ensure(*args, **kwargs):
+                    raise helpers.RuntimeUnavailable(
+                        "worker_start_failed", 503, retry_after=5)
+    
+                adapter.ensure = ensure
+                manager = RuntimeManager(
+                    store, adapter, owner_id="owner-c", gateway_required=True,
+                    clock=lambda: 1201)
+                with pytest.raises(helpers.RuntimeUnavailable):
+                    await manager.ensure_ready(workspace, 1)
+                failed = store.get_worker_lease(workspace)
+                assert failed is not None
+                assert failed.state == "ready"
+                assert failed.attempt_id == old_attempt
+                assert failed.gateway_state == "unavailable"
+                assert failed.pending_attempt_id == ""
+                assert failed.generation > old_generation
+                assert failed.lease_expires_at > 1201
+                # 预占已撤销，旧代次迟到写回同样不得命中新代次。
+                assert store.mark_worker_gateway_unavailable(
+                    workspace, old_generation, 1201) is False
+    
+>       asyncio.run(scenario())
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:298: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        store, service, gateway, workspace, lease, handle, original = \
+            helpers._seed_expired_ensure(tmp_path)
+        with store:
+            ready = await helpers._make_normal_ready(
+                store, service, workspace, handle)
+            old_attempt = ready.attempt_id
+            old_generation = ready.generation
+            adapter = helpers._lost_response_adapter(
+                service, handle, replacement, {"count": 0})
+            adapter.inspect = helpers._ready_inspect
+    
+            async def ensure(*args, **kwargs):
+                raise helpers.RuntimeUnavailable(
+                    "worker_start_failed", 503, retry_after=5)
+    
+            adapter.ensure = ensure
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(helpers.RuntimeUnavailable):
+                await manager.ensure_ready(workspace, 1)
+            failed = store.get_worker_lease(workspace)
+            assert failed is not None
+            assert failed.state == "ready"
+            assert failed.attempt_id == old_attempt
+            assert failed.gateway_state == "unavailable"
+            assert failed.pending_attempt_id == ""
+>           assert failed.generation > old_generation
+E           AssertionError: assert 3 > 3
+E            +  where 3 = WorkerLease(workspace_id='5dd1b4de02ea42ba923fb0c049d9460d', container_id='ccccccccccccccccccccccccccccccccccccccccccc...nding_attempt_id='', cleanup_purpose='', cleanup_scope='', cleanup_worker_created=False, cleanup_gateway_created=False).generation
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:292: AssertionError
+_________ test_ready_restore_definite_failure_rolls_back_reservation __________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4398/test_ready_restore_definite_fa0')
+
+    def test_ready_restore_definite_failure_rolls_back_reservation(tmp_path):
+        """显式 restore 确定失败同样撤销预占，保留既有 worker 与 ready。"""
+        replacement = "f" * 64
+    
+        async def scenario():
+            store, service, gateway, workspace, lease, handle, original = \
+                helpers._seed_expired_ensure(tmp_path)
+            with store:
+                ready = await helpers._make_normal_ready(
+                    store, service, workspace, handle)
+                old_attempt = ready.attempt_id
+                adapter = helpers._lost_response_adapter(
+                    service, handle, replacement, {"count": 0})
+    
+                async def restore_gateway(*args, **kwargs):
+                    raise helpers.RuntimeUnavailable(
+                        "gateway_recovery_failed", 503, retry_after=5)
+    
+                adapter.restore_gateway = restore_gateway
+                manager = RuntimeManager(
+                    store, adapter, owner_id="owner-c", gateway_required=True,
+                    clock=lambda: 1201)
+                with pytest.raises(helpers.RuntimeUnavailable):
+                    await manager.restore_gateway(workspace, WORKER, 1)
+                failed = store.get_worker_lease(workspace)
+                assert failed is not None
+                assert failed.state == "ready"
+                assert failed.attempt_id == old_attempt
+                assert failed.gateway_state == "unavailable"
+                assert failed.pending_attempt_id == ""
+                assert failed.container_id == WORKER
+                assert gateway.stops == []
+    
+>       asyncio.run(scenario())
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:334: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+..\..\..\..\anaconda3\envs\Agent\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        store, service, gateway, workspace, lease, handle, original = \
+            helpers._seed_expired_ensure(tmp_path)
+        with store:
+            ready = await helpers._make_normal_ready(
+                store, service, workspace, handle)
+            old_attempt = ready.attempt_id
+            adapter = helpers._lost_response_adapter(
+                service, handle, replacement, {"count": 0})
+    
+            async def restore_gateway(*args, **kwargs):
+                raise helpers.RuntimeUnavailable(
+                    "gateway_recovery_failed", 503, retry_after=5)
+    
+            adapter.restore_gateway = restore_gateway
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(helpers.RuntimeUnavailable):
+                await manager.restore_gateway(workspace, WORKER, 1)
+            failed = store.get_worker_lease(workspace)
+            assert failed is not None
+            assert failed.state == "ready"
+            assert failed.attempt_id == old_attempt
+>           assert failed.gateway_state == "unavailable"
+E           AssertionError: assert 'available' == 'unavailable'
+E             
+E             - unavailable
+E             ? --
+E             + available
+
+tests\multiuser\test_attempt_ownership_r4r1_503.py:329: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_attempt_ownership_r4r1_503.py::test_ready_refresh_process_exit_after_remote_recovers
+FAILED tests/multiuser/test_attempt_ownership_r4r1_503.py::test_ready_restore_process_exit_after_remote_recovers
+FAILED tests/multiuser/test_attempt_ownership_r4r1_503.py::test_ready_refresh_process_exit_before_remote_recovers_g1
+FAILED tests/multiuser/test_attempt_ownership_r4r1_503.py::test_ready_refresh_definite_failure_rolls_back_reservation
+FAILED tests/multiuser/test_attempt_ownership_r4r1_503.py::test_ready_restore_definite_failure_rolls_back_reservation
+5 failed in 2.32s

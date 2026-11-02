@@ -1,0 +1,10 @@
+IMAGE: sha256:b30351b19ff72bd38b371d81c607db582c9e242581fb90776ef39564d9092ee3
+COMMAND: MSYS_NO_PATHCONV=1 docker run --rm --network none --read-only easel-control:503-r4-r1-final sha256sum /opt/easel/easel/control/runtime.py /opt/easel/easel/control/store.py
+--- image ---
+04a9f8be595160c3df99ef727349365024eb035e7ae63620bf3543d4ede35196  /opt/easel/easel/control/runtime.py
+0f9a2fa00c327a38340af3928514a17be9d941f567f79066175668dd595d34ae  /opt/easel/easel/control/store.py
+RUN_EXIT=0
+--- host ---
+04a9f8be595160c3df99ef727349365024eb035e7ae63620bf3543d4ede35196 *easel/control/runtime.py
+0f9a2fa00c327a38340af3928514a17be9d941f567f79066175668dd595d34ae *easel/control/store.py
+HOST_EXIT=0
