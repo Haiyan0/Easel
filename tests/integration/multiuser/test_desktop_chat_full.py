@@ -19,6 +19,7 @@ import socket
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import httpx
@@ -30,9 +31,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-CONTROL_TAG = "easel-control-test:a4"
-GATEWAY_TAG = "easel-gateway-test:g2"
-WORKER_TAG = "easel-worker-execution:a4"
+CONTROL_TAG = os.environ.get(
+    "EASEL_A4_CONTROL_TAG", "easel-control-test:a4")
+GATEWAY_TAG = os.environ.get(
+    "EASEL_A4_GATEWAY_TAG", "easel-gateway-test:g2")
+WORKER_TAG = os.environ.get(
+    "EASEL_A4_WORKER_TAG", "easel-worker-execution:a4")
+SOURCE_ROOT = os.environ.get("EASEL_A4_SOURCE_ROOT", "/mnt/c/Code/Easel")
 FIXTURE = ROOT / "tests" / "fixtures" / "broker_acp.py"
 FAKE_PROVIDER = ROOT / "tests" / "fixtures" / "fake_openai_tls.py"
 WSL_DISTRO = "Ubuntu-26.04"
@@ -584,8 +589,8 @@ def test_public_control_gateway_sidecar_broker_chain(
                        keys / "egress-policy.json", run_id)
 
         provisioner_command = " ".join([
-            ("cd /mnt/c/Code/Easel && "
-             "export PYTHONPATH=/mnt/c/Code/Easel && exec python3"),
+            (f"cd {SOURCE_ROOT} && "
+             f"export PYTHONPATH={SOURCE_ROOT} && exec python3"),
             "deploy/multiuser/provisioner.py",
             "--socket", provisioner_socket,
             "--workspace-root", _wsl_path(root),
@@ -708,6 +713,29 @@ def test_public_control_gateway_sidecar_broker_chain(
                                      user_b.workspace_id)
         audit_b = _prepare_workspace(root, user_b.workspace_id,
                                      user_a.workspace_id)
+
+        # 503 回归：原 Web 首屏并发读取必须全部 200。
+        first_screen = [
+            "/api/status", "/api/ideas", "/api/schedule",
+            "/api/outputs", "/api/accounts", "/api/personas",
+        ]
+
+        def _first_screen_get(path: str):
+            return path, user_a.client.get(
+                path, headers=user_a.headers())
+
+        with ThreadPoolExecutor(max_workers=len(first_screen)) as pool:
+            first_screen_results = list(
+                pool.map(_first_screen_get, first_screen))
+        assert all(response.status_code == 200
+                   for _, response in first_screen_results), [
+            (path, response.status_code, response.text[:200])
+            for path, response in first_screen_results
+            if response.status_code != 200]
+        print("A4_FIRST_SCREEN", json.dumps({
+            "codes": {path: response.status_code
+                      for path, response in first_screen_results}},
+            sort_keys=True))
 
         session_a = _create_session(user_a, "A 私有会话")
         session_b = _create_session(user_b, "B 私有会话")
@@ -868,6 +896,18 @@ def test_public_control_gateway_sidecar_broker_chain(
             "tokens_after": tokens_after,
             "same_worker": _container_id(worker_a) == worker_a_id,
         }, sort_keys=True))
+        with ThreadPoolExecutor(max_workers=len(first_screen)) as pool:
+            recovered_screen = list(
+                pool.map(_first_screen_get, first_screen))
+        assert all(response.status_code == 200
+                   for _, response in recovered_screen), [
+            (path, response.status_code, response.text[:200])
+            for path, response in recovered_screen
+            if response.status_code != 200]
+        print("A4_FIRST_SCREEN_AFTER_RECOVERY", json.dumps({
+            "codes": {path: response.status_code
+                      for path, response in recovered_screen}},
+            sort_keys=True))
         stopped_restart = user_a.client.post(
             "/api/chat/stop", headers=user_a.headers(write=True),
             json={"runId": restart_run})

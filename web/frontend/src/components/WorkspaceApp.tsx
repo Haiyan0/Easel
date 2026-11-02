@@ -19,6 +19,7 @@ import { AuthError } from '../lib/auth';
 import { workspaceModeFeatures } from '../lib/workspaceClient';
 import { createControlWorkspaceData } from '../lib/workspaceData';
 import type { WorkspaceStatus } from '../lib/workspaceData';
+import { workspaceGatewayStatus } from '../lib/statusCopy';
 import WorkspaceDataProvider from './WorkspaceDataProvider';
 import { useWorkspace } from '../hooks/useWorkspace';
 import type { ChatQuestion, PersonaItem } from '../lib/api';
@@ -223,7 +224,7 @@ export default function WorkspaceApp({
       return (
         <DashboardPage
           persona={selectedPersona}
-          gatewayStatus={workspaceStatus?.gateway ? 'connected' : 'connecting'}
+          gatewayStatus={workspaceGatewayStatus(workspaceStatus)}
           apiDirect={false}
           agentRuntime="control"
           onNavigate={navigate}
@@ -339,7 +340,7 @@ export default function WorkspaceApp({
         void workspace.archiveSession(id, archived);
       }}
       onNewChat={newChat}
-      gatewayStatus={workspaceStatus?.gateway ? 'connected' : 'connecting'}
+      gatewayStatus={workspaceGatewayStatus(workspaceStatus)}
       apiDirect={false}
       agentRuntime="control"
       onOpenSettings={openSettings}

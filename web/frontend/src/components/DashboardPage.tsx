@@ -6,6 +6,7 @@ import type {
 import type { Page } from './Sidebar';
 import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { isIdentityExpired, workspaceErrorMessage } from '../lib/workspaceData';
+import { dashboardHeroText } from '../lib/statusCopy';
 import {
   IconFire, IconCalendar, IconOutputs, IconChat, IconSkills, IconAccounts,
   IconIdea, IconPublish,
@@ -218,11 +219,7 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
       <div className="dash-hero">
         <h1 className="page-title" style={{ fontSize: 26 }}>{greet} 👋</h1>
         <p className="page-subtitle">
-          {apiDirect ? (gatewayStatus === 'connected' ? '仅聊天模式已配置，可开始对话。' : '请先配置仅聊天模式的模型 API。')
-            : agentRuntime !== 'openclaw' ? (gatewayStatus === 'connected'
-            ? `${agentRuntime} CLI 已安装；原生登录及模型可用性请发送消息验证。`
-            : `请先在服务器安装并配置 ${agentRuntime} CLI。`)
-            : gatewayStatus === 'connected' ? '一切就绪。' : '⚠ 网关未连接。'}
+          {dashboardHeroText(gatewayStatus, apiDirect, agentRuntime)}
           {persona ? ` 当前画像「${persona}」。` : ' 通用模式——指定画像效果更好。'}
           从热点到发布，一站式搞定今天的内容。
         </p>

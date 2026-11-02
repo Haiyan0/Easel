@@ -178,7 +178,12 @@ while True:
         else:
             SESSION = (message.get("params") or {}).get(
                 "sessionId", "fixture-session")
-        _reply(message, {"sessionId": SESSION})
+        # 6A 起 worker 会按受管模型目录下发 model；夹具声明一个可用模型，
+        # 证明实际走 session/set_model，而不是靠清空覆盖值绕过。
+        _reply(message, {
+            "sessionId": SESSION,
+            "models": [{"modelId": "deepseek-chat"}],
+        })
     elif method == "session/set_config_option":
         _reply(message, {})
     elif method in ("turn/interrupt", "session/cancel"):

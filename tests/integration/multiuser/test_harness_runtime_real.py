@@ -28,9 +28,12 @@ FAKE_PROVIDER = ROOT / "tests" / "fixtures" / "fake_openai_tls.py"
 WSL_DISTRO = "Ubuntu-26.04"
 RUN_LABEL = "easel.a5.harness"
 PROVIDER_MODEL = "deepseek-chat"
-CONTROL_TAG = "easel-control-test:a4"
-GATEWAY_TAG = "easel-gateway-test:g2"
+CONTROL_TAG = os.environ.get(
+    "EASEL_A4_CONTROL_TAG", "easel-control-test:a4")
+GATEWAY_TAG = os.environ.get(
+    "EASEL_A4_GATEWAY_TAG", "easel-gateway-test:g2")
 HARNESS_TAG = "easel-worker-harness:a5"
+SOURCE_ROOT = os.environ.get("EASEL_A4_SOURCE_ROOT", "/mnt/c/Code/Easel")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("EASEL_RUN_CONTAINER_TESTS") != "1",
@@ -284,8 +287,8 @@ def test_real_harness_broker_resume_and_failure_semantics(
                           keys / "egress-policy.json", run_id)
 
         provisioner_command = " ".join([
-            ("cd /mnt/c/Code/Easel && "
-             "export PYTHONPATH=/mnt/c/Code/Easel && exec python3"),
+            (f"cd {SOURCE_ROOT} && "
+             f"export PYTHONPATH={SOURCE_ROOT} && exec python3"),
             "deploy/multiuser/provisioner.py",
             "--socket", provisioner_socket,
             "--workspace-root", a4._wsl_path(root),

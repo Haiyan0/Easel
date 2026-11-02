@@ -83,7 +83,7 @@ WORKER_COMMAND = (
 DEFAULT_QUOTA_BYTES = 10 * 1024 ** 3
 
 ACTIONS = ("ensure", "stop", "inspect", "activate", "abort",
-           "restore_gateway", "identity")
+           "restore_gateway", "commit_attempt", "recover_abort", "identity")
 
 _WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _PINNED_IMAGE = re.compile(
@@ -121,6 +121,7 @@ class WorkerRequest:
     gateway_created: bool = False
     attempt_id: str = ""
     cleanup_scope: str = ""
+    orphan_takeover: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,17 +178,19 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     if action not in ACTIONS:
         raise _reject("invalid_action")
     if version == LEGACY_PROTOCOL_VERSION and action in (
-            "activate", "abort", "restore_gateway", "identity"):
+            "activate", "abort", "restore_gateway", "commit_attempt",
+            "recover_abort", "identity"):
         raise _reject("unsupported_protocol")
     if action == "identity":
         if set(data) != {"version", "action"}:
             raise _reject("unknown_field")
         return WorkerRequest(action, "")
     allowed = {"version", "action", "workspace_id"}
-    if action in ("ensure", "activate", "restore_gateway"):
+    if action in ("ensure", "activate", "restore_gateway",
+                  "recover_abort"):
         allowed.add("config_version")
     if action == "ensure" and version == PROTOCOL_VERSION:
-        allowed.add("attempt_id")
+        allowed.update({"attempt_id", "orphan_takeover"})
     if action == "restore_gateway":
         allowed.update({"worker_container_id", "attempt_id"})
     if action == "stop":
@@ -197,10 +200,13 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     if action == "activate":
         allowed.update({"gateway_instance_id", "worker_container_id",
                         "boot_generation"})
-    if action == "abort":
+    if action in ("abort", "recover_abort"):
         allowed.update({"gateway_instance_id", "worker_container_id",
                         "worker_created", "gateway_created", "attempt_id",
                         "scope"})
+    if action == "commit_attempt":
+        allowed.update({"gateway_instance_id", "worker_container_id",
+                        "attempt_id"})
     unknown = {key for key in data if key not in allowed}
     if unknown:
         # 明确拒绝所有镜像/命令/挂载/网络/环境注入尝试
@@ -212,8 +218,8 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
         raise _reject("invalid_workspace")
 
     config_version = data.get("config_version", 0)
-    if action in ("ensure", "activate", "restore_gateway") \
-            and "config_version" not in data:
+    if action in ("ensure", "activate", "restore_gateway",
+                  "recover_abort") and "config_version" not in data:
         raise _reject("invalid_config_version")
     if not _valid_config_version(config_version):
         raise _reject("invalid_config_version")
@@ -226,6 +232,7 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     gateway_created = False
     attempt_id = ""
     cleanup_scope = ""
+    orphan_takeover = False
     if action == "stop":
         instance_id = data.get("instance_id")
         if (not isinstance(instance_id, str)
@@ -233,9 +240,12 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
             raise _reject("invalid_instance")
         if version == PROTOCOL_VERSION:
             gateway_instance_id = data.get("gateway_instance_id")
+            # gateway-only 恢复完成后 control 已没有 gateway ID；允许
+            # 显式空串，由 stop 在确无同名 gateway 时只停 worker。
             if (not isinstance(gateway_instance_id, str)
-                    or _CONTAINER_INSTANCE.fullmatch(
-                        gateway_instance_id) is None):
+                    or (gateway_instance_id != ""
+                        and _CONTAINER_INSTANCE.fullmatch(
+                            gateway_instance_id) is None)):
                 raise _reject("invalid_gateway_instance")
     elif action == "activate":
         gateway_instance_id = data.get("gateway_instance_id")
@@ -251,7 +261,7 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
         if (not isinstance(boot_generation, str)
                 or not re.fullmatch(r"[0-9a-f]{32}", boot_generation)):
             raise _reject("invalid_boot_generation")
-    elif action == "abort":
+    elif action in ("abort", "recover_abort"):
         gateway_instance_id = data.get("gateway_instance_id")
         worker_container_id = data.get("worker_container_id")
         worker_created = data.get("worker_created")
@@ -277,12 +287,30 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
                 or gateway_created != (cleanup_scope in (
                     "gateway", "worker_gateway"))):
             raise _reject("invalid_cleanup_scope")
+    elif action == "commit_attempt":
+        gateway_instance_id = data.get("gateway_instance_id")
+        worker_container_id = data.get("worker_container_id")
+        if (not isinstance(gateway_instance_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(
+                    gateway_instance_id) is None):
+            raise _reject("invalid_gateway_instance")
+        if (not isinstance(worker_container_id, str)
+                or _CONTAINER_INSTANCE.fullmatch(worker_container_id) is None):
+            raise _reject("invalid_instance")
+        attempt_id = data.get("attempt_id", "")
+        if attempt_id and (not isinstance(attempt_id, str)
+                           or re.fullmatch(r"[0-9a-f]{32}", attempt_id)
+                           is None):
+            raise _reject("invalid_attempt_id")
     elif action == "ensure" and version == PROTOCOL_VERSION:
         attempt_id = data.get("attempt_id", "")
         if attempt_id and (not isinstance(attempt_id, str)
                            or re.fullmatch(r"[0-9a-f]{32}", attempt_id)
                            is None):
             raise _reject("invalid_attempt_id")
+        orphan_takeover = data.get("orphan_takeover", False)
+        if type(orphan_takeover) is not bool:
+            raise _reject("invalid_orphan_takeover")
     elif action == "restore_gateway":
         worker_container_id = data.get("worker_container_id")
         if (not isinstance(worker_container_id, str)
@@ -295,7 +323,8 @@ def parse_request(payload: bytes | str | dict) -> WorkerRequest:
     return WorkerRequest(
         action, workspace_id, config_version, instance_id, version,
         gateway_instance_id, worker_container_id, boot_generation,
-        worker_created, gateway_created, attempt_id, cleanup_scope)
+        worker_created, gateway_created, attempt_id, cleanup_scope,
+        orphan_takeover)
 
 
 def _valid_config_version(value: object) -> bool:
@@ -1922,7 +1951,8 @@ class Provisioner:
 
     async def ensure(self, workspace_id: str, config_version: int, *,
                      protocol_version: int = LEGACY_PROTOCOL_VERSION,
-                     attempt_id: str = "") -> WorkerHandle:
+                     attempt_id: str = "",
+                     orphan_takeover: bool = False) -> WorkerHandle:
         if protocol_version >= PROTOCOL_VERSION and not attempt_id:
             attempt_id = uuid.uuid4().hex
         payload = {"version": protocol_version, "action": "ensure",
@@ -1930,17 +1960,29 @@ class Provisioner:
                    "config_version": config_version}
         if protocol_version >= PROTOCOL_VERSION:
             payload["attempt_id"] = attempt_id
+        if orphan_takeover:
+            if protocol_version < PROTOCOL_VERSION:
+                raise ProvisionerError("unsupported_protocol")
+            payload["orphan_takeover"] = True
         parse_request(payload)
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
             return await self._ensure_locked(
-                workspace_id, config_version, protocol_version, attempt_id)
+                workspace_id, config_version, protocol_version, attempt_id,
+                orphan_takeover=orphan_takeover)
 
     async def _ensure_locked(self, workspace_id: str, config_version: int,
                              protocol_version: int,
-                             attempt_id: str = "") -> WorkerHandle:
+                             attempt_id: str = "",
+                             *, orphan_takeover: bool = False) -> WorkerHandle:
         if self._worker_public_key is None:
             raise ProvisionerError("worker_public_key_unavailable")
+        if attempt_id:
+            # 在任何目录/容器动作前拒绝未消解的旧清理承诺；只有 control
+            # 明确声明 DB 无 attempt 的新代次可以接管孤儿记录。
+            self._ensure_attempt_available(
+                workspace_id, attempt_id,
+                allow_supersede=orphan_takeover)
         paths = await asyncio.to_thread(
             prepare_workspace, self.settings.workspace_root, workspace_id)
         await asyncio.to_thread(ensure_worker_ownership, paths)
@@ -2003,7 +2045,8 @@ class Provisioner:
                     report["upstream"], token, config_version)
                 return await self._with_gateway(
                     handle, protocol_version, worker_created=False,
-                    attempt_id=attempt_id)
+                    attempt_id=attempt_id,
+                    orphan_takeover=orphan_takeover)
 
         # 只有本轮新建实例才允许生成 token；既有实例已在上面严格比较。
         token = await asyncio.to_thread(
@@ -2055,7 +2098,8 @@ class Provisioner:
                         config_version)
                     return await self._with_gateway(
                         handle, protocol_version, worker_created=True,
-                        attempt_id=attempt_id)
+                        attempt_id=attempt_id,
+                        orphan_takeover=orphan_takeover)
                 await asyncio.sleep(HEALTH_POLL_SECONDS)
             raise ProvisionerError("worker_not_ready")
         except asyncio.CancelledError:
@@ -2090,13 +2134,41 @@ class Provisioner:
 
     def _record_attempt(self, workspace_id: str, attempt_id: str,
                         handle: WorkerHandle, *,
-                        worker_created: bool, gateway_created: bool) -> None:
+                        worker_created: bool, gateway_created: bool,
+                        allow_supersede: bool = False) -> None:
+        """只为真正创建了资源的尝试写清理承诺。
+
+        纯复用没有可清理资源，只能写 completed/no-op tombstone，绝不能
+        覆盖其他 attempt 的 pending 清理承诺。pending 只允许同 attempt
+        更新或由 control 明确 commit 后回收；任何其他 attempt 都必须
+        先消解旧承诺，否则失败关闭。
+        """
+        if not worker_created and not gateway_created:
+            self._record_noop_attempt(
+                workspace_id, attempt_id, handle,
+                allow_supersede=allow_supersede)
+            return
         if worker_created and gateway_created:
             scope = "worker_gateway"
         elif worker_created:
             scope = "worker"
         else:
             scope = "gateway"
+        existing = self._load_attempt(workspace_id)
+        if existing is not None:
+            if existing["attempt_id"] == attempt_id:
+                if existing["status"] == "completed":
+                    if self._attempt_matches(
+                            existing, attempt_id, handle,
+                            worker_created=worker_created,
+                            gateway_created=gateway_created):
+                        return
+                    raise ProvisionerError(
+                        "gateway_attempt_record_unreadable")
+            elif existing["status"] != "completed" and not allow_supersede:
+                raise ProvisionerError("gateway_cleanup_pending")
+        elif self._attempt_path(workspace_id).exists():
+            raise ProvisionerError("gateway_attempt_record_unreadable")
         record = {
             "attempt_id": attempt_id,
             "worker_container_id": handle.container_id,
@@ -2107,6 +2179,60 @@ class Provisioner:
             "status": "pending",
         }
         self._persist_attempt(workspace_id, record)
+
+    def _record_noop_attempt(self, workspace_id: str, attempt_id: str,
+                             handle: WorkerHandle, *,
+                             allow_supersede: bool = False) -> None:
+        """纯复用写 completed/no-op tombstone，作为迟到 abort 的代次围栏。"""
+        existing = self._load_attempt(workspace_id)
+        if (existing is not None and existing["status"] == "pending"
+                and existing["attempt_id"] == attempt_id):
+            # 同一 attempt 的纯复用重试不能把已创建的清理承诺降级成
+            # no-op；保留原 pending 记录。
+            return
+        if (existing is not None and existing["status"] == "pending"
+                and not allow_supersede):
+            raise ProvisionerError("gateway_cleanup_pending")
+        if existing is None and self._attempt_path(workspace_id).exists():
+            raise ProvisionerError("gateway_attempt_record_unreadable")
+        record = {
+            "attempt_id": attempt_id,
+            "worker_container_id": handle.container_id,
+            "gateway_instance_id": handle.gateway_instance_id,
+            "worker_created": False,
+            "gateway_created": False,
+            "scope": "none",
+            "status": "completed",
+        }
+        self._persist_attempt(workspace_id, record)
+
+    @staticmethod
+    def _attempt_matches(record: dict, attempt_id: str,
+                         handle: WorkerHandle, *, worker_created: bool,
+                         gateway_created: bool) -> bool:
+        return (
+            record["attempt_id"] == attempt_id
+            and record["worker_container_id"] == handle.container_id
+            and record["gateway_instance_id"]
+            == handle.gateway_instance_id
+            and record["worker_created"] == bool(worker_created)
+            and record["gateway_created"] == bool(gateway_created))
+
+    def _ensure_attempt_available(self, workspace_id: str,
+                                  attempt_id: str, *,
+                                  allow_supersede: bool = False) -> None:
+        """在创建任何资源前拒绝未消解的清理承诺或不可读坏记录。"""
+        if not attempt_id:
+            return
+        record = self._load_attempt(workspace_id)
+        if record is not None:
+            if (record["attempt_id"] == attempt_id
+                    or record["status"] == "completed"
+                    or allow_supersede):
+                return
+            raise ProvisionerError("gateway_cleanup_pending")
+        if self._attempt_path(workspace_id).exists():
+            raise ProvisionerError("gateway_attempt_record_unreadable")
 
     def _persist_attempt(self, workspace_id: str, record: dict) -> None:
         """原子持久 attempt 状态；completed tombstone 不得被提前删除。"""
@@ -2130,16 +2256,21 @@ class Provisioner:
             raise
         self._attempts[workspace_id] = record
 
-    def _load_attempt(self, workspace_id: str) -> dict | None:
-        cached = self._attempts.get(workspace_id)
-        if cached is not None:
-            return cached
+    def _read_attempt_payload(self, workspace_id: str) -> dict | None:
+        """读取原始 attempt JSON；用于识别旧版坏记录，不做兼容放行。"""
         path = self._attempt_path(workspace_id)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if not isinstance(payload, dict):
+        return payload if isinstance(payload, dict) else None
+
+    def _load_attempt(self, workspace_id: str) -> dict | None:
+        cached = self._attempts.get(workspace_id)
+        if cached is not None:
+            return cached
+        payload = self._read_attempt_payload(workspace_id)
+        if payload is None:
             return None
         attempt_id = payload.get("attempt_id")
         worker = payload.get("worker_container_id")
@@ -2154,10 +2285,15 @@ class Provisioner:
                 or _CONTAINER_INSTANCE.fullmatch(worker) is None
                 or not isinstance(gateway, str)
                 or _CONTAINER_INSTANCE.fullmatch(gateway) is None
-                or scope not in ("gateway", "worker", "worker_gateway")
+                or scope not in ("gateway", "worker", "worker_gateway",
+                                 "none")
                 or type(wc) is not bool or type(gc) is not bool
-                or wc != (scope in ("worker", "worker_gateway"))
-                or gc != (scope in ("gateway", "worker_gateway"))
+                or (scope == "none"
+                    and (wc or gc or status != "completed"))
+                or (scope != "none"
+                    and (wc != (scope in ("worker", "worker_gateway"))
+                         or gc != (scope in ("gateway",
+                                             "worker_gateway"))))
                 or status not in ("pending", "completed")):
             return None
         record = {
@@ -2193,7 +2329,8 @@ class Provisioner:
     async def _with_gateway(self, handle: WorkerHandle, protocol_version: int,
                             *, worker_created: bool,
                             attempt_id: str = "",
-                            replace_unavailable: bool = False) -> WorkerHandle:
+                            replace_unavailable: bool = False,
+                            orphan_takeover: bool = False) -> WorkerHandle:
         """gateway 启用时只返回候选；v1 缺失元数据必须失败关闭。"""
         if not self.gateway_enabled:
             if protocol_version >= PROTOCOL_VERSION:
@@ -2202,6 +2339,11 @@ class Provisioner:
         if protocol_version < PROTOCOL_VERSION:
             raise ProvisionerError("gateway_required")
         assert self._gateway is not None
+        if attempt_id:
+            # 必须在 gateway 创建前失败，避免制造无法归属的新资源。
+            self._ensure_attempt_available(
+                handle.workspace_id, attempt_id,
+                allow_supersede=orphan_takeover)
         try:
             candidate = await self._gateway.ensure(
                 workspace_id=handle.workspace_id,
@@ -2222,10 +2364,24 @@ class Provisioner:
             worker_created=worker_created,
             gateway_created=candidate.gateway_created)
         if attempt_id:
-            self._record_attempt(
-                result.workspace_id, attempt_id, result,
-                worker_created=worker_created,
-                gateway_created=candidate.gateway_created)
+            try:
+                self._record_attempt(
+                    result.workspace_id, attempt_id, result,
+                    worker_created=worker_created,
+                    gateway_created=candidate.gateway_created,
+                    allow_supersede=orphan_takeover)
+            except BaseException:
+                # 归属写盘失败时不能留下无主 gateway；按本轮精确 ID 清理。
+                if candidate.gateway_created:
+                    try:
+                        await self._gateway.stop(
+                            handle.workspace_id, handle.container_id,
+                            candidate.gateway_instance_id)
+                    except BaseException:  # noqa: BLE001 - 保留原始失败
+                        LOGGER.error(
+                            "attempt 记录失败后 gateway 清理未完成，"
+                            "保留追踪材料")
+                raise
         return result
 
     async def restore_gateway(self, workspace_id: str,
@@ -2251,6 +2407,8 @@ class Provisioner:
             "attempt_id": attempt_id})
         lock = self._locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
+            # restore 同样不能在未消解的旧清理承诺下创建新 gateway。
+            self._ensure_attempt_available(workspace_id, attempt_id)
             raw = await self._inspect_instance(worker_container_id)
             if raw is None:
                 raise ProvisionerError("worker_identity_mismatch")
@@ -2322,19 +2480,27 @@ class Provisioner:
         async with lock:
             if self.gateway_enabled:
                 assert self._gateway is not None
-                try:
-                    # 先按精确 gateway 实例停止；失败时绝不继续删除 worker。
-                    await self._gateway.stop(
-                        workspace_id, instance_id, gateway_instance_id)
-                except GatewayRuntimeError as error:
-                    raise ProvisionerError(error.code) from None
-                # 旧 gateway 已消失但同名新 gateway 仍存在时，旧 tuple
-                # 不能据此停止当前 worker。
-                current_gateway = await self._gateway.current_instance_id(
-                    workspace_id)
-                if (current_gateway
-                        and current_gateway != gateway_instance_id):
-                    raise ProvisionerError("gateway_target_mismatch")
+                if gateway_instance_id:
+                    try:
+                        # 先按精确 gateway 实例停止；失败时绝不继续删除 worker。
+                        await self._gateway.stop(
+                            workspace_id, instance_id, gateway_instance_id)
+                    except GatewayRuntimeError as error:
+                        raise ProvisionerError(error.code) from None
+                    # 旧 gateway 已消失但同名新 gateway 仍存在时，旧 tuple
+                    # 不能据此停止当前 worker。
+                    current_gateway = await self._gateway.current_instance_id(
+                        workspace_id)
+                    if (current_gateway
+                            and current_gateway != gateway_instance_id):
+                        raise ProvisionerError("gateway_target_mismatch")
+                else:
+                    # gateway-only 恢复后 control 已没有 gateway ID；只有
+                    # 确认没有同名 gateway 时才允许继续停 worker/sidecar。
+                    current_gateway = await self._gateway.current_instance_id(
+                        workspace_id)
+                    if current_gateway:
+                        raise ProvisionerError("gateway_target_mismatch")
             await self._stop_worker_locked(workspace_id, instance_id)
             self._clear_attempt(
                 workspace_id, worker_container_id=instance_id,
@@ -2399,29 +2565,212 @@ class Provisioner:
                     or record["gateway_created"] != gateway_created
                     or record["scope"] != scope):
                 raise ProvisionerError("gateway_abort_superseded")
-            if record.get("status") == "completed":
-                # 物理清理已完成、control 可能尚未提交 DB；同 attempt/ID/
-                # scope 的重试直接幂等成功，不再次执行破坏操作。
+            await self._abort_locked(workspace_id, record)
+
+    async def _abort_locked(self, workspace_id: str, record: dict) -> None:
+        """调用方已按持久记录完成精确匹配，此处只执行记录中的范围。"""
+        if record["status"] == "completed":
+            # 物理清理已完成、control 可能尚未提交 DB；同 attempt/ID/
+            # scope 的重试直接幂等成功，不再次执行破坏操作。
+            return
+        scope = record["scope"]
+        if scope in ("gateway", "worker_gateway"):
+            assert self._gateway is not None
+            try:
+                await self._gateway.stop(
+                    workspace_id, record["worker_container_id"],
+                    record["gateway_instance_id"])
+            except GatewayRuntimeError as error:
+                raise ProvisionerError(error.code) from None
+        if scope in ("worker", "worker_gateway"):
+            await self._stop_worker_locked(
+                workspace_id, record["worker_container_id"])
+        completed = dict(record)
+        completed["status"] = "completed"
+        try:
+            self._persist_attempt(workspace_id, completed)
+        except OSError:
+            # 物理已完成但 tombstone 未持久化：保持 pending，重试可
+            # 幂等重做终态核验；绝不能假报已收口。
+            raise ProvisionerError("gateway_abort_record_failed") from None
+
+    async def commit_attempt(self, workspace_id: str,
+                             worker_container_id: str,
+                             gateway_instance_id: str, *,
+                             attempt_id: str = "") -> None:
+        """control 已提交成功启动后收口 attempt，允许后续尝试接管。
+
+        只匹配同一 attempt 或明确给出的精确目标；pending 记录被其他
+        attempt 占用时失败关闭。文件不存在表示纯复用从未写记录，按无
+        cleanup 承诺处理。
+        """
+        if not self.gateway_enabled:
+            raise ProvisionerError("gateway_disabled")
+        parse_request({
+            "version": PROTOCOL_VERSION, "action": "commit_attempt",
+            "workspace_id": workspace_id,
+            "worker_container_id": worker_container_id,
+            "gateway_instance_id": gateway_instance_id,
+            "attempt_id": attempt_id})
+        lock = self._locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            self._commit_attempt_locked(
+                workspace_id, worker_container_id, gateway_instance_id,
+                attempt_id)
+
+    def _commit_attempt_locked(self, workspace_id: str,
+                               worker_container_id: str,
+                               gateway_instance_id: str,
+                               attempt_id: str) -> None:
+        record = self._load_attempt(workspace_id)
+        path = self._attempt_path(workspace_id)
+        if record is None:
+            if not path.exists():
                 return
-            if scope in ("gateway", "worker_gateway"):
-                assert self._gateway is not None
-                try:
-                    await self._gateway.stop(
-                        workspace_id, worker_container_id,
-                        gateway_instance_id)
-                except GatewayRuntimeError as error:
-                    raise ProvisionerError(error.code) from None
-            if scope in ("worker", "worker_gateway"):
-                await self._stop_worker_locked(
-                    workspace_id, worker_container_id)
+            # 旧版纯复用覆盖产生的不可读记录：只有在它明确声明未创建
+            # 任何资源、且目标完全一致时，才允许用 completed/no-op 收口。
+            raw = self._read_attempt_payload(workspace_id)
+            if (raw is None
+                    or raw.get("status", "pending") != "pending"
+                    or raw.get("worker_created") is not False
+                    or raw.get("gateway_created") is not False
+                    or raw.get("worker_container_id") != worker_container_id
+                    or raw.get("gateway_instance_id")
+                    != gateway_instance_id):
+                raise ProvisionerError("gateway_attempt_record_unreadable")
+            raw_attempt = raw.get("attempt_id")
+            recovered_attempt = (
+                raw_attempt if isinstance(raw_attempt, str)
+                and re.fullmatch(r"[0-9a-f]{32}", raw_attempt) is not None
+                else attempt_id or uuid.uuid4().hex)
+            self._persist_attempt(workspace_id, {
+                "attempt_id": recovered_attempt,
+                "worker_container_id": worker_container_id,
+                "gateway_instance_id": gateway_instance_id,
+                "worker_created": False,
+                "gateway_created": False,
+                "scope": "none",
+                "status": "completed",
+            })
+            return
+        if attempt_id and record["attempt_id"] != attempt_id:
+            if record["status"] == "completed":
+                return
+            raise ProvisionerError("gateway_commit_superseded")
+        if (record["worker_container_id"] != worker_container_id
+                or record["gateway_instance_id"] != gateway_instance_id):
+            if record["status"] == "completed":
+                return
+            raise ProvisionerError("gateway_commit_superseded")
+        if record["status"] == "pending":
             completed = dict(record)
             completed["status"] = "completed"
-            try:
-                self._persist_attempt(workspace_id, completed)
-            except OSError:
-                # 物理已完成但 tombstone 未持久化：保持 pending，重试可
-                # 幂等重做终态核验；绝不能假报已收口。
-                raise ProvisionerError("gateway_abort_record_failed") from None
+            self._persist_attempt(workspace_id, completed)
+
+    async def recover_abort(self, workspace_id: str,
+                            worker_container_id: str,
+                            gateway_instance_id: str, config_version: int, *,
+                            attempt_id: str, scope: str,
+                            worker_created: bool,
+                            gateway_created: bool) -> None:
+        """受限恢复旧版无资源记录覆盖后的 gateway-only 清理承诺。
+
+        只在以下条件全部满足时重建 attempt 归属并执行原 scope 清理：
+        现有记录缺失或为旧版“未创建任何资源”的 pending 坏记录、目标
+        worker/gateway 与请求精确一致、worker 与 gateway 的真实身份
+        和 config_version 均已核验。任何不符都拒绝，不按名称删除。
+        """
+        if not self.gateway_enabled:
+            raise ProvisionerError("gateway_disabled")
+        parse_request({
+            "version": PROTOCOL_VERSION, "action": "recover_abort",
+            "workspace_id": workspace_id,
+            "config_version": config_version,
+            "worker_container_id": worker_container_id,
+            "gateway_instance_id": gateway_instance_id,
+            "worker_created": worker_created,
+            "gateway_created": gateway_created,
+            "attempt_id": attempt_id, "scope": scope})
+        lock = self._locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            self._require_recoverable_scope(
+                worker_created=worker_created,
+                gateway_created=gateway_created, scope=scope)
+            record = self._load_attempt(workspace_id)
+            if record is not None:
+                if (record["attempt_id"] != attempt_id
+                        or record["worker_container_id"]
+                        != worker_container_id
+                        or record["gateway_instance_id"]
+                        != gateway_instance_id
+                        or record["worker_created"] != worker_created
+                        or record["gateway_created"] != gateway_created
+                        or record["scope"] != scope):
+                    raise ProvisionerError("gateway_abort_superseded")
+                await self._abort_locked(workspace_id, record)
+                return
+            path = self._attempt_path(workspace_id)
+            if not path.exists():
+                raise ProvisionerError("gateway_abort_superseded")
+            raw = self._read_attempt_payload(workspace_id)
+            if (raw is None
+                    or raw.get("status", "pending") != "pending"
+                    or raw.get("worker_created") is not False
+                    or raw.get("gateway_created") is not False
+                    or raw.get("worker_container_id") != worker_container_id
+                    or raw.get("gateway_instance_id")
+                    != gateway_instance_id):
+                raise ProvisionerError("gateway_abort_recovery_refused")
+            await self._verify_recovery_identity(
+                workspace_id, worker_container_id, gateway_instance_id,
+                config_version)
+            reconstructed = {
+                "attempt_id": attempt_id,
+                "worker_container_id": worker_container_id,
+                "gateway_instance_id": gateway_instance_id,
+                "worker_created": False,
+                "gateway_created": True,
+                "scope": "gateway",
+                "status": "pending",
+            }
+            self._persist_attempt(workspace_id, reconstructed)
+            await self._abort_locked(workspace_id, reconstructed)
+
+    @staticmethod
+    def _require_recoverable_scope(*, worker_created: bool,
+                                   gateway_created: bool, scope: str) -> None:
+        # 只恢复 gateway-only：worker 不删除，历史/Run/凭证不受影响。
+        if (scope != "gateway" or worker_created is not False
+                or gateway_created is not True):
+            raise ProvisionerError("gateway_abort_recovery_refused")
+
+    async def _verify_recovery_identity(
+            self, workspace_id: str, worker_container_id: str,
+            gateway_instance_id: str, config_version: int) -> None:
+        raw = await self._inspect_instance(worker_container_id)
+        report = sanitize_inspect(raw)
+        if (not report["managed"]
+                or report["workspace_id"] != workspace_id
+                or report["instance_id"] != worker_container_id
+                or report["config_version"] != config_version):
+            raise ProvisionerError("gateway_abort_recovery_refused")
+        assert self._gateway is not None
+        try:
+            gateway = await self._gateway.inspect(
+                workspace_id=workspace_id,
+                gateway_instance_id=gateway_instance_id)
+        except (GatewayRuntimeError, AttributeError, TypeError):
+            raise ProvisionerError(
+                "gateway_abort_recovery_refused") from None
+        if (not isinstance(gateway, dict)
+                or gateway.get("managed") is not True
+                or gateway.get("workspace_id") != workspace_id
+                or gateway.get("gateway_instance_id")
+                != gateway_instance_id
+                or gateway.get("worker_container_id")
+                != worker_container_id
+                or gateway.get("config_version") != config_version):
+            raise ProvisionerError("gateway_abort_recovery_refused")
 
     async def activate(self, workspace_id: str, worker_container_id: str,
                        gateway_instance_id: str, boot_generation: str,
@@ -2724,7 +3073,8 @@ class Provisioner:
             handle = await self.ensure(
                 request.workspace_id, request.config_version,
                 protocol_version=request.version,
-                attempt_id=request.attempt_id)
+                attempt_id=request.attempt_id,
+                orphan_takeover=request.orphan_takeover)
             payload = {
                 "workspace_id": handle.workspace_id,
                 "container_id": handle.container_id,
@@ -2769,6 +3119,21 @@ class Provisioner:
             await self.abort(
                 request.workspace_id, request.worker_container_id,
                 request.gateway_instance_id, attempt_id=request.attempt_id,
+                scope=request.cleanup_scope,
+                worker_created=request.worker_created,
+                gateway_created=request.gateway_created)
+            return {"ok": True}
+        if request.action == "commit_attempt":
+            await self.commit_attempt(
+                request.workspace_id, request.worker_container_id,
+                request.gateway_instance_id,
+                attempt_id=request.attempt_id)
+            return {"ok": True}
+        if request.action == "recover_abort":
+            await self.recover_abort(
+                request.workspace_id, request.worker_container_id,
+                request.gateway_instance_id, request.config_version,
+                attempt_id=request.attempt_id,
                 scope=request.cleanup_scope,
                 worker_created=request.worker_created,
                 gateway_created=request.gateway_created)

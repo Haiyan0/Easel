@@ -50,6 +50,12 @@ class GatewayFake:
         self.fail_restore: Exception | None = None
         self.next_worker = ""
         self.report_worker_container = ""
+        self.ensure_block: asyncio.Event | None = None
+        self.ensure_entered = asyncio.Event()
+        self.ensure_orphan_takeovers: list[bool] = []
+        self.commit_calls: list[dict] = []
+        self.fail_commit: Exception | None = None
+        self.recover_calls: list[dict] = []
 
     def handle(self, workspace_id: str, version: int) -> WorkerHandle:
         return WorkerHandle(
@@ -64,9 +70,14 @@ class GatewayFake:
             gateway_created=self.gateway_created)
 
     async def ensure(self, workspace_id: str, version: int, *,
-                     attempt_id: str = "") -> WorkerHandle:
+                     attempt_id: str = "",
+                     orphan_takeover: bool = False) -> WorkerHandle:
         self.ensure_calls += 1
         self.attempt_id = attempt_id
+        self.ensure_orphan_takeovers.append(orphan_takeover)
+        self.ensure_entered.set()
+        if self.ensure_block is not None:
+            await self.ensure_block.wait()
         if self.fail_ensure is not None:
             raise self.fail_ensure
         return self.handle(workspace_id, version)
@@ -164,6 +175,36 @@ class GatewayFake:
         })
         if self.fail_abort is not None:
             raise self.fail_abort
+
+    async def commit_attempt(self, workspace_id: str,
+                             worker_container_id: str,
+                             gateway_instance_id: str, *,
+                             attempt_id: str = "") -> None:
+        self.commit_calls.append({
+            "workspace": workspace_id,
+            "worker": worker_container_id,
+            "gateway": gateway_instance_id,
+            "attempt_id": attempt_id,
+        })
+        if self.fail_commit is not None:
+            raise self.fail_commit
+
+    async def recover_abort(self, workspace_id: str,
+                            worker_container_id: str,
+                            gateway_instance_id: str, config_version: int, *,
+                            attempt_id: str, scope: str,
+                            worker_created: bool,
+                            gateway_created: bool) -> None:
+        self.recover_calls.append({
+            "workspace": workspace_id,
+            "worker": worker_container_id,
+            "gateway": gateway_instance_id,
+            "config_version": config_version,
+            "attempt_id": attempt_id,
+            "scope": scope,
+            "worker_created": worker_created,
+            "gateway_created": gateway_created,
+        })
 
 
 def _run(coro):
@@ -672,6 +713,217 @@ def test_abort_claim_fences_new_owner_until_stop_terminal(tmp_path):
                 user.workspace_id, 1, "owner-b", 1005, 60)
             assert outcome == "started"
             assert current is not None
+    _run(scenario())
+
+
+def test_same_workspace_lock_wait_is_bounded_by_ready_timeout(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            fake.ensure_block = asyncio.Event()
+            first = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(),
+                ready_timeout=10, poll_interval=0.01)
+            second = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(1001),
+                ready_timeout=0.1, poll_interval=0.01)
+            # 同一 manager 的 workspace 锁就是这条预算边界；这里让两个
+            # manager 共享锁，仅为了用不同就绪预算观察排队等待。
+            second._ensure_locks = first._ensure_locks
+            running = asyncio.create_task(
+                first.ensure_ready(user.workspace_id, 1))
+            await asyncio.wait_for(fake.ensure_entered.wait(), 1)
+
+            with pytest.raises(RuntimeUnavailable) as error:
+                await asyncio.wait_for(
+                    second.ensure_ready(user.workspace_id, 1), 2)
+            assert error.value.code == "worker_start_timeout"
+            # 排队超时不能进入 provisioner，也不能再获得完整等待窗口。
+            assert fake.ensure_calls == 1
+
+            fake.ensure_block.set()
+            await running
+    _run(scenario())
+
+
+def test_cancelled_lock_wait_does_not_poison_following_start(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            fake.ensure_block = asyncio.Event()
+            first = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(),
+                ready_timeout=10, poll_interval=0.01)
+            second = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(1001),
+                ready_timeout=10, poll_interval=0.01)
+            second._ensure_locks = first._ensure_locks
+            running = asyncio.create_task(
+                first.ensure_ready(user.workspace_id, 1))
+            await asyncio.wait_for(fake.ensure_entered.wait(), 1)
+            queued = asyncio.create_task(
+                second.ensure_ready(user.workspace_id, 1))
+            await asyncio.sleep(0.01)
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+
+            fake.ensure_block.set()
+            await running
+            third = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(1100),
+                ready_timeout=2, poll_interval=0.01)
+            third._ensure_locks = first._ensure_locks
+            handle = await third.ensure_ready(user.workspace_id, 1)
+            assert handle.workspace_id == user.workspace_id
+    _run(scenario())
+
+
+def test_fresh_generation_authorizes_orphan_attempt_takeover(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            # 新代次没有 DB attempt/container；只有这种明确状态才允许
+            # provisioner 接管控制面崩溃遗留的孤儿 pending 记录。
+            assert fake.ensure_orphan_takeovers == [True]
+    _run(scenario())
+
+
+def test_successful_start_commits_attempt_once(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            assert fake.commit_calls == [{
+                "workspace": user.workspace_id,
+                "worker": WORKER,
+                "gateway": GATEWAY,
+                "attempt_id": fake.attempt_id,
+            }]
+            await manager.ensure_ready(user.workspace_id, 1)
+            assert len(fake.commit_calls) == 1
+    _run(scenario())
+
+
+def test_commit_failure_is_retried_on_ready_path(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            fake.fail_commit = RuntimeUnavailable(
+                "provisioner_timeout", 503, retry_after=5)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            handle = await manager.ensure_ready(user.workspace_id, 1)
+            assert handle.workspace_id == user.workspace_id
+            assert len(fake.commit_calls) == 1
+
+            fake.fail_commit = None
+            await manager.ensure_ready(user.workspace_id, 1)
+            assert len(fake.commit_calls) == 2
+    _run(scenario())
+
+
+def test_recover_stop_uses_recover_abort_for_superseded_legacy_record(
+        tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as first, Store.open(
+                tmp_path / "db") as second:
+            user = first.create_user("A")
+            fake = GatewayFake(first)
+            manager = RuntimeManager(
+                first, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            lease = first.get_worker_lease(user.workspace_id)
+            assert lease is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1),
+                gateway_instance_id="f" * 64,
+                gateway_state="staged",
+                worker_created=False,
+                gateway_created=True,
+                attempt_id="a" * 32)
+            staged = first.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                candidate, "a" * 32, 1001, 60)
+            assert staged is not None
+            fake.fail_abort = RuntimeUnavailable("gateway_abort_superseded")
+            with pytest.raises(RuntimeUnavailable):
+                await manager._cleanup_candidate(
+                    user.workspace_id, candidate, staged, "a" * 32)
+            assert first.get_worker_lease(
+                user.workspace_id).state == "stopping"
+
+            recovered = RuntimeManager(
+                second, fake, gateway_required=True, clock=Clock(1200),
+                poll_interval=0.01)
+            stopping = second.get_worker_lease(user.workspace_id)
+            assert stopping is not None
+            await recovered._recover_stop(
+                user.workspace_id, stopping, 1300)
+            assert fake.recover_calls == [{
+                "workspace": user.workspace_id,
+                "worker": WORKER,
+                "gateway": "f" * 64,
+                "config_version": 1,
+                "attempt_id": "a" * 32,
+                "scope": "gateway",
+                "worker_created": False,
+                "gateway_created": True,
+            }]
+            after = second.get_worker_lease(user.workspace_id)
+            assert after.state == "ready"
+            assert after.gateway_state == "unavailable"
+            assert after.container_id == WORKER
+    _run(scenario())
+
+
+def test_drain_all_recovers_expired_stopping_before_stop(tmp_path):
+    async def scenario():
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            fake = GatewayFake(store)
+            manager = RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock())
+            await manager.ensure_ready(user.workspace_id, 1)
+            lease = store.get_worker_lease(user.workspace_id)
+            assert lease is not None
+            candidate = dataclasses.replace(
+                fake.handle(user.workspace_id, 1),
+                gateway_instance_id="f" * 64,
+                gateway_state="staged",
+                worker_created=False,
+                gateway_created=True,
+                attempt_id="a" * 32)
+            staged = store.begin_worker_gateway_refresh(
+                user.workspace_id, lease.generation, manager.owner_id,
+                candidate, "a" * 32, 1001, 60)
+            assert staged is not None
+            fake.fail_abort = RuntimeUnavailable("gateway_abort_superseded")
+            with pytest.raises(RuntimeUnavailable):
+                await manager._cleanup_candidate(
+                    user.workspace_id, candidate, staged, "a" * 32)
+            assert store.get_worker_lease(
+                user.workspace_id).state == "stopping"
+
+            drained = await RuntimeManager(
+                store, fake, gateway_required=True, clock=Clock(1200),
+                drain_timeout=5, poll_interval=0.01).drain_all()
+            assert drained == [user.workspace_id]
+            assert fake.recover_calls
+            assert fake.stop_calls
+            after = store.get_worker_lease(user.workspace_id)
+            assert after.state == "stopped"
+            assert store.drain_status(1200)["settled"] is True
     _run(scenario())
 
 
