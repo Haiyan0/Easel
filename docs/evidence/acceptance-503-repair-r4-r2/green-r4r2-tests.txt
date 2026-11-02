@@ -1,4 +1,4 @@
-TREE: 174af97
+TREE: b686ea5
 COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_r4r2_503.py -v
 ----
 ============================= test session starts =============================
@@ -22,5 +22,5 @@ tests/multiuser/test_attempt_ownership_r4r2_503.py::test_unknown_result_before_t
 tests/multiuser/test_attempt_ownership_r4r2_503.py::test_cancel_before_takeover_does_not_resurrect_late_attempt PASSED [ 90%]
 tests/multiuser/test_attempt_ownership_r4r2_503.py::test_interrupted_takeover_commit_fences_both_attempts PASSED [100%]
 
-============================= 11 passed in 0.59s ==============================
+============================= 11 passed in 0.61s ==============================
 EXIT=0

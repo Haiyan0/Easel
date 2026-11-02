@@ -1,4 +1,4 @@
-TREE: 174af97
+TREE: b686ea5
 
 WORKTREE BYTES (core.autocrlf=true, CRLF where applicable):
 6f54486b3f31097e5e97fb504dbb825c9480ab7aaa1702b6bc2b5c3fa7e19ee2 *deploy/multiuser/provisioner.py
@@ -17,5 +17,9 @@ GIT DIFF CHECK:
 clean
 
 COMMITS:
+b686ea5 test: 断言迟到请求的确定失败结果（R4-R2-01）
+72e4ca6 docs: 校正 R4-R2 报告提交引用
+94bfbb3 docs: 注明 R4-R2 生产与证据提交
+7a0ce2e docs: 补齐 R4-R2 验收证据
 174af97 fix: 旧坏记录收口同样围栏未知 attempt（R4-R2-01）
 8361ce5 fix: 精确围栏未执行 attempt 的执行权（R4-R2-01）
