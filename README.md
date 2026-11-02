@@ -386,6 +386,8 @@ Easel 使用独立的 `easel` OpenClaw profile，不会覆盖你本机已有的 
 - [能力地图](docs/skill-function-mapping.md)
 - [SKILL 接口规范](docs/SKILL-SPEC.md)
 - [提示词与架构分层](docs/prompt-stack.md)
+- [新手手册：Windows 本机与 Docker Desktop](docs/windows-desktop-operations.zh-CN.md)
+- [新手手册：Linux Docker 部署与运维](docs/linux-docker-operations.zh-CN.md)
 - [多人部署、备份恢复与显式迁移](docs/multiuser-deployment.zh-CN.md)
 - [已知问题](docs/known-issues.md)
 - [完整致谢](docs/ACKNOWLEDGMENTS.md)
