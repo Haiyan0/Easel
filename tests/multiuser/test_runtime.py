@@ -654,6 +654,50 @@ def test_unix_client_decodes_only_strict_protocol_responses(tmp_path):
     assert handle.service_token == "t"
 
 
+def test_unix_client_maps_transport_loss_to_unknown_outcome_codes(
+        monkeypatch, tmp_path):
+    """真实 Unix 客户端的 EOF/超时必须映射为可恢复的未知结果码。"""
+    from easel.control.runtime import UnixProvisionerClient
+
+    client = UnixProvisionerClient(tmp_path / "provisioner.sock")
+
+    async def unavailable(*args, **kwargs):
+        raise OSError("socket reset")
+
+    monkeypatch.setattr(
+        asyncio, "open_unix_connection", unavailable, raising=False)
+    with pytest.raises(RuntimeUnavailable) as error:
+        asyncio.run(client._call({"action": "inspect"}, 0.1))
+    assert error.value.code == "provisioner_unavailable"
+
+    class Reader:
+        async def readline(self):
+            await asyncio.sleep(1)
+            return b""
+
+    class Writer:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    async def hanging(*args, **kwargs):
+        return Reader(), Writer()
+
+    monkeypatch.setattr(
+        asyncio, "open_unix_connection", hanging, raising=False)
+    with pytest.raises(RuntimeUnavailable) as error:
+        asyncio.run(client._call({"action": "inspect"}, 0.01))
+    assert error.value.code == "provisioner_timeout"
+
+
 def test_late_drain_reply_cannot_overwrite_new_generation(tmp_path):
     """旧 drain 的 stop 已发生但回复暂停；新代次就绪后旧回复不得改写。"""
     async def scenario():

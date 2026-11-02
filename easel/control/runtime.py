@@ -33,6 +33,15 @@ CONFIG_VERSION_LABEL = "easel.config-version"
 
 READY_TIMEOUT_SECONDS = 60.0
 CONFIRM_STOP_TIMEOUT_SECONDS = 15.0
+# ensure/restore 请求已发出但未取得可信回复的错误码：远程可能已经创建
+# 资源。此类未知结果必须保留精确 attempt 归属等待恢复，不能当成确定失败
+# 回退 ready 后另起 attempt。
+_UNKNOWN_ENSURE_OUTCOME_CODES = frozenset({
+    "provisioner_timeout",
+    "provisioner_unavailable",
+    "provisioner_invalid_response",
+    "worker_start_timeout",
+})
 # 非必要成功后收口的最小剩余预算；低于该值时直接留给下一次 ready 重试，
 # 不用一次注定超时的远程等待把当前响应拖到 deadline 之外。
 MIN_COMMIT_BUDGET_SECONDS = 0.02
@@ -561,13 +570,22 @@ class RuntimeManager:
             return await self._commit_gateway_candidate(
                 workspace_id, config_version, lease, recovered,
                 attempt_id, deadline)
+        dispatched = deadline - self._clock() > 0
         try:
             candidate = await self._ensure_candidate(
                 workspace_id, config_version, deadline, lease,
                 attempt_id=attempt_id)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            if (dispatched and lease.state == "starting"
+                    and isinstance(error, RuntimeUnavailable)
+                    and error.code in _UNKNOWN_ENSURE_OUTCOME_CODES):
+                # 回复超时/连接中断是未知结果：远程可能已替换并持久化候选。
+                # 保留 starting 的 owner/generation/attempt 归属，下一次首屏
+                # 才能按精确 attempt 解析，而不是回退 ready 后被新 attempt
+                # 的 pending 记录永久挡住。
+                raise
             if lease.state == "starting":
                 await self._db(
                     self._store.fail_expired_worker_gateway_refresh,
