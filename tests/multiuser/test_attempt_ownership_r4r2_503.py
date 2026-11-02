@@ -310,7 +310,10 @@ def test_live_takeover_fences_late_ensure_before_side_effects(tmp_path):
 
             final = await asyncio.wait_for(b.ensure_ready(workspace, 1), 2)
             assert final.gateway_instance_id == GATEWAY
-            await asyncio.gather(task, return_exceptions=True)
+            results = await asyncio.gather(task, return_exceptions=True)
+            # A 的迟到请求按确定失败结束，绝不能覆盖 B 的新代次。
+            assert isinstance(results[0], RuntimeUnavailable)
+            assert results[0].code == "gateway_attempt_fenced"
 
             # A 恢复时 B 已接管并清空槽位；A 在副作用前被拒绝。
             assert pause["owner"] == "live-b"
@@ -379,7 +382,9 @@ def test_live_takeover_fences_late_restore_before_side_effects(tmp_path):
                 b.restore_gateway(workspace, WORKER, 1), 2)
             assert final is not None
             assert final.gateway_instance_id == GATEWAY
-            await asyncio.gather(task, return_exceptions=True)
+            results = await asyncio.gather(task, return_exceptions=True)
+            assert isinstance(results[0], RuntimeUnavailable)
+            assert results[0].code == "gateway_attempt_fenced"
 
             assert pause["owner"] == "live-b"
             assert pause["pending_slot"] == ""
@@ -438,8 +443,10 @@ def test_unknown_result_before_takeover_fences_late_attempt(tmp_path):
 
             final = await asyncio.wait_for(b.ensure_ready(workspace, 1), 2)
             assert final.gateway_instance_id == GATEWAY
-            await asyncio.gather(task, return_exceptions=True)
+            results = await asyncio.gather(task, return_exceptions=True)
             assert pause["error"] == "provisioner_timeout"
+            assert isinstance(results[0], RuntimeUnavailable)
+            assert results[0].code == "provisioner_timeout"
 
             ready_now = store.get_worker_lease(workspace)
             assert ready_now is not None
