@@ -1,0 +1,5 @@
+A5_IMAGES {"control": "sha256:2582886195031ac4d71746bbddf670270e47f21f09a2d0bf55d26d1d00011ac2", "gateway": "sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a", "worker": "sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612"}
+A5_REAL_PASS {"pids_a1": [26, 39], "pids_a2": [51, 64], "provider_requests": 9, "token_rows": [{"revoked": true, "run": "12f3e7fb0296442b9d40d7526bcbcde4"}, {"revoked": true, "run": "4a292c625c914be6962b8f651e7ea07f"}], "worker_a": "db530aab97f28e2af787845593a6d39ffc0d5e4033f8cf7a841880972297426d", "worker_b": "fe67728da53b8f2fae6894b96e99127a6f7d92c30815269ca0414f4b43148ddb"}
+..
+2 passed in 73.10s (0:01:13)
+PYTEST_EXIT=0

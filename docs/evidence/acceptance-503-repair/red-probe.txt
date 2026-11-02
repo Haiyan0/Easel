@@ -1,0 +1,6 @@
+=== base 665f7e8 (fix worktree, untouched) ===
+{"original_attempt_overwritten": true, "original_abort_error": "gateway_abort_superseded", "record_loadable_after_restart": false}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
+=== acceptance 4382180 ===
+{"original_attempt_overwritten": true, "original_abort_error": "gateway_abort_superseded", "record_loadable_after_restart": false}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false
