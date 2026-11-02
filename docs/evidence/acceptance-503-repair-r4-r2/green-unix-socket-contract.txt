@@ -1,0 +1,6 @@
+TREE: 174af97
+COMMAND: MSYS_NO_PATHCONV=1 docker run --rm -i --network none -v C:/Code/Easel-acceptance:/src:ro easel-control:503-r4-r1-final python3 - < docs/evidence/acceptance-503-repair-r4-r2/provisioner_socket_contract.py
+----
+{"attempt_a": "11111111111111111111111111111111", "attempt_b": "22222222222222222222222222222222", "client": "UnixProvisionerClient", "fenced_attempts": ["11111111111111111111111111111111", "22222222222222222222222222222222"], "new_attempt_allowed": "33333333333333333333333333333333", "record_status": "completed", "server": "Provisioner._handle_client"}
+UNIX_CONTRACT_OK
+EXIT=0

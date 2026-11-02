@@ -1,0 +1,16 @@
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r1_live_takeover.py C:\Users\hyh\AppData\Local\Temp\easel-r4-r2-red
+BASELINE: 188f1c8 (parent of R4-R2 fix)
+----
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+attempt 收口失败，保留 ready 并等待下次重试 workspace=24cde7ac8e82490aa321b9b52022babd
+B first error: gateway_cleanup_pending
+B retry 0 gateway_cleanup_pending
+B retry 1 gateway_cleanup_pending
+B retry 2 gateway_cleanup_pending
+{"attempts": {"a": "b3b12188a6d4483abdbf7ab7b148424e", "b": "5d76a34fff314d25af013252b4ba0927"}, "db_state": "ready", "db_attempt": "a129bdeb113241109d01051b8531fd03", "pending_slot": "", "remote_attempt": "b3b12188a6d4483abdbf7ab7b148424e", "remote_status": "pending"}
+REPRODUCED: A pending 归属已从 DB 丢失，连续普通首屏无法恢复
+EXIT=0
