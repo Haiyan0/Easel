@@ -4,7 +4,7 @@ At line:1 char:372
 +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 
 #1 [internal] load build definition from Dockerfile.control
 #1 transferring dockerfile: 2.98kB done
@@ -92,10 +92,10 @@ de79529d0c 0.0s done
 #22 DONE 0.0s
 
 #18 [frontend 6/6] RUN npm run build
-#18 0.412 
+#18 0.412
 #18 0.412 > frontend@0.0.0 build
 #18 0.412 > tsc -b && vite build
-#18 0.412 
+#18 0.412
 #18 3.637 vite v8.1.4 building client environment for production...
 #18 3.646 [2K
 transforming...✓ 73 modules transformed.
@@ -104,9 +104,9 @@ transforming...✓ 73 modules transformed.
 #18 3.859 dist/index.html                   2.54 kB │ gzip:   1.46 kB
 #18 3.859 dist/assets/index-Da4NYWkv.css   95.44 kB │ gzip:  17.34 kB
 #18 3.859 dist/assets/index-D5UTpITU.js   661.58 kB │ gzip: 203.62 kB
-#18 3.859 
+#18 3.859
 #18 3.860 ✓ built in 222ms
-#18 3.860 [plugin builtin:vite-reporter] 
+#18 3.860 [plugin builtin:vite-reporter]
 #18 3.860 (!) Some chunks are larger than 500 kB after minification. Consider:
 #18 3.860 - Using dynamic import() to code-split the application
 #18 3.860 - Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOpt
@@ -121,7 +121,7 @@ ions.codeSplitting
 7,<1"       "pydantic>=2.7,<3"       "cryptography>=42"  && groupadd --gid 10001 easel  && useradd --uid 10001 --gid 10
 001 --home-dir /home/easel             --create-home --shell /usr/sbin/nologin easel  && mkdir -p /srv/easel/control  &
 & chown 10001:10001 /srv/easel/control /home/easel  && chown -R root:root /opt/easel  && chmod -R a-w /opt/easel  && ch
-mod 0555 /opt/easel/deploy/desktop/keygen.py                     /opt/easel/deploy/desktop/initialize_state.py         
+mod 0555 /opt/easel/deploy/desktop/keygen.py                     /opt/easel/deploy/desktop/initialize_state.py
             /opt/easel/deploy/desktop/read_stop_state.py                     /opt/easel/deploy/desktop/provisioner_iden
 tity.py
 #24 1.594 Collecting fastapi<1,>=0.115

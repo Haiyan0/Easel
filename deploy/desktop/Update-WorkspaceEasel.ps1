@@ -140,29 +140,50 @@ echo "provisioner_pid=$pid"
 }
 
 function Get-ManagedSnapshot {
-    $lookup = Invoke-EaselDocker -Arguments @(
-        'ps', '-a', '-q', '--filter', 'label=easel.managed=true')
-    if ($lookup.ExitCode -ne 0) {
-        throw ("managed_snapshot_unavailable:ps:" +
-            ($lookup.Output -join '|'))
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string[]]$WorkspaceIds = @()
+    )
+    # 只快照本项目登记/可信 workspace 的受管实例。其他部署正常增删
+    # worker/gateway 不应阻断本项目更新；本项目实例被替换仍必须拒绝。
+    $ids = @($WorkspaceIds | ForEach-Object { "$_".Trim().ToLowerInvariant() } |
+        Where-Object { $_ -match '^[0-9a-f]{32}$' } | Sort-Object -Unique)
+    if ($ids.Count -eq 0 -and
+        (Test-Path -LiteralPath $Root -PathType Container)) {
+        # 控制库不可读时的受限后备：仅枚举本项目持久根下的 workspace 目录。
+        $ids = @(Get-ChildItem -LiteralPath $Root -Directory |
+            Where-Object { $_.Name -match '^[0-9a-f]{32}$' } |
+            ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object -Unique)
     }
-    $ids = @($lookup.Output | ForEach-Object { "$_".Trim() } |
-        Where-Object { $_ })
-    if ($ids.Count -eq 0) {
+    $containerIds = @()
+    foreach ($workspaceId in $ids) {
+        $lookup = Invoke-EaselDocker -Arguments @(
+            'ps', '-a', '-q',
+            '--filter', 'label=easel.managed=true',
+            '--filter', "label=easel.workspace-id=$workspaceId")
+        if ($lookup.ExitCode -ne 0) {
+            throw ("managed_snapshot_unavailable:ps:" +
+                ($lookup.Output -join '|'))
+        }
+        $containerIds += @($lookup.Output | ForEach-Object { "$_".Trim() } |
+            Where-Object { $_ })
+    }
+    $containerIds = @($containerIds | Sort-Object -Unique)
+    if ($containerIds.Count -eq 0) {
         return @()
     }
     # 不在 --format 内使用双引号标签索引：PowerShell 传给原生 docker 时
     # 内层引号会被剥离，导致模板解析失败。只比较不可复用实例 ID 与运行态，
     # 已足以证明更新没有替换 worker/gateway。
     $inspectArguments = @('inspect', '--format', '{{.Id}}|{{.State.Running}}')
-    $inspectArguments += $ids
+    $inspectArguments += $containerIds
     $inspect = Invoke-EaselDocker -Arguments $inspectArguments
     if ($inspect.ExitCode -ne 0) {
         throw ("managed_snapshot_unavailable:inspect:" +
             ($inspect.Output -join '|') + ':args:' +
             ($inspectArguments -join ',') + ':argcount:' +
             $inspectArguments.Count + ':arg0:' + $inspectArguments[0] +
-            ':ids:' + ($ids -join ','))
+            ':ids:' + ($containerIds -join ','))
     }
     return @($inspect.Output | Where-Object { "$_".Trim() } |
         ForEach-Object { "$_".Trim() } | Sort-Object)
@@ -226,6 +247,180 @@ function Get-BarrierStatus {
     return [pscustomobject]@{
         ExitCode = $result.ExitCode
         Text = (($result.Output -join '').Trim())
+    }
+}
+
+function Get-OfflineControlFacts {
+    param(
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string]$ControlVolume
+    )
+    # 只读数据库事实：不打开 Store（Store.open 可能迁移/写 WAL），也不
+    # 依赖正在运行的控制进程。旧镜像/新镜像均可由目标镜像执行该脚本。
+    $code = @'
+import json, sqlite3, sys
+path = '/srv/easel/control/control.sqlite3'
+now = int(sys.argv[1])
+try:
+    conn = sqlite3.connect('file:' + path + '?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT value FROM control_state WHERE key='admission_barrier'"
+    ).fetchone()
+    barrier = json.loads(row['value']) if row is not None else None
+    active_runs = conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE status NOT IN"
+        " ('done','failed','interrupted','cancelled')").fetchone()[0]
+    active_requests = conn.execute(
+        "SELECT COUNT(*) FROM request_leases WHERE expires_at > ?",
+        (now,)).fetchone()[0]
+    leases = conn.execute(
+        "SELECT COUNT(*) FROM worker_leases WHERE state IN"
+        " ('starting','ready','draining','stopping')").fetchone()[0]
+    workspaces = [r[0] for r in conn.execute(
+        "SELECT id FROM workspaces ORDER BY id")]
+    print(json.dumps({
+        'barrier': barrier,
+        'activeRuns': int(active_runs),
+        'activeRequests': int(active_requests),
+        'activeLeaseCount': int(leases),
+        'workspaceIds': workspaces,
+    }, sort_keys=True, separators=(',', ':')))
+except Exception as error:
+    print('update_control_facts_offline_failed:' + type(error).__name__,
+          file=sys.stderr)
+    sys.exit(1)
+'@
+    $stamp = [string][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    return Invoke-EaselDocker -Arguments @(
+        'run', '--rm', '--network', 'none', '--read-only',
+        '--entrypoint', 'python',
+        '--mount',
+        "type=volume,src=$ControlVolume,dst=/srv/easel/control,readonly",
+        $Image, '-c', $code, $stamp)
+}
+
+function Get-ControlFacts {
+    param(
+        [string]$ControlId,
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string]$ControlVolume
+    )
+    # 优先在运行中的控制容器内用其自带 Store 读取事实；旧镜像没有
+    # update-status 命令也能执行这段受限内联脚本。随后尝试新 CLI，
+    # 控制不可用时退回只读 SQLite。三者输出同一事实集合。
+    if ($ControlId) {
+        $code = @'
+import json, time
+from easel.control.store import Store
+with Store.open('/srv/easel/control/control.sqlite3') as store:
+    status = store.drain_status(int(time.time()))
+    print(json.dumps({
+        'barrier': store.admission_barrier(),
+        'activeRuns': status['activeRuns'],
+        'activeRequests': status['activeRequests'],
+        'activeLeaseCount': len(status['activeLeases']),
+        'workspaceIds': store.list_workspace_ids(),
+    }, sort_keys=True, separators=(',', ':')))
+'@
+        $inline = Invoke-EaselDocker -Arguments @(
+            'exec', $ControlId, 'python', '-c', $code)
+        $payload = $null
+        if ($inline.ExitCode -eq 0) {
+            foreach ($line in $inline.Output) {
+                if ("$line".Trim().StartsWith('{')) {
+                    try {
+                        $payload = "$line".Trim() | ConvertFrom-Json
+                    }
+                    catch {
+                        $payload = $null
+                    }
+                }
+            }
+            if ($null -ne $payload) {
+                return [pscustomobject]@{
+                    ExitCode = 0
+                    Source = 'control-store'
+                    Payload = $payload
+                    Output = ''
+                }
+            }
+        }
+        $status = Invoke-EaselDocker -Arguments @(
+            'exec', $ControlId, 'python', '-m', 'easel', 'admin',
+            'update-status', '--control-dir', '/srv/easel/control')
+        if ($status.ExitCode -eq 0) {
+            $text = (($status.Output -join '').Trim())
+            try {
+                $payload = $text | ConvertFrom-Json
+            }
+            catch {
+                $payload = $null
+            }
+            if ($null -ne $payload) {
+                return [pscustomobject]@{
+                    ExitCode = 0
+                    Source = 'control-cli'
+                    Payload = $payload
+                    Output = ''
+                }
+            }
+        }
+    }
+    $offline = Get-OfflineControlFacts -Image $Image `
+        -ControlVolume $ControlVolume
+    $payload = $null
+    if ($offline.ExitCode -eq 0) {
+        foreach ($line in $offline.Output) {
+            if ("$line".Trim().StartsWith('{')) {
+                try {
+                    $payload = "$line".Trim() | ConvertFrom-Json
+                }
+                catch {
+                    $payload = $null
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        ExitCode = $(if ($null -ne $payload) { 0 } else { 1 })
+        Source = 'offline'
+        Payload = $payload
+        Output = ($offline.Output -join '|')
+    }
+}
+
+function Wait-UpdateWorkload {
+    param(
+        [string]$ControlId,
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string]$ControlVolume,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+    # 只等待已接纳的 Run 与在途请求；静态坏 worker lease 由 Start 的
+    # 恢复流程处理，不能在这里 drain，否则现场会死锁。控制面已经不在
+    # 运行时没有可替换的服务，明确记录 unobservable 后继续。
+    if (-not $ControlId) {
+        Write-Output 'update_active_work=unobservable'
+        return
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $facts = Get-ControlFacts -ControlId $ControlId -Image $Image `
+            -ControlVolume $ControlVolume
+        if ($facts.ExitCode -ne 0 -or $null -eq $facts.Payload) {
+            throw ("update_work_status_unavailable:" + $facts.Output)
+        }
+        $runs = [int]$facts.Payload.activeRuns
+        $requests = [int]$facts.Payload.activeRequests
+        Write-Output ("update_active_work={0}/{1}" -f $runs, $requests)
+        if ($runs -eq 0 -and $requests -eq 0) {
+            return
+        }
+        if ((Get-Date) -ge $deadline) {
+            throw ("update_active_work_timeout:{0}/{1}" -f $runs, $requests)
+        }
+        Start-Sleep -Seconds 2
     }
 }
 
@@ -294,43 +489,104 @@ try {
     }
 
     $controlId = Get-EaselControlContainerId -ProjectName $ProjectName
-    if (-not $controlId) {
-        throw 'update_control_unavailable'
-    }
-    $controlImageNow = Invoke-EaselDocker -Arguments @(
-        'inspect', '--format', '{{.Image}}', $controlId)
-    $controlImageNow = (($controlImageNow.Output -join '').Trim())
-    if ($controlImageNow -ne $oldControlImage) {
-        throw "update_control_image_mismatch:$controlImageNow/$oldControlImage"
-    }
-    $oldRuntimeSha = Get-WslFileSha256 -Distro $Distro `
-        -Path "$WslRepo/easel/control/runtime.py"
-    $newRuntimeSha = $oldRuntimeSha
-    $oldProvisionerSha = ''
-    $oldIdentity = Invoke-ProvisionerIdentity -Image $Image `
-        -SocketPath "/tmp/easel-runtime/$ProjectName/provisioner.sock" `
-        -Distro $Distro -ProvisionerGid $ProvisionerGid -Mode show
-    if ($oldIdentity.ExitCode -eq 0) {
-        try {
-            $oldIdentityPayload = (($oldIdentity.Output -join '') |
-                ConvertFrom-Json)
-            $oldProvisionerSha = [string]$oldIdentityPayload.sourceSha256
+    $controlImageNow = ''
+    if ($controlId) {
+        $imageResult = Invoke-EaselDocker -Arguments @(
+            'inspect', '--format', '{{.Image}}', $controlId)
+        if ($imageResult.ExitCode -eq 0) {
+            $controlImageNow = (($imageResult.Output -join '').Trim())
         }
-        catch {
-            throw 'update_old_identity_invalid'
-        }
-    }
-    else {
-        throw 'update_old_identity_unavailable'
-    }
-    $oldProvisionerPid = Get-ProvisionerPid -Distro $Distro `
-        -SocketPath "/tmp/easel-runtime/$ProjectName/provisioner.sock" `
-        -ScriptDir $logDir
-    if ($oldProvisionerPid.ExitCode -ne 0) {
-        throw 'update_old_provisioner_pid_unavailable'
     }
 
-    $managedBefore = @(Get-ManagedSnapshot)
+    # 先读控制库事实再决定阶段：desktop-update 屏障存在说明这是同一
+    # 更新命令的未完成阶段，允许 control 已换新镜像/暂不可用或旧
+    # provisioner 已停止；不带该屏障则必须是完整的旧版本现场。
+    $facts = Get-ControlFacts -ControlId $controlId -Image $Image `
+        -ControlVolume $volumes.Control
+    if ($facts.ExitCode -ne 0 -or $null -eq $facts.Payload) {
+        throw ("update_control_facts_unavailable:" + $facts.Output)
+    }
+    $factsPayload = $facts.Payload
+    $barrierRecord = $factsPayload.barrier
+    $resuming = $false
+    $barrierId = ''
+    if ($null -ne $barrierRecord) {
+        if ([string]$barrierRecord.reason -ne 'desktop-update') {
+            throw ("update_barrier_preexisting:" +
+                [string]$barrierRecord.id + ':' +
+                [string]$barrierRecord.reason)
+        }
+        $existingBarrierId = [string]$barrierRecord.id
+        if ($existingBarrierId -notmatch '^update-[0-9a-f]{12}$') {
+            # 只沿用本脚本格式的更新屏障；其他/损坏 id 必须人工处理。
+            throw ("update_barrier_preexisting_invalid:" +
+                $existingBarrierId)
+        }
+        $resuming = $true
+        $barrierId = $existingBarrierId
+        Write-Output ("update_resumed_phase={0}" -f $barrierId)
+    }
+
+    $oldProvisionerSha = ''
+    $oldProvisionerPid = $null
+    if ($resuming) {
+        # 未完成阶段只接受本项目本次屏障保护下的两种控制身份：旧镜像
+        # 尚未替换，或目标镜像已替换但部署记录尚未更新。其他镜像拒绝。
+        if ($controlImageNow -and
+            $controlImageNow -notin @($oldControlImage, $Image)) {
+            throw ("update_control_image_unexpected:" +
+                $controlImageNow)
+        }
+        Write-Output ("update_resume_control_image={0}" -f $(
+            if ($controlImageNow) { $controlImageNow } else { 'unavailable' }))
+    }
+    else {
+        if (-not $controlId -or -not $controlImageNow) {
+            throw 'update_control_unavailable'
+        }
+        if ($controlImageNow -ne $oldControlImage) {
+            throw ("update_control_image_mismatch:" +
+                "$controlImageNow/$oldControlImage")
+        }
+        $oldIdentity = Invoke-ProvisionerIdentity -Image $Image `
+            -SocketPath "/tmp/easel-runtime/$ProjectName/provisioner.sock" `
+            -Distro $Distro -ProvisionerGid $ProvisionerGid -Mode show
+        if ($oldIdentity.ExitCode -eq 0) {
+            try {
+                $oldIdentityPayload = (($oldIdentity.Output -join '') |
+                    ConvertFrom-Json)
+                $oldProvisionerSha = [string]$oldIdentityPayload.sourceSha256
+            }
+            catch {
+                throw 'update_old_identity_invalid'
+            }
+        }
+        else {
+            throw 'update_old_identity_unavailable'
+        }
+        $oldProvisionerPid = Get-ProvisionerPid -Distro $Distro `
+            -SocketPath "/tmp/easel-runtime/$ProjectName/provisioner.sock" `
+            -ScriptDir $logDir
+        if ($oldProvisionerPid.ExitCode -ne 0) {
+            throw 'update_old_provisioner_pid_unavailable'
+        }
+    }
+    $newRuntimeSha = Get-WslFileSha256 -Distro $Distro `
+        -Path "$WslRepo/easel/control/runtime.py"
+
+    # 只快照本项目登记 workspace；另一部署的正常增删不影响本轮。
+    $workspaceIds = @($factsPayload.workspaceIds |
+        ForEach-Object { "$_".Trim().ToLowerInvariant() } |
+        Where-Object { $_ -match '^[0-9a-f]{32}$' } | Sort-Object -Unique)
+    if ($workspaceIds.Count -eq 0 -and
+        (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
+        $workspaceIds = @(Get-ChildItem -LiteralPath $WorkspaceRoot `
+            -Directory | Where-Object { $_.Name -match '^[0-9a-f]{32}$' } |
+            ForEach-Object { $_.Name.ToLowerInvariant() } |
+            Sort-Object -Unique)
+    }
+    $managedBefore = @(Get-ManagedSnapshot -Root $WorkspaceRoot `
+        -WorkspaceIds $workspaceIds)
     $attemptBefore = @(Get-AttemptSnapshot -Root $WorkspaceRoot)
     $keyBefore = (Get-EaselKeyFingerprints -Image $Image `
         -KeyVolume $volumes.Keys | ConvertTo-Json -Compress)
@@ -338,50 +594,65 @@ try {
         -KeyVolume $volumes.Keys -EgressVolume $volumes.Egress |
         ConvertTo-Json -Compress)
 
-    # 屏障必须在本轮写入；已有 desktop-stop 等屏障时失败关闭，绝不借用
-    # 或清除其他生命周期的承诺。desktop-update 屏障可被重试沿用。
-    $barrierSuffix = [guid]::NewGuid().ToString('N').Substring(0, 12)
-    $barrierId = "update-$barrierSuffix"
-    $barrierResult = Get-BarrierRecord -ControlId $controlId `
-        -BarrierId $barrierId
-    if ($barrierResult.ExitCode -ne 0) {
-        throw ("update_barrier_create_failed:" +
-            ($barrierResult.Output -join '|'))
-    }
-    $barrierPayload = $null
-    foreach ($line in $barrierResult.Output) {
-        if ("$line".Trim().StartsWith('{')) {
-            $barrierPayload = "$line".Trim() | ConvertFrom-Json
+    if (-not $resuming) {
+        # 屏障必须在本轮写入；已有 desktop-stop 等屏障时失败关闭，绝不
+        # 借用或清除其他生命周期的承诺。desktop-update 屏障可被重试沿用。
+        $barrierSuffix = [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $barrierId = "update-$barrierSuffix"
+        $barrierResult = Get-BarrierRecord -ControlId $controlId `
+            -BarrierId $barrierId
+        if ($barrierResult.ExitCode -ne 0) {
+            throw ("update_barrier_create_failed:" +
+                ($barrierResult.Output -join '|'))
+        }
+        $barrierPayload = $null
+        foreach ($line in $barrierResult.Output) {
+            if ("$line".Trim().StartsWith('{')) {
+                $barrierPayload = "$line".Trim() | ConvertFrom-Json
+            }
+        }
+        if ($null -eq $barrierPayload) {
+            throw 'update_barrier_response_invalid'
+        }
+        if ($null -ne $barrierPayload.existing) {
+            if ([string]$barrierPayload.existing.reason -ne
+                'desktop-update') {
+                throw ("update_barrier_preexisting:" +
+                    [string]$barrierPayload.existing.id + ':' +
+                    [string]$barrierPayload.existing.reason)
+            }
+            $existingBarrierId = [string]$barrierPayload.existing.id
+            if ($existingBarrierId -notmatch '^update-[0-9a-f]{12}$') {
+                throw ("update_barrier_preexisting_invalid:" +
+                    $existingBarrierId)
+            }
+            $barrierId = $existingBarrierId
+        }
+        else {
+            $barrierId = [string]$barrierPayload.created.id
+        }
+        if (-not $barrierId) {
+            throw 'update_barrier_response_invalid'
+        }
+        $barrierCheck = Get-BarrierStatus -ControlId $controlId
+        if ($barrierCheck.ExitCode -ne 0 -or
+            $barrierCheck.Text -ne "barrier=$barrierId") {
+            throw "update_barrier_not_established:$($barrierCheck.Text)"
         }
     }
-    if ($null -eq $barrierPayload) {
-        throw 'update_barrier_response_invalid'
-    }
-    if ($null -ne $barrierPayload.existing) {
-        if ([string]$barrierPayload.existing.reason -ne 'desktop-update') {
-            throw ("update_barrier_preexisting:" +
-                [string]$barrierPayload.existing.id + ':' +
-                [string]$barrierPayload.existing.reason)
+    elseif ($controlId) {
+        # 恢复阶段再核对一次屏障没有在两次读取之间被清除。
+        $barrierCheck = Get-BarrierStatus -ControlId $controlId
+        if ($barrierCheck.ExitCode -eq 0 -and
+            $barrierCheck.Text -ne "barrier=$barrierId") {
+            throw "update_barrier_lost:$($barrierCheck.Text)"
         }
-        $existingBarrierId = [string]$barrierPayload.existing.id
-        if ($existingBarrierId -notmatch '^update-[0-9a-f]{12}$') {
-            # 只沿用本脚本格式的更新屏障；其他/损坏 id 必须人工处理。
-            throw ("update_barrier_preexisting_invalid:" +
-                $existingBarrierId)
-        }
-        $barrierId = $existingBarrierId
     }
-    else {
-        $barrierId = [string]$barrierPayload.created.id
-    }
-    if (-not $barrierId) {
-        throw 'update_barrier_response_invalid'
-    }
-    $barrierCheck = Get-BarrierStatus -ControlId $controlId
-    if ($barrierCheck.ExitCode -ne 0 -or
-        $barrierCheck.Text -ne "barrier=$barrierId") {
-        throw "update_barrier_not_established:$($barrierCheck.Text)"
-    }
+
+    # 活动工作边界：只等待已接纳 Run 与在途请求；静态坏 lease 交给
+    # Start 的恢复路径，避免在现场坏状态上 drain 死锁。
+    Wait-UpdateWorkload -ControlId $controlId -Image $Image `
+        -ControlVolume $volumes.Control -TimeoutSeconds $TimeoutSeconds
     Write-Output ("update_barrier={0}" -f $barrierId)
 
     $startScript = Join-Path $PSScriptRoot 'Start-WorkspaceEasel.ps1'
@@ -501,7 +772,8 @@ try {
         throw 'update_new_provisioner_pid_unavailable'
     }
 
-    $managedAfter = @(Get-ManagedSnapshot)
+    $managedAfter = @(Get-ManagedSnapshot -Root $WorkspaceRoot `
+        -WorkspaceIds $workspaceIds)
     if (($managedBefore -join "`n") -ne ($managedAfter -join "`n")) {
         throw 'update_managed_instances_changed'
     }
@@ -536,6 +808,10 @@ try {
         throw "update_barrier_still_active:$($barrierCheck.Text)"
     }
 
+    $oldPidText = 'unavailable'
+    if ($null -ne $oldProvisionerPid) {
+        $oldPidText = "$($oldProvisionerPid.Output -join '')"
+    }
     $summary = [ordered]@{
         project = $ProjectName
         barrier_id = $barrierId
@@ -544,7 +820,7 @@ try {
         control_runtime_sha256 = $newRuntimeSha
         provisioner_source_before = $oldProvisionerSha
         provisioner_source_after = $newProvisionerSha
-        provisioner_pid_before = "$($oldProvisionerPid.Output -join '')"
+        provisioner_pid_before = $oldPidText
         provisioner_pid_after = "$($newProvisionerPid.Output -join '')"
         managed_instances = $managedAfter
         attempt_records = $attemptAfter
@@ -565,7 +841,7 @@ try {
     Write-Output ("update_provisioner_source={0}->{1}" -f `
         $oldProvisionerSha, $newProvisionerSha)
     Write-Output ("update_provisioner_pid={0}->{1}" -f `
-        ($oldProvisionerPid.Output -join ''), `
+        $oldPidText, `
         ($newProvisionerPid.Output -join ''))
     Write-Output ("update_managed_instances={0}" -f $managedAfter.Count)
     Write-Output ("update_attempt_records={0}" -f $attemptAfter.Count)

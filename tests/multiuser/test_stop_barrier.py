@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -297,3 +298,34 @@ def test_admin_drain_sets_barrier_and_resume_clears_it(tmp_path, monkeypatch,
     assert cli.cmd_admin_resume(resume) == 0
     with Store.open(control / "control.sqlite3") as store:
         assert store.admission_barrier() is None
+
+
+def test_admin_update_status_reports_active_work_and_workspaces(tmp_path,
+                                                               capsys):
+    """更新前事实读取区分活动 Run/请求与静态 worker lease。"""
+    control = tmp_path / "control"
+    control.mkdir()
+    with Store.open(control / "control.sqlite3") as store:
+        actor = store.create_user("A")
+        conversation = store.create_conversation(actor, "临时测试")
+        run = store.reserve_run(actor, conversation.id, "request-1",
+                               "digest-1", 1)
+        store.mark_running(actor, run.id)
+        barrier = store.set_admission_barrier(
+            "update-abcdef123456", "desktop-update", 1000)
+
+    args = SimpleNamespace(control_dir=str(control))
+    assert cli.cmd_admin_update_status(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["barrier"] == barrier
+    assert payload["activeRuns"] == 1
+    assert payload["activeRequests"] == 0
+    assert payload["activeLeaseCount"] == 0
+    assert payload["workspaceIds"] == [actor.workspace_id]
+
+    with Store.open(control / "control.sqlite3") as store:
+        store.finish_run(actor, run.id, "done")
+    assert cli.cmd_admin_update_status(args) == 0
+    settled = json.loads(capsys.readouterr().out)
+    assert settled["activeRuns"] == 0
+    assert settled["activeRequests"] == 0

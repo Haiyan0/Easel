@@ -28,7 +28,8 @@ from easel.control.cli import (cmd_admin_backup, cmd_admin_barrier_status,
                                cmd_admin_migrate_local, cmd_admin_prepare_restore,
                                cmd_admin_reopen, cmd_admin_restore,
                                cmd_admin_resume, cmd_admin_stop_complete,
-                               cmd_admin_stop_status, cmd_admin_upgrade_complete,
+                               cmd_admin_stop_status, cmd_admin_update_status,
+                               cmd_admin_upgrade_complete,
                                cmd_admin_verify_backup, cmd_serve_control)
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
@@ -358,6 +359,10 @@ def main(argv: list[str] | None = None) -> int:
         "barrier-status", help="只读打印当前停止接纳屏障")
     p_barrier.add_argument("--control-dir", required=True)
     p_barrier.set_defaults(func=cmd_admin_barrier_status)
+    p_update_status = admin_sub.add_parser(
+        "update-status", help="只读输出更新所需的活动工作与 workspace 清单")
+    p_update_status.add_argument("--control-dir", required=True)
+    p_update_status.set_defaults(func=cmd_admin_update_status)
     p_backup = admin_sub.add_parser(
         "backup", help="备份控制库、master key 与 workspace 持久区")
     p_backup.add_argument("--control-dir", required=True)
