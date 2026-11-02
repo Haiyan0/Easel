@@ -131,6 +131,10 @@ A4_REAL_PASS
 1 passed
 ```
 
+`tests/fixtures/broker_acp.py` 补充 `models` 声明，使 A4 夹具匹配 6A
+受管模型契约（worker 会按目录下发 model）；这是测试夹具修正，不进入
+产品镜像。
+
 ### 真实 Harness 受控 provider
 
 使用 `easel-worker:task6a-4382180`（含 `/opt/dsh`）与受控 TLS
@@ -166,13 +170,13 @@ Store + 真实 Provisioner + 临时目录，复刻“DB stopping/gateway A、磁
 | 用户当前 worker/gateway | `sha256:02ff3af…` / `sha256:5ea06bb…`（未被本轮改动） |
 | 前端 dist | `index.html` `ca8a6917…`；`index-D5UTpITU.js` `7a64e481…`；`index-Da4NYWkv.css` `f5c7b6c1…` |
 
-control 镜像构建命令：
+control 镜像构建命令（在新源码根目录执行）：
 
 ```powershell
 docker build -f deploy/desktop/Dockerfile.control `
   --build-arg HTTP_PROXY=http://host.docker.internal:7897 `
   --build-arg HTTPS_PROXY=http://host.docker.internal:7897 `
-  -t easel-control:503-fix <NEW_SOURCE>
+  -t easel-control:503-fix .
 docker image inspect --format '{{.Id}}' easel-control:503-fix
 ```
 
@@ -206,7 +210,24 @@ WslRepo       = /mnt/c/Code/Easel-acceptance
    -DataRoot C:\Easel\acceptance-data -PublishMode manual
    -WslRepo /mnt/c/Code/Easel-acceptance
    -WorkerImage sha256:02ff3af… -GatewayImage sha256:5ea06bb…`。
-   `Start` 会用新源码生成 provisioner-start.sh。
+   `Start` 会用新源码生成 provisioner-start.sh。完整模板（从新源码根目录
+   执行）：
+
+```powershell
+powershell -File deploy/desktop/Start-WorkspaceEasel.ps1 `
+  -PublicOrigin https://acts-revise-unrented.ngrok-free.dev `
+  -Image sha256:2582886195031ac4d71746bbddf670270e47f21f09a2d0bf55d26d1d00011ac2 `
+  -WorkerImage sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 `
+  -GatewayImage sha256:5ea06bbef5a6c349e14c815239dc64683295c8d505d5d26fa13aa74596059eac `
+  -ProjectName easel -Port 7863 -PublishMode manual `
+  -WorkspaceRoot C:\Easel\acceptance-workspaces `
+  -DataRoot C:\Easel\acceptance-data `
+  -WslRepo /mnt/c/Code/Easel-acceptance `
+  -ProvisionerGid 1000
+```
+
+若现有 DataRoot 的受管配置/出口策略不变，无需重新 Initialize；若这些
+配置变化，先按 Windows 手册执行幂等 Initialize，再 Start。
 4. 更新后由用户在网页手动重试一条短消息。首屏请求会触发
    `ensure_ready -> recover_stop -> recover_abort`；若状态从后端 503
    变为正常对话，再区分后续模型上游错误。
@@ -228,6 +249,8 @@ WslRepo       = /mnt/c/Code/Easel-acceptance
   主审。拒绝本身就是安全边界。
 
 ### 6.3 Stop / Backup / 回退
+
+以下 PowerShell 均从新源码根目录执行。
 
 ```powershell
 # Stop（新 control 的 drain 会先恢复过期 stopping）
@@ -251,8 +274,10 @@ powershell -File deploy/desktop/Backup-WorkspaceEasel.ps1 `
 回退使用备份恢复到**新项目/新目录/新端口**，不覆盖原实例：
 
 ```powershell
+# 先在 PowerShell 里设置实际备份目录
+$Backup = 'C:\Easel\acceptance-data\backups\<timestamp>'
 powershell -File deploy/desktop/Restore-WorkspaceEasel.ps1 `
-  -Backup <备份目录> -ProjectName easel-rollback `
+  -Backup $Backup -ProjectName easel-rollback `
   -PublicOrigin https://acts-revise-unrented.ngrok-free.dev `
   -Image sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2 `
   -WorkerImage sha256:02ff3af7913a90c63677a6cfcc1602187465441fd7eb680537e74b73880c5b57 `
