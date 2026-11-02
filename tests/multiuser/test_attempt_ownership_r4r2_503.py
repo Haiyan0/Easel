@@ -148,6 +148,31 @@ def test_commit_of_unknown_attempt_keeps_committed_record(tmp_path):
     assert service._load_attempt(WORKSPACE)["fenced_attempts"] == [unknown]
 
 
+def test_legacy_record_commit_fences_different_attempt(tmp_path):
+    """修复旧坏记录时同样围栏请求收口的另一个未知 attempt。"""
+    service = h._service(tmp_path)
+    legacy, requested = "e" * 32, "a" * 32
+    h._write_attempt(tmp_path, {
+        "attempt_id": legacy,
+        "worker_container_id": WORKER,
+        "gateway_instance_id": GATEWAY,
+        "worker_created": False,
+        "gateway_created": False,
+        "scope": "gateway",
+        "status": "pending",
+    })
+
+    _commit(service, requested)
+
+    record = service._load_attempt(WORKSPACE)
+    assert record["attempt_id"] == legacy
+    assert record["status"] == "completed"
+    assert record["fenced_attempts"] == [requested]
+    with pytest.raises(provisioner.ProvisionerError) as refused:
+        service._ensure_attempt_available(WORKSPACE, requested)
+    assert refused.value.code == "gateway_attempt_fenced"
+
+
 # ----------------------------------------------------------------------
 # 运行时确定性交错：真实 Store/RuntimeManager + 真实 commit/admission
 # ----------------------------------------------------------------------

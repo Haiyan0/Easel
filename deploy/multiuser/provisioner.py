@@ -2801,7 +2801,7 @@ class Provisioner:
                 raw_attempt if isinstance(raw_attempt, str)
                 and re.fullmatch(r"[0-9a-f]{32}", raw_attempt) is not None
                 else attempt_id or uuid.uuid4().hex)
-            self._persist_attempt(workspace_id, {
+            record = {
                 "attempt_id": recovered_attempt,
                 "worker_container_id": worker_container_id,
                 "gateway_instance_id": gateway_instance_id,
@@ -2809,7 +2809,21 @@ class Provisioner:
                 "gateway_created": False,
                 "scope": "none",
                 "status": "completed",
-            })
+            }
+            raw_fenced = raw.get("fenced_attempts")
+            fenced = []
+            if isinstance(raw_fenced, list):
+                fenced = [item for item in raw_fenced
+                          if isinstance(item, str)
+                          and re.fullmatch(r"[0-9a-f]{32}", item) is not None]
+            if attempt_id and attempt_id != recovered_attempt:
+                # 请求收口的 attempt 与旧记录不同：它同样没有执行记录，
+                # 必须进入围栏，不能因旧记录被修复而重新获得执行权。
+                if attempt_id not in fenced:
+                    fenced.append(attempt_id)
+            if fenced:
+                record["fenced_attempts"] = fenced
+            self._persist_attempt(workspace_id, record)
             return
         if attempt_id and attempt_id in record.get("fenced_attempts", ()):
             # 已围栏 attempt 的重复收口幂等成功，不再改写当前记录。
