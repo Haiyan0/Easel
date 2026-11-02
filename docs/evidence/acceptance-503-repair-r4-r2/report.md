@@ -219,7 +219,7 @@ UNIX_CONTRACT_OK
 
 ## 9. 交付状态
 
-- 生产提交：`8361ce5`、`174af97`（交付 tip `174af97`）
-- 证据目录：`docs/evidence/acceptance-503-repair-r4-r2/`
-- 分支：`fix/acceptance-503-r3`（未合并、未推送）
+- 生产提交：`8361ce5`、`174af97`
+- 证据提交：`7a0ce2e`（`docs/evidence/acceptance-503-repair-r4-r2/`）
+- 分支：`fix/acceptance-503-r3`（未合并、未推送）；交付 tip 为本分支 HEAD
 - 等待主审独立验证；不自动推进其他组。
