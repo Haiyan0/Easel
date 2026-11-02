@@ -17,6 +17,81 @@ IDLE_SECONDS = 300
 MAX_IDLE_PROCESSES = 8
 # Bound outstanding reverse RPCs (permissions/questions), not tool executions.
 MAX_CLIENT_REQUESTS = 64
+# stderr 只保留固定上限供诊断；读取循环仍持续排空到 EOF，防止大输出/无换行
+# 把子进程或父进程阻塞。
+MAX_STDERR_BYTES = 4096
+
+# 只有 JSON-RPC error.data 里的结构化字段才能作为分类证据；message 文本
+# 可能混有提示词、Key 或用户路径，绝不参与分类。
+_EVIDENCE_STATUS_FIELDS = ("status", "statusCode", "status_code",
+                           "httpStatus", "http_status")
+_EVIDENCE_CODE_CATEGORIES = {
+    "unauthorized": "auth",
+    "forbidden": "auth",
+    "invalid_token": "auth",
+    "authentication_failed": "auth",
+    "rate_limited": "rate_limited",
+    "rate_limit_exceeded": "rate_limited",
+    "too_many_requests": "rate_limited",
+    "invalid_request": "request_rejected",
+    "bad_request": "request_rejected",
+    "validation_error": "request_rejected",
+    "service_unavailable": "service_unavailable",
+    "upstream_unavailable": "service_unavailable",
+    "overloaded": "service_unavailable",
+}
+
+
+def _status_value(value: object) -> int | None:
+    if type(value) is int:
+        status = value
+    elif (type(value) is str and len(value) <= 3
+          and value.isascii() and value.isdigit()):
+        # 先限长再做 ASCII 十进制校验，最后才 int()；任意长度/Unicode 数字
+        # 以及超长字符串都不能抛到 reader。
+        status = int(value)
+    else:
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _category_for_status(status: int) -> str | None:
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate_limited"
+    if status in (400, 413, 415, 422):
+        return "request_rejected"
+    if 500 <= status <= 599:
+        return "service_unavailable"
+    return None
+
+
+def classify_error_evidence(error: object) -> tuple[str | None, int | None]:
+    """只读取结构化字段；没有证据时返回 (None, None)，不猜鉴权/限速。"""
+    if not isinstance(error, dict):
+        return None, None
+    data = error.get("data")
+    if not isinstance(data, dict):
+        return None, None
+    status = None
+    for field in _EVIDENCE_STATUS_FIELDS:
+        candidate = _status_value(data.get(field))
+        if candidate is None:
+            continue
+        if status is None:
+            status = candidate
+        category = _category_for_status(candidate)
+        if category is not None:
+            return category, candidate
+    # 状态码无效/未映射时继续检查已知 code/error；都无效才回 unknown。
+    for field in ("code", "error"):
+        value = data.get(field)
+        if type(value) is str:
+            category = _EVIDENCE_CODE_CATEGORIES.get(value.lower())
+            if category is not None:
+                return category, status
+    return None, status
 
 
 async def close_sessions(session_key: str | None = None,
@@ -138,6 +213,8 @@ class RPC:
         self.process = None
         self.reader = None
         self.stderr = None
+        self.stderr_buffer = b""
+        self.stderr_total = 0
         self.write_lock = asyncio.Lock()
         self.client_error = None
         self.reader_error = None
@@ -154,7 +231,8 @@ class RPC:
                 stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024,
                 start_new_session=os.name != "nt")
         except OSError as error:
-            raise HarnessError("无法启动 Agent CLI，请检查安装与 PATH") from error
+            raise HarnessError("无法启动 Agent CLI，请检查安装与 PATH",
+                               stage="cli_start") from error
         self.reader = asyncio.create_task(self._read())
         self.stderr = asyncio.create_task(self._drain_stderr())
         return self
@@ -169,7 +247,8 @@ class RPC:
             except (BrokenPipeError, ConnectionResetError) as error:
                 raise HarnessError("Agent 进程已退出，请检查 CLI 登录与模型配置") from error
 
-    async def call(self, method: str, params: dict, timeout=60):
+    async def call(self, method: str, params: dict, timeout=60, *,
+                   stage: str | None = None):
         self.sequence += 1
         request_id = self.sequence
         future = asyncio.get_running_loop().create_future()
@@ -181,7 +260,16 @@ class RPC:
                 raise self.client_error
             return result
         except asyncio.TimeoutError as error:
-            raise HarnessError(f"Agent 协议请求超时：{method}") from error
+            raise HarnessError(f"Agent 协议请求超时：{method}",
+                               stage=stage or "rpc") from error
+        except HarnessError as error:
+            # 断连/协议错误发生在等待具体调用时，阶段归到该调用；
+            # 已带具体阶段的错误保持原样，不覆盖真实来源。
+            if stage and error.stage in (None, "rpc"):
+                raise HarnessError(
+                    str(error), stage=stage, category=error.category,
+                    status=error.status) from error
+            raise
         finally:
             self.pending.pop(request_id, None)
 
@@ -200,7 +288,9 @@ class RPC:
                 pass
 
     async def _read(self):
-        failure = HarnessError("Agent 协议连接已断开，请检查 CLI 登录、模型与版本")
+        failure = HarnessError(
+            "Agent 协议连接已断开，请检查 CLI 登录、模型与版本",
+            stage="rpc")
         try:
             while line := await self.process.stdout.readline():
                 try:
@@ -208,12 +298,15 @@ class RPC:
                     if not isinstance(message, dict):
                         raise ValueError
                 except ValueError:
-                    raise HarnessError("Agent 返回了无效 JSON-RPC 数据") from None
+                    raise HarnessError("Agent 返回了无效 JSON-RPC 数据",
+                                       stage="rpc") from None
                 if "method" in message:
                     if "id" in message:
                         self.tasks.difference_update([task for task in self.tasks if task.done()])
                         if len(self.tasks) >= MAX_CLIENT_REQUESTS:
-                            raise HarnessError("Agent 客户端请求并发超过上限，本轮已终止")
+                            raise HarnessError(
+                                "Agent 客户端请求并发超过上限，本轮已终止",
+                                stage="rpc")
                         task = asyncio.create_task(self._serve(message))
                         self.tasks.add(task)
                         task.add_done_callback(self.tasks.discard)
@@ -229,13 +322,17 @@ class RPC:
                                 if any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
                                     if len(value) >= 4:
                                         detail = detail.replace(value, "***")
-                            future.set_exception(HarnessError(f"Agent 协议错误：{detail}"))
+                            category, status = classify_error_evidence(error)
+                            future.set_exception(HarnessError(
+                                f"Agent 协议错误：{detail}",
+                                category=category, status=status))
                         else:
                             future.set_result(message.get("result") or {})
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            failure = error if isinstance(error, HarnessError) else HarnessError("Agent 协议读取失败")
+            failure = error if isinstance(error, HarnessError) else \
+                HarnessError("Agent 协议读取失败", stage="rpc")
         finally:
             self.reader_error = failure
             for future in self.pending.values():
@@ -243,8 +340,15 @@ class RPC:
                     future.set_exception(failure)
 
     async def _drain_stderr(self):
-        while await self.process.stderr.read(8192):
-            pass
+        """持续排空 stderr；内存只保留固定上限，绝不按行或全量采集。"""
+        while True:
+            chunk = await self.process.stderr.read(8192)
+            if not chunk:
+                return
+            self.stderr_total += len(chunk)
+            if len(self.stderr_buffer) < MAX_STDERR_BYTES:
+                remaining = MAX_STDERR_BYTES - len(self.stderr_buffer)
+                self.stderr_buffer += chunk[:remaining]
 
     async def wait_notification(self, future: asyncio.Future):
         finished, _ = await asyncio.wait((future, self.reader), return_when=asyncio.FIRST_COMPLETED)
@@ -253,7 +357,9 @@ class RPC:
             if self.client_error:
                 raise self.client_error
             return result
-        raise self.reader_error or HarnessError("Agent 在本轮完成前退出，请检查 CLI 登录与模型配置")
+        raise self.reader_error or HarnessError(
+            "Agent 在本轮完成前退出，请检查 CLI 登录与模型配置",
+            stage="rpc")
 
     async def __aexit__(self, *arguments):
         for task in self.tasks:

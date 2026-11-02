@@ -1,10 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  createSchedule, executeSkill, runAgent, streamChat,
-  fetchAccounts, publishNow, publishStatus, submitPublishSms, fetchOutputs, mediaUrl,
-} from '../lib/api';
 import type { AccountItem, OutputFile } from '../lib/api';
-import { loadPublishDraft, savePublishDraft } from '../lib/store';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { isUncertainPublishError, workspaceErrorMessage } from '../lib/workspaceData';
+import {
+  clearPublishIntent, loadPublishDraft, loadPublishIntents,
+  savePublishDraft, savePublishIntents,
+} from '../lib/store';
+import type { PublishIntentPayload } from '../lib/store';
+import { decidePublishIntent, publishFingerprint } from '../lib/publishIntent';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconPublish, IconCopy, IconCheck, IconCalendar, IconSkills, IconEdit, IconStop, IconTrash } from './icons';
 
@@ -39,10 +42,41 @@ function parseSections(text: string): Record<string, string> {
   return map;
 }
 
-type PubState = { status: 'publishing' | 'ok' | 'fail'; msg: string };
+type PubState = { status: 'publishing' | 'ok' | 'fail' | 'unknown'; msg: string };
+
+type PublishPayload = PublishIntentPayload;
+
+function newPublishRequestId(platform: string): string {
+  return `publish-${platform}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 首次发送前固定意图并落盘；同稿重试/刷新复用，新稿才换新号。 */
+function rememberPublishIntent(
+  scope: string, platform: string, payload: PublishPayload,
+  requestId: string,
+): void {
+  const intents = loadPublishIntents(scope);
+  intents[platform] = {
+    requestId,
+    fingerprint: publishFingerprint(platform, payload),
+    payload,
+  };
+  savePublishIntents(intents, scope);
+}
 
 export default function PublishPage({ persona }: PublishPageProps) {
-  const draft0 = loadPublishDraft();
+  const data = useWorkspaceData();
+  const draftScope = data.publishDraftScope;
+  const draft0 = loadPublishDraft(draftScope);
+  // 草稿是否真的保存过媒体/画像：旧版草稿没有字段，刷新后只能视为丢失。
+  const mediaPersisted = useRef(Array.isArray(draft0.media));
+  const personaPersisted = useRef(typeof draft0.persona === 'string');
+  // 本页生命周期内用户是否显式改过媒体/画像；只有丢失且没动过才恢复旧稿。
+  const mediaEdited = useRef(false);
+  const personaEdited = useRef(false);
+  const lastPersonaProp = useRef(persona);
+  const [publishPersona, setPublishPersona] = useState(
+    () => persona || draft0.persona || '');
   const [title, setTitle] = useState(draft0.title);
   const [body, setBody] = useState(draft0.body);
   const [platforms, setPlatforms] = useState<string[]>(draft0.platforms);
@@ -54,7 +88,10 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const [adapting, setAdapting] = useState(false);
   const [checking, setChecking] = useState(false);
   const [checkResult, setCheckResult] = useState('');
-  const adaptCtl = useRef<AbortController | null>(null);
+  const adaptCtl = useRef<{ abort(): void } | null>(null);
+  const adaptRun = useRef('');
+  // 每个平台当前发布的 Run；旧轮询/短信回应不得写入新任务。
+  const publishRuns = useRef<Record<string, string>>({});
   // 异步发布轮询的 interval 集合：离开页面统一清掉，否则最长还会继续转 15 分钟
   const pollTimers = useRef<Set<ReturnType<typeof setInterval>>>(new Set());
   const aliveRef = useRef(true);
@@ -62,19 +99,38 @@ export default function PublishPage({ persona }: PublishPageProps) {
   // 发布相关
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [mediaFiles, setMediaFiles] = useState<OutputFile[]>([]);
-  const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
+  // 刷新后同时恢复可见选择，避免“页面显示空、实际提交旧图”。
+  const [selectedMedia, setSelectedMedia] = useState<string[]>(
+    () => draft0.media ?? []);
   const [showPicker, setShowPicker] = useState(false);
   const [pub, setPub] = useState<Record<string, PubState>>({});
   const [publishing, setPublishing] = useState(false);
   // 发布时的短信验证窗口（抖音风控条件触发；没触发就不弹）
-  const [pubSms, setPubSms] = useState<{ platform: string; name: string; state: string; message: string } | null>(null);
+  const [pubSms, setPubSms] = useState<{ platform: string; name: string; state: string; message: string; runId: string } | null>(null);
   const [pubSmsCode, setPubSmsCode] = useState('');
   const [pubSmsBusy, setPubSmsBusy] = useState(false);
 
-  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在
+  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在。
+  // 旧版草稿没有媒体/画像字段；用户没动过时不要抢先写空值，否则会
+  // 把“刷新丢失”误标成“用户主动清空”。
   useEffect(() => {
-    savePublishDraft({ title, body, platforms, overrides, tags });
-  }, [title, body, platforms, overrides, tags]);
+    savePublishDraft({
+      title, body, platforms, overrides, tags,
+      media: mediaPersisted.current || mediaEdited.current
+        ? selectedMedia : undefined,
+      persona: personaPersisted.current || personaEdited.current
+        ? publishPersona : undefined,
+    }, draftScope);
+  }, [title, body, platforms, overrides, tags, selectedMedia, publishPersona,
+    draftScope]);
+
+  // 画像来自应用级选择：挂载后发生的切换视为显式改稿，刷新恢复不算。
+  useEffect(() => {
+    if (persona === lastPersonaProp.current) return;
+    lastPersonaProp.current = persona;
+    personaEdited.current = true;
+    setPublishPersona(persona);
+  }, [persona]);
 
   const cleanupPublishActivity = useCallback(() => {
     // 卸载：中止流 + 停掉所有发布状态轮询（否则在后台空转最长 15 分钟）
@@ -91,8 +147,8 @@ export default function PublishPage({ persona }: PublishPageProps) {
 
   // 登录态 + 可选媒体列表
   useEffect(() => {
-    fetchAccounts().then(setAccounts).catch(() => { /* 忽略 */ });
-    fetchOutputs().then((roots) => {
+    data.fetchAccounts().then(setAccounts).catch(() => { /* 忽略 */ });
+    data.fetchOutputs().then((roots) => {
       const files: OutputFile[] = [];
       const walk = (n: OutputFile) => {
         if (n.type === 'file') { if (n.kind === 'image' || n.kind === 'video') files.push(n); return; }
@@ -102,7 +158,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
       files.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
       setMediaFiles(files);
     }).catch(() => { /* 忽略 */ });
-  }, []);
+  }, [data]);
 
   const loginOf = (key: string) => accounts.find((a) => a.platform === key)?.loggedIn ?? false;
 
@@ -114,13 +170,18 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const isVideoPath = (p: string) => /\.(mp4|mov|flv|mkv|avi|webm|m4v|wmv|ts|mpe?g)$/i.test(p);
   const toggleMedia = (path: string) =>
     setSelectedMedia((prev) => {
-      if (prev.includes(path)) return prev.filter((x) => x !== path);
+      if (prev.includes(path)) {
+        mediaEdited.current = true;
+        return prev.filter((x) => x !== path);
+      }
       // 通用规则：图片和视频不能同时；视频一次只发一个
       if (isVideoPath(path)) {
         if (prev.length && !prev.every(isVideoPath)) { showToast('图片和视频不能同时发布，请先取消已选图片'); return prev; }
+        mediaEdited.current = true;
         return [path]; // 视频单选
       }
       if (prev.some(isVideoPath)) { showToast('图片和视频不能同时发布，请先取消已选视频'); return prev; }
+      mediaEdited.current = true;
       return [...prev, path]; // 图片可多选（图文）
     });
 
@@ -138,11 +199,11 @@ export default function PublishPage({ persona }: PublishPageProps) {
       `\n\n原始内容：\n标题：${title}\n正文：${body}`;
 
     setAdapting(true);
+    adaptRun.current = '';
     let acc = '';
     const base = { ...overrides };
-    adaptCtl.current = streamChat(
-      prompt, persona, `adapt-${Date.now()}`,
-      (chunk) => {                       // 逐字：实时解析并流进对应平台卡片
+    adaptCtl.current = data.adaptContent(prompt, persona, {
+      onToken: (chunk) => {             // 逐字：实时解析并流进对应平台卡片
         acc += chunk;
         const map = parseSections(acc);
         const next = { ...base };
@@ -152,15 +213,25 @@ export default function PublishPage({ persona }: PublishPageProps) {
         }
         setOverrides(next);
       },
-      () => {                            // 完成
+      onDone: () => {                   // 完成
         const hit = Object.keys(parseSections(acc)).length;
         setAdapting(false);
         showToast(hit ? `已生成 ${hit} 个平台版本` : '未能解析，可重试');
       },
-      () => { setAdapting(false); showToast('改写失败，请重试'); },
-    );
+      onError: (error) => {
+        setAdapting(false);
+        showToast(workspaceErrorMessage(error, '改写失败，请重试'));
+      },
+      onAdmission: (runId) => { adaptRun.current = runId; },
+    });
   };
-  const stopAdapt = () => { adaptCtl.current?.abort(); setAdapting(false); };
+  const stopAdapt = () => {
+    adaptCtl.current?.abort();
+    const runId = adaptRun.current;
+    adaptRun.current = '';
+    if (runId) void data.stopTask(runId).catch(() => { /* 保留原提示 */ });
+    setAdapting(false);
+  };
 
   const performPrecheck = async () => {
     const prompt =
@@ -170,8 +241,8 @@ export default function PublishPage({ persona }: PublishPageProps) {
       `最后一行给「✅可发 / ⚠️建议修改」结论。\n\n待检内容：\n标题：${title}\n正文：${body}`;
     const content = `待发布内容：\n标题：${title}\n正文：${body}`;
     const [general, personaResult] = await Promise.all([
-      runAgent(prompt),
-      persona ? executeSkill('persona-check', content, persona) : Promise.resolve(null),
+      data.runAgent(prompt),
+      persona ? data.executeSkill('persona-check', content, persona) : Promise.resolve(null),
     ]);
     return `${general.response}\n\n---\n\n## 人设一致性\n\n${personaResult?.response || '未选择画像，已跳过人设一致性检查。'}`;
   };
@@ -203,70 +274,193 @@ export default function PublishPage({ persona }: PublishPageProps) {
     } finally {
       setChecking(false);
     }
+    // 先固定每个平台要提交的稿件。显式改过媒体/画像时按当前可见选择
+    // 新建请求；只有刷新/切身份丢失选择且用户没动过，才复用落盘旧稿。
+    const intentScope = data.publishDraftScope;
+    const provenance = {
+      mediaPersisted: mediaPersisted.current,
+      personaPersisted: personaPersisted.current,
+      mediaEdited: mediaEdited.current,
+      personaEdited: personaEdited.current,
+      appPersona: publishPersona,
+    };
+    const plans = targets.map((t) => {
+      const payload: PublishPayload = {
+        title, body: effective(t.key), media: selectedMedia, tags,
+        persona: publishPersona,
+      };
+      const prior = intentScope
+        ? loadPublishIntents(intentScope)[t.key] : undefined;
+      const decision = decidePublishIntent(
+        prior, t.key, payload, provenance);
+      return {
+        target: t,
+        payload: decision.payload,
+        reuse: decision.action === 'reuse',
+        requestId: decision.action === 'reuse'
+          ? decision.requestId : newPublishRequestId(t.key),
+        prior,
+      };
+    });
+    const unresolved = plans.filter((plan) => plan.prior && !plan.reuse);
+    const submitLines = plans.map((plan) =>
+      `- ${plan.target.label}：素材 ${
+        plan.payload.media.length ? plan.payload.media.join('、') : '无'}` +
+      `；画像 ${plan.payload.persona || '无'}`).join('\n');
     const okToSend = window.confirm(
       `发布前预检已执行，结果已显示在页面中。人设评分只做提醒，不会阻止发布。\n\n` +
-      `即将【真实发布】到：${targets.map((t) => t.label).join('、')}。\n` +
-      `这会公开发布到你的账号，确定继续？`);
+      `即将【真实发布】到：${targets.map((t) => t.label).join('、')}\n` +
+      `${submitLines}\n` +
+      (unresolved.length
+        ? `\n注意：${unresolved.map((plan) => plan.target.label).join('、')}` +
+          `有一笔旧发布请求结果尚未确认。本次将按当前页面显示的稿件` +
+          `新建请求；若旧请求已被平台接纳，可能造成重复发布。` +
+          `如不确定，请先取消并核对旧请求状态后再发布。\n`
+        : '') +
+      `\n这会公开发布到你的账号，确定继续？`);
     if (!okToSend) return;
 
     setPublishing(true);
-    for (const t of targets) {
+    for (const plan of plans) {
+      const { target: t, payload, requestId } = plan;
       if (!loginOf(t.key)) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '未登录 · 去账号页登录' } }));
         continue;
       }
-      if (MEDIA_REQUIRED.has(t.key) && selectedMedia.length === 0) {
+      const pendingMedia = payload.media;
+      if (MEDIA_REQUIRED.has(t.key) && pendingMedia.length === 0) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '需附带图片/视频' } }));
         continue;
       }
-      if (VIDEO_ONLY.has(t.key) && !selectedMedia.some((p) => VIDEO_RE.test(p))) {
+      if (VIDEO_ONLY.has(t.key)
+          && !pendingMedia.some((p) => VIDEO_RE.test(p))) {
         setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: `${t.label}只能发视频，请从内容库选一个视频` } }));
         continue;
       }
+      // 首次发送前就固定意图并落盘；接纳结果不明时刷新/重试仍用同一个
+      // requestId 与落盘 payload，服务端据此返回同一个 Run，不会开启
+      // 第二次外部动作。显式改稿时替换旧意图，旧回包按 requestId 丢弃。
+      if (intentScope && !plan.reuse) {
+        rememberPublishIntent(intentScope, t.key, payload, requestId);
+      }
       setPub((r) => ({ ...r, [t.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
       try {
-        const res = await publishNow(t.key, { title, body: effective(t.key), media: selectedMedia, tags, persona });
+        const res = await data.publishNow(
+          t.key, payload, { requestId });
+        publishRuns.current[t.key] = res.runId || '';
         if (res.async) {
-          // 抖音：异步发布，轮询状态；风控触发短信墙时弹输入框（条件触发，没触发就直接跑完）
-          await pollAsyncPublish(t.key, t.label);
+          // 所有平台都先接纳后轮询；短信只绑定当前 Run。
+          await pollAsyncPublish(t.key, t.label,
+            intentScope ? requestId : undefined, intentScope);
         } else {
+          const status = res.state === 'success'
+            ? 'ok' : res.state === 'unknown' ? 'unknown' : 'fail';
+          if (intentScope) {
+            clearPublishIntent(t.key, intentScope, requestId);
+          }
           setPub((r) => ({
             ...r,
-            [t.key]: res.ok
-              ? { status: 'ok', msg: '已发布 ✅' }
-              : { status: 'fail', msg: res.detail || res.message || '发布失败' },
+            [t.key]: {
+              status,
+              msg: status === 'ok'
+                ? (res.calendarRecorded === false
+                  ? '已发布 ✅（日历记录失败，平台结果不受影响）'
+                  : '已发布 ✅')
+                : status === 'unknown'
+                  ? (res.message || '发布结果未知，请到平台核对，勿自动重发')
+                  : (res.detail || res.message || '发布失败'),
+            },
           }));
         }
       } catch (e) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: e instanceof Error ? e.message : '发布失败' } }));
+        if (intentScope && isUncertainPublishError(e)) {
+          // 响应丢失时服务端可能已接纳：保留意图，显示未知/核对中，
+          // 不自动补发；用户再次点击会重试同一请求。
+          setPub((r) => ({
+            ...r,
+            [t.key]: {
+              status: 'unknown',
+              msg: '网络中断或服务暂不可用，发布结果未知；再次点击「一键发布」会核对/重试同一请求，不会重复提交。',
+            },
+          }));
+        } else {
+          setPub((r) => ({
+            ...r,
+            [t.key]: {
+              status: 'fail',
+              msg: workspaceErrorMessage(e, '发布失败'),
+            },
+          }));
+        }
       }
     }
     setPublishing(false);
     showToast('发布流程结束，见各平台卡片状态');
   };
 
-  // 异步发布轮询（抖音）：直到 success/error；遇 sms_required/verifying 弹短信窗口
-  const pollAsyncPublish = (key: string, label: string) => new Promise<void>((resolve) => {
+  // 异步发布轮询：直到 success/error/unknown；只接受当前 Run 的回应。
+  const pollAsyncPublish = (
+    key: string, label: string, requestId?: string, intentScope?: string,
+  ) => new Promise<void>((resolve) => {
     const started = Date.now();
+    const expectedRun = publishRuns.current[key] || '';
     const iv = setInterval(async () => {
       if (!aliveRef.current) { clearInterval(iv); pollTimers.current.delete(iv); resolve(); return; }
       if (Date.now() - started > 15 * 60 * 1000) {   // 15min 兜底
         clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
-        setPub((r) => ({ ...r, [key]: { status: 'fail', msg: '发布超时' } }));
+        setPub((r) => ({ ...r, [key]: { status: 'unknown', msg: '发布超时，平台结果未知，请到平台核对' } }));
         resolve(); return;
       }
       let s;
-      try { s = await publishStatus(key); } catch { return; }  // 单次失败忽略
+      try {
+        s = await data.publishStatus(
+          key, requestId ? { requestId } : undefined);
+      } catch { return; }  // 单次失败忽略
+      if (!aliveRef.current) return;
+      // 同一平台已换成新意图：旧请求的迟到回应不得覆盖新卡片或清除新意图。
+      if (requestId && intentScope) {
+        const current = loadPublishIntents(intentScope)[key];
+        if (!current || current.requestId !== requestId) {
+          clearInterval(iv);
+          pollTimers.current.delete(iv);
+          resolve();
+          return;
+        }
+      }
+      if (expectedRun && s.runId && s.runId !== expectedRun) return;  // 迟到旧回应
+      const runId = s.runId || expectedRun;
       if (s.state === 'sms_required' || s.state === 'verifying') {
-        setPubSms({ platform: key, name: label, state: s.state, message: s.message });
+        setPubSms({ platform: key, name: label, state: s.state,
+                    message: s.message, runId });
         setPub((r) => ({ ...r, [key]: { status: 'publishing', msg: s.message || '需短信验证' } }));
       } else if (s.state === 'success') {
         clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
-        setPub((r) => ({ ...r, [key]: { status: 'ok', msg: '已发布 ✅' } }));
+        if (intentScope && requestId) {
+          clearPublishIntent(key, intentScope, requestId);
+        }
+        setPub((r) => ({ ...r, [key]: {
+          status: 'ok',
+          msg: s.calendarRecorded === false
+            ? '已发布 ✅（日历记录失败，平台结果不受影响）'
+            : '已发布 ✅',
+        } }));
         resolve();
       } else if (s.state === 'error') {
         clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
+        if (intentScope && requestId) {
+          clearPublishIntent(key, intentScope, requestId);
+        }
         setPub((r) => ({ ...r, [key]: { status: 'fail', msg: s.message || '发布失败' } }));
+        resolve();
+      } else if (s.state === 'unknown' && !data.localSettingsEnabled) {
+        clearInterval(iv); pollTimers.current.delete(iv); setPubSms(null);
+        if (intentScope && requestId) {
+          clearPublishIntent(key, intentScope, requestId);
+        }
+        setPub((r) => ({ ...r, [key]: {
+          status: 'unknown',
+          msg: s.message || '发布结果未知，请到平台核对，勿自动重发',
+        } }));
         resolve();
       } else {
         setPub((r) => ({ ...r, [key]: { status: 'publishing', msg: s.message || '发布中…' } }));
@@ -275,17 +469,121 @@ export default function PublishPage({ persona }: PublishPageProps) {
     pollTimers.current.add(iv);
   });
 
+  // 刷新后按本人当前 Run 恢复卡片/短信/轮询；只读状态，不创建新任务。
+  useEffect(() => {
+    let active = true;
+    const restore = async () => {
+      const intentScope = data.publishDraftScope;
+      const intents = intentScope ? loadPublishIntents(intentScope) : {};
+      for (const key of draft0.platforms) {
+        if (!PUBLISHABLE.has(key)) continue;
+        const runBefore = publishRuns.current[key] || '';
+        const intent = intentScope ? intents[key] : undefined;
+        try {
+          // 有未确认意图时精确查询该请求的原 Run，避免把上次已完成任务
+          // 误当成这次请求的结果。
+          const s = await data.publishStatus(
+            key, intent ? { requestId: intent.requestId } : undefined);
+          if (!active) return;
+          // 恢复期间用户已开始新发布：旧状态不能覆盖新任务。
+          if ((publishRuns.current[key] || '') !== runBefore) continue;
+          if (intent) {
+            const current = loadPublishIntents(intentScope)[key];
+            if (!current || current.requestId !== intent.requestId) continue;
+          }
+          const runId = s.runId || '';
+          if (!runId) {
+            if (intent) {
+              // 未确认的接纳结果：保留意图，可重试同一请求，不自动补发。
+              setPub((r) => ({ ...r, [key]: {
+                status: 'unknown',
+                msg: '上次发布请求尚未确认，可再次点击「一键发布」核对/重试同一请求。',
+              } }));
+            }
+            continue;
+          }
+          publishRuns.current[key] = runId;
+          const label = PLATFORMS.find((p) => p.key === key)?.label || key;
+          if (s.state === 'success') {
+            if (intent) {
+              clearPublishIntent(key, intentScope, intent.requestId);
+            }
+            setPub((r) => ({ ...r, [key]: {
+              status: 'ok',
+              msg: s.calendarRecorded === false
+                ? '已发布 ✅（日历记录失败，平台结果不受影响）'
+                : '已发布 ✅',
+            } }));
+          } else if (s.state === 'error') {
+            if (intent) {
+              clearPublishIntent(key, intentScope, intent.requestId);
+            }
+            setPub((r) => ({ ...r, [key]: { status: 'fail', msg: s.message || '发布失败' } }));
+          } else if (s.state === 'unknown') {
+            // 精确查询已找到终态 Run：本轮意图已有确定结果。
+            if (intent) {
+              clearPublishIntent(key, intentScope, intent.requestId);
+            }
+            setPub((r) => ({ ...r, [key]: {
+              status: 'unknown',
+              msg: s.message || '发布结果未知，请到平台核对，勿自动重发',
+            } }));
+          } else {
+            setPub((r) => ({ ...r, [key]: { status: 'publishing', msg: s.message || '发布中…' } }));
+            if (s.state === 'sms_required' || s.state === 'verifying') {
+              setPubSms({ platform: key, name: label, state: s.state,
+                          message: s.message, runId });
+            }
+            void pollAsyncPublish(key, label, intent?.requestId, intentScope);
+          }
+        } catch { /* 暂时不可用：保留重试，不创建新任务 */ }
+      }
+    };
+    void restore();
+    return () => { active = false; };
+    // 只在挂载时恢复一次；platforms 以草稿初始值为准。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  const stopPublish = async (key: string) => {
+    const runId = publishRuns.current[key];
+    if (!runId) return;
+    // 先如实标为“未知”：停止只代表本地执行被要求停下，不能撤销已发生的
+    // 外部发布，也不能把停止请求的失败伪装成平台失败。
+    setPubSms(null);
+    setPub((r) => ({ ...r, [key]: {
+      status: 'unknown',
+      msg: '已停止本地执行；平台结果未知，请到平台核对',
+    } }));
+    try {
+      await data.stopTask(runId);
+    } catch (error) {
+      // 迟到停止失败不能覆盖已经开始的另一条发布。
+      if (publishRuns.current[key] !== runId) return;
+      showToast(workspaceErrorMessage(error, '停止发布失败'));
+      setPub((r) => ({ ...r, [key]: {
+        status: 'unknown',
+        msg: '停止请求未完成，平台结果未知，请到平台核对',
+      } }));
+    }
+  };
+
   const submitPubSms = async () => {
     if (!pubSms) return;
     const code = pubSmsCode.replace(/\D/g, '');
     if (code.length < 4) { showToast('验证码应为 4-6 位数字'); return; }
     setPubSmsBusy(true);
     try {
-      await submitPublishSms(pubSms.platform, code);
+      const target = { platform: pubSms.platform, runId: pubSms.runId };
+      await data.submitPublishSms(
+        pubSms.platform, code, { runId: pubSms.runId || undefined });
       setPubSmsCode('');
-      setPubSms((p) => p && ({ ...p, state: 'verifying', message: '正在验证验证码…' }));
+      setPubSms((p) => p && p.platform === target.platform
+        && p.runId === target.runId
+        ? { ...p, state: 'verifying', message: '正在验证验证码…' }
+        : p);
     } catch (e) {
-      showToast(e instanceof Error ? e.message : '提交失败');
+      showToast(workspaceErrorMessage(e, '提交失败'));
     } finally {
       setPubSmsBusy(false);
     }
@@ -301,11 +599,16 @@ export default function PublishPage({ persona }: PublishPageProps) {
     // 用本地日期（日历页按本地渲染）：toISOString 是 UTC，东八区 0-8 点会落到「昨天」
     const d = new Date();
     const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    await createSchedule({
-      title: title.trim() || effective(key).slice(0, 20), date,
-      platform: PLATFORMS.find((p) => p.key === key)?.label || '', time: '', status: 'draft', note: effective(key),
-    });
-    showToast('已存为草稿并加入今天的日历');
+    try {
+      await data.createSchedule({
+        title: title.trim() || effective(key).slice(0, 20), date,
+        platform: PLATFORMS.find((p) => p.key === key)?.label || '',
+        time: '', status: 'draft', note: effective(key),
+      });
+      showToast('已存为草稿并加入今天的日历');
+    } catch (error) {
+      showToast(workspaceErrorMessage(error, '保存失败'));
+    }
   };
 
   const canPublish = platforms.some((k) => PUBLISHABLE.has(k));
@@ -347,7 +650,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
           {selectedMedia.map((path) => (
             <div key={path} className="media-chip" onClick={() => toggleMedia(path)} title="点击移除">
               {mediaFiles.find((f) => f.path === path)?.kind === 'image'
-                ? <img src={mediaUrl(path)} alt="" /> : <span className="media-vid">🎬</span>}
+                ? <img src={data.mediaUrl(path)} alt="" /> : <span className="media-vid">🎬</span>}
               <span className="media-x">×</span>
             </div>
           ))}
@@ -360,7 +663,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
                 className={`media-cell ${selectedMedia.includes(f.path) ? 'sel' : ''}`}
                 onClick={() => toggleMedia(f.path)} title={f.path}>
                 {f.kind === 'image'
-                  ? <img src={mediaUrl(f.path)} alt={f.name} loading="lazy" />
+                  ? <img src={data.mediaUrl(f.path)} alt={f.name} loading="lazy" />
                   : <span className="media-vid">🎬<br />{f.name.slice(0, 12)}</span>}
                 {selectedMedia.includes(f.path) && <span className="media-check">✓</span>}
               </div>
@@ -436,7 +739,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
               {ps && (
                 <div className={`pv-pubstate ${ps.status}`}>
                   {ps.status === 'publishing' && <span className="live-pulse" />}
-                  {ps.status === 'ok' ? '✅ ' : ps.status === 'fail' ? '⚠️ ' : ''}{ps.msg}
+                  {ps.status === 'ok' ? '✅ ' : ps.status === 'unknown' ? '❓ ' : ps.status === 'fail' ? '⚠️ ' : ''}{ps.msg}
                 </div>
               )}
               <div className="pv-foot">
@@ -448,6 +751,11 @@ export default function PublishPage({ persona }: PublishPageProps) {
                   <button className="pv-copy" onClick={() => copyFor(p.key)}>
                     {copied === p.key ? <IconCheck size={13} /> : <IconCopy size={13} />}{copied === p.key ? '已复制' : '复制'}
                   </button>
+                  {ps?.status === 'publishing' && publishRuns.current[p.key] && (
+                    <button className="pv-copy" onClick={() => { void stopPublish(p.key); }}>
+                      停止本地执行
+                    </button>
+                  )}
                 </div>
               </div>
             </div>

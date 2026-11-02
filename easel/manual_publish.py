@@ -21,6 +21,36 @@ PLATFORMS = {
 }
 MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif",
                     ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".flv", ".ts"}
+_SAFE_NAME = re.compile(r"[^0-9A-Za-z一-鿿._-]+")
+_ARCHIVE_NAME = re.compile(r"^easel-[a-z-]+-[0-9a-f]{12}\.zip$")
+
+
+def _archive_media_name(name: str) -> str:
+    """ZIP 内媒体名只保留安全字符，避免路径形态或控制字符进入包。"""
+    cleaned = _SAFE_NAME.sub("_", name).lstrip(".") or "media"
+    return cleaned[:120]
+
+
+def _safe_destination(root: Path) -> Path:
+    """_publish/manual 必须是 outputs 内的真实目录，不能是链接目录。"""
+    raw_publish = root / "_publish"
+    destination = (raw_publish / "manual").resolve()
+    if destination == root or root not in destination.parents:
+        raise ValueError("导出目录超出内容库")
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        resolved = destination.resolve()
+    except OSError:
+        raise ValueError("导出目录不可用") from None
+    if resolved == root or root not in resolved.parents:
+        raise ValueError("导出目录超出内容库")
+    # 链接/junction 即使在 outputs 内也会让返回的 _publish/... 路径与实际
+    # 文件不一致；首次创建时直接失败，避免生成不可下载的包。
+    if resolved.parent != raw_publish or resolved.name != "manual":
+        raise ValueError("导出目录不可用")
+    if not resolved.is_dir():
+        raise ValueError("导出目录不可用")
+    return resolved
 
 
 def publishing_mode(settings: Mapping[str, str]) -> str:
@@ -53,14 +83,14 @@ def build_package(outputs: Path, platform: str, title: str, body: str,
         files.append(path)
     if sum(path.stat().st_size for path in files) > 2 * 1024**3:
         raise ValueError("素材超过 2GB，请分批导出")
-    destination = root / "_publish" / "manual"
-    destination.mkdir(parents=True, exist_ok=True)
+    destination = _safe_destination(root)
     package = destination / f"easel-{platform}-{uuid.uuid4().hex[:12]}.zip"
     label, url = PLATFORMS[platform]
     metadata = {"platform": platform, "title": title, "tags": tags,
                 "reviewed": True, "exportedAt": datetime.now(timezone.utc).isoformat(),
                 "status": "ready_for_manual_submission", "officialUrl": url,
-                "media": [f"media/{index:02d}_{path.name}" for index, path in enumerate(files, 1)]}
+                "media": [f"media/{index:02d}_{_archive_media_name(path.name)}"
+                          for index, path in enumerate(files, 1)]}
     try:
         with zipfile.ZipFile(package, "w") as archive:
             for name, text in {"title.txt": title, "body.txt": body, "tags.txt": tags,
@@ -73,7 +103,10 @@ def build_package(outputs: Path, platform: str, title: str, body: str,
                                    "导出不等于上传或发布；此包不包含登录凭证。\n")}.items():
                 archive.writestr(name, text, compress_type=zipfile.ZIP_DEFLATED)
             for index, path in enumerate(files, 1):
-                archive.write(path, f"media/{index:02d}_{path.name}", compress_type=zipfile.ZIP_STORED)
+                archive.write(
+                    path,
+                    f"media/{index:02d}_{_archive_media_name(path.name)}",
+                    compress_type=zipfile.ZIP_STORED)
             if platform == "wechat-oa":
                 import markdown
                 paragraphs = markdown.markdown(html.escape(body), extensions=["sane_lists"])

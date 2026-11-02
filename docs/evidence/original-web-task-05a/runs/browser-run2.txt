@@ -1,0 +1,31 @@
+﻿python.exe : Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+At line:1 char:335
++ ...  { $i = $_; & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' tests/fr ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Exception in ca...tion_lost(None):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_workspace.py:255: Ru
+ntimeWarning: coroutine 'Server.stop.<locals>.close_clients' was never awaited
+  pass
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+BROWSER_VERSION 151.0.7922.34
+TASK5A_BROWSER_RESULTS {'outputs_media_delete_light': True, 'profile_and_attachment': True, 'dark_mobile': True, 'logout_media_401': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05a\\browser\\01-outputs-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\02-media-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\03-html-preview-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\04-profile-edit-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\05-attachment-upload-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\06-outputs-dark.png', 'docs\\evidence\\original-web-task-05a\\browser\\07-outputs-mobile.png']
+TASK5A_BROWSER_OK True

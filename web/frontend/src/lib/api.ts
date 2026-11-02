@@ -161,11 +161,21 @@ export interface ProfileBuildResponse {
   async?: boolean;
   status?: string;
   log?: string;
+  runId?: string;
+  sessionId?: string;
+  detail?: string;
+  enhancement?: { state: string; detail?: string };
+  question?: ChatQuestion;
+  questionPending?: boolean;
 }
 
 export interface ProfileBuildStatus {
-  state: 'running' | 'done' | 'failed' | 'unknown';
+  state: 'running' | 'awaiting_permission' | 'done' | 'failed' | 'unknown';
   log: string;
+  runId?: string;
+  sessionId?: string;
+  question?: ChatQuestion;
+  questionPending?: boolean;
 }
 
 export function fetchStatus(): Promise<StatusResponse> {
@@ -203,7 +213,14 @@ export function deletePersona(name: string): Promise<{ ok: boolean; deleted: str
 
 // ---- 热点雷达 ----
 export interface TrendItem { title: string; hot: string; url: string; }
-export interface TrendGroup { platform: string; label: string; items: TrendItem[]; ok?: boolean; }
+export interface TrendGroup {
+  platform: string;
+  label: string;
+  items: TrendItem[];
+  ok?: boolean;
+  stale?: boolean;       // 本次上游刷新失败，items 来自旧缓存
+  cached_at?: number;    // 旧缓存实际取数时间（秒）
+}
 export function fetchTrends(platforms: string, limit = 12): Promise<{ trends: TrendGroup[]; updated: number }> {
   return request(`/api/trends?platforms=${encodeURIComponent(platforms)}&limit=${limit}`);
 }
@@ -335,7 +352,11 @@ export function deleteOutput(path: string): Promise<{ ok: boolean; deleted: stri
 export interface UploadedFile { id: string; name: string; path: string; }
 
 /** OpenClaw ask_user 问答题（SSE question 事件 payload）。 */
-export interface ChatQuestionOption { label: string; description?: string; }
+export interface ChatQuestionOption {
+  label: string;
+  description?: string;
+  value?: string;      // control 的 opaque 选项值；local 无此字段时回退 label
+}
 export interface ChatQuestionItem {
   questionId: string;
   header?: string;
@@ -408,6 +429,9 @@ export interface AccountItem {
   supported: boolean;
   loggedIn: boolean;
   note: string;
+  // 公众号区分后台扫码会话与 AppID 凭证；其它平台不返回。
+  mpLoggedIn?: boolean;
+  credentialConfigured?: boolean;
 }
 
 export interface LoginStart {
@@ -573,6 +597,8 @@ export interface AccountAnalytics {
     { followers: number | null; likes: number | null; posts: number | null; since_days: number | null } | null>;
   fetched_at: number;
   warning?: string;
+  /** 前端缓存标记：本次刷新失败，显示的是上次真实取数结果。 */
+  stale?: boolean;
 }
 
 /** 支持抓数据的平台 + 各自登录态。 */

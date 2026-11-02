@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -132,10 +133,41 @@ def test_fetch_platform_falls_back_on_error_or_empty_response(monkeypatch, prima
     assert calls == [primary, backup]
 
 
-def test_trends_reuses_cached_items_when_all_sources_fail(monkeypatch):
+def test_trends_reuses_cached_items_with_stale_marker_when_sources_fail(
+        monkeypatch):
     items = [{"title": "缓存热点", "hot": "", "url": ""}]
-    web._TREND_CACHE["weibo"] = (0, items)
+    cached_at = time.time() - 3600
+    web._TREND_CACHE["weibo"] = (cached_at, items)
     monkeypatch.setattr(web, "_fetch_platform", lambda platform: [])
     data = asyncio.run(web.api_trends("weibo", 15))
-    assert data["trends"][0]["items"] == items
-    assert data["trends"][0]["ok"] is True
+    group = data["trends"][0]
+    assert group["items"] == items
+    assert group["ok"] is False
+    assert group["stale"] is True
+    assert group["cached_at"] == int(cached_at)
+    assert data["updated"] == int(cached_at)
+    assert data["stale"] is True
+    assert data["failed_platforms"] == ["weibo"]
+
+
+def test_trends_fresh_and_valid_cache_are_not_marked_stale(monkeypatch):
+    now = time.time()
+    web._TREND_CACHE.clear()
+    web._TREND_CACHE["weibo"] = (
+        now - 30, [{"title": "有效缓存", "hot": "", "url": ""}])
+    monkeypatch.setattr(web, "_fetch_platform", lambda platform: [])
+    cached = asyncio.run(web.api_trends("weibo", 15))
+    assert cached["trends"][0]["ok"] is True
+    assert "stale" not in cached["trends"][0]
+    assert cached["updated"] == int(web._TREND_CACHE["weibo"][0])
+    assert "stale" not in cached
+
+    web._TREND_CACHE.clear()
+    monkeypatch.setattr(
+        web, "_fetch_platform",
+        lambda platform: [{"title": "新热点", "hot": "", "url": ""}])
+    fresh = asyncio.run(web.api_trends("weibo", 15))
+    assert fresh["trends"][0]["ok"] is True
+    assert "stale" not in fresh["trends"][0]
+    assert fresh["updated"] >= int(now)
+    assert "stale" not in fresh

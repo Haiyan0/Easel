@@ -1,0 +1,8 @@
+# Task 5C3：在已验收执行镜像上增量覆盖当前源码；保留镜像内 Playwright/Chromium。
+ARG BASE_IMAGE=easel-worker-execution:task5c2-r1-20261101
+FROM ${BASE_IMAGE}
+USER root
+COPY easel /opt/easel/easel
+COPY web/app.py /opt/easel/web/app.py
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+USER 10001:10001

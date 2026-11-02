@@ -1,0 +1,11 @@
+{
+  "image": "easel-worker:task6a-4382180",
+  "files_in_image": 1005,
+  "checked": 1002,
+  "mismatches": [],
+  "missing_in_worktree": [
+    "managed/README.md",
+    "managed/acp-profile.json",
+    "managed/acp.patch.yml"
+  ]
+}

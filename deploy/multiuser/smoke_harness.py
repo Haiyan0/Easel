@@ -19,12 +19,20 @@ import tempfile
 from pathlib import Path
 
 DEFAULT_TIMEOUT = 180.0
-_PROVIDER = "easel-broker"
-_MODEL = "deepseek-chat"
 
 
 class SmokeError(RuntimeError):
     """真实 Harness 未能按 A5 契约启动 ACP。"""
+
+
+def _current_model_value(result: object) -> str | None:
+    options = result.get("configOptions") if isinstance(result, dict) else None
+    if not isinstance(options, list):
+        return None
+    option = next(
+        (item for item in options
+         if isinstance(item, dict) and item.get("category") == "model"), None)
+    return option.get("currentValue") if isinstance(option, dict) else None
 
 
 async def _call(process, identifier: int, method: str, params: dict,
@@ -60,6 +68,7 @@ def _model_value(provider: str, model: str) -> str:
 
 
 async def _run(command: list[str], workspace: Path, home: Path,
+                provider: str, default_model: str, models: list[str],
                 timeout: float) -> dict:
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -116,14 +125,38 @@ async def _run(command: list[str], workspace: Path, home: Path,
              and option.get("category") == "model"), None)
         if model is None:
             raise SmokeError("Harness returned no model config option")
-        expected = _model_value(_PROVIDER, _MODEL)
+        expected = _model_value(provider, default_model)
         if model.get("currentValue") != expected:
             raise SmokeError(
                 "managed ACP profile did not select the Easel broker route")
+        choices: dict[str, object] = {}
+        for group in model.get("options") or []:
+            if not isinstance(group, dict):
+                continue
+            for choice in group.get("options") or []:
+                if (isinstance(choice, dict)
+                        and isinstance(choice.get("value"), str)):
+                    choices[choice["value"]] = choice
+        selected: list[str] = []
+        for index, candidate in enumerate(models):
+            value = _model_value(provider, candidate)
+            if value not in choices:
+                raise SmokeError(
+                    f"managed ACP profile did not expose {candidate}")
+            result = await _call(
+                process, 10 + index, "session/set_config_option", {
+                    "sessionId": session_id, "configId": model.get("id"),
+                    "value": value}, timeout)
+            if _current_model_value(result) != value:
+                raise SmokeError(
+                    f"managed ACP profile could not select {candidate}")
+            selected.append(f"{provider}/{candidate}")
 
         await _call(process, 3, "session/close", {"sessionId": session_id},
                     timeout)
-        return {"session": session_id, "model": f"{_PROVIDER}/{_MODEL}"}
+        return {"session": session_id,
+                "model": f"{provider}/{default_model}",
+                "models": selected}
     finally:
         if process.returncode is None:
             process.terminate()
@@ -155,6 +188,18 @@ def run_smoke(manifest_path: str | Path, *,
     if (not isinstance(command, list) or not command
             or any(not isinstance(part, str) or not part for part in command)):
         raise SmokeError("managed ACP command is invalid")
+    provider = manifest.get("provider") if isinstance(manifest, dict) else None
+    if not isinstance(provider, dict):
+        raise SmokeError("managed ACP provider is invalid")
+    provider_id = provider.get("id")
+    default_model = provider.get("model")
+    models = provider.get("models")
+    if (not isinstance(provider_id, str) or not provider_id
+            or not isinstance(default_model, str) or not default_model
+            or not isinstance(models, list) or not models
+            or any(not isinstance(item, str) or not item for item in models)
+            or default_model not in models):
+        raise SmokeError("managed ACP model catalog is invalid")
     executable = shutil.which(command[0])
     if executable is None:
         raise SmokeError("managed ACP executable is not on PATH")
@@ -172,7 +217,8 @@ def run_smoke(manifest_path: str | Path, *,
         home.mkdir()
         (home / ".dsh").mkdir()
         (home / "state").mkdir()
-        details = asyncio.run(_run(argv, workspace, home, timeout))
+        details = asyncio.run(_run(argv, workspace, home, provider_id,
+                                   default_model, models, timeout))
     return details
 
 
@@ -190,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"harness_acp_smoke_failed: {type(error).__name__}",
               file=sys.stderr)
         return 1
-    print("harness_acp_smoke=ok model=" + details["model"])
+    print("harness_acp_smoke=ok model=" + details["model"]
+          + " models=" + ",".join(details["models"]))
     return 0
 
 

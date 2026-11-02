@@ -1,0 +1,21 @@
+FAIL: 20 documentation path errors (1194 references checked)
+docs\evidence\desktop-a2\report.md:27: path does not exist: ../../deploy/desktop/topology.json
+docs\evidence\desktop-a2\report.md:28: path does not exist: ../../deploy/desktop/README.md
+docs\evidence\desktop-a2\report.md:117: path does not exist: ../../deploy/desktop/topology.json
+docs\evidence\desktop-a3\report.md:25: path does not exist: ../../deploy/desktop/persistence_probe.py
+docs\evidence\desktop-a3\report.md:65: path does not exist: ../../tests/integration/multiuser/test_worker_execution_real.py
+docs\evidence\desktop-a5\report.md:16: path does not exist: scripts/build.ts
+docs\evidence\original-web-task-05a\README.md:54: path does not exist: skills/personas
+docs\evidence\original-web-task-05a\README.md:227: path does not exist: skills/技能执行、工作台热点/选题/日历/概览、账号/平台登录/分析/
+docs\evidence\original-web-task-05c1\R1\README.md:48: path does not exist: docs/evidence/original-web-task-05c1-review/
+docs\evidence\original-web-task-05c1\README.md:122: path does not exist: skills/detail/prepare/baseline
+docs\evidence\original-web-task-05c2\r1\verification.md:13: path does not exist: docs/superpowers/tasks/2026-11-01-original-web-task-05c2-rework-r1.md
+docs\evidence\original-web-task-05c2\r1\verification.md:178: path does not exist: docs/evidence/original-web-task-05c2-review/
+docs\evidence\original-web-task-05c3\r1\verification.md:6: path does not exist: ../../../superpowers/audits/2026-11-01-original-web-task-05c3-review-round-1.md
+docs\evidence\original-web-task-05c3\r1\verification.md:6: path does not exist: ../../../superpowers/tasks/2026-11-01-original-web-task-05c3-rework-r1.md
+docs\evidence\original-web-task-05c3\r2\verification.md:104: path does not exist: docs/evidence/original-web-task-05c3-review/probe_r1_changed_media.py
+docs\evidence\original-web-task-05c3\r2\verification.md:8: path does not exist: ../../../superpowers/audits/2026-11-02-original-web-task-05c3-review-round-2.md
+docs\evidence\original-web-task-05c3\r2\verification.md:8: path does not exist: ../../../superpowers/tasks/2026-11-02-original-web-task-05c3-rework-r2.md
+docs\linux-docker-operations.zh-CN.md:686: path does not exist: superpowers/audits/2026-10-26-task-14-accepted.md
+docs\skills-profile-multiuser-handbook.zh-CN.md:164: path does not exist: references/onboarding-questions.md
+docs\skills-profile-multiuser-handbook.zh-CN.md:164: path does not exist: references/social-link-analysis.md

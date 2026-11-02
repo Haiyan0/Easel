@@ -280,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="受保护的 32 字节 AES-GCM master key 文件")
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_serve.add_argument("--port", type=int, default=7861, help="端口（默认 7861）")
+    p_serve.add_argument(
+        "--publish-mode", choices=("automated", "manual"),
+        default="automated",
+        help="受管发布策略（默认 automated，保留原自动发布路径）")
     p_serve.add_argument("--egress-proxy", default=None,
                          help="受控出口代理 URL，例如 http://127.0.0.1:8899")
     p_serve.add_argument("--egress-policy", default=None,
@@ -295,6 +299,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="受保护的 Ed25519 私钥文件；与受管 Agent 配置成对使用")
     p_serve.add_argument("--managed-agent-config", default=None,
                          help="受保护的受管 Agent JSON（revision/agent）；不从用户目录推断")
+    p_serve.add_argument(
+        "--managed-profile", default=None,
+        help="受管 ACP manifest（默认控制镜像内 /opt/easel/managed/acp-profile.json）")
+    p_serve.add_argument(
+        "--expected-harness-commit", default=None,
+        help="可选：目标 worker 镜像的 Harness commit；与 manifest 不符时失败")
     p_serve.add_argument(
         "--frontend-dir",
         default=str(PROJECT_ROOT / "web" / "frontend" / "dist"),

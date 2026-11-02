@@ -29,7 +29,12 @@
   "provider": {
     "id": "easel-broker",
     "api": "openai-completions",
-    "model": "deepseek-chat"
+    "model": "deepseek-chat",
+    "models": [
+      "deepseek-chat",
+      "deepseek-flash",
+      "deepseek-v4-pro"
+    ]
   },
   "validated": {
     "date": "2026-10-28",

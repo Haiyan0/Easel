@@ -1,0 +1,589 @@
+........FF.FFF.FF.........                                               [100%]
+================================== FAILURES ===================================
+_ test_invalid_diagnostic_status_never_kills_reader[error_data0-rate_limited-None] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status0')
+error_data = {'status': '²', 'code': 'rate_limited'}, category = 'rate_limited'
+status = None
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'rate_limited'
+E            +  where None = getattr(HarnessError('Agent 协议读取失败'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+_ test_invalid_diagnostic_status_never_kills_reader[error_data1-rate_limited-None] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status1')
+error_data = {'status': '9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999...999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999', 'code': 'rate_limited'}
+category = 'rate_limited', status = None
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'rate_limited'
+E            +  where None = getattr(HarnessError('Agent 协议读取失败'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+__ test_invalid_diagnostic_status_never_kills_reader[error_data3-None-None] ___
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status3')
+error_data = {'status': '²'}, category = None, status = None
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+            assert getattr(error, "category", None) == category
+            assert getattr(error, "status", None) == status
+>           assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+E           AssertionError: 无效诊断字段不得结束 reader
+E           assert not True
+E            +  where True = <built-in method done of _asyncio.Task object at 0x000001FE704AEF60>()
+E            +    where <built-in method done of _asyncio.Task object at 0x000001FE704AEF60> = <Task finished name='Task-101' coro=<RPC._read() done, defined at <worktree>\easel\harnesses\rpc.py:283> result=None>.done
+E            +      where <Task finished name='Task-101' coro=<RPC._read() done, defined at <worktree>\easel\harnesses\rpc.py:283> result=None> = <easel.harnesses.rpc.RPC object at 0x000001FE70384610>.reader
+
+tests\multiuser\test_run_diagnostics.py:241: AssertionError
+_ test_invalid_diagnostic_status_never_kills_reader[error_data4-service_unavailable-503] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status4')
+error_data = {'status': '²', 'statusCode': 503}
+category = 'service_unavailable', status = 503
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'service_unavailable'
+E            +  where None = getattr(HarnessError('Agent 协议读取失败'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+_ test_invalid_diagnostic_status_never_kills_reader[error_data5-request_rejected-None] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status5')
+error_data = {'status': '²', 'error': 'invalid_request'}
+category = 'request_rejected', status = None
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'request_rejected'
+E            +  where None = getattr(HarnessError('Agent 协议读取失败'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+_ test_invalid_diagnostic_status_never_kills_reader[error_data7-rate_limited-418] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status7')
+error_data = {'status': 418, 'code': 'rate_limited'}, category = 'rate_limited'
+status = 418
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'rate_limited'
+E            +  where None = getattr(HarnessError('Agent 协议错误：fixture failure'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+_ test_invalid_diagnostic_status_never_kills_reader[error_data8-rate_limited-429] _
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3871/test_invalid_diagnostic_status8')
+error_data = {'status': 418, 'statusCode': 429}, category = 'rate_limited'
+status = 429
+
+    @pytest.mark.parametrize(
+        ("error_data", "category", "status"),
+        [
+            # Unicode 数字不是可转换的 ASCII 状态码；已知 code 必须继续生效。
+            ({"status": "²", "code": "rate_limited"},
+             "rate_limited", None),
+            # 4301 位数字超过 CPython 默认 int 字符串转换上限，绝不能先转 int。
+            ({"status": "9" * 4301, "code": "rate_limited"},
+             "rate_limited", None),
+            # 合法 ASCII 状态字符串仍正常分类。
+            ({"status": "429"}, "rate_limited", 429),
+            # 完全没有可用结构化证据时才回 unknown。
+            ({"status": "²"}, None, None),
+            # 无效 status 不得掩盖后续可用的 status 字段。
+            ({"status": "²", "statusCode": 503},
+             "service_unavailable", 503),
+            # 无效 status 不得掩盖已知 code/error。
+            ({"status": "²", "error": "invalid_request"},
+             "request_rejected", None),
+            # bool 不是有效状态码；已知 code 仍生效。
+            ({"status": True, "code": "invalid_token"}, "auth", None),
+            # 可解析但未映射的状态码保留；code 证据仍继续检查。
+            ({"status": 418, "code": "rate_limited"},
+             "rate_limited", 418),
+            # 未映射 status 不得掩盖后续可用的 status 字段。
+            ({"status": 418, "statusCode": 429},
+             "rate_limited", 429),
+        ],
+    )
+    def test_invalid_diagnostic_status_never_kills_reader(
+            tmp_path, error_data, category, status):
+        """真实 RPC._read：错误帧的诊断字段再怪，也必须继续消费后续正常帧。"""
+
+        async def scenario():
+            request = RunRequest("", tmp_path, dict(os.environ))
+            command = _command(tmp_path, "normal",
+                               audit_name="status-audit.jsonl",
+                               error_data=error_data)
+            async with transport.RPC(
+                    request, command, lambda *args: None, _reject) as rpc:
+                with pytest.raises(HarnessError) as caught:
+                    await rpc.call("probe-error", {}, timeout=10)
+                error = caught.value
+                assert getattr(error, "category", None) == category
+                assert getattr(error, "status", None) == status
+                assert not rpc.reader.done(), "无效诊断字段不得结束 reader"
+                assert await rpc.call("probe-ok", {}, timeout=10) == {
+                    "ok": True}
+                assert not rpc.reader.done()
+            assert rpc.stderr.done()
+
+>       asyncio.run(scenario())
+
+tests\multiuser\test_run_diagnostics.py:247:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+<python-env>\lib\asyncio\runners.py:44: in run
+    return loop.run_until_complete(main)
+<python-env>\lib\asyncio\base_events.py:649: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def scenario():
+        request = RunRequest("", tmp_path, dict(os.environ))
+        command = _command(tmp_path, "normal",
+                           audit_name="status-audit.jsonl",
+                           error_data=error_data)
+        async with transport.RPC(
+                request, command, lambda *args: None, _reject) as rpc:
+            with pytest.raises(HarnessError) as caught:
+                await rpc.call("probe-error", {}, timeout=10)
+            error = caught.value
+>           assert getattr(error, "category", None) == category
+E           AssertionError: assert None == 'rate_limited'
+E            +  where None = getattr(HarnessError('Agent 协议错误：fixture failure'), 'category', None)
+
+tests\multiuser\test_run_diagnostics.py:239: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data0-rate_limited-None]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data1-rate_limited-None]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data3-None-None]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data4-service_unavailable-503]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data5-request_rejected-None]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data7-rate_limited-418]
+FAILED tests/multiuser/test_run_diagnostics.py::test_invalid_diagnostic_status_never_kills_reader[error_data8-rate_limited-429]
+7 failed, 19 passed in 6.31s

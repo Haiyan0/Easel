@@ -1,0 +1,21 @@
+# Task 6A 受控平台 runner 派生镜像（仅隔离演练）。
+#
+# 以当前提交构建的最终 worker runtime 为基础，只替换原平台脚本文件；Harness、
+# worker、Chromium、技能和其余运行时文件保持不变。替代关系在演练证据中显式
+# 列出，原平台脚本未执行，本镜像不得作为生产镜像。
+ARG BASE_IMAGE=easel-worker:task6a-4382180
+FROM ${BASE_IMAGE}
+
+USER root
+# 构建上下文是 tests/fixtures，避免 .dockerignore 的 tests/ 排除规则。
+COPY task6a_controlled_platform.py /tmp/task6a_controlled_platform.py
+RUN set -eu; \
+    for name in xhs_publish.py douyin_publish.py web_publisher.py \
+                weixin_mp_stats.py account_stats.py bili_login.py; do \
+      cp /tmp/task6a_controlled_platform.py \
+         "/opt/easel/skills/shared/scripts/$name"; \
+      chmod 0555 "/opt/easel/skills/shared/scripts/$name"; \
+      chown root:root "/opt/easel/skills/shared/scripts/$name"; \
+    done; \
+    rm -f /tmp/task6a_controlled_platform.py
+USER 10001:10001

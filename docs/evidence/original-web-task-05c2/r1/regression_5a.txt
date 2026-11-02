@@ -1,0 +1,8 @@
+C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_workspace.py:258: RuntimeWarning: coroutine 'Server.stop.<locals>.close_clients' was never awaited
+  pass
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+BROWSER_VERSION 151.0.7922.34
+TASK5A_BROWSER_RESULTS {'outputs_media_delete_light': True, 'profile_and_attachment': True, 'dark_mobile': True, 'logout_media_401': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\01-outputs-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\02-media-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\03-html-preview-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\04-profile-edit-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\05-attachment-upload-light.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\06-outputs-dark.png', 'docs\\evidence\\original-web-task-05c2\\r1\\regression\\5a\\07-outputs-mobile.png']
+TASK5A_BROWSER_OK True

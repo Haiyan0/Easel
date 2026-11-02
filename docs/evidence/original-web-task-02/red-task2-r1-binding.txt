@@ -1,0 +1,121 @@
+...........................FFFFFF.                                       [100%]
+================================== FAILURES ===================================
+____________ test_load_managed_profile_models_reads_repo_manifest _____________
+
+    def test_load_managed_profile_models_reads_repo_manifest():
+>       from easel.control.snapshot import load_managed_profile_models
+E       ImportError: cannot import name 'load_managed_profile_models' from 'easel.control.snapshot' (<worktree>\easel\control\snapshot.py)
+
+tests\multiuser\test_managed_chat_model.py:546: ImportError
+_______ test_load_managed_profile_models_rejects_missing_or_mismatched ________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3930/test_load_managed_profile_mode0')
+
+    def test_load_managed_profile_models_rejects_missing_or_mismatched(tmp_path):
+>       from easel.control.snapshot import load_managed_profile_models
+E       ImportError: cannot import name 'load_managed_profile_models' from 'easel.control.snapshot' (<worktree>\easel\control\snapshot.py)
+
+tests\multiuser\test_managed_chat_model.py:552: ImportError
+___________ test_serve_control_rejects_model_outside_image_catalog ____________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3930/test_serve_control_rejects_mod0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000011D1FEB6AA0>
+capsys = <_pytest.capture.CaptureFixture object at 0x0000011D1FEB6950>
+
+    def test_serve_control_rejects_model_outside_image_catalog(
+            tmp_path, monkeypatch, capsys):
+        captured = relay_cli.capture_app(tmp_path, monkeypatch)
+        agent_config = relay_cli.write_agent_config(tmp_path, {
+            "revision": 4,
+            "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                      "models": ["not-in-worker-image-catalog"]},
+            "broker": {"url": "https://control.internal", "channel": "chat"},
+        })
+        code = relay_cli.main(_serve_args(tmp_path, agent_config))
+>       assert code != 0
+E       assert 0 != 0
+
+tests\multiuser\test_managed_chat_model.py:582: AssertionError
+__________ test_serve_control_uses_image_catalog_when_models_absent ___________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3930/test_serve_control_uses_image_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000011D200D7880>
+
+    def test_serve_control_uses_image_catalog_when_models_absent(
+            tmp_path, monkeypatch):
+        captured = relay_cli.capture_app(tmp_path, monkeypatch)
+        agent_config = relay_cli.write_agent_config(tmp_path, {
+            "revision": 4,
+            "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                      "sandbox": "read-only"},
+            "broker": {"url": "https://control.internal", "channel": "chat"},
+        })
+        code = relay_cli.main(_serve_args(tmp_path, agent_config))
+        assert code == 0
+        app = captured["app"]
+        with TestClient(app, base_url=relay_cli.ORIGIN):
+>           assert app.state.config_service._model_catalog == CATALOG
+E           AssertionError: assert () == ('deepseek-ch...pseek-v4-pro')
+E
+E             Right contains 3 more items, first extra item: 'deepseek-chat'
+E             Use -v to get more diff
+
+tests\multiuser\test_managed_chat_model.py:601: AssertionError
+_____________ test_serve_control_rejects_missing_managed_profile ______________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3930/test_serve_control_rejects_mis0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000011D202CFCD0>
+capsys = <_pytest.capture.CaptureFixture object at 0x0000011D202CFC40>
+
+    def test_serve_control_rejects_missing_managed_profile(
+            tmp_path, monkeypatch, capsys):
+        captured = relay_cli.capture_app(tmp_path, monkeypatch)
+        agent_config = relay_cli.write_agent_config(tmp_path, {
+            "revision": 4,
+            "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                      "sandbox": "read-only"},
+            "broker": {"url": "https://control.internal", "channel": "chat"},
+        })
+        monkeypatch.setenv("EASEL_MANAGED_PROFILE",
+                           str(tmp_path / "missing-profile.json"))
+        code = relay_cli.main(_serve_args(tmp_path, agent_config))
+>       assert code != 0
+E       assert 0 != 0
+
+tests\multiuser\test_managed_chat_model.py:616: AssertionError
+_________ test_serve_control_rejects_managed_profile_version_mismatch _________
+
+tmp_path = WindowsPath('<pytest-tmp>/pytest-3930/test_serve_control_rejects_man0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000011D2031BE50>
+capsys = <_pytest.capture.CaptureFixture object at 0x0000011D2031BA00>
+
+    def test_serve_control_rejects_managed_profile_version_mismatch(
+            tmp_path, monkeypatch, capsys):
+        captured = relay_cli.capture_app(tmp_path, monkeypatch)
+        original = json.loads(MANAGED_PROFILE.read_text(encoding="utf-8"))
+        expected = original["harness"]["commit"]
+        mismatch = json.loads(json.dumps(original))
+        mismatch["harness"]["commit"] = "1" * 40
+        profile = tmp_path / "acp-profile.json"
+        profile.write_text(json.dumps(mismatch), encoding="utf-8")
+        agent_config = relay_cli.write_agent_config(tmp_path, {
+            "revision": 4,
+            "agent": {"runtime": "acp", "command": ["managed-agent", "--acp"],
+                      "sandbox": "read-only"},
+            "broker": {"url": "https://control.internal", "channel": "chat"},
+        })
+        monkeypatch.setenv("EASEL_MANAGED_PROFILE", str(profile))
+        monkeypatch.setenv("EASEL_EXPECTED_HARNESS_COMMIT", expected)
+        code = relay_cli.main(_serve_args(tmp_path, agent_config))
+>       assert code != 0
+E       assert 0 != 0
+
+tests\multiuser\test_managed_chat_model.py:640: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_managed_chat_model.py::test_load_managed_profile_models_reads_repo_manifest
+FAILED tests/multiuser/test_managed_chat_model.py::test_load_managed_profile_models_rejects_missing_or_mismatched
+FAILED tests/multiuser/test_managed_chat_model.py::test_serve_control_rejects_model_outside_image_catalog
+FAILED tests/multiuser/test_managed_chat_model.py::test_serve_control_uses_image_catalog_when_models_absent
+FAILED tests/multiuser/test_managed_chat_model.py::test_serve_control_rejects_missing_managed_profile
+FAILED tests/multiuser/test_managed_chat_model.py::test_serve_control_rejects_managed_profile_version_mismatch
+6 failed, 28 passed in 2.71s

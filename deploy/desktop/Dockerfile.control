@@ -36,6 +36,7 @@ COPY deploy/desktop/keygen.py ./deploy/desktop/keygen.py
 COPY deploy/desktop/initialize_state.py ./deploy/desktop/initialize_state.py
 COPY deploy/desktop/read_stop_state.py ./deploy/desktop/read_stop_state.py
 COPY deploy/desktop/provisioner_identity.py ./deploy/desktop/provisioner_identity.py
+COPY deploy/multiuser/managed /opt/easel/managed
 COPY deploy/multiuser/egress_proxy.py ./deploy/multiuser/egress_proxy.py
 COPY --from=frontend /build/dist /opt/easel/web/frontend/dist
 

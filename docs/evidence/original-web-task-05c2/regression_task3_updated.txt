@@ -1,0 +1,28 @@
+﻿BROWSER_VERSION 151.0.7922.34
+TASK3_BROWSER_RESULTS {"control_accounts_connected": true, "control_admission_ordering": true, "control_continue_after_stop": true, "control_cross_identity_late_results": true, "control_cross_tab_identity": true, "control_delayed_history": true, "control_failure_preserves_completed": true, "control_history_pagination": true, "control_identity_unavailable": true, "control_original_layout": true, "control_question_card": true, "control_refresh_reconnect": true, "control_selection_interleaving": true, "control_session_crud": true, "control_settings_bridge": true, "control_settings_delayed": true, "control_stop": true, "control_text_thinking_activity": true, "local_original_chat": true, "r1_answer_403": true, "r1_answer_409": true, "r1_answer_503_retry": true, "r1_initial_history_401": true, "r1_late_401_keeps_b": true, "r1_question_cursor": true, "r1_question_status_401": true, "r1_submit_401": true, "r1_thinking_cursor": true, "r2_pending_question_reconnect": true, "r2_question_expired_on_reconnect": true, "r2_question_resolved_on_reconnect": true, "r3_question_checking_status": true, "r3_question_unknown_status": true}
+FAILURES []
+python.exe : Traceback (most recent call last):
+At line:1 char:668
++ ... ion/task3'; & $py -u tests/frontend/browser_original_web_task03.py *> ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_task03.py", 
+line 2327, in <module>
+    raise SystemExit(asyncio.run(main()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_task03.py", 
+line 2301, in main
+    [str(Path(item).relative_to(ROOT)) for item in EVIDENCE.iterdir()
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_task03.py", 
+line 2301, in <listcomp>
+    [str(Path(item).relative_to(ROOT)) for item in EVIDENCE.iterdir()
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\pathlib.py", line 818, in relative_to
+    raise ValueError("{!r} is not in the subpath of {!r}"
+ValueError: 'docs\\evidence\\original-web-task-05c2\\regression\\task3\\01-control-layout.png' is not in the subpath of
+ 'C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics' OR one path is relative and the other is absolut
+e.

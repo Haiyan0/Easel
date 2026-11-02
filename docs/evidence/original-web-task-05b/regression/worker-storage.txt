@@ -1,0 +1,51 @@
+............................................................F..          [100%]
+================================== FAILURES ===================================
+_____ test_video_pipeline_gates_empty_phase_fails_and_python_placeholder ______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002765E75DF60>
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-3999/test_video_pipeline_gates_empt0')
+
+    def test_video_pipeline_gates_empty_phase_fails_and_python_placeholder(monkeypatch, tmp_path):
+        aggregate = _load(
+            "video_gate_aggregate_fix",
+            Path(__file__).resolve().parents[1]
+            / "skills" / "builtin" / "video-production" / "vendor" / "video-pipeline-sdk"
+            / "gates" / "aggregate.py",
+        )
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "gates.json").write_text(json.dumps({"gates": []}), encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["aggregate.py", "--run-dir", str(run_dir), "--phase", "verify"])
+        with pytest.raises(SystemExit) as exc:
+            aggregate.main()
+        assert exc.value.code == 1
+        assert "无质量门" in (run_dir / "gate-report.json").read_text(encoding="utf-8")
+
+        (run_dir / "gates.json").write_text(json.dumps({"gates": [
+            {"id": "py", "title": "py", "phase": "verify", "cmd": "{python} -c pass"}
+        ]}), encoding="utf-8")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(aggregate.subprocess, "run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["aggregate.py", "--run-dir", str(run_dir), "--phase", "verify"])
+        with pytest.raises(SystemExit) as exc:
+            aggregate.main()
+        assert exc.value.code == 0
+>       assert sys.executable in calls[-1][-1]
+E       AssertionError: assert 'C:\\Users\\hyh\\anaconda3\\envs\\Agent\\python.exe' in 'C:/Users/hyh/anaconda3/envs/Agent/python.exe -c pass'
+E        +  where 'C:\\Users\\hyh\\anaconda3\\envs\\Agent\\python.exe' = sys.executable
+
+tests\test_bugfix_regressions.py:476: AssertionError
+---------------------------- Captured stdout call -----------------------------
+报告：C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3999\test_video_pipeline_gates_empt0\run\gate-report.md
+现状：共 0 项，通过 0，失败 0
+[PASS] py · py
+报告：C:\Users\hyh\AppData\Local\Temp\pytest-of-hyh\pytest-3999\test_video_pipeline_gates_empt0\run\gate-report.md
+现状：共 1 项，通过 1，失败 0
+=========================== short test summary info ===========================
+FAILED tests/test_bugfix_regressions.py::test_video_pipeline_gates_empty_phase_fails_and_python_placeholder
+1 failed, 62 passed in 1.94s

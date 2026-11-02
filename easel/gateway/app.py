@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -108,23 +108,85 @@ _NO_AUTH = _NoAuth()
 @dataclass(frozen=True)
 class _Route:
     name: str
-    method: str
+    methods: frozenset[str]
     path: str
     stream: bool
     allowed_query: frozenset[str]
 
 
 _ROUTES: dict[str, _Route] = {
-    "health": _Route("health", "GET", "/internal/lifecycle/health",
-                     False, frozenset()),
-    "submit": _Route("submit", "POST", "", False, frozenset()),
-    "events": _Route("events", "GET", "", True,
+    "health": _Route("health", frozenset({"GET"}),
+                     "/internal/lifecycle/health", False, frozenset()),
+    "submit": _Route("submit", frozenset({"POST"}), "", False, frozenset()),
+    "events": _Route("events", frozenset({"GET"}), "", True,
                      frozenset({"after", "nonce"})),
-    "stop": _Route("stop", "POST", "", False, frozenset()),
-    "answer": _Route("answer", "POST", "", False, frozenset()),
-    "status": _Route("status", "POST", "", False, frozenset()),
-    "messages": _Route("messages", "GET", "", False,
+    "stop": _Route("stop", frozenset({"POST"}), "", False, frozenset()),
+    "answer": _Route("answer", frozenset({"POST"}), "", False, frozenset()),
+    "status": _Route("status", frozenset({"POST"}), "", False, frozenset()),
+    "messages": _Route("messages", frozenset({"GET"}), "", False,
                        frozenset({"limit", "offset"})),
+}
+
+# 基础工作区/工作台路由只覆盖 Task 5A/5B 已实现的精确入口；skills/accounts
+# 等未接组不在 gateway 放行，避免用前缀代理扩大边界。
+_WS_OUTPUT_INTERNAL = frozenset({"analytics", "wechat"})
+_WS_RECORD_ID = re.compile(r"^[0-9a-f]{12}$")
+_WS_EXPORT_NAME = re.compile(
+    r"^easel-(?:xiaohongshu|douyin|kuaishou|weixin-channels|zhihu|bilibili"
+    r"|wechat-oa)-[0-9a-f]{12}\.zip$")
+_WS_ACCOUNT_PLATFORMS = frozenset({
+    "xiaohongshu", "kuaishou", "weixin-channels", "zhihu",
+    "bilibili", "douyin", "wechat-oa",
+})
+_WS_ANALYTICS_PLATFORMS = frozenset({
+    "xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels",
+    "bilibili", "wechat-oa",
+})
+_WS_TREND_PLATFORMS = re.compile(
+    r"^(?:weibo|douyin|zhihu|bilibili|baidu|toutiao)"
+    r"(?:,(?:weibo|douyin|zhihu|bilibili|baidu|toutiao))*$")
+_WS_SIMPLE: dict[tuple[str, ...], _Route] = {
+    ("api", "status"): _Route("ws_status", frozenset({"GET"}),
+                              "/api/status", False, frozenset()),
+    ("api", "personas"): _Route("ws_personas", frozenset({"GET"}),
+                                "/api/personas", False, frozenset()),
+    ("api", "outputs"): _Route("ws_outputs", frozenset({"GET"}),
+                               "/api/outputs", False, frozenset()),
+    ("api", "upload"): _Route("ws_upload", frozenset({"POST"}),
+                              "/api/upload", False, frozenset()),
+    ("api", "upload", "limits"): _Route(
+        "ws_upload_limits", frozenset({"GET"}), "/api/upload/limits",
+        False, frozenset()),
+    ("api", "artifacts", "archive"): _Route(
+        "ws_archive", frozenset({"GET"}), "/api/artifacts/archive",
+        False, frozenset({"path"})),
+    ("api", "trends"): _Route(
+        "ws_trends", frozenset({"GET"}), "/api/trends", False,
+        frozenset({"platforms", "limit"})),
+    ("api", "schedule"): _Route(
+        "ws_schedule", frozenset({"GET", "POST"}), "/api/schedule", False,
+        frozenset()),
+    ("api", "schedule", "context"): _Route(
+        "ws_schedule_context", frozenset({"GET"}), "/api/schedule/context",
+        False, frozenset({"days"})),
+    ("api", "ideas"): _Route(
+        "ws_ideas", frozenset({"GET", "POST"}), "/api/ideas", False,
+        frozenset()),
+    ("api", "skills"): _Route(
+        "ws_skills", frozenset({"GET"}), "/api/skills", False,
+        frozenset()),
+    ("api", "skill", "prepare"): _Route(
+        "ws_skill_prepare", frozenset({"POST"}), "/api/skill/prepare",
+        False, frozenset()),
+    ("api", "profile", "baseline"): _Route(
+        "ws_profile_baseline", frozenset({"POST"}),
+        "/api/profile/baseline", False, frozenset()),
+    ("api", "accounts"): _Route(
+        "ws_accounts", frozenset({"GET"}), "/api/accounts", False,
+        frozenset()),
+    ("api", "analytics", "platforms"): _Route(
+        "ws_analytics_platforms", frozenset({"GET"}),
+        "/api/analytics/platforms", False, frozenset()),
 }
 
 
@@ -363,6 +425,166 @@ def _question_segment(segment: str) -> str:
     return canonical
 
 
+def _workspace_segment(segment: str, *, persona: bool) -> str:
+    """严格解码一个工作区路径段并返回规范编码形式。
+
+    gateway 是第二道边界：拒绝编码 slash/反斜杠/NUL、点段、编码 unreserved
+    别名与内部保留名；最终安全路径仍由 worker 的既有路径工具复核。
+    """
+    decoded = bytearray()
+    index = 0
+    while index < len(segment):
+        character = segment[index]
+        if character == "%":
+            if (index + 2 >= len(segment)
+                    or segment[index + 1] not in _HEX
+                    or segment[index + 2] not in _HEX):
+                raise _invalid_path()
+            byte = int(segment[index + 1:index + 3], 16)
+            if chr(byte) in _UNRESERVED:
+                # 拒绝 %61 这类与字面量同义的编码别名。
+                raise _invalid_path()
+            decoded.append(byte)
+            index += 3
+            continue
+        if character not in _UNRESERVED:
+            raise _invalid_path()
+        decoded.extend(character.encode("ascii"))
+        index += 1
+    try:
+        value = bytes(decoded).decode("utf-8")
+    except UnicodeDecodeError:
+        raise _invalid_path() from None
+    if (not value or value in (".", "..")
+            or any(character in value for character in "/\\:\x00\r\n")
+            or any(ord(character) < 32 or ord(character) == 127
+                   for character in value)
+            or len(value) > 255
+            or value.startswith(".")):
+        raise _invalid_path()
+    if persona:
+        if (value.startswith("_") or len(value) > 200
+                or value != value.strip()):
+            raise _invalid_path()
+    return quote(value, safe="-._~", encoding="utf-8", errors="strict")
+
+
+def _workspace_record_id(segment: str) -> str:
+    """工作台记录 id 只接受 12 位小写十六进制，不允许路径别名。"""
+    encoded = _workspace_segment(segment, persona=False)
+    value = unquote(encoded, encoding="utf-8", errors="strict")
+    if not _WS_RECORD_ID.fullmatch(value):
+        raise _invalid_path()
+    return encoded
+
+
+def _workspace_output_path(parts: list[str], *,
+                           allow_export: bool = False) -> str:
+    if not parts:
+        raise _invalid_path()
+    first = _workspace_segment(parts[0], persona=False)
+    decoded_first = unquote(first, encoding="utf-8", errors="strict")
+    if (decoded_first.startswith("_")
+            or decoded_first in _WS_OUTPUT_INTERNAL):
+        export = (
+            allow_export and len(parts) == 3 and decoded_first == "_publish"
+            and unquote(parts[1], encoding="utf-8", errors="strict") == "manual"
+            and _WS_EXPORT_NAME.fullmatch(
+                unquote(parts[2], encoding="utf-8", errors="strict")) is not None)
+        if not export:
+            raise _invalid_path()
+    canonical = [first]
+    for part in parts[1:]:
+        canonical.append(_workspace_segment(part, persona=False))
+    return "/".join(canonical)
+
+
+def _workspace_route(parts: list[str],
+                     method: str) -> _Route | None:
+    key = tuple(parts)
+    simple = _WS_SIMPLE.get(key)
+    if simple is not None:
+        return simple
+    if len(parts) == 3 and parts[1] == "persona":
+        name = _workspace_segment(parts[2], persona=True)
+        return _Route("ws_persona", frozenset({"GET", "DELETE"}),
+                      f"/api/persona/{name}", False, frozenset())
+    if (len(parts) == 4 and parts[1] == "persona"
+            and parts[3] in ("files", "file")):
+        name = _workspace_segment(parts[2], persona=True)
+        if parts[3] == "files":
+            return _Route("ws_persona_files", frozenset({"GET"}),
+                          f"/api/persona/{name}/files", False, frozenset())
+        return _Route("ws_persona_file", frozenset({"PUT"}),
+                      f"/api/persona/{name}/file", False, frozenset())
+    if len(parts) == 3 and parts[1] in ("schedule", "ideas"):
+        record = _workspace_record_id(parts[2])
+        name = "ws_schedule_item" if parts[1] == "schedule" \
+            else "ws_idea_item"
+        return _Route(name, frozenset({"PUT", "DELETE"}),
+                      f"/api/{parts[1]}/{record}", False, frozenset())
+    if len(parts) == 3 and parts[1] == "skill":
+        name = _workspace_segment(parts[2], persona=False)
+        return _Route("ws_skill", frozenset({"GET"}),
+                      f"/api/skill/{name}", False, frozenset())
+    if len(parts) >= 3 and parts[1] in ("output", "media"):
+        path = _workspace_output_path(
+            parts[2:], allow_export=(parts[1] == "media"))
+        if parts[1] == "output":
+            return _Route("ws_output", frozenset({"GET", "DELETE"}),
+                          f"/api/output/{path}", False, frozenset())
+        return _Route("ws_media", frozenset({"GET", "HEAD"}),
+                      f"/api/media/{path}", True, frozenset())
+    if len(parts) == 4 and parts[1] == "publish" and parts[3] == "sms":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        return _Route("ws_publish_sms", frozenset({"POST"}),
+                      f"/api/publish/{platform}/sms", False, frozenset())
+    if len(parts) >= 3 and parts[1] == "login":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        if len(parts) == 4 and parts[3] == "status":
+            return _Route("ws_login_status", frozenset({"GET"}),
+                          f"/api/login/{platform}/status", False,
+                          frozenset())
+        if len(parts) == 4 and parts[3] == "sms":
+            return _Route("ws_login_sms", frozenset({"POST"}),
+                          f"/api/login/{platform}/sms", False,
+                          frozenset())
+        raise _not_found()
+    if len(parts) == 3 and parts[1] == "logout":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        return _Route("ws_logout", frozenset({"POST"}),
+                      f"/api/logout/{platform}", False, frozenset())
+    if len(parts) >= 4 and parts[1] == "accounts":
+        platform = _workspace_segment(parts[2], persona=False)
+        if unquote(platform) not in _WS_ACCOUNT_PLATFORMS:
+            raise _invalid_path()
+        tail = parts[3:]
+        if tail == ["credentials"]:
+            return _Route("ws_account_credentials",
+                          frozenset({"GET", "POST"}),
+                          f"/api/accounts/{platform}/credentials", False,
+                          frozenset())
+        if tail == ["qr"]:
+            return _Route("ws_account_qr", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/qr", True, frozenset())
+        if tail == ["mp-login", "status"]:
+            return _Route("ws_mp_login_status", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/mp-login/status",
+                          False, frozenset())
+        if tail == ["mp-login", "qr"]:
+            return _Route("ws_mp_login_qr", frozenset({"GET"}),
+                          f"/api/accounts/{platform}/mp-login/qr",
+                          True, frozenset())
+        raise _not_found()
+    return None
+
+
 def _match_path(raw_path: bytes, method: str,
                 limits: GatewayLimits) -> _Route:
     path = _validate_raw_path(raw_path, limits)
@@ -373,24 +595,29 @@ def _match_path(raw_path: bytes, method: str,
     if (len(parts) == 6 and parts[0] == "internal" and parts[1] == "runs"
             and parts[3] == "questions" and parts[5] == "answer"):
         question_index = 4
-    for index, segment in enumerate(parts):
-        if "%" in segment and index != question_index:
-            raise _invalid_path()
-    if len(parts) == 3 and parts[0] == "internal" \
+    if parts and parts[0] == "internal":
+        for index, segment in enumerate(parts):
+            if "%" in segment and index != question_index:
+                raise _invalid_path()
+    if parts and parts[0] == "api":
+        route = _workspace_route(parts, method)
+        if route is None:
+            raise _not_found()
+    elif len(parts) == 3 and parts[0] == "internal" \
             and parts[1] == "lifecycle" and parts[2] == "health":
         route = _ROUTES["health"]
     elif len(parts) == 3 and parts[0] == "internal" and parts[1] == "runs":
         run_id = _run_or_session_id(parts[2])
-        route = _Route("submit", "POST", f"/internal/runs/{run_id}",
-                       False, frozenset())
+        route = _Route("submit", frozenset({"POST"}),
+                       f"/internal/runs/{run_id}", False, frozenset())
     elif len(parts) == 4 and parts[0] == "internal" and parts[1] == "runs":
         run_id = _run_or_session_id(parts[2])
         if parts[3] == "events":
-            route = _Route("events", "GET",
+            route = _Route("events", frozenset({"GET"}),
                            f"/internal/runs/{run_id}/events", True,
                            _ROUTES["events"].allowed_query)
         elif parts[3] == "stop":
-            route = _Route("stop", "POST",
+            route = _Route("stop", frozenset({"POST"}),
                            f"/internal/runs/{run_id}/stop", False,
                            frozenset())
         else:
@@ -400,7 +627,7 @@ def _match_path(raw_path: bytes, method: str,
         if parts[3] != "questions":
             raise _not_found()
         if parts[4] == "status":
-            route = _Route("status", "POST",
+            route = _Route("status", frozenset({"POST"}),
                            f"/internal/runs/{run_id}/questions/status",
                            False, frozenset())
         else:
@@ -411,19 +638,19 @@ def _match_path(raw_path: bytes, method: str,
             raise _not_found()
         question_id = _question_segment(parts[4])
         route = _Route(
-            "answer", "POST",
+            "answer", frozenset({"POST"}),
             f"/internal/runs/{run_id}/questions/{question_id}/answer",
             False, frozenset())
     elif (len(parts) == 4 and parts[0] == "internal"
           and parts[1] == "sessions" and parts[3] == "messages"):
         session_id = _run_or_session_id(parts[2])
         route = _Route(
-            "messages", "GET",
+            "messages", frozenset({"GET"}),
             f"/internal/sessions/{session_id}/messages", False,
             _ROUTES["messages"].allowed_query)
     else:
         raise _not_found()
-    if method != route.method:
+    if method not in route.methods:
         raise _method_not_allowed()
     return route
 
@@ -504,6 +731,25 @@ def _parse_query(raw_query: bytes, route: _Route,
             if (not 1 <= len(value) <= 128
                     or any(character not in _VISIBLE for character in value)):
                 raise _invalid_query()
+        elif key == "path":
+            if (not 1 <= len(value) <= 2048
+                    or value.startswith(("/", "\\"))
+                    or "\\" in value or ":" in value
+                    or any(ord(character) < 32 or ord(character) == 127
+                           for character in value)):
+                raise _invalid_query()
+            parts = value.split("/")
+            if any(not part or part in (".", "..")
+                   or part.startswith(".") for part in parts):
+                raise _invalid_query()
+            if parts[0].startswith("_") or parts[0] in _WS_OUTPUT_INTERNAL:
+                raise _invalid_query()
+        elif key == "platforms":
+            if (not 1 <= len(value) <= 200
+                    or not _WS_TREND_PLATFORMS.fullmatch(value)):
+                raise _invalid_query()
+        elif key == "days":
+            values[key] = _canonical_int(value, minimum=1, maximum=90)
         else:
             raise _invalid_query()
     return "&".join(
@@ -781,14 +1027,25 @@ class GatewayController:
             self._nonces.accept(
                 assertion.nonce, expires_at=assertion.expires_at, now=now)
             response = await self._send_upstream(
-                route, canonical_query, parsed_headers, body)
+                route, method, canonical_query, parsed_headers, body)
             guard = _ResponseCleanup(response, slot)
-            if 300 <= response.status_code < 400:
+            # 304 是合法条件响应，不是重定向；其它 3xx 仍失败关闭。
+            if (300 <= response.status_code < 400
+                    and response.status_code != 304):
                 await guard.close()
                 raise GatewayError("gateway_upstream_redirect", 502)
             if response.is_stream_consumed:
                 await guard.close()
                 raise GatewayError("gateway_upstream_unavailable", 502)
+            if method == "HEAD":
+                headers = _stream_response_headers(response.headers)
+                await guard.close()
+                return Response(status_code=response.status_code,
+                                headers=headers)
+            if response.status_code == 304:
+                headers = _clean_response_headers(response.headers)
+                await guard.close()
+                return Response(status_code=304, headers=headers)
             if route.stream or _is_streaming_response(response):
                 try:
                     streamed = self._streaming_response(guard)
@@ -812,7 +1069,8 @@ class GatewayController:
                 else:
                     await guard.close()
 
-    async def _send_upstream(self, route: _Route, canonical_query: str,
+    async def _send_upstream(self, route: _Route, method: str,
+                             canonical_query: str,
                              headers: _InboundHeaders,
                              body: bytes) -> httpx.Response:
         url = self._config.worker_origin + route.path
@@ -822,13 +1080,13 @@ class GatewayController:
         try:
             expected_url = httpx.URL(url)
             request = self._client.build_request(
-                route.method, url, headers=headers.forwarded, content=body)
+                method, url, headers=headers.forwarded, content=body)
             # build_request 会合并注入 client 的默认 params；必须在最终
             # Request 上恢复已验签的精确 URL，不能只清洗 headers。
             request.url = expected_url
             _clean_request_headers(request.headers, headers.connection_tokens)
             request.headers["Host"] = host
-            if body or route.method == "POST":
+            if body or method == "POST":
                 request.headers["Content-Length"] = str(len(body))
             else:
                 try:

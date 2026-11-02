@@ -60,6 +60,10 @@ class RunRecord:
     conversation_id: str
     status: str
     config_version: int
+    # 仅用于同一幂等键复核；不改变既有 RunRecord 的相等/传输契约。
+    client_request_id: str = field(default="", compare=False)
+    # 同 requestId 复核输入；旧调用方不传时保持空值，不改变相等契约。
+    input_digest: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)

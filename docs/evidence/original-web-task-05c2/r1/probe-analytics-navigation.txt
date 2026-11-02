@@ -1,0 +1,24 @@
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\original-web-task-05c2-review\probe_analytics_navigation.py", line 26, in <module>
+    asyncio.run(main())
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\original-web-task-05c2-review\probe_analytics_navigation.py", line 20, in main
+    await f.wait_for(lambda:len(server.fake.analytics_calls)>before,15,'analytics execution absent')
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\frontend\browser_original_web_task05c2.py", line 407, in wait_for
+    raise AssertionError(message)
+AssertionError: analytics execution absent

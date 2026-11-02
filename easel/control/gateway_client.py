@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -51,11 +52,14 @@ def _retry_after(response: httpx.Response) -> int | None:
     return number
 
 
-def _gateway_error(response: httpx.Response) -> str:
-    """只读取有界的错误码；不把响应正文或底层异常带出本模块。"""
+_ERROR_BODY_LIMIT = 64 * 1024
+
+
+def _parse_gateway_error(raw: bytes) -> str:
+    """只接受 gateway_ 前缀的稳定错误码；不把正文或异常带出本模块。"""
     try:
-        payload = response.json()
-    except ValueError:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
         return ""
     if not isinstance(payload, dict):
         return ""
@@ -67,6 +71,50 @@ def _gateway_error(response: httpx.Response) -> str:
                         or character == "_") for character in value)):
         return ""
     return value
+
+
+async def _read_gateway_error(response: httpx.Response) -> str:
+    """有界读取错误正文；流未消费时绝不能直接 ``response.json()``。"""
+    if response.is_stream_consumed:
+        raw = response.content
+        if len(raw) > _ERROR_BODY_LIMIT:
+            return ""
+        return _parse_gateway_error(raw)
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > _ERROR_BODY_LIMIT:
+                # 停止读取，由 finally 关闭连接丢弃剩余内容。
+                return ""
+            chunks.append(chunk)
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        return ""
+    return _parse_gateway_error(b"".join(chunks))
+
+
+def _retrieve_task(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+async def _close_response(response: httpx.Response) -> None:
+    """关闭错误响应；取消路径也不把底层连接留给 TTL/GC。"""
+    task = asyncio.create_task(response.aclose())
+    task.add_done_callback(_retrieve_task)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # cleanup 任务继续执行；调用方会把取消继续抛给 lease 释放路径。
+        raise
+    except Exception:
+        # 关闭失败不能掩盖稳定的 HTTP 错误语义；连接由底层池丢弃。
+        pass
 
 
 def _serialize_payload(payload: object) -> bytes:
@@ -94,53 +142,111 @@ class GatewayClient:
         self._http = http_client
         self._clock = clock
 
+    _FORWARD_HEADERS = frozenset({
+        "range", "if-range", "if-none-match", "if-modified-since",
+    })
+
     async def request(self, handle: WorkerHandle, method: str, path: str, *,
                       query: Mapping[str, str]
                       | Iterable[tuple[str, str]] | None = None,
-                      payload: object | None = None) -> httpx.Response:
+                      payload: object | None = None,
+                      body: bytes | None = None,
+                      content_type: str | None = None,
+                      headers: Mapping[str, str] | None = None,
+                      stream: bool = False,
+                      status_mode: str = "relay") -> httpx.Response:
+        """签名一次固定 worker 请求。
+
+        ``payload`` 走 JSON；``body`` 用于 multipart/原始字节，两者互斥。
+        ``headers`` 仅允许条件请求白名单，不能借调用方注入身份或目标。
+        流式响应由调用方负责关闭。
+        """
         audience = self._audience(handle)
         normalized_method = method.upper() if isinstance(method, str) else ""
-        if normalized_method not in ("GET", "POST"):
+        if normalized_method not in ("GET", "POST", "PUT", "DELETE", "HEAD"):
             raise DomainError("invalid_request", 400)
         if not isinstance(path, str) or not path.startswith("/") \
                 or "?" in path or "#" in path or "\\" in path:
             raise DomainError("invalid_request", 400)
+        if payload is not None and body is not None:
+            raise DomainError("invalid_request", 400)
+        if status_mode not in ("relay", "workspace"):
+            raise DomainError("invalid_request", 400)
         query_text = canonical_query({} if query is None else query)
-        body = b"" if payload is None else _serialize_payload(payload)
+        if body is not None:
+            if not isinstance(body, (bytes, bytearray, memoryview)):
+                raise DomainError("invalid_request", 400)
+            body_bytes = bytes(body)
+        elif payload is not None:
+            body_bytes = _serialize_payload(payload)
+        else:
+            body_bytes = b""
+        extras = self._forward_headers(headers)
+        if content_type is not None:
+            if (not isinstance(content_type, str) or not content_type
+                    or not content_type.isascii()
+                    or any(ord(character) < 32 or ord(character) == 127
+                           for character in content_type)):
+                raise DomainError("invalid_request", 400)
         try:
             assertion = build_gateway_assertion_headers(
                 self._key, audience, method=normalized_method, path=path,
-                query=query, body=body, clock=self._clock)
+                query=query, body=body_bytes, clock=self._clock)
         except (ValueError, GatewayError):
             raise DomainError("invalid_request", 400) from None
         upstream = self._origin(handle.gateway_upstream)
         url = upstream + path
         if query_text:
             url += "?" + query_text
-        headers = dict(assertion)
-        if body:
-            headers["Content-Type"] = "application/json"
+        request_headers = dict(assertion)
+        if body_bytes:
+            default_type = "application/json" if payload is not None else None
+            selected_type = content_type or default_type
+            if selected_type:
+                request_headers["Content-Type"] = selected_type
+        request_headers.update(extras)
         try:
             request = self._http.build_request(
-                normalized_method, url, headers=headers, content=body)
+                normalized_method, url, headers=request_headers,
+                content=body_bytes)
             # build_request 会合并 client 默认 params/headers/cookies/auth；
             # 最终 Request 必须精确恢复到已签名 URL 与最小头集合。
             request.url = httpx.URL(url)
-            self._clean_headers(request, assertion)
+            self._clean_headers(request, assertion, extras)
             response = await self._http.send(
-                request, auth=no_client_auth(), follow_redirects=False)
+                request, auth=no_client_auth(), follow_redirects=False,
+                stream=stream)
         except DomainError:
             raise
         except httpx.HTTPError:
             raise DomainError(
                 "worker_gateway_unavailable", 503,
                 retry_after=5) from None
-        if 300 <= response.status_code < 400:
+        if 300 <= response.status_code < 400 \
+                and response.status_code != 304:
             await response.aclose()
             raise DomainError("upstream_redirect", 502)
         if response.status_code >= 400:
-            await self._raise_for_status(response)
+            await self._raise_for_status(response, status_mode)
         return response
+
+    @classmethod
+    def _forward_headers(cls, headers: Mapping[str, str] | None
+                         ) -> dict[str, str]:
+        if headers is None:
+            return {}
+        if not isinstance(headers, Mapping):
+            raise DomainError("invalid_request", 400)
+        result: dict[str, str] = {}
+        for name, value in headers.items():
+            if (not isinstance(name, str) or name.lower() not in cls._FORWARD_HEADERS
+                    or not isinstance(value, str) or not value
+                    or len(value) > 4096
+                    or any(ord(character) < 32 or ord(character) == 127
+                           for character in value)):
+                raise DomainError("invalid_request", 400)
+            result[name] = value
+        return result
 
     async def health(self, handle: WorkerHandle) -> bool:
         """经固定 lifecycle 路由确认 gateway 确实能到达同一 worker。"""
@@ -201,12 +307,14 @@ class GatewayClient:
 
     @staticmethod
     def _clean_headers(request: httpx.Request,
-                       assertion: Mapping[str, str]) -> None:
+                       assertion: Mapping[str, str],
+                       extras: Mapping[str, str] | None = None) -> None:
         assert_header = next(iter(assertion))
         allowed = {assert_header.lower(), "host"}
         if (request.headers.get("content-length") not in (None, "0")
                 or request.headers.get("content-type") is not None):
             allowed.update({"content-type", "content-length"})
+        allowed.update(name.lower() for name in (extras or {}))
         for name in {key.lower() for key in request.headers}:
             if name not in allowed:
                 try:
@@ -214,16 +322,48 @@ class GatewayClient:
                 except KeyError:
                     pass
         request.headers[assert_header] = assertion[assert_header]
+        for name, value in (extras or {}).items():
+            request.headers[name] = value
         if "content-length" not in {key.lower() for key in request.headers} \
-                and request.method == "POST":
+                and request.method in ("POST", "PUT"):
             request.headers["Content-Length"] = str(
                 len(request.content or b""))
 
-    async def _raise_for_status(self, response: httpx.Response) -> None:
+    async def _raise_for_status(self, response: httpx.Response,
+                                status_mode: str = "relay") -> None:
         status = response.status_code
         retry_after = _retry_after(response)
-        gateway_error = _gateway_error(response)
-        await response.aclose()
+        gateway_error = ""
+        try:
+            # relay 的 401/403/503 仍需正文里的 gateway_* 码区分实例故障；
+            # stream=True 时先有界读取。workspace 业务错误只按状态映射，
+            # 不读取 worker 正文。
+            if status_mode == "relay" and status in (401, 403, 503):
+                gateway_error = await _read_gateway_error(response)
+        finally:
+            await _close_response(response)
+        if status_mode == "workspace":
+            # worker 业务错误保留可操作的状态语义；不把文件/上传失败伪装成
+            # gateway 故障，也不回显 worker 的原始 detail。
+            if status == 429:
+                raise DomainError("worker_gateway_busy", 429,
+                                  retry_after=retry_after or 1)
+            if status == 403:
+                raise DomainError("forbidden", 403)
+            if status == 404:
+                raise DomainError("not_found", 404)
+            if status == 409:
+                raise DomainError("conflict", 409)
+            if status == 413:
+                raise DomainError("payload_too_large", 413)
+            if status == 415:
+                raise DomainError("unsupported_media_type", 415)
+            if status in (400, 422):
+                raise DomainError("invalid_request", 400)
+            if status == 503:
+                raise DomainError("upstream_unavailable", 503,
+                                  retry_after=retry_after or 5)
+            raise DomainError("upstream_invalid", 502)
         if status == 429:
             raise DomainError(
                 "worker_gateway_busy", 429,

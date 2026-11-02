@@ -1,0 +1,21 @@
+﻿
+=================================== ERRORS ====================================
+_________ ERROR collecting tests/multiuser/test_workspace_accounts.py _________
+ImportError while importing test module 'C:\Code\Easel\.claude\worktrees\_baseline_5c2\tests\multiuser\test_workspace_accounts.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests\multiuser\test_workspace_accounts.py:20: in <module>
+    from easel.control.workspace_accounts import (
+E   ModuleNotFoundError: No module named 'easel.control.workspace_accounts'
+________ ERROR collecting tests/multiuser/test_worker_browser_tasks.py ________
+ImportError while importing test module 'C:\Code\Easel\.claude\worktrees\_baseline_5c2\tests\multiuser\test_worker_browser_tasks.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests\multiuser\test_worker_browser_tasks.py:15: in <module>
+    from easel.worker import browser_tasks
+E   ImportError: cannot import name 'browser_tasks' from 'easel.worker' (C:\Code\Easel\.claude\worktrees\_baseline_5c2\easel\worker\__init__.py)
+=========================== short test summary info ===========================
+ERROR tests/multiuser/test_workspace_accounts.py
+ERROR tests/multiuser/test_worker_browser_tasks.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!
+2 errors in 1.35s

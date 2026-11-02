@@ -1,0 +1,5 @@
+BROWSER_VERSION 151.0.7922.34
+TASK5B_BROWSER_RESULTS {'workbench_flow': True, 'identity_isolation': True, 'member_no_accounts': True, 'dark_mobile': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05b\\browser\\01-dashboard-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\02-trends-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\03-ideas-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\04-calendar-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\05-topic-draft-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\06-identity-b.png', 'docs\\evidence\\original-web-task-05b\\browser\\07-accounts-unavailable.png', 'docs\\evidence\\original-web-task-05b\\browser\\08-dashboard-dark.png', 'docs\\evidence\\original-web-task-05b\\browser\\09-dashboard-mobile.png']
+TASK5B_BROWSER_OK True

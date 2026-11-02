@@ -1,0 +1,501 @@
+﻿........................................................................ [ 92%]
+.FF.F.                                                                   [100%]
+================================== FAILURES ===================================
+__________ test_duplicate_stream_request_preserves_original_turn_log __________
+
+request = <starlette.middleware.base._CachedRequest object at 0x000001CEE2B7F8B0>
+
+    async def call_next(request: Request) -> Response:
+        async def receive_or_disconnect() -> Message:
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            async with anyio.create_task_group() as task_group:
+    
+                async def wrap(func: Callable[[], Awaitable[T]]) -> T:
+                    result = await func()
+                    task_group.cancel_scope.cancel()
+                    return result
+    
+                task_group.start_soon(wrap, response_sent.wait)
+                message = await wrap(wrapped_receive)
+    
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            return message
+    
+        async def send_no_error(message: Message) -> None:
+            try:
+                await send_stream.send(message)
+            except anyio.BrokenResourceError:
+                # recv_stream has been closed, i.e. response_sent has been set.
+                return
+    
+        async def coro() -> None:
+            nonlocal app_exc
+    
+            with send_stream:
+                try:
+                    await self.app(scope, receive_or_disconnect, send_no_error)
+                except Exception as exc:
+                    app_exc = exc
+    
+        task_group.start_soon(coro)
+    
+        try:
+>           message = await recv_stream.receive()
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = MemoryObjectReceiveStream(_state=_MemoryObjectStreamState(max_buffer_size=0, buffer=deque([]), open_send_channels=0, open_receive_channels=0, waiting_receivers=OrderedDict(), waiting_senders=OrderedDict()), _closed=True)
+
+    async def receive(self) -> T_co:
+        await checkpoint()
+        try:
+            return self.receive_nowait()
+        except WouldBlock:
+            # Add ourselves in the queue
+            receive_event = Event()
+            receiver = _MemoryObjectItemReceiver[T_co]()
+            self._state.waiting_receivers[receive_event] = receiver
+    
+            try:
+                await receive_event.wait()
+            finally:
+                self._state.waiting_receivers.pop(receive_event, None)
+    
+            try:
+                return receiver.item
+            except AttributeError:
+>               raise EndOfStream from None
+E               anyio.EndOfStream
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\streams\memory.py:132: EndOfStream
+
+The above exception was the direct cause of the following exception:
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4081/test_duplicate_stream_request_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001CEE2B8BC10>
+
+    def test_duplicate_stream_request_preserves_original_turn_log(
+            tmp_path, monkeypatch):
+        install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+        fake = install_fake_adapter(monkeypatch)
+    
+        with worker_client() as client:
+>           first = stream_chat(client, "stream-session", "turn-stream-1")
+
+tests\multiuser\test_worker_execution_gate.py:206: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\multiuser\test_worker_execution_gate.py:104: in stream_chat
+    return client.post("/api/chat/stream", headers=HEADERS,
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:556: in post
+    return super().post(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1204: in post
+    return self.request(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:455: in request
+    return super().request(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:797: in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:980: in send
+    response = self._send_handling_auth(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1008: in _send_handling_auth
+    response = self._send_handling_redirects(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1043: in _send_handling_redirects
+    response = self._send_single_request(request)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1076: in _send_single_request
+    response = transport.handle_request(request)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:354: in handle_request
+    raise exc
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:351: in handle_request
+    portal.call(self.app, scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:334: in call
+    return cast(T_Retval, self.start_task_soon(func, *args).result())
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:458: in result
+    return self.__get_result()
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:403: in __get_result
+    raise self._exception
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:259: in _call_func
+    retval = await retval_or_awaitable
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\applications.py:1159: in __call__
+    await super().__call__(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\applications.py:96: in __call__
+    await self.middleware_stack(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py:186: in __call__
+    raise exc
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py:164: in __call__
+    await self.app(scope, receive, _send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:193: in __call__
+    response = await self.dispatch_func(request, call_next)
+web\app.py:1045: in local_write_guard
+    return await call_next(request)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+request = <starlette.middleware.base._CachedRequest object at 0x000001CEE2B7F8B0>
+
+    async def call_next(request: Request) -> Response:
+        async def receive_or_disconnect() -> Message:
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            async with anyio.create_task_group() as task_group:
+    
+                async def wrap(func: Callable[[], Awaitable[T]]) -> T:
+                    result = await func()
+                    task_group.cancel_scope.cancel()
+                    return result
+    
+                task_group.start_soon(wrap, response_sent.wait)
+                message = await wrap(wrapped_receive)
+    
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            return message
+    
+        async def send_no_error(message: Message) -> None:
+            try:
+                await send_stream.send(message)
+            except anyio.BrokenResourceError:
+                # recv_stream has been closed, i.e. response_sent has been set.
+                return
+    
+        async def coro() -> None:
+            nonlocal app_exc
+    
+            with send_stream:
+                try:
+                    await self.app(scope, receive_or_disconnect, send_no_error)
+                except Exception as exc:
+                    app_exc = exc
+    
+        task_group.start_soon(coro)
+    
+        try:
+            message = await recv_stream.receive()
+            info = message.get("info", None)
+            if message["type"] == "http.response.debug" and info is not None:
+                message = await recv_stream.receive()
+        except anyio.EndOfStream:
+            if app_exc is not None:
+                nonlocal exception_already_raised
+                exception_already_raised = True
+                # Prevent `anyio.EndOfStream` from polluting app exception context.
+                # If both cause and context are None then the context is suppressed
+                # and `anyio.EndOfStream` is not present in the exception traceback.
+                # If exception cause is not None then it is propagated with
+                # reraising here.
+                # If exception has no cause but has context set then the context is
+                # propagated as a cause with the reraise. This is necessary in order
+                # to prevent `anyio.EndOfStream` from polluting the exception
+                # context.
+                raise app_exc from app_exc.__cause__ or app_exc.__context__
+>           raise RuntimeError("No response returned.")
+E           RuntimeError: No response returned.
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:169: RuntimeError
+______ test_in_flight_duplicate_stream_does_not_corrupt_original_events _______
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4081/test_in_flight_duplicate_strea0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001CEE2FB5C60>
+
+    def test_in_flight_duplicate_stream_does_not_corrupt_original_events(
+            tmp_path, monkeypatch):
+        install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+        fake = install_fake_adapter(monkeypatch)
+        started = threading.Event()
+        release = threading.Event()
+    
+        async def hold():
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.02)
+    
+        fake.on_run = hold
+>       with worker_client() as first_client, worker_client() as second_client:
+
+tests\multiuser\test_worker_execution_gate.py:241: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:709: in __exit__
+    self.exit_stack.close()
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:584: in close
+    self.__exit__(None, None, None)
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:576: in __exit__
+    raise exc_details[1]
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:153: in __exit__
+    self.gen.throw(typ, value, traceback)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:546: in start_blocking_portal
+    yield portal
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:561: in __exit__
+    if cb(*exc_details):
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:449: in _exit_wrapper
+    callback(*args, **kwds)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:702: in wait_shutdown
+    portal.call(self.wait_shutdown)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:334: in call
+    return cast(T_Retval, self.start_task_soon(func, *args).result())
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:458: in result
+    return self.__get_result()
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:403: in __get_result
+    raise self._exception
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:259: in _call_func
+    retval = await retval_or_awaitable
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:749: in wait_shutdown
+    await receive()
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:739: in receive
+    self.task.result()
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:451: in result
+    return self.__get_result()
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:403: in __get_result
+    raise self._exception
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:259: in _call_func
+    retval = await retval_or_awaitable
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:714: in lifespan
+    await self.app(scope, self.stream_receive.receive, self.stream_send.send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\applications.py:1159: in __call__
+    await super().__call__(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\applications.py:96: in __call__
+    await self.middleware_stack(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py:151: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:103: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\trustedhost.py:36: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\cors.py:80: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\exceptions.py:49: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\middleware\asyncexitstack.py:18: in __call__
+    await self.app(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py:670: in __call__
+    await self.middleware_stack(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py:679: in app
+    await self.lifespan(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\routing.py:648: in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+C:\Users\hyh\anaconda3\envs\Agent\lib\contextlib.py:206: in __aexit__
+    await anext(self.gen)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+_app = <fastapi.applications.FastAPI object at 0x000001CEE1FD7E80>
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
+        global _HARNESS_LOOP
+        _HARNESS_LOOP = asyncio.get_running_loop()
+        yield
+        tasks = list(_HARNESS_TASKS)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+>           await asyncio.gather(*tasks, return_exceptions=True)
+E           RuntimeError: Task <Task pending name='anyio.from_thread.BlockingPortal._call_func' coro=<BlockingPortal._call_func() running at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:259> cb=[TaskGroup._spawn.<locals>.task_done() at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\_backends\_asyncio.py:805]> got Future <_GatheringFuture pending> attached to a different loop
+
+web\app.py:945: RuntimeError
+_____ test_legal_first_request_executes_once_without_double_claim[stream] _____
+
+request = <starlette.middleware.base._CachedRequest object at 0x000001CEE3047CD0>
+
+    async def call_next(request: Request) -> Response:
+        async def receive_or_disconnect() -> Message:
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            async with anyio.create_task_group() as task_group:
+    
+                async def wrap(func: Callable[[], Awaitable[T]]) -> T:
+                    result = await func()
+                    task_group.cancel_scope.cancel()
+                    return result
+    
+                task_group.start_soon(wrap, response_sent.wait)
+                message = await wrap(wrapped_receive)
+    
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            return message
+    
+        async def send_no_error(message: Message) -> None:
+            try:
+                await send_stream.send(message)
+            except anyio.BrokenResourceError:
+                # recv_stream has been closed, i.e. response_sent has been set.
+                return
+    
+        async def coro() -> None:
+            nonlocal app_exc
+    
+            with send_stream:
+                try:
+                    await self.app(scope, receive_or_disconnect, send_no_error)
+                except Exception as exc:
+                    app_exc = exc
+    
+        task_group.start_soon(coro)
+    
+        try:
+>           message = await recv_stream.receive()
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = MemoryObjectReceiveStream(_state=_MemoryObjectStreamState(max_buffer_size=0, buffer=deque([]), open_send_channels=0, open_receive_channels=0, waiting_receivers=OrderedDict(), waiting_senders=OrderedDict()), _closed=True)
+
+    async def receive(self) -> T_co:
+        await checkpoint()
+        try:
+            return self.receive_nowait()
+        except WouldBlock:
+            # Add ourselves in the queue
+            receive_event = Event()
+            receiver = _MemoryObjectItemReceiver[T_co]()
+            self._state.waiting_receivers[receive_event] = receiver
+    
+            try:
+                await receive_event.wait()
+            finally:
+                self._state.waiting_receivers.pop(receive_event, None)
+    
+            try:
+                return receiver.item
+            except AttributeError:
+>               raise EndOfStream from None
+E               anyio.EndOfStream
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\streams\memory.py:132: EndOfStream
+
+The above exception was the direct cause of the following exception:
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4081/test_legal_first_request_execu0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001CEE2C9BF70>
+entry = 'stream'
+
+    @pytest.mark.parametrize("entry", ["stream", "chat"])
+    def test_legal_first_request_executes_once_without_double_claim(
+            tmp_path, monkeypatch, entry):
+        install_worker(tmp_path, monkeypatch, expires_at=int(time.time()) + 3600)
+        fake = install_fake_adapter(monkeypatch)
+    
+        with worker_client() as client:
+            if entry == "stream":
+>               response = stream_chat(client, "legal-stream", "turn-legal")
+
+tests\multiuser\test_worker_execution_gate.py:289: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\multiuser\test_worker_execution_gate.py:104: in stream_chat
+    return client.post("/api/chat/stream", headers=HEADERS,
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:556: in post
+    return super().post(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1204: in post
+    return self.request(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:455: in request
+    return super().request(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:797: in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:980: in send
+    response = self._send_handling_auth(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1008: in _send_handling_auth
+    response = self._send_handling_redirects(
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1043: in _send_handling_redirects
+    response = self._send_single_request(request)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\httpx2\_client.py:1076: in _send_single_request
+    response = transport.handle_request(request)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:354: in handle_request
+    raise exc
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\testclient.py:351: in handle_request
+    portal.call(self.app, scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:334: in call
+    return cast(T_Retval, self.start_task_soon(func, *args).result())
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:458: in result
+    return self.__get_result()
+C:\Users\hyh\anaconda3\envs\Agent\lib\concurrent\futures\_base.py:403: in __get_result
+    raise self._exception
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\anyio\from_thread.py:259: in _call_func
+    retval = await retval_or_awaitable
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\fastapi\applications.py:1159: in __call__
+    await super().__call__(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\applications.py:96: in __call__
+    await self.middleware_stack(scope, receive, send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py:186: in __call__
+    raise exc
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\errors.py:164: in __call__
+    await self.app(scope, receive, _send)
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:193: in __call__
+    response = await self.dispatch_func(request, call_next)
+web\app.py:1045: in local_write_guard
+    return await call_next(request)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+request = <starlette.middleware.base._CachedRequest object at 0x000001CEE3047CD0>
+
+    async def call_next(request: Request) -> Response:
+        async def receive_or_disconnect() -> Message:
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            async with anyio.create_task_group() as task_group:
+    
+                async def wrap(func: Callable[[], Awaitable[T]]) -> T:
+                    result = await func()
+                    task_group.cancel_scope.cancel()
+                    return result
+    
+                task_group.start_soon(wrap, response_sent.wait)
+                message = await wrap(wrapped_receive)
+    
+            if response_sent.is_set():
+                return {"type": "http.disconnect"}
+    
+            return message
+    
+        async def send_no_error(message: Message) -> None:
+            try:
+                await send_stream.send(message)
+            except anyio.BrokenResourceError:
+                # recv_stream has been closed, i.e. response_sent has been set.
+                return
+    
+        async def coro() -> None:
+            nonlocal app_exc
+    
+            with send_stream:
+                try:
+                    await self.app(scope, receive_or_disconnect, send_no_error)
+                except Exception as exc:
+                    app_exc = exc
+    
+        task_group.start_soon(coro)
+    
+        try:
+            message = await recv_stream.receive()
+            info = message.get("info", None)
+            if message["type"] == "http.response.debug" and info is not None:
+                message = await recv_stream.receive()
+        except anyio.EndOfStream:
+            if app_exc is not None:
+                nonlocal exception_already_raised
+                exception_already_raised = True
+                # Prevent `anyio.EndOfStream` from polluting app exception context.
+                # If both cause and context are None then the context is suppressed
+                # and `anyio.EndOfStream` is not present in the exception traceback.
+                # If exception cause is not None then it is propagated with
+                # reraising here.
+                # If exception has no cause but has context set then the context is
+                # propagated as a cause with the reraise. This is necessary in order
+                # to prevent `anyio.EndOfStream` from polluting the exception
+                # context.
+                raise app_exc from app_exc.__cause__ or app_exc.__context__
+>           raise RuntimeError("No response returned.")
+E           RuntimeError: No response returned.
+
+C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\starlette\middleware\base.py:169: RuntimeError
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_worker_execution_gate.py::test_duplicate_stream_request_preserves_original_turn_log
+FAILED tests/multiuser/test_worker_execution_gate.py::test_in_flight_duplicate_stream_does_not_corrupt_original_events
+FAILED tests/multiuser/test_worker_execution_gate.py::test_legal_first_request_executes_once_without_double_claim[stream]
+3 failed, 75 passed in 15.00s

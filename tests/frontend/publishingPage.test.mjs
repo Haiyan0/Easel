@@ -23,6 +23,12 @@ function setup(responses = [automaticPolicy]) {
   let pending = [];
   let requests = 0;
   const createElement = (type, props) => ({ type, props });
+  const workspaceData = {
+    fetchPublishingPolicy() {
+      const response = responses[requests++];
+      return response instanceof Error ? Promise.reject(response) : Promise.resolve(response);
+    },
+  };
   const modules = {
     react: {
       useState(initial) {
@@ -44,11 +50,12 @@ function setup(responses = [automaticPolicy]) {
       },
     },
     'react/jsx-runtime': { jsx: createElement, jsxs: createElement },
-    '../lib/api': {
-      fetchPublishingPolicy() {
-        const response = responses[requests++];
-        return response instanceof Error ? Promise.reject(response) : Promise.resolve(response);
-      },
+    '../lib/workspaceDataContext': {
+      useWorkspaceData: () => workspaceData,
+    },
+    '../lib/workspaceData': {
+      workspaceErrorMessage: (error, fallback) =>
+        error instanceof Error && error.message ? error.message : fallback,
     },
     './PublishPage': { __esModule: true, default: 'automated-page' },
     './ManualPublishPage': { __esModule: true, default: 'manual-page' },

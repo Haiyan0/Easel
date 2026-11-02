@@ -1,19 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import {
-  fetchAccounts, startLogin, loginStatus, mediaUrl,
-  accountWhoami, logoutAccount, submitLoginSms,
-  saveCredentials, getCredentials, startMpLogin, mpLoginStatus,
-} from '../lib/api';
 import type { AccountItem, AccountWhoami } from '../lib/api';
-import { getWhoamiCache, setWhoamiCache, verifyStale } from '../lib/whoami';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { isIdentityExpired, workspaceErrorMessage } from '../lib/workspaceData';
 
 type QRState = {
   platform: string;
   name: string;
+  mp: boolean;
   state: string;       // starting | qr_ready | success | expired | error | unknown
   message: string;
   qr: string;          // outputs 相对路径
+  qrUrl?: string;      // 已审媒体入口（control 专用）
   qrTs?: number;       // 二维码文件 mtime，作 img 缓存键：码刷新一次就变，避免看到过期旧码
+  runId?: string;
 };
 
 const STATE_LABEL: Record<string, string> = {
@@ -28,6 +27,24 @@ const STATE_LABEL: Record<string, string> = {
   unknown: '等待中…',
 };
 
+function newRequestId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** 轮询连续失败：503 保留服务语义，其余按连接中断处理，不无限吞错。 */
+function loginPollError(error: unknown): string {
+  const status = error && typeof error === 'object'
+    ? (error as { status?: unknown }).status : undefined;
+  if (status === 503) return '登录状态服务暂不可用（503），请稍后重试';
+  if (status === 401) return '登录已失效，请重新登录。';
+  return '登录状态连接中断，请检查网络后重新登录';
+}
+
 /** 头像：有 URL 就显示图（加载失败退回首字），否则显示昵称/平台名首字。 */
 function Avatar({ url, name }: { url?: string; name: string }) {
   const [broken, setBroken] = useState('');
@@ -40,6 +57,10 @@ function Avatar({ url, name }: { url?: string; name: string }) {
 }
 
 export default function AccountsPage() {
+  const data = useWorkspaceData();
+  const expireIfNeeded = useCallback((error: unknown) => {
+    if (isIdentityExpired(error)) data.expireIdentity?.();
+  }, [data]);
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [err, setErr] = useState('');
   const [qr, setQr] = useState<QRState | null>(null);
@@ -50,17 +71,21 @@ export default function AccountsPage() {
   const [smsCode, setSmsCode] = useState('');
   const [smsBusy, setSmsBusy] = useState(false);
   const [smsErr, setSmsErr] = useState('');
-  // whoami 结果缓存到 localStorage：打开页面秒显示昵称/头像，不必每次都起浏览器校验
-  const [whoami, setWhoami] = useState<Record<string, AccountWhoami | 'loading'>>(() => getWhoamiCache());
+  // whoami 结果：local 持久化到 localStorage；control 由适配器按身份内存隔离。
+  const [whoami, setWhoami] = useState<Record<string, AccountWhoami | 'loading'>>(
+    () => data.whoami.get());
   // 凭证式登录（微信公众号 AppID/AppSecret）
   const [cred, setCred] = useState<{ platform: string; name: string } | null>(null);
   const [credForm, setCredForm] = useState({ appId: '', appSecret: '', author: '' });
   const [credBusy, setCredBusy] = useState(false);
   const [credMsg, setCredMsg] = useState('');
   const [credErr, setCredErr] = useState('');
+  const [stopBusy, setStopBusy] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const aliveRef = useRef(true);
   const qrPlatformRef = useRef('');   // 当前登录中的平台，供 submitSms 稳定引用
+  const qrRunRef = useRef('');
+  const qrKindRef = useRef(false);
   const whoamiRequests = useRef<Record<string, number>>({});
   const qrRequest = useRef(0);
 
@@ -74,43 +99,42 @@ export default function AccountsPage() {
     const sequence = (whoamiRequests.current[platform] || 0) + 1;
     whoamiRequests.current[platform] = sequence;
     setWhoami((w) => ({ ...w, [platform]: 'loading' }));
-    accountWhoami(platform, true)
+    data.accountWhoami(platform, true)
       .then((r) => {
         if (aliveRef.current && whoamiRequests.current[platform] === sequence) {
           setWhoami((w) => ({ ...w, [platform]: r }));
-          setWhoamiCache(platform, r);
+          data.whoami.set(platform, r);
           setAccounts((list) => list.map((account) =>
             account.platform === platform ? { ...account, loggedIn: r.loggedIn } : account));
         }
       })
-      .catch(() => {
+      .catch((e) => {
+        expireIfNeeded(e);
         if (aliveRef.current && whoamiRequests.current[platform] === sequence) {
           setWhoami((previous) => {
             const updated = { ...previous };
-            const cached = getWhoamiCache()[platform];
+            const cached = data.whoami.get()[platform];
             if (cached) updated[platform] = cached;
             else delete updated[platform];
             return updated;
           });
         }
       });
-  }, []);
+  }, [data, expireIfNeeded]);
 
   // 打开页面：拉「快」状态（读 status.json，不起浏览器），随后后台自愈——对缓存缺失/过期的
   // 浏览器平台逐个真校验（whoami），结果到了刷新 UI，并令陈旧的假阴性缓存被真值覆盖。
   const load = useCallback(() => {
     setErr('');
-    fetchAccounts()
+    data.fetchAccounts()
       .then((list) => {
         if (!aliveRef.current) return;
         setAccounts(list);
-        const targets = list
-          .filter((a) => a.supported && a.backend !== 'biliup')
-          .map((a) => a.platform);
+        const cache = data.whoami.get();
         for (const account of list) {
-          const cached = getWhoamiCache()[account.platform];
+          const cached = cache[account.platform];
           if (cached && cached.loggedIn !== account.loggedIn) {
-            setWhoamiCache(account.platform, null);
+            data.whoami.set(account.platform, null);
             setWhoami((previous) => {
               const updated = { ...previous };
               delete updated[account.platform];
@@ -118,7 +142,13 @@ export default function AccountsPage() {
             });
           }
         }
-        verifyStale(targets, {
+        // 页面加载只对有 last-known 登录态的前 N 个平台做后台自愈，避免
+        // 一次打开账号页就为全部平台同时起浏览器；其余由用户手动校验。
+        const targets = list
+          .filter((a) => a.supported && a.backend !== 'biliup' && a.loggedIn)
+          .slice(0, data.autoVerifyLimit)
+          .map((a) => a.platform);
+        data.whoami.verifyStale(targets, {
           alive: () => aliveRef.current,
           onUpdate: (platform, r) => {
             setWhoami((w) => ({ ...w, [platform]: r }));
@@ -127,8 +157,11 @@ export default function AccountsPage() {
           },
         });
       })
-      .catch(() => setErr('加载账号状态失败'));
-  }, []);
+      .catch((error) => {
+        expireIfNeeded(error);
+        setErr(workspaceErrorMessage(error, '加载账号状态失败'));
+      });
+  }, [data, expireIfNeeded]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -164,27 +197,30 @@ export default function AccountsPage() {
     if (code.length < 4) { setSmsErr('请输入手机收到的验证码'); return; }
     setSmsBusy(true); setSmsErr('');
     try {
-      await submitLoginSms(qrPlatformRef.current, code);
+      await data.submitLoginSms(
+        qrPlatformRef.current, code,
+        qrRunRef.current ? { runId: qrRunRef.current } : {});
       setSmsCode('');
       // 乐观切到「验证中」转圈：后端读走码→verifying；成功→success，失败→退回 sms_required 带错误
       setQr((prev) => prev && ({ ...prev, state: 'verifying', message: '正在验证验证码…' }));
       // 不停轮询：runner 读走验证码填码提交后，state 会转 success / 或退回 sms_required 重试
     } catch (e) {
-      setSmsErr(e instanceof Error ? e.message : '提交验证码失败');
+      expireIfNeeded(e);
+      setSmsErr(workspaceErrorMessage(e, '提交验证码失败'));
     } finally {
       setSmsBusy(false);
     }
-  }, [smsCode]);
+  }, [smsCode, data, expireIfNeeded]);
 
   // 凭证式（公众号）：打开 AppID/AppSecret 表单
   const openCred = useCallback((a: AccountItem) => {
     setCred({ platform: a.platform, name: a.name });
     setCredForm({ appId: '', appSecret: '', author: '' });
     setCredMsg(''); setCredErr('');
-    getCredentials(a.platform)
+    data.getCredentials(a.platform)
       .then((c) => { if (aliveRef.current && c.configured) setCredMsg(`已配置：AppID ${c.appIdMasked}`); })
       .catch(() => { /* 未配置，忽略 */ });
-  }, []);
+  }, [data]);
 
   const closeCred = useCallback(() => { setCred(null); setCredBusy(false); load(); }, [load]);
 
@@ -195,7 +231,9 @@ export default function AccountsPage() {
     if (!appId || !appSecret) { setCredErr('AppID 和 AppSecret 都要填'); return; }
     setCredBusy(true); setCredErr(''); setCredMsg('');
     try {
-      const r = await saveCredentials(cred.platform, { appId, appSecret, name: cred.name, author: credForm.author.trim() });
+      const r = await data.saveCredentials(cred.platform, {
+        appId, appSecret, name: cred.name, author: credForm.author.trim(),
+      });
       if (r.ok) {
         runWhoami(cred.platform);
         closeCred();
@@ -203,11 +241,12 @@ export default function AccountsPage() {
         setCredErr(r.message || '验证未通过');
       }
     } catch (e) {
-      setCredErr(e instanceof Error ? e.message : '保存失败');
+      expireIfNeeded(e);
+      setCredErr(workspaceErrorMessage(e, '保存失败'));
     } finally {
       setCredBusy(false);
     }
-  }, [cred, credForm, runWhoami, closeCred]);
+  }, [cred, credForm, runWhoami, closeCred, data, expireIfNeeded]);
 
   const handleLogin = useCallback(async (a: AccountItem) => {
     if (!a.supported) return;
@@ -216,16 +255,23 @@ export default function AccountsPage() {
     stopPoll();
     setErr('');
     whoamiRequests.current[a.platform] = (whoamiRequests.current[a.platform] || 0) + 1;
-    setWhoamiCache(a.platform, null);
+    data.whoami.set(a.platform, null);
     setTerminalMsg('');
     setBusy(a.platform);
+    // 新弹窗属于新的登录序列：旧停止请求即使还没回来，也不能让新弹窗
+    // 一直停留在“停止中…”。
+    setStopBusy(false);
     setSmsCode(''); setSmsErr('');
     qrPlatformRef.current = a.platform;
+    qrRunRef.current = '';
+    qrKindRef.current = false;
     setQrNonce((n) => n + 1);
-    setQr({ platform: a.platform, name: a.name, state: 'starting',
+    setQr({ platform: a.platform, name: a.name, mp: false, state: 'starting',
             message: '正在启动浏览器并准备二维码…', qr: '' });
     try {
-      const res = await startLogin(a.platform);
+      const res = await data.startLogin(a.platform, {
+        requestId: newRequestId(), restart: false,
+      });
       if (!aliveRef.current || qrRequest.current !== sequence) return;
       if (res.mode === 'terminal') {
         setQr(null);
@@ -233,8 +279,11 @@ export default function AccountsPage() {
         return;
       }
       if (res.mode === 'credentials') { setQr(null); openCred(a); return; }
-      setQr({ platform: a.platform, name: a.name, state: res.state || 'starting',
-              message: res.message || '', qr: res.qr || '', qrTs: res.qrTs });
+      qrRunRef.current = res.runId || '';
+      setQr({ platform: a.platform, name: a.name, mp: false,
+              state: res.state || 'starting', message: res.message || '',
+              qr: res.qr || '', qrUrl: res.qrUrl, qrTs: res.qrTs,
+              runId: res.runId });
       stopPoll();
       let polling = false;
       let finished = false;
@@ -246,46 +295,52 @@ export default function AccountsPage() {
           finished = true;
           stopPoll();
           setQr((previous) => previous && ({ ...previous, state: 'expired',
-            message: '登录等待超时，请关闭后重新登录', qr: '' }));
+            message: '登录等待超时，请关闭后重新登录', qr: '', qrUrl: '' }));
           return;
         }
         polling = true;
         try {
-          const s = await loginStatus(a.platform);
+          const s = await data.loginStatus(a.platform);
           if (!aliveRef.current || qrRequest.current !== sequence) return;
           failures = 0;
-          setQr((prev) => prev && ({ ...prev, state: s.state, message: s.message, qr: s.qr, qrTs: s.qrTs }));
+          qrRunRef.current = s.runId || qrRunRef.current;
+          setQr((prev) => prev && ({ ...prev, state: s.state,
+            message: s.message, qr: s.qr, qrUrl: s.qrUrl, qrTs: s.qrTs,
+            runId: s.runId || prev.runId }));
           if (['success', 'expired', 'error'].includes(s.state)) {
             finished = true;
             stopPoll();
             if (s.state === 'success') {
               setAccounts((list) => list.map((account) =>
                 account.platform === a.platform ? { ...account, loggedIn: true } : account));
-              setWhoamiCache(a.platform, null);
+              data.whoami.set(a.platform, null);
               runWhoami(a.platform);
             }
           }
-        } catch {
+        } catch (e) {
+          expireIfNeeded(e);
           if (!aliveRef.current || qrRequest.current !== sequence) return;
           failures += 1;
           if (failures >= 5) {
             finished = true;
             stopPoll();
             setQr((previous) => previous && ({ ...previous, state: 'error',
-              message: '登录状态连接中断，请检查网络后重新登录', qr: '' }));
+              message: loginPollError(e),
+              qr: '', qrUrl: '' }));
           }
         } finally {
           polling = false;
         }
       }, 1000);
     } catch (e) {
+      expireIfNeeded(e);
       if (!aliveRef.current || qrRequest.current !== sequence) return;
-      const message = e instanceof Error ? e.message : '启动登录失败';
-      setQr((previous) => previous && ({ ...previous, state: 'error', message, qr: '' }));
+      setQr((previous) => previous && ({ ...previous, state: 'error',
+        message: workspaceErrorMessage(e, '启动登录失败'), qr: '', qrUrl: '' }));
     } finally {
       if (aliveRef.current && qrRequest.current === sequence) setBusy('');
     }
-  }, [stopPoll, runWhoami, openCred]);
+  }, [stopPoll, runWhoami, openCred, data, expireIfNeeded]);
 
   // 公众号后台扫码登录（数据中心取数用，独立于 AppID 凭证）
   const handleMpLogin = useCallback(async (a: AccountItem) => {
@@ -293,15 +348,24 @@ export default function AccountsPage() {
     stopPoll();
     setErr('');
     setBusy(a.platform + ':mp');
+    setStopBusy(false);
     setSmsCode(''); setSmsErr('');
+    qrPlatformRef.current = a.platform;
+    qrRunRef.current = '';
+    qrKindRef.current = true;
     setQrNonce((n) => n + 1);
-    setQr({ platform: a.platform, name: a.name + ' · 后台取数', state: 'starting',
-            message: '正在启动浏览器并准备二维码…', qr: '' });
+    setQr({ platform: a.platform, name: a.name + ' · 后台取数', mp: true,
+            state: 'starting', message: '正在启动浏览器并准备二维码…', qr: '' });
     try {
-      const res = await startMpLogin(a.platform);
+      const res = await data.startMpLogin(a.platform, {
+        requestId: newRequestId(), restart: false,
+      });
       if (!aliveRef.current || qrRequest.current !== sequence) return;
-      setQr({ platform: a.platform, name: a.name + ' · 后台取数', state: res.state || 'starting',
-              message: res.message || '', qr: res.qr || '', qrTs: res.qrTs });
+      qrRunRef.current = res.runId || '';
+      setQr({ platform: a.platform, name: a.name + ' · 后台取数', mp: true,
+              state: res.state || 'starting', message: res.message || '',
+              qr: res.qr || '', qrUrl: res.qrUrl, qrTs: res.qrTs,
+              runId: res.runId });
       stopPoll();
       let polling = false;
       let finished = false;
@@ -313,15 +377,18 @@ export default function AccountsPage() {
           finished = true;
           stopPoll();
           setQr((previous) => previous && ({ ...previous, state: 'expired',
-            message: '登录等待超时，请关闭后重新登录', qr: '' }));
+            message: '登录等待超时，请关闭后重新登录', qr: '', qrUrl: '' }));
           return;
         }
         polling = true;
         try {
-          const s = await mpLoginStatus(a.platform);
+          const s = await data.mpLoginStatus(a.platform);
           if (!aliveRef.current || qrRequest.current !== sequence) return;
           failures = 0;
-          setQr((prev) => prev && ({ ...prev, state: s.state, message: s.message, qr: s.qr, qrTs: s.qrTs }));
+          qrRunRef.current = s.runId || qrRunRef.current;
+          setQr((prev) => prev && ({ ...prev, state: s.state,
+            message: s.message, qr: s.qr, qrUrl: s.qrUrl, qrTs: s.qrTs,
+            runId: s.runId || prev.runId }));
           if (['success', 'expired', 'error'].includes(s.state)) {
             finished = true;
             stopPoll();
@@ -330,49 +397,100 @@ export default function AccountsPage() {
               // 卡片瞬间变「已登录」，不必等 load() 那趟网络往返（后面 load() 再对账兜底）。
               setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: true } : x));
               setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
-              setWhoamiCache(a.platform, null);
+              data.whoami.set(a.platform, null);
               runWhoami(a.platform);
               load();
             }
           }
-        } catch {
+        } catch (e) {
+          expireIfNeeded(e);
           if (!aliveRef.current || qrRequest.current !== sequence) return;
           failures += 1;
           if (failures >= 5) {
             finished = true;
             stopPoll();
             setQr((previous) => previous && ({ ...previous, state: 'error',
-              message: '登录状态连接中断，请检查网络后重新登录', qr: '' }));
+              message: loginPollError(e),
+              qr: '', qrUrl: '' }));
           }
         } finally {
           polling = false;
         }
       }, 1000);
     } catch (e) {
+      expireIfNeeded(e);
       if (!aliveRef.current || qrRequest.current !== sequence) return;
-      const message = e instanceof Error ? e.message : '启动后台登录失败';
-      setQr((previous) => previous && ({ ...previous, state: 'error', message, qr: '' }));
+      setQr((previous) => previous && ({ ...previous, state: 'error',
+        message: workspaceErrorMessage(e, '启动后台登录失败'),
+        qr: '', qrUrl: '' }));
     } finally {
       if (aliveRef.current && qrRequest.current === sequence) setBusy('');
     }
-  }, [stopPoll, runWhoami, load]);
+  }, [stopPoll, runWhoami, load, data, expireIfNeeded]);
 
   const handleLogout = useCallback(async (a: AccountItem) => {
     if (!window.confirm(`确定退出「${a.name}」的登录？登录态将被清除，下次发布需重新扫码。`)) return;
     setLogoutBusy(a.platform);
     try {
-      await logoutAccount(a.platform);
+      await data.logoutAccount(a.platform);
       // 内存态立即翻未登录（同登录路径），不等 load() 回来
       setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: false } : x));
       setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
-      setWhoamiCache(a.platform, null);
+      data.whoami.set(a.platform, null);
       load();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : '退出登录失败');
+      expireIfNeeded(e);
+      setErr(workspaceErrorMessage(e, '退出登录失败'));
     } finally {
       setLogoutBusy('');
     }
-  }, [load]);
+  }, [load, data, expireIfNeeded]);
+
+  // 显式停止：终止本人当前登录 Run/浏览器；与「关闭弹窗」语义不同。
+  // 停止是异步请求；用户可能在它返回前关闭 A、打开 B。回包只能修改它
+  // 发起时那个弹窗（序列 + platform/mp/runId），不得覆盖新平台/新 Run。
+  const handleStopLogin = useCallback(async () => {
+    if (!qr) return;
+    const sequence = ++qrRequest.current;
+    const owner = {
+      platform: qr.platform, mp: qr.mp, runId: qr.runId || '',
+    };
+    stopPoll();
+    setStopBusy(true);
+    const isCurrent = () => aliveRef.current && qrRequest.current === sequence;
+    const owns = (previous: QRState | null) => Boolean(
+      previous
+      && previous.platform === owner.platform
+      && previous.mp === owner.mp
+      && (previous.runId || '') === owner.runId);
+    try {
+      const result = await data.stopLogin(owner.platform, {
+        mp: owner.mp, ...(owner.runId ? { runId: owner.runId } : {}),
+      });
+      if (!isCurrent()) return;
+      if (owner.runId && result.runId && result.runId !== owner.runId) return;
+      setQr((previous) => {
+        if (!previous || !owns(previous)) return previous;
+        return {
+          ...previous, state: 'error', message: '已停止登录',
+          qr: '', qrUrl: '',
+        };
+      });
+      data.whoami.set(owner.platform, null);
+      load();
+    } catch (e) {
+      if (!isCurrent()) return;
+      expireIfNeeded(e);
+      setQr((previous) => {
+        if (!previous || !owns(previous)) return previous;
+        return {
+          ...previous, message: workspaceErrorMessage(e, '停止登录失败'),
+        };
+      });
+    } finally {
+      if (isCurrent()) setStopBusy(false);
+    }
+  }, [qr, data, stopPoll, load, expireIfNeeded]);
 
   // 卡片真实登录态：whoami 权威（已返回则以它为准，自愈假阳性），否则用后端 last-known。
   const effLoggedIn = (a: AccountItem): boolean => {
@@ -424,6 +542,13 @@ export default function AccountsPage() {
                   <span className="account-nick">{info.name || '（已登录）'}</span>
                 </div>
               )}
+              {a.backend === 'wechat-oa' && (
+                <div className="account-card-note">
+                  后台扫码：{a.mpLoggedIn ? '已登录' : '未登录'}
+                  {' · '}
+                  AppID 凭证：{a.credentialConfigured ? '已配置' : '未配置'}
+                </div>
+              )}
               {!logged && (
                 <div className="account-card-note">{a.note ? a.note : `后端：${a.name}`}</div>
               )}
@@ -442,13 +567,26 @@ export default function AccountsPage() {
                       {logoutBusy === a.platform ? '退出中…' : '退出登录'}
                     </button>
                   </>
-                ) : (
-                  // 公众号与其它平台统一：都走扫码登录（公众号扫的是后台会话，用于发布+数据）
+                ) : a.backend === 'wechat-oa' ? null : (
                   <button
                     className={`btn btn-block ${a.supported ? 'btn-primary' : ''}`}
                     disabled={!a.supported || busy === a.platform || busy === a.platform + ':mp'}
-                    onClick={() => (a.backend === 'wechat-oa' ? handleMpLogin(a) : handleLogin(a))}>
+                    onClick={() => handleLogin(a)}>
                     {(busy === a.platform || busy === a.platform + ':mp') ? '启动中…' : '登录'}
+                  </button>
+                )}
+                {a.backend === 'wechat-oa' && (
+                  <button className="btn btn-sm btn-ghost" style={{ flex: 1 }}
+                    disabled={busy === a.platform + ':mp'}
+                    onClick={() => handleMpLogin(a)}>
+                    后台扫码
+                  </button>
+                )}
+                {a.backend === 'wechat-oa' && (
+                  <button className="btn btn-sm btn-ghost" style={{ flex: 1 }}
+                    disabled={busy === a.platform + ':mp'}
+                    onClick={() => openCred(a)}>
+                    凭证配置
                   </button>
                 )}
               </div>
@@ -489,7 +627,9 @@ export default function AccountsPage() {
                 </button>
               </div>
             ) : qr.state === 'qr_ready' && qr.qr ? (
-              <img className="qr-img" src={`${mediaUrl(qr.qr)}?v=${qr.qrTs || qrNonce}`} alt="登录二维码" />
+              <img className="qr-img"
+                src={`${qr.qrUrl || data.accountQrUrl(qr.platform, qr.mp)}?v=${qr.qrTs || qrNonce}`}
+                alt="登录二维码" />
             ) : qr.state === 'scanned' ? (
               <div className="loading" style={{ padding: 40 }}><div className="spinner" />
                 {qr.message || '扫码成功，请在手机上确认登录，正在等待平台验证…'}
@@ -505,9 +645,24 @@ export default function AccountsPage() {
             ) : (
               <div className="loading" style={{ padding: 40 }}><div className="spinner" />准备二维码…</div>
             )}
-            <div style={{ marginTop: 16 }}>
+            <div style={{ marginTop: 16, display: 'flex', gap: 8, justifyContent: 'center' }}>
+              {data.loginStopEnabled
+                && ['starting', 'qr_ready', 'scanned', 'sms_required', 'verifying']
+                  .includes(qr.state) && (
+                  <button className="btn btn-ghost" disabled={stopBusy}
+                    onClick={handleStopLogin}>
+                    {stopBusy ? '停止中…' : '停止登录'}
+                  </button>
+                )}
               <button className="btn" onClick={closeQr}>{qr.state === 'success' ? '完成' : '关闭'}</button>
             </div>
+            {data.loginStopEnabled
+              && ['starting', 'qr_ready', 'scanned', 'sms_required', 'verifying']
+                .includes(qr.state) && (
+              <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>
+                关闭窗口不会停止登录任务；如需终止浏览器，请点「停止登录」。
+              </div>
+            )}
           </div>
         </div>
       )}

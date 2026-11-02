@@ -1,0 +1,20 @@
+DIRECTORY_LINK_KIND=junction
+CONTROL_NAME_ACCEPTED=True
+python.exe : Traceback (most recent call last):
+At line:1 char:820
++ ... TEXITCODE"; & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' 'C:\Code ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+  File "C:\Code\Easel\docs\evidence\original-web-task-05a-review\probe_persona_links.py", line 77, in <module>
+    main()
+  File "C:\Code\Easel\docs\evidence\original-web-task-05a-review\probe_persona_links.py", line 50, in main
+    detail = asyncio.run(worker.api_persona('public-profile'))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 1786, in api_persona
+    raise HTTPException(404, "画像不存在")
+fastapi.exceptions.HTTPException: 404: 画像不存在

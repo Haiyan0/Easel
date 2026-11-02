@@ -1,0 +1,144 @@
+﻿✔ old identity cannot commit after switch, including same-user relogin (2.2766ms)
+✔ write requests add in-memory CSRF and same-origin credentials (1.1111ms)
+✔ a stale epoch 401 cannot invalidate the newly logged-in identity (1.342ms)
+✔ 403 and 503 keep explicit status, never fall back to local (0.9817ms)
+✔ identity cache keys are scoped by user, workspace and name (0.7636ms)
+✔ loadIdentity distinguishes anonymous, unavailable and valid (1.0537ms)
+✔ invite exchange clears neither token to storage and errors stay typed (1.1035ms)
+✔ login errors keep 401/429/503/network semantics (1.1761ms)
+✖ raw identity fetch exposes 202 while preserving CSRF and 401 ownership (1.1722ms)
+✖ identity cache clearing removes only the captured identity keys (1.1095ms)
+✔ logout uses the captured CSRF and reports remote failure (0.8805ms)
+✔ runtime mode fails closed on unknown or unavailable startup info (1.3836ms)
+✔ 202 admission is parsed; other statuses and malformed bodies fail (1.1312ms)
+✔ SSE frames split across chunks and CRLF are parsed without loss (0.6394ms)
+✔ question payloads support double JSON encoding and opaque values (0.4008ms)
+✔ recovery only streams active runs and never re-submits prompts (0.3275ms)
+✔ session, run and message pages validate shape and pagination (0.4972ms)
+✔ local session history still reads, continues and deletes in isolation (25.9764ms)
+✔ older message windows exactly cover the unloaded interval (0.3224ms)
+✔ terminal states are explicit and do not depend on a done event name (0.1957ms)
+✔ parsers keep provenance fields and reject malformed payloads (2.0796ms)
+✔ route builders send raw snake_case protocol and omit an empty secret (0.873ms)
+✔ form conversion never reads a secret back from public settings (0.3335ms)
+✔ personal settings load provenance and save an empty key without secret (49.1263ms)
+✔ personal complete route sends a newly typed key and never stores it (21.2152ms)
+✔ a stale A settings response cannot fill the B form (21.1335ms)
+✔ managed-model form edits only personal raw values and keeps following (12.5575ms)
+✔ explicit managed model is preserved even when equal to the default (11.8527ms)
+✔ multi-field provider sends a typed bundle and never reads secrets back (11.5126ms)
+✔ multi-field credentials reject partial input and allow all blank reuse (10.2579ms)
+✔ admin member and invite pages can load later rows (23.3607ms)
+✔ stale invite load-more cannot override a create refresh or cursor (16.1695ms)
+✔ stale invite load-more cannot override a revoke refresh (13.7427ms)
+✔ stale invite failure and finally cannot disturb a newer page request (13.2243ms)
+✔ full reload invalidates an in-flight invite page and its loading state (12.2564ms)
+✔ member never renders admin write controls or calls admin APIs (14.0833ms)
+✔ admin default conflict keeps the form and warns without overwriting (11.3506ms)
+✔ admin member and invite actions use exact protocol without leaking tokens (12.8093ms)
+✔ admin member management still loads when managed config is unavailable (11.2742ms)
+✔ admin page refuses a non-admin even if mounted by mistake (14.2256ms)
+node:fs:439
+    return binding.readFileUtf8(path, stringToFlags(options.flag));
+                   ^
+
+Error: ENOENT: no such file or directory, open 'C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\frontend\src\lib\workspaceClient.ts'
+    at readFileSync (node:fs:439:20)
+    at file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/personaSession.test.mjs:40:25
+    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+  errno: -4058,
+  code: 'ENOENT',
+  syscall: 'open',
+  path: 'C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\web\\frontend\\src\\lib\\workspaceClient.ts'
+}
+
+Node.js v24.13.0
+✖ tests\frontend\personaSession.test.mjs (258.0324ms)
+✔ approval cards preserve long multiline commands and both permission choices (5.7148ms)
+✖ control options carry opaque values while showing human labels (0.9768ms)
+✔ approval card grids can shrink and wrap commands without clipping their content (0.8705ms)
+✔ loading without the obsolete reset marker preserves existing conversation history and recovery (2.2825ms)
+✔ local history tolerates shared workspace view fields without identity storage (0.9888ms)
+✔ legacy conversation history migrates rather than being deleted on first load (0.6825ms)
+node:fs:439
+    return binding.readFileUtf8(path, stringToFlags(options.flag));
+                   ^
+
+Error: ENOENT: no such file or directory, open 'C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\frontend\src\lib\workspaceClient.ts'
+    at readFileSync (node:fs:439:20)
+    at transpile (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/workspaceClient.test.mjs:11:18)
+    at file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/workspaceClient.test.mjs:24:24
+    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+  errno: -4058,
+  code: 'ENOENT',
+  syscall: 'open',
+  path: 'C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\web\\frontend\\src\\lib\\workspaceClient.ts'
+}
+
+Node.js v24.13.0
+✖ tests\frontend\workspaceClient.test.mjs (290.0422ms)
+ℹ tests 48
+ℹ suites 0
+ℹ pass 43
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 577.129
+
+✖ failing tests:
+
+test at tests\frontend\multiuserAuth.test.mjs:232:1
+✖ raw identity fetch exposes 202 while preserving CSRF and 401 ownership (1.1722ms)
+  TypeError: auth.identityFetchRaw is not a function
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserAuth.test.mjs:240:31)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7)
+
+test at tests\frontend\multiuserAuth.test.mjs:270:1
+✖ identity cache clearing removes only the captured identity keys (1.1095ms)
+  TypeError: auth.clearIdentityCache is not a function
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/multiuserAuth.test.mjs:289:8)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7)
+
+test at tests\frontend\personaSession.test.mjs:1:1
+✖ tests\frontend\personaSession.test.mjs (258.0324ms)
+  'test failed'
+
+test at tests\frontend\questionCards.test.mjs:54:1
+✖ control options carry opaque values while showing human labels (0.9768ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /data-value="qopt_allow"/. Input:
+
+  '<div class="message-row assistant"><div class="msg-col assistant" style="max-width:80%"><div class="question-card"><div class="question-card__item"><div class="question-card__chip">授权</div><div class="question-card__title">允许？</div><div class="question-card__options"><button class="question-card__option"><strong>允许本次</strong></button><button class="question-card__option"><strong>拒绝</strong></button><button class="question-card__other">自行输入…</button></div></div><div class="question-card__actions"><button class="question-card__submit" disabled="">提交</button></div></div></div></div>'
+
+      at TestContext.<anonymous> (file:///C:/Code/Easel/.claude/worktrees/original-web-task1-diagnostics/tests/frontend/questionCards.test.mjs:70:10)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '<div class="message-row assistant"><div class="msg-col assistant" style="max-width:80%"><div class="question-card"><div class="question-card__item"><div class="question-card__chip">授权</div><div class="question-card__title">允许？</div><div class="question-card__options"><button class="question-card__option"><strong>允许本次</strong></button><button class="question-card__option"><strong>拒绝</strong></button><button class="question-card__other">自行输入…</button></div></div><div class="question-card__actions"><button class="question-card__submit" disabled="">提交</button></div></div></div></div>',
+    expected: /data-value="qopt_allow"/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at tests\frontend\workspaceClient.test.mjs:1:1
+✖ tests\frontend\workspaceClient.test.mjs (290.0422ms)
+  'test failed'

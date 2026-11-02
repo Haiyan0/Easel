@@ -1,0 +1,2 @@
+QUESTION_GATE={"cards_before_reconnect": 1, "cards_after_reconnect": 1, "after_values": [0, 3], "question_status_calls": 2, "backend_pending": true, "chat_posts": 1}
+FIXTURE_CLEANUP=ok

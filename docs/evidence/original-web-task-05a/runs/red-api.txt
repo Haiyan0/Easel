@@ -1,0 +1,10 @@
+实现前（父基线 1b57e19）运行：
+python -m pytest tests/multiuser/test_gateway_workspace.py tests/multiuser/test_original_web_api.py -q
+
+结果：
+ERROR collecting tests/multiuser/test_original_web_api.py
+ImportError while importing test module:
+  from easel.control.workspace_api import (
+E   ModuleNotFoundError: No module named 'easel.control.workspace_api'
+
+说明：新增的 workspace 路由/服务尚不存在，红测在收集阶段失败。

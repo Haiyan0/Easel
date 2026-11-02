@@ -1,0 +1,9 @@
+# Task 5C3：在已验收 control 镜像上增量覆盖当前后端与前端构建。
+# 不重建 Node 前端缓存；dist 由宿主当前源码构建后复制。
+ARG BASE_IMAGE=easel-control:task5c2-r1-20261101
+FROM ${BASE_IMAGE}
+USER root
+COPY easel /opt/easel/easel
+COPY web/frontend/dist /opt/easel/web/frontend/dist
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+USER 10001:10001

@@ -1,0 +1,58 @@
+docker : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:473
++ ... TEXITCODE"; docker build -f tests/multiuser/Dockerfile.worker-task5a  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+#1 [internal] load build definition from Dockerfile.worker-task5a
+#1 transferring dockerfile: 429B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-worker-execution:a4
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 DONE 0.0s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 resolve docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc
+61f4f24 0.0s done
+#5 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 69.38MB 5.0s
+#4 transferring context: 144.80MB 10.0s
+#4 transferring context: 211.67MB 14.9s done
+#4 DONE 14.9s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 CACHED
+
+#6 [2/4] COPY easel /opt/easel/easel
+#6 DONE 0.4s
+
+#7 [3/4] COPY web /opt/easel/web
+#7 DONE 1.6s
+
+#8 [4/4] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#8 DONE 6.1s
+
+#9 exporting to image
+#9 exporting layers
+#9 exporting layers 6.9s done
+#9 exporting manifest sha256:46408b8e5c77eee22de1f6930c4ba13a573aec85166d484ea4f1288a135b91c6 0.0s done
+#9 exporting config sha256:2b2021923d2dcd6483e754317a2cac4212cbc579575ed7718512deec1abb39a0 0.0s done
+#9 exporting attestation manifest sha256:4a6437f0b8c703d579355e69ce96432991128e212c13b9005cb82194b939bcca 0.0s done
+#9 exporting manifest list sha256:75426efd0ee0f12bdd71d17dae30c42b37d3eacac64dd40e5fde11f53043bace 0.0s done
+#9 naming to docker.io/library/easel-worker-execution:task5a-20261030 done
+#9 unpacking to docker.io/library/easel-worker-execution:task5a-20261030
+#9 unpacking to docker.io/library/easel-worker-execution:task5a-20261030 3.1s done
+#9 DONE 10.1s

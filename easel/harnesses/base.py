@@ -7,7 +7,21 @@ from typing import Awaitable, Callable, Protocol
 
 
 class HarnessError(Exception):
-    pass
+    """适配器失败；可选诊断字段保持 ``HarnessError(message)`` 兼容。
+
+    * ``stage``：失败阶段（cli_start/initialize/session/model/prompt/rpc）；
+    * ``category``：仅在上游或 broker 提供结构化证据时填写
+      （auth/rate_limited/request_rejected/service_unavailable）；
+    * ``status``：结构化证据里的 HTTP 状态码，可为空。
+    """
+
+    def __init__(self, message: str, *, stage: str | None = None,
+                 category: str | None = None,
+                 status: int | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.category = category
+        self.status = status
 
 
 Emit = Callable[[str, str], None]

@@ -73,7 +73,6 @@ _PATCH_MARKERS = (
     "apiKeyEnv: EASEL_BROKER_TOKEN",
     "EASEL_WORKSPACE_ID",
     "EASEL_RUN_ID",
-    "model: deepseek-chat",
     "maxRetries: 0",
 )
 _NATIVE_PROBE = r"""
@@ -193,11 +192,21 @@ def _check_manifest_shape(manifest: object, expected_commit: str | None) -> dict
         _fail("broker must select the workspace sidecar chat channel")
 
     provider = _mapping(data["provider"], "provider")
-    _exact_keys(provider, {"id", "api", "model"}, "provider")
+    _exact_keys(provider, {"id", "api", "model", "models"}, "provider")
     if (_text(provider["id"], "provider.id") != PROVIDER_ID
             or _text(provider["api"], "provider.api") != PROVIDER_API
             or _text(provider["model"], "provider.model") != PROVIDER_MODEL):
         _fail("provider must be the fixed Easel broker route")
+    models = provider["models"]
+    if (not isinstance(models, list) or not 1 <= len(models) <= 64
+            or any(not isinstance(item, str) or not item
+                   or len(item) > 256
+                   or any(ord(character) < 32 for character in item)
+                   for item in models)
+            or len(set(models)) != len(models)):
+        _fail("provider.models must be a bounded unique model list")
+    if provider["model"] not in models:
+        _fail("provider.model must be inside provider.models")
 
     validated = _mapping(data["validated"], "validated")
     _exact_keys(validated, {"date", "scope"}, "validated")
@@ -207,7 +216,29 @@ def _check_manifest_shape(manifest: object, expected_commit: str | None) -> dict
     return dict(data)
 
 
-def _check_patch(patch_path: Path) -> str:
+def _patch_model_ids(text: str) -> list[str] | None:
+    """解析 patch 的 llm-pi-ai models 段；不依赖第三方 YAML。"""
+    lines = text.splitlines()
+    start = None
+    indent = 0
+    for index, line in enumerate(lines):
+        if line.strip() == "models:":
+            start = index
+            indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return None
+    models: list[str] = []
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        stripped = line.strip()
+        if stripped.startswith("- id: "):
+            models.append(stripped[len("- id: "):])
+    return models
+
+
+def _check_patch(patch_path: Path, models: list[str]) -> str:
     try:
         raw = patch_path.read_bytes()
     except OSError as error:
@@ -221,6 +252,8 @@ def _check_patch(patch_path: Path) -> str:
     for marker in _PATCH_MARKERS:
         if marker not in text:
             _fail(f"managed patch is missing marker: {marker}")
+    if _patch_model_ids(text) != list(models):
+        _fail("managed patch models do not match manifest provider.models")
     for pattern in _SECRET_VALUES:
         if pattern.search(text):
             _fail("managed patch contains a secret-like value")
@@ -237,7 +270,7 @@ def validate_manifest(manifest: object, *, expected_commit: str | None = None,
     data = _check_manifest_shape(manifest, expected_commit)
     if patch_root is not None:
         root = Path(patch_root)
-        _check_patch(root / data["patch"])
+        _check_patch(root / data["patch"], data["provider"]["models"])
     return data
 
 

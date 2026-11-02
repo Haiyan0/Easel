@@ -1,0 +1,89 @@
+﻿[5C2] starting server
+[5C2] server started https://127.0.0.1:54071
+[5C2] launching chromium
+[5C2] chromium launched
+[5C2] scenario start: login_flow
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] open accounts
+[5C2] accounts open
+[5C2] open accounts
+[5C2] accounts open
+[5C2] scenario ok: login_flow
+[5C2] scenario start: wechat_states
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] open accounts
+[5C2] accounts open
+[5C2] scenario ok: wechat_states
+[5C2] scenario start: analytics
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] analytics: dashboard
+[5C2] analytics: click platform
+[5C2] analytics: wait numbers
+[5C2] analytics: numbers ready
+[5C2] scenario ok: analytics
+[5C2] scenario start: stop_503_401
+[5C2] login: goto
+[5C2] login: fill invite
+[5C2] login: wait sidebar
+[5C2] login: ready
+[5C2] open accounts
+[5C2] accounts open
+[5C2] wait zhihu card
+[5C2] click zhihu login
+[5C2] zhihu login clicked
+[5C2] clicking stop
+[5C2] stop clicked
+[5C2] HTTP 200 https://127.0.0.1:54071/api/login/zhihu/stop
+[5C2] stop state observed
+[5C2] scenario ok: stop_503_401
+{
+  "results": {
+    "login_flow": true,
+    "wechat_states": true,
+    "analytics": true,
+    "stop_503_401": true
+  },
+  "failures": [],
+  "screenshots": [
+    "docs\\evidence\\original-web-task-05c2\\browser\\01_accounts_light.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\02_login_qr.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\03_login_sms.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\04_accounts_restored.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\05_accounts_dark.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\06_accounts_mobile.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\07_wechat_two_states.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\08_wechat_mp_success.png",
+    "docs\\evidence\\original-web-task-05c2\\browser\\09_analytics_success.png"
+  ],
+  "login_starts": [
+    "xiaohongshu",
+    "zhihu",
+    "zhihu"
+  ],
+  "mp_login_starts": [
+    "wechat-oa"
+  ],
+  "whoami_calls": [
+    "xiaohongshu",
+    "xiaohongshu",
+    "xiaohongshu",
+    "wechat-oa",
+    "wechat-oa",
+    "xiaohongshu",
+    "wechat-oa"
+  ],
+  "analytics_calls": [
+    "xiaohongshu",
+    "xiaohongshu",
+    "xiaohongshu"
+  ]
+}

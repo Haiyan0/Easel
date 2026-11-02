@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { ComponentType } from 'react';
-import { fetchSkills } from '../lib/api';
 import type { SkillItem } from '../lib/api';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import SkillDrawer from './SkillDrawer';
 import { displayName } from '../lib/skillDisplayNames';
 import {
@@ -54,15 +55,35 @@ const LAYER_DESC: Record<string, string> = {
 };
 
 export default function SkillPage({ persona }: SkillPageProps) {
+  const data = useWorkspaceData();
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
 
-  const load = () => {
-    fetchSkills().then(setSkills).catch(() => setError('加载 SKILL 列表失败'));
-  };
-  useEffect(load, []);
+  const load = useCallback(() => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setError('');
+    data.fetchSkills(controller.signal)
+      .then((list) => { if (!controller.signal.aborted) setSkills(list); })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(workspaceErrorMessage(error, '加载 SKILL 列表失败'));
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+  }, [data]);
+  useEffect(() => {
+    load();
+    return () => request.current?.abort();
+  }, [load]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -105,6 +126,9 @@ export default function SkillPage({ persona }: SkillPageProps) {
       </div>
 
       {error && <div style={{ color: 'var(--red)', maxWidth: 1100, margin: '16px auto' }}>{error}</div>}
+      {loading && skills.length === 0 && !error && (
+        <div className="dash-empty">技能目录加载中…</div>
+      )}
 
       <div className="skills-body">
         {orderedLayers.length === 0 && !error && (

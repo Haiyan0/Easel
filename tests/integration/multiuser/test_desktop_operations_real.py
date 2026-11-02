@@ -156,6 +156,7 @@ def _write_configs(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
         "agent": {
             "runtime": "acp",
             "command": profile["command"],
+            "models": profile["provider"]["models"],
             "sandbox": "workspace-write",
             "timeout": 300,
         },

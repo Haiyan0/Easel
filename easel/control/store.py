@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -2373,6 +2374,68 @@ class Store:
                 (workspace_id, conversation_id, title, stamp, stamp))
         return ConversationRecord(conversation_id, workspace_id, title, False)
 
+    @staticmethod
+    def _task_conversation_id(workspace_id: str, task_key: str) -> str:
+        raw = f"{workspace_id}\x00{task_key}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:32]
+
+    def get_task_conversation(self, actor: Identity,
+                              task_key: str) -> ConversationRecord | None:
+        """按确定性 task key 查找本人任务会话；不存在/已删除返回 None。"""
+        workspace_id = self._require_actor(actor)
+        if (not isinstance(task_key, str) or not task_key
+                or len(task_key) > 256
+                or any(ord(character) < 32 for character in task_key)):
+            raise DomainError("invalid_argument", 400)
+        conversation_id = self._task_conversation_id(workspace_id, task_key)
+        row = self._connection.execute(
+            "SELECT id, workspace_id, title, archived FROM conversations"
+            " WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL",
+            (workspace_id, conversation_id)).fetchone()
+        return _conversation_record(row) if row is not None else None
+
+    def get_or_create_task_conversation(
+            self, actor: Identity, task_key: str, title: str) -> ConversationRecord:
+        """为技能/画像任务取得稳定会话；任务历史不写入普通对话目录的隐式位置。
+
+        会话 id 由 workspace + task key 确定性派生，因而刷新后可重新定位；
+        同名任务最多一个目录。用户删除后会恢复为可见，不覆盖其他会话。
+        """
+        workspace_id = self._require_actor(actor)
+        self._require_ready_workspace(workspace_id)
+        if (not isinstance(task_key, str) or not task_key
+                or len(task_key) > 256
+                or any(ord(character) < 32 for character in task_key)):
+            raise DomainError("invalid_argument", 400)
+        if (not isinstance(title, str) or not title or len(title) > 200
+                or any(ord(character) < 32 for character in title)):
+            raise DomainError("invalid_argument", 400)
+        conversation_id = self._task_conversation_id(workspace_id, task_key)
+        stamp = _now()
+        with self._transaction():
+            self._require_actor(actor)
+            self._require_ready_workspace(workspace_id)
+            row = self._connection.execute(
+                "SELECT id, workspace_id, title, archived, deleted_at"
+                " FROM conversations WHERE workspace_id = ? AND id = ?",
+                (workspace_id, conversation_id)).fetchone()
+            if row is not None and row["deleted_at"] is None:
+                return _conversation_record(row)
+            if row is not None:
+                self._connection.execute(
+                    "UPDATE conversations SET title = ?, archived = 0,"
+                    " deleted_at = NULL, updated_at = ?"
+                    " WHERE workspace_id = ? AND id = ?",
+                    (title, stamp, workspace_id, conversation_id))
+                return ConversationRecord(conversation_id, workspace_id,
+                                          title, False)
+            self._connection.execute(
+                "INSERT INTO conversations"
+                " (workspace_id, id, title, archived, created_at, updated_at)"
+                " VALUES (?, ?, ?, 0, ?, ?)",
+                (workspace_id, conversation_id, title, stamp, stamp))
+        return ConversationRecord(conversation_id, workspace_id, title, False)
+
     def get_conversation(self, actor: Identity, conversation_id: str) -> ConversationRecord:
         workspace_id = self._require_actor(actor)
         row = self._connection.execute(
@@ -2506,6 +2569,24 @@ class Store:
                     or existing["input_digest"] != input_digest):
                 raise DomainError("request_conflict", 409)
             return _run_record(existing)
+
+    def find_run_by_client_request(
+            self, actor: Identity, conversation_id: str,
+            client_request_id: str) -> RunRecord | None:
+        """按本人幂等键读取原 Run；只返回本会话，不接受跨会话/跨用户探测。
+
+        与 :meth:`lookup_run` 不同，这里没有当前输入可用于摘要校验；调用方
+        只把它当作“原意图是否已接纳”的只读查询，真正提交仍走摘要校验。
+        """
+        workspace_id = self._require_actor(actor, allow_disabled=True)
+        row = self._connection.execute(
+            "SELECT workspace_id, id, conversation_id, client_request_id,"
+            " input_digest, status, config_version FROM runs"
+            " WHERE workspace_id = ? AND client_request_id = ?",
+            (workspace_id, _text(client_request_id))).fetchone()
+        if row is None or row["conversation_id"] != _text(conversation_id):
+            return None
+        return _run_record(row)
 
     def reserve_run(self, actor: Identity, conversation_id: str, client_request_id: str,
                     input_digest: str, config_version: int) -> RunRecord:
@@ -3162,7 +3243,8 @@ def _conversation_record(row: sqlite3.Row) -> ConversationRecord:
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
     return RunRecord(row["id"], row["workspace_id"], row["conversation_id"],
-                     row["status"], row["config_version"])
+                     row["status"], row["config_version"],
+                     row["client_request_id"], row["input_digest"])
 
 
 def _restrict_directory(directory: Path) -> None:

@@ -97,7 +97,15 @@ function gallery() {
       useState: initial => typeof initial === 'number' ? [selected, value => { selected = value; }] : [[], () => {}],
       useEffect: () => {},
     } : id === 'react/jsx-runtime' ? { jsx, jsxs: jsx }
-      : id.endsWith('/artifacts') ? exports : { IconChevron: 'chevron', IconOutputs: 'outputs' },
+      : id.endsWith('/artifacts') ? exports
+      : id.endsWith('/workspaceDataContext') ? {
+        useWorkspaceData: () => ({
+          fetchArtifactArchive: async () => ({ paths: [] }),
+          mediaUrl: path => `/api/media/${path}`,
+          fetchText: async () => '',
+        }),
+      }
+      : { IconChevron: 'chevron', IconOutputs: 'outputs' },
   });
   const artifacts = ['first', 'second', 'third'].map(name => ({
     url: `/api/media/project/${name}.png`, name: `${name}.png`, kind: 'image',

@@ -21,7 +21,30 @@
 
 ## 配置与兼容
 
-默认无需配置，两条路径均可使用，首次进入选择自动发布。也可在项目 `.env` 中显式配置：
+默认无需配置，两条路径均可使用，首次进入选择自动发布。
+
+### 多人 Desktop（control）
+
+正式部署的发布策略由管理员在启动/升级时显式给出，成员没有修改入口：
+
+```powershell
+deploy/desktop/Start-WorkspaceEasel.ps1 ... -PublishMode manual
+```
+
+- 策略写入部署登记 `deployment.json` 的 `publish_mode`，并通过正式 Compose 的
+  `EASEL_PUBLISH_MODE` 传给 control；全新部署省略时保留 `automated` 默认。
+- **旧部署（deployment.json 尚无 `publish_mode`）再次启动/升级时不会静默
+  按新默认放开自动发布**：脚本会以 `publish_mode_migration_required` 拒绝
+  启动，必须显式传 `-PublishMode manual` 或 `-PublishMode automated` 完成迁移。
+  曾把 worker/宿主 `.env` 的 `EASEL_PUBLISH_MODE` 配成 `manual` 的部署，
+  迁移时应显式选择 `manual`。
+- control 只读取自己的受管配置，不读取 worker/宿主 `.env` 作为实时权限源；
+  成员请求不能改变策略。策略为 `manual` 时，发布请求在 Run 接纳前即返回
+  `publishing_manual_only`，不会创建任务或启动 worker。
+
+### 本机 Web（local）
+
+本机模式仍沿用项目 `.env`：
 
 ```dotenv
 EASEL_PUBLISH_MODE=automated

@@ -14,10 +14,30 @@ const { outputText } = ts.transpileModule(source, {
     jsx: ts.JsxEmit.ReactJSX,
   },
 });
+const questionsSource = readFileSync(
+  new URL('../../web/frontend/src/lib/questions.ts', import.meta.url), 'utf8');
+const { outputText: questionsText } = ts.transpileModule(questionsSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.CommonJS,
+    target: ts.ScriptTarget.ES2022,
+  },
+});
+const questions = { exports: {} };
+runInNewContext(questionsText, { exports: questions.exports });
 const component = { exports: {} };
 runInNewContext(outputText, {
   exports: component.exports,
-  require: name => name === '../lib/api' ? {} : require(name),
+  require: name => {
+    if (name === '../lib/api') return {};
+    if (name === '../lib/questions') return questions.exports;
+    if (name === '../lib/control') {
+      return {
+        optionSubmitValue: (option) => option && typeof option.value === 'string'
+          && option.value ? option.value : option.label,
+      };
+    }
+    return require(name);
+  },
 });
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
@@ -40,6 +60,36 @@ test('approval cards preserve long multiline commands and both permission choice
   assert.match(rendered, /<strong>允许本次<\/strong>/);
   assert.match(rendered, /<strong>拒绝<\/strong>/);
   assert.match(rendered, /disabled="">提交<\/button>/);
+});
+
+test('control options carry opaque values while showing human labels', () => {
+  const rendered = renderToStaticMarkup(React.createElement(component.exports.default, {
+    questions: [{
+      id: 'q1',
+      questions: [{
+        questionId: 'permission',
+        header: '授权',
+        question: '允许？',
+        options: [
+          { label: '允许本次', value: 'qopt_allow' },
+          { label: '拒绝', value: 'qopt_deny' },
+        ],
+      }],
+    }],
+    onAnswer: async () => ({ ok: true }),
+  }));
+  assert.match(rendered, /data-value="qopt_allow"/);
+  assert.match(rendered, /data-value="qopt_deny"/);
+  assert.match(rendered, /<strong>允许本次<\/strong>/);
+  assert.match(rendered, /<strong>拒绝<\/strong>/);
+  assert.equal(typeof questions.exports.questionAnswersFor, 'function');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(questions.exports.questionAnswersFor(
+      [{ questionId: 'permission', question: '允许？' }],
+      { permission: ['qopt_allow'] },
+    ))),
+    { permission: ['qopt_allow'] },
+  );
 });
 
 test('approval card grids can shrink and wrap commands without clipping their content', () => {

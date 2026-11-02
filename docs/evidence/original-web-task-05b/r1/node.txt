@@ -1,0 +1,15 @@
+✔ control workspace data exposes only implemented basic capabilities (0.5274ms)
+✔ control workspace data uses identity call for reads, writes and uploads (0.598ms)
+✔ oversize files never use local adoption in control (0.1894ms)
+✔ errors keep 401/403/404/413/503 semantics (0.1902ms)
+✔ control parsers reject malformed payloads instead of faking empty data (0.6902ms)
+✔ control trend parser preserves stale cache metadata (0.5203ms)
+✔ control workbench methods use identity call with exact paths and bodies (0.5489ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 234.0165

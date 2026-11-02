@@ -1,6 +1,10 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { fetchSkillDetail, executeSkill, saveEnv } from '../lib/api';
-import type { SkillDetail } from '../lib/api';
+import { saveEnv } from '../lib/api';
+import { AuthError } from '../lib/auth';
+import type { ChatQuestion, SkillDetail } from '../lib/api';
+import QuestionCards from './QuestionCards';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { renderMarkdown } from '../lib/sanitize';
 import { displayName } from '../lib/skillDisplayNames';
 
@@ -12,6 +16,7 @@ interface SkillDrawerProps {
 }
 
 export default function SkillDrawer({ skillName, persona, onClose, onConfigured }: SkillDrawerProps) {
+  const data = useWorkspaceData();
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [loadErr, setLoadErr] = useState('');
 
@@ -25,17 +30,95 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
   const [result, setResult] = useState('');
   const [running, setRunning] = useState(false);
   const [runErr, setRunErr] = useState('');
+  const [activeRunId, setActiveRunId] = useState('');
+  const [question, setQuestion] = useState<ChatQuestion | null>(null);
+  const [questionPending, setQuestionPending] = useState(false);
   const reqSeq = useRef(0);
+  const runRequest = useRef<AbortController | null>(null);
+  const pendingTurn = useRef<{ input: string; id: string } | null>(null);
 
   const loadDetail = () => {
-    let ignore = false;
-    fetchSkillDetail(skillName)
-      .then((d) => { if (!ignore) { setDetail(d); setLoadErr(''); } })
-      .catch(() => { if (!ignore) setLoadErr('加载 SKILL 详情失败'); });
-    return () => { ignore = true; };
+    const controller = new AbortController();
+    data.fetchSkillDetail(skillName, controller.signal)
+      .then((d) => {
+        if (!controller.signal.aborted) { setDetail(d); setLoadErr(''); }
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setLoadErr(workspaceErrorMessage(error, '加载 SKILL 详情失败'));
+        }
+      });
+    return () => controller.abort();
   };
 
-  useEffect(loadDetail, [skillName]);
+  useEffect(loadDetail, [data, skillName]);
+
+  useEffect(() => {
+    if (!detail?.name) return;
+    let alive = true;
+    let timer: number | undefined;
+    const controller = new AbortController();
+    const check = async () => {
+      try {
+        const status = await data.skillStatus(
+          detail.name, controller.signal);
+        if (!alive) return;
+        if (status.response) setResult(status.response);
+        setQuestion(status.question || null);
+        let questionPending = status.questionPending === true;
+        if (status.question && status.runId) {
+          try {
+            const states = await data.taskQuestionStatus(
+              status.runId, [status.question.id], controller.signal);
+            const state = states[status.question.id]?.status;
+            if (state === 'pending') questionPending = false;
+            else if (state === 'answered' || state === 'resolved'
+                || state === 'expired' || state === 'not_found') {
+              setQuestion(null);
+              questionPending = false;
+            } else {
+              questionPending = true;
+            }
+          } catch {
+            // 未知状态保留题卡但禁用提交；重连/下一次轮询继续确认。
+            questionPending = true;
+          }
+        }
+        if (!alive) return;
+        setQuestionPending(questionPending);
+        if (status.state === 'running'
+            || status.state === 'awaiting_permission') {
+          setRunning(true);
+          if (status.runId) setActiveRunId(status.runId);
+          timer = window.setTimeout(check, status.state === 'awaiting_permission'
+            ? 1500 : 3000);
+        } else {
+          setRunning(false);
+          if (status.state === 'failed') {
+            setRunErr((current) => current || '上次技能任务未完成，可重新执行。');
+          }
+        }
+      } catch (error) {
+        if (!alive || controller.signal.aborted) return;
+        // 401 已由身份层卸载，不能在旧组件上继续轮询。
+        if (error instanceof AuthError && error.status === 401) return;
+        // 临时 503/断网保留原题卡、Run 标识和待确认状态，但必须安排
+        // 下一轮恢复查询；成功确认 pending 后才重新允许提交。
+        setQuestionPending(true);
+        setRunErr((current) => current || workspaceErrorMessage(
+          error, '技能任务状态读取失败'));
+        timer = window.setTimeout(check, 1500);
+      }
+    };
+    void check();
+    return () => {
+      alive = false;
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [data, detail?.name, activeRunId]);
+
+  useEffect(() => () => runRequest.current?.abort(), []);
 
   const bodyHtml = useMemo(() => renderMarkdown(detail?.body || ''), [detail?.body]);
   const resultHtml = useMemo(() => renderMarkdown(result), [result]);
@@ -44,39 +127,83 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
     const updates = Object.fromEntries(
       Object.entries(envInputs).filter(([, v]) => v.trim() !== '')
     );
+    if (!data.skillEnvEnabled) {
+      setSavedMsg('受管工作区不支持在此写入全局 .env');
+      return;
+    }
     if (Object.keys(updates).length === 0) { setSavedMsg('没有填写新值'); return; }
     setSaving(true);
     setSavedMsg('');
     try {
       await saveEnv(updates);
+      const fresh = await data.fetchSkillDetail(skillName);
       setEnvInputs({});
-      const seq = ++reqSeq.current;
-      const fresh = await fetchSkillDetail(skillName);
-      if (seq === reqSeq.current) setDetail(fresh);
+      setDetail(fresh);
       setSavedMsg('已保存 ✓');
       onConfigured();
       setTimeout(() => setSavedMsg(''), 2500);
     } catch (e) {
-      setSavedMsg(e instanceof Error ? e.message : '保存失败');
+      setSavedMsg(workspaceErrorMessage(e, '保存失败'));
     } finally {
       setSaving(false);
     }
   };
 
   const handleRun = async () => {
-    if (!input.trim()) return;
+    if (!input.trim() || running) return;
     const seq = ++reqSeq.current;
+    runRequest.current?.abort();
+    const controller = new AbortController();
+    runRequest.current = controller;
     setRunning(true);
     setRunErr('');
     setResult('');
+    setActiveRunId('');
+    const text = input.trim();
+    const turnId = pendingTurn.current?.input === text
+      ? pendingTurn.current.id
+      : `skill:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+    pendingTurn.current = { input: text, id: turnId };
     try {
-      const res = await executeSkill(skillName, input.trim(), persona || undefined);
-      if (seq === reqSeq.current) setResult(res.response);
+      const res = await data.executeSkill(
+        skillName, text, persona || undefined,
+        controller.signal, turnId,
+        (runId) => { if (seq === reqSeq.current) setActiveRunId(runId); });
+      if (seq === reqSeq.current && !controller.signal.aborted) {
+        pendingTurn.current = null;
+        setResult(res.response);
+      }
     } catch (e) {
-      if (seq === reqSeq.current) setRunErr(e instanceof Error ? e.message : '执行失败');
+      if (seq === reqSeq.current && !controller.signal.aborted) {
+        setRunErr(workspaceErrorMessage(e, '执行失败'));
+      }
     } finally {
       if (seq === reqSeq.current) setRunning(false);
     }
+  };
+
+  const handleStop = async () => {
+    if (!activeRunId) return;
+    try {
+      await data.stopTask(activeRunId);
+    } catch (error) {
+      setRunErr(workspaceErrorMessage(error, '停止任务失败'));
+    }
+  };
+
+  const handleAnswer = async (
+    current: ChatQuestion, answers: Record<string, string[]>,
+  ) => {
+    if (!activeRunId) {
+      return { ok: false, error: '任务尚未接纳，无法回答问题。' };
+    }
+    const result = await data.answerTaskQuestion(
+      activeRunId, current.id, answers);
+    if (result.ok) {
+      setQuestion(null);
+      setQuestionPending(false);
+    }
+    return result;
   };
 
   const blocked = detail?.needsApi && !detail.apiConfigured;
@@ -106,7 +233,7 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
           {loadErr && <div style={{ color: 'var(--red)', fontSize: 14 }}>{loadErr}</div>}
 
           {/* API 配置 */}
-          {detail?.needsApi && detail.apiSpec && (
+          {detail?.needsApi && detail.apiSpec && data.skillEnvEnabled && (
             <div className="panel">
               <div className="panel-title">🔑 {detail.apiSpec.label} · API 配置
                 <span style={{ fontWeight: 400, color: 'var(--text-secondary)', fontSize: 12 }}>
@@ -193,6 +320,12 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
             </div>
           )}
 
+          {detail?.needsApi && !detail.apiConfigured && !data.skillEnvEnabled && (
+            <div className="panel" style={{ color: 'var(--amber)', fontSize: 13 }}>
+              该技能需要受管 API/依赖；当前工作区未配置，且成员不能在此写入全局 .env。
+            </div>
+          )}
+
           {/* 执行 */}
           <div className="panel">
             <div className="panel-title">▶ 运行</div>
@@ -214,8 +347,22 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
                   ? <><span className="spinner" style={{ width: 14, height: 14, margin: 0 }} />执行中…</>
                   : '执行'}
               </button>
+              {running && activeRunId && (
+                <button className="btn btn-sm" style={{ marginLeft: 8 }}
+                  onClick={handleStop}>停止</button>
+              )}
             </div>
             {runErr && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{runErr}</div>}
+            {question && (
+              <div style={{ marginTop: 12 }}>
+                <QuestionCards
+                  questions={[question]}
+                  pending={questionPending}
+                  onDone={() => setQuestion(null)}
+                  onAnswer={handleAnswer}
+                />
+              </div>
+            )}
             {resultHtml && (
               <div className="skill-result" dangerouslySetInnerHTML={{ __html: resultHtml }} />
             )}

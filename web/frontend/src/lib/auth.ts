@@ -96,8 +96,11 @@ export async function loadIdentity(
 /** 登录页错误文案：保留状态语义，不把 503 说成“没有邀请”。 */
 export function loginErrorMessage(error: unknown): string {
   if (error instanceof AuthError) {
-    if (error.status === 401 || error.status === 403) {
+    if (error.status === 401) {
       return '邀请无效、已使用或已过期，请联系管理员重新获取。';
+    }
+    if (error.status === 403) {
+      return '当前来源或账号权限不允许登录。请从管理员提供的地址重新打开，或联系管理员确认账号状态。';
     }
     if (error.status === 429) return '尝试次数过多，请稍后再试。';
     if (error.status === 0) return '网络不可用，请检查连接后重试。';
@@ -170,6 +173,32 @@ export function identityCacheKey(
   ].join(':');
 }
 
+export interface StorageLike {
+  readonly length: number;
+  key(index: number): string | null;
+  removeItem(key: string): void;
+}
+
+/** 只清理该身份的私有键；共享主题等非身份键保持不变。 */
+export function clearIdentityCache(
+  ctx: Pick<AuthContext, 'userId' | 'workspaceId'>,
+  storages: StorageLike[],
+): void {
+  const prefix = identityCacheKey(ctx, '');
+  for (const storage of storages) {
+    const keys: string[] = [];
+    try {
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key && key.startsWith(prefix)) keys.push(key);
+      }
+    } catch { /* storage disabled */ }
+    for (const key of keys) {
+      try { storage.removeItem(key); } catch { /* ignore */ }
+    }
+  }
+}
+
 /**
  * 身份 epoch：每次认证/重新登录都递增，invalidate 后旧 epoch 全部失效。
  * 同一 user/workspace 也不能复用旧号码。
@@ -217,7 +246,7 @@ export function commitIfCurrent(
   return true;
 }
 
-interface IdentityRequest {
+export interface IdentityRequest {
   epochs: IdentityEpoch;
   epoch: number;
   ctx: AuthContext;
@@ -228,13 +257,19 @@ interface IdentityRequest {
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+export interface IdentityResponse<T> {
+  status: number;
+  body: T;
+}
+
 /**
  * 统一同源请求层：写请求带内存 CSRF；401 只失效捕获的 epoch。
  * 调用方拿到结果后仍需用 commitIfCurrent 做最终提交校验。
+ * raw 变体保留 HTTP 状态（如 202 接纳），但安全语义与 identityFetch 相同。
  */
-export async function identityFetch<T>(
+export async function identityFetchRaw<T>(
   request: IdentityRequest,
-): Promise<T> {
+): Promise<IdentityResponse<T>> {
   const fetchImpl = request.fetchImpl || fetch;
   const method = (request.init?.method || 'GET').toUpperCase();
   const headers: Record<string, string> = {
@@ -265,6 +300,52 @@ export async function identityFetch<T>(
     throw error;
   }
   if (!response.ok) throw await errorFrom(response);
-  if (response.status === 204) return undefined as T;
-  return await response.json() as T;
+  if (response.status === 204) {
+    return { status: 204, body: undefined as T };
+  }
+  return {
+    status: response.status,
+    body: await response.json() as T,
+  };
+}
+
+/** 同源文本请求（如 HTML 产物预览）：与 identityFetchRaw 同样的 401/CSRF。 */
+export async function identityFetchText(
+  request: IdentityRequest,
+): Promise<string> {
+  const fetchImpl = request.fetchImpl || fetch;
+  const method = (request.init?.method || 'GET').toUpperCase();
+  const headers: Record<string, string> = {
+    ...((request.init?.headers as Record<string, string> | undefined) || {}),
+  };
+  if (!SAFE_METHODS.has(method)) {
+    headers['X-CSRF-Token'] = request.ctx.csrfToken;
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(request.url, {
+      ...request.init,
+      method,
+      headers,
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  } catch {
+    throw new AuthError(0, 'network_unavailable');
+  }
+  if (response.status === 401) {
+    const owned = request.epochs.isCurrent(request.epoch);
+    if (owned) request.epochs.invalidate();
+    const error = new AuthError(401, 'unauthorized');
+    error.identityInvalidated = owned;
+    throw error;
+  }
+  if (!response.ok) throw await errorFrom(response);
+  return response.text();
+}
+
+export async function identityFetch<T>(
+  request: IdentityRequest,
+): Promise<T> {
+  return (await identityFetchRaw<T>(request)).body;
 }

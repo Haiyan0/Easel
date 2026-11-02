@@ -1,0 +1,191 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
+import { test } from 'node:test';
+
+const require = createRequire(new URL('../../web/frontend/package.json', import.meta.url));
+const ts = require('typescript');
+const source = readFileSync(
+  new URL('../../web/frontend/src/lib/store.ts', import.meta.url), 'utf8');
+const { outputText } = ts.transpileModule(source, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+});
+
+function load() {
+  const module = { exports: {} };
+  const storage = new Map();
+  runInNewContext(outputText, {
+    exports: module.exports, module,
+    require: () => { throw new Error('no runtime imports expected'); },
+    localStorage: {
+      getItem: key => storage.has(key) ? storage.get(key) : null,
+      setItem: (key, value) => storage.set(key, String(value)),
+      removeItem: key => storage.delete(key),
+    },
+    Promise, Array, Object, String, Number, Error, JSON, Math, Set, Map,
+    Date, encodeURIComponent, console,
+  });
+  return { store: module.exports, storage };
+}
+
+const draft = (title) => ({
+  title, body: '正文', platforms: ['xiaohongshu'],
+  overrides: {}, tags: '',
+});
+
+test('draft media and persona survive a reload', () => {
+  const { store, storage } = load();
+  store.savePublishDraft({
+    ...draft('带素材'), media: ['project/cover.png'], persona: '画像A',
+  }, 'user-a:ws-a');
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.deepEqual(loaded.media, ['project/cover.png']);
+  assert.equal(loaded.persona, '画像A');
+  assert.equal(JSON.parse(
+    storage.get('easel_publish_draft:user-a:ws-a')).media[0],
+  'project/cover.png');
+});
+
+test('a legacy draft keeps media/persona absent instead of claiming empty', () => {
+  const { store, storage } = load();
+  // 旧版草稿没有 media/persona 字段：必须能区分“刷新丢失”和“用户清空”。
+  storage.set('easel_publish_draft:user-a:ws-a', JSON.stringify(draft('旧稿')));
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal('media' in loaded, false);
+  assert.equal('persona' in loaded, false);
+});
+
+test('saving a draft without media/persona preserves the earlier selection', () => {
+  const { store } = load();
+  store.savePublishDraft({
+    ...draft('自动页'), media: ['project/other.png'], persona: '画像A',
+  }, 'user-a:ws-a');
+  // 人工审核页只保存文案字段，不能把自动页的媒体/画像来源抹掉。
+  store.savePublishDraft(draft('人工页'), 'user-a:ws-a');
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal(loaded.title, '人工页');
+  assert.deepEqual(loaded.media, ['project/other.png']);
+  assert.equal(loaded.persona, '画像A');
+});
+
+test('corrupt media/persona fields are dropped on load', () => {
+  const { store, storage } = load();
+  storage.set('easel_publish_draft:user-a:ws-a', JSON.stringify({
+    ...draft('坏字段'), media: 'project/cover.png', persona: 42,
+  }));
+  const loaded = store.loadPublishDraft('user-a:ws-a');
+  assert.equal('media' in loaded, false);
+  assert.equal('persona' in loaded, false);
+});
+
+test('local draft keeps the original global key', () => {
+  const { store, storage } = load();
+  store.savePublishDraft(draft('本机'));
+  assert.equal(storage.has('easel_publish_draft'), true);
+  assert.equal(store.loadPublishDraft().title, '本机');
+});
+
+test('control draft is scoped and never falls back to the global key', () => {
+  const { store, storage } = load();
+  storage.set('easel_publish_draft', JSON.stringify(draft('旧全局')));
+  store.savePublishDraft(draft('A'), 'user-a:ws-a');
+  store.savePublishDraft(draft('B'), 'user-b:ws-b');
+  assert.equal(store.loadPublishDraft('user-a:ws-a').title, 'A');
+  assert.equal(store.loadPublishDraft('user-b:ws-b').title, 'B');
+  assert.equal(store.loadPublishDraft('user-c:ws-c').title, '');
+  assert.equal(store.loadPublishDraft().title, '旧全局');
+});
+
+test('scoped draft stays independent when the global draft changes', () => {
+  const { store } = load();
+  store.savePublishDraft(draft('A'), 'user-a:ws-a');
+  store.savePublishDraft(draft('本机新稿'));
+  assert.equal(store.loadPublishDraft('user-a:ws-a').title, 'A');
+  assert.equal(store.loadPublishDraft().title, '本机新稿');
+});
+
+test('publish intent is scoped per identity and never global', () => {
+  const { store, storage } = load();
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-a', fingerprint: 'fp-1' },
+  }, 'user-a:ws-a');
+  const reloaded = store.loadPublishIntents('user-a:ws-a');
+  assert.equal(reloaded.xiaohongshu.requestId, 'req-a');
+  assert.equal(reloaded.xiaohongshu.fingerprint, 'fp-1');
+  assert.equal(Object.keys(store.loadPublishIntents('user-b:ws-b')).length, 0);
+  assert.equal(Object.keys(store.loadPublishIntents()).length, 0);
+  assert.equal(storage.has('easel_publish_intent'), false);
+  assert.equal([...storage.keys()].every(
+    key => key.includes('user-a:ws-a')), true);
+});
+
+test('publish intent persists the full payload for refresh retry', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  const payload = {
+    title: '标题', body: '正文', media: ['project/cover.png'],
+    tags: '工具', persona: '复测画像',
+  };
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-payload', fingerprint: 'fp', payload },
+  }, scope);
+  const loaded = store.loadPublishIntents(scope).xiaohongshu;
+  assert.equal(loaded.requestId, 'req-payload');
+  assert.equal(loaded.payload.persona, '复测画像');
+  assert.equal(loaded.payload.media[0], 'project/cover.png');
+  // 损坏的 payload 被忽略，但 requestId 仍保留用于原请求核对。
+  store.savePublishIntents({
+    xiaohongshu: {
+      requestId: 'req-broken', fingerprint: 'fp',
+      payload: { title: 1, body: '正文', media: 'x', tags: '', persona: '' },
+    },
+  }, scope);
+  const broken = store.loadPublishIntents(scope).xiaohongshu;
+  assert.equal(broken.requestId, 'req-broken');
+  assert.equal(broken.payload, undefined);
+});
+
+test('publish intent clear removes only the requested platform', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-a', fingerprint: 'fp-1' },
+    douyin: { requestId: 'req-b', fingerprint: 'fp-2' },
+  }, scope);
+  store.clearPublishIntent('xiaohongshu', scope);
+  const remaining = store.loadPublishIntents(scope);
+  assert.equal(remaining.xiaohongshu, undefined);
+  assert.equal(remaining.douyin.requestId, 'req-b');
+  store.clearPublishIntent('xiaohongshu', 'user-b:ws-b');
+  assert.equal(store.loadPublishIntents(scope).douyin.requestId, 'req-b');
+});
+
+test('stale terminal response cannot clear a newer intent', () => {
+  const { store } = load();
+  const scope = 'user-a:ws-a';
+  store.savePublishIntents({
+    xiaohongshu: { requestId: 'req-new', fingerprint: 'fp-new' },
+  }, scope);
+  store.clearPublishIntent('xiaohongshu', scope, 'req-old');
+  assert.equal(
+    store.loadPublishIntents(scope).xiaohongshu.requestId, 'req-new');
+  store.clearPublishIntent('xiaohongshu', scope, 'req-new');
+  assert.equal(store.loadPublishIntents(scope).xiaohongshu, undefined);
+});
+
+test('corrupt publish intent data is ignored', () => {
+  const { store, storage } = load();
+  const key = 'easel_publish_intent:user-a:ws-a';
+  storage.set(key, '{not-json');
+  assert.equal(Object.keys(store.loadPublishIntents('user-a:ws-a')).length, 0);
+  storage.set(key, JSON.stringify({
+    xiaohongshu: { requestId: 1, fingerprint: null },
+    douyin: { requestId: 'ok', fingerprint: 'fp' },
+    bad: 'value',
+  }));
+  const parsed = store.loadPublishIntents('user-a:ws-a');
+  assert.equal(Object.keys(parsed).length, 1);
+  assert.equal(parsed.douyin.requestId, 'ok');
+  assert.equal(parsed.douyin.fingerprint, 'fp');
+});

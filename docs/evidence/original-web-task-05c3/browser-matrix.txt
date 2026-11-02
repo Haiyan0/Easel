@@ -1,0 +1,243 @@
+[5C3] scenario start: manual-export-review-calendar
+[5C3] scenario ok: manual-export-review-calendar
+[5C3] scenario start: policy-automated
+[5C3] scenario ok: policy-automated
+[5C3] scenario start: auto-publish-sms-stop-refresh
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+STOP RESP 200 0.06
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+Exception in callback AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97
+handle: <Handle AsyncIOEventEmitter._emit_run.<locals>.callback(<Task finishe...dy handled!')>) at C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py:97>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 105, in callback
+    self.emit("error", exc)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\asyncio.py", line 70, in emit
+    return super().emit(event, *args, **kwargs)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 223, in emit
+    self._emit_handle_potential_error(event, args[0] if args else None)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\pyee\base.py", line 181, in _emit_handle_potential_error
+    raise error
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\async_api\_generated.py", line 7781, in accept
+    await self._impl_obj.accept(promptText=prompt_text)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_dialog.py", line 52, in accept
+    await self._channel.send("accept", None, locals_to_params(locals()))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Dialog.accept: Cannot accept dialog which is already handled!
+[5C3] scenario ok: auto-publish-sms-stop-refresh
+[5C3] scenario start: duplicate-submit-once
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+[5C3] scenario ok: duplicate-submit-once
+[5C3] scenario start: policy-manual
+[5C3] scenario ok: policy-manual
+{
+  "results": {
+    "manual-export-review-calendar": true,
+    "policy-automated": true,
+    "auto-publish-sms-stop-refresh": true,
+    "duplicate-submit-once": true,
+    "policy-manual": true
+  },
+  "failures": [],
+  "screenshots": [
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\01-manual-export-review.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\02-manual-mobile.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\03-manual-dark.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\04-policy-automated.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\06-auto-publish-success.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\07-auto-refresh-recovered.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\browser\\05-policy-manual.png"
+  ]
+}
+TASK5C3_BROWSER_OK True

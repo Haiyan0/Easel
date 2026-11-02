@@ -1,0 +1,9 @@
+# Task 5A isolated file-chain worker: reuse the already verified execution
+# image (dependencies/Chromium) and overlay only the current source. This does
+# not rebuild Harness or download system packages.
+FROM easel-worker-execution:a4
+USER root
+COPY easel /opt/easel/easel
+COPY web /opt/easel/web
+RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+USER 10001:10001

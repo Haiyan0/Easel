@@ -213,13 +213,16 @@ test('invite exchange clears neither token to storage and errors stay typed', as
   );
 });
 
-test('login errors keep 401/429/503/network semantics', () => {
+test('login errors keep 401/403/429/503/network semantics', () => {
   const auth = load(async () => {
     throw new Error('no network');
   });
   const { AuthError } = auth;
   assert.match(auth.loginErrorMessage(new AuthError(401, 'unauthorized')),
     /已使用|已过期/);
+  const forbidden = auth.loginErrorMessage(new AuthError(403, 'forbidden'));
+  assert.match(forbidden, /来源|权限/);
+  assert.doesNotMatch(forbidden, /邀请无效|已使用|已过期/);
   assert.match(auth.loginErrorMessage(new AuthError(429, 'rate_limited')),
     /过多/);
   assert.match(auth.loginErrorMessage(new AuthError(0, 'network_unavailable')),
@@ -227,6 +230,72 @@ test('login errors keep 401/429/503/network semantics', () => {
   const unavailable = auth.loginErrorMessage(new AuthError(503, 'unavailable'));
   assert.match(unavailable, /服务暂不可用/);
   assert.doesNotMatch(unavailable, /邀请无效/);
+});
+
+test('raw identity fetch exposes 202 while preserving CSRF and 401 ownership', async () => {
+  const auth = load(async () => {
+    throw new Error('no network');
+  });
+  const epochs = new auth.IdentityEpoch();
+  const ctx = context();
+  const epoch = epochs.begin(ctx);
+  let seen;
+  const accepted = await auth.identityFetchRaw({
+    epochs, epoch, ctx, url: '/api/chat',
+    init: {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: 'turn-1' }),
+    },
+    fetchImpl: async (url, init) => {
+      seen = { url, init };
+      return { status: 202, ok: true, json: async () => ({ runId: 'run-1' }) };
+    },
+  });
+  assert.equal(accepted.status, 202);
+  assert.equal(accepted.body.runId, 'run-1');
+  assert.equal(seen.init.headers['X-CSRF-Token'], 'csrf-a');
+  assert.equal(seen.init.credentials, 'same-origin');
+
+  const current = epochs.begin(ctx);
+  await assert.rejects(
+    () => auth.identityFetchRaw({
+      epochs, epoch: current, ctx, url: '/x',
+      fetchImpl: async () => ({
+        status: 401, ok: false, json: async () => ({ code: 'unauthorized' }),
+      }),
+    }),
+    (error) => error.status === 401 && error.identityInvalidated === true,
+  );
+  assert.equal(epochs.isCurrent(current), false);
+});
+
+test('identity cache clearing removes only the captured identity keys', () => {
+  const auth = load(async () => {
+    throw new Error('no network');
+  });
+  const aActive = auth.identityCacheKey(A, 'active_session');
+  const aRun = auth.identityCacheKey(A, 'run:s1');
+  const bActive = auth.identityCacheKey(B, 'active_session');
+  const shared = 'easel_theme';
+  function storage(initial) {
+    const map = new Map(Object.entries(initial));
+    return {
+      get length() { return map.size; },
+      key: (index) => Array.from(map.keys())[index] ?? null,
+      removeItem: (key) => { map.delete(key); },
+      has: (key) => map.has(key),
+    };
+  }
+  const local = storage({ [aActive]: '1', [aRun]: '2', [bActive]: '3', [shared]: 'dark' });
+  const session = storage({ [aRun]: '2', [bActive]: '3' });
+  auth.clearIdentityCache(A, [local, session]);
+  assert.equal(local.has(aActive), false);
+  assert.equal(local.has(aRun), false);
+  assert.equal(local.has(bActive), true);
+  assert.equal(local.has(shared), true);
+  assert.equal(session.has(aRun), false);
+  assert.equal(session.has(bActive), true);
 });
 
 test('logout uses the captured CSRF and reports remote failure', async () => {

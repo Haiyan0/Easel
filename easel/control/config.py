@@ -292,11 +292,22 @@ class ConfigService:
 
     def __init__(self, store: Store, master_key: bytes,
                  egress_policy: EgressPolicy | None = None, *,
-                 egress_policy_configured: bool | None = None):
+                 egress_policy_configured: bool | None = None,
+                 model_catalog: tuple[str, ...] | None = None):
         if (not isinstance(master_key, (bytes, bytearray))
                 or len(master_key) != MASTER_KEY_BYTES):
             raise ValueError(
                 f"master_key must be exactly {MASTER_KEY_BYTES} bytes")
+        if model_catalog is not None:
+            if (not isinstance(model_catalog, tuple)
+                    or len(model_catalog) > 64
+                    or any(not isinstance(item, str) or not item
+                           or len(item) > 256
+                           or any(ord(character) < 32 for character in item)
+                           for item in model_catalog)
+                    or len(set(model_catalog)) != len(model_catalog)):
+                raise ValueError("model_catalog is invalid")
+        self._model_catalog = model_catalog
         if egress_policy_configured is None:
             egress_policy_configured = egress_policy is not None
         if not isinstance(egress_policy_configured, bool):
@@ -316,7 +327,12 @@ class ConfigService:
         return ConfigService(
             store, self._key,
             egress_policy=self.egress_policy,
-            egress_policy_configured=self.egress_policy_configured)
+            egress_policy_configured=self.egress_policy_configured,
+            model_catalog=self._model_catalog)
+
+    @property
+    def model_catalog(self) -> tuple[str, ...] | None:
+        return self._model_catalog
 
     def _now(self) -> int:
         return int(time.time())
@@ -486,6 +502,8 @@ class ConfigService:
             public = _validate_complete_route(
                 channel, route, allow_allowed_models=True,
                 for_admin_default=True)
+            if channel == "chat":
+                self._validate_chat_catalog(public)
             # 保存时即执行与签发/实际请求一致的出口前置校验
             self.egress_policy.validate_url(public["base_url"], resolve=False)
             metadata = provider_metadata(_REGISTRY_GROUP[channel],
@@ -517,6 +535,17 @@ class ConfigService:
         public_json = _canonical({"defaults": merged_public})
         return self._store.publish_managed_revision(
             actor, public_json, encrypted, expected_version, self._now())
+
+    def _validate_chat_catalog(self, public: dict) -> None:
+        """受管 chat 只能使用锁定 Harness 已验证的模型目录。"""
+        if self._model_catalog is None:
+            return
+        if not self._model_catalog:
+            raise DomainError("model_catalog_unavailable", 503)
+        allowed = tuple(public.get("allowed_models") or (public["model"],))
+        if (public["model"] not in self._model_catalog
+                or any(model not in self._model_catalog for model in allowed)):
+            raise DomainError("model_not_allowed", 409)
 
     def _validated_managed_bundle(self, value: Any) -> dict[str, dict]:
         """受管凭证 bundle 只允许已知通道 → 非空字符串键值。"""
@@ -931,6 +960,15 @@ class ConfigService:
                         _REGISTRY_GROUP[channel], entry["provider"])
                 except (ImportError, KeyError):
                     entry["broker_supported"] = False
+            if channel == "chat" and self._model_catalog is not None:
+                # 公共目录只暴露锁定 Harness 已验证的模型；旧版本中越界
+                # 的 allowed_models 不再出现在可选项里。
+                entry["model_catalog"] = list(self._model_catalog)
+                allowed = entry.get("allowed_models")
+                if isinstance(allowed, list):
+                    entry["allowed_models"] = [
+                        model for model in allowed
+                        if model in self._model_catalog]
             channels[channel] = entry
 
         return {

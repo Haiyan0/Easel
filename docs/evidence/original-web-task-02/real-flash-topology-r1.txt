@@ -1,0 +1,5 @@
+A5_IMAGES {"control": "sha256:2acb2485b07dbc65732c0c9996d987922a9d98dbe4fc9a14312217011b46e745", "gateway": "sha256:c0a35aaa9f304c47f9f5c3e73add7d9d5920041baef156e2ea674f3000c5580a", "worker": "sha256:c44c786aa4ef70734ca878fdd9e5ca90c390acf907fc4598b42b042a62c80195"}
+A5_REAL_PASS {"pids_a1": [27, 40], "pids_a2": [52, 65], "provider_requests": 9, "token_rows": [{"revoked": true, "run": "1ed25572a008429cb86cf92be0239bfa"}, {"revoked": true, "run": "44dbab867ebe4d12ac22ae46abd5a622"}], "worker_a": "0d5813db0942132df5902c5a9454e3d338160a06aeecb2863f435cbafa9d4e1d", "worker_b": "a7853d148f123e16a0cd88cf26cdbbac7da09e301dc67b90848f3c8f081a6ce2"}
+TASK2_MODEL_AUDIT {"authorization_is_fake_sentinel": true, "chat_requests": 9, "provider_model": "deepseek-flash", "workspace_requests": 10}
+.
+1 passed, 1 deselected in 74.92s (0:01:14)

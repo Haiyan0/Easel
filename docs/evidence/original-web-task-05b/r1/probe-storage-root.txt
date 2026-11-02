@@ -1,0 +1,29 @@
+LINK_KIND=junction
+python.exe : Traceback (most recent call last):
+At line:1 char:389
++ ... | Out-Null; & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' 'C:\Code ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+  File "C:\Code\Easel\docs\evidence\original-web-task-05b-review\probe_storage_root.py", line 61, in <module>
+    main()
+  File "C:\Code\Easel\docs\evidence\original-web-task-05b-review\probe_storage_root.py", line 47, in main
+    print(label + '_INITIAL_READ=' + str(asyncio.run(read())))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6296, in api_ideas_list
+    return _read_ideas()
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6280, in _read_ideas
+    return _read_workbench_json("_ideas.json", "选题")
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6098, in _read_workbench_json
+    path = _workbench_file(name)
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6073, in _workbench_file
+    root = _workbench_root(create=False)
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6059, in _workbench_root
+    if not _real_directory(root):
+  File "C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\web\app.py", line 6042, in _real_directory
+    raise HTTPException(500, "工作台存储不可用")
+fastapi.exceptions.HTTPException: 500: 工作台存储不可用

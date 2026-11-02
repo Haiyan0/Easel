@@ -1,0 +1,13 @@
+﻿
+=================================== ERRORS ====================================
+_________ ERROR collecting tests/multiuser/test_workspace_accounts.py _________
+ImportError while importing test module 'C:\Code\Easel\.claude\worktrees\original-web-task1-diagnostics\tests\multiuser\test_workspace_accounts.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests\multiuser\test_workspace_accounts.py:20: in <module>
+    from easel.control.workspace_accounts import (
+E   ModuleNotFoundError: No module named 'easel.control.workspace_accounts'
+=========================== short test summary info ===========================
+ERROR tests/multiuser/test_workspace_accounts.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.65s

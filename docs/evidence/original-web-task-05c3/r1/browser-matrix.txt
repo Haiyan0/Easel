@@ -1,0 +1,176 @@
+[5C3] scenario start: manual-export-review-calendar
+[5C3] scenario ok: manual-export-review-calendar
+[5C3] scenario start: policy-automated
+[5C3] scenario ok: policy-automated
+[5C3] scenario start: auto-publish-sms-stop-refresh
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+STOP RESP 200 0.06
+[5C3] scenario ok: auto-publish-sms-stop-refresh
+[5C3] scenario start: duplicate-submit-once
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+[5C3] scenario ok: duplicate-submit-once
+[5C3] scenario start: lost-ack-running-retry-once
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+[5C3] scenario ok: lost-ack-running-retry-once
+[5C3] scenario start: lost-ack-done-retry-once
+[5C3] scenario ok: lost-ack-done-retry-once
+[5C3] scenario start: lost-ack-refresh-recovers
+[5C3] scenario ok: lost-ack-refresh-recovers
+[5C3] scenario start: lost-ack-refresh-retry-stored-payload
+[5C3] scenario ok: lost-ack-refresh-retry-stored-payload
+[5C3] scenario start: explicit-new-intent
+[5C3] scenario ok: explicit-new-intent
+[5C3] scenario start: identity-switch-isolates-intent
+[5C3] scenario ok: identity-switch-isolates-intent
+[5C3] scenario start: policy-manual
+[5C3] scenario ok: policy-manual
+{
+  "results": {
+    "manual-export-review-calendar": true,
+    "policy-automated": true,
+    "auto-publish-sms-stop-refresh": true,
+    "duplicate-submit-once": true,
+    "lost-ack-running-retry-once": true,
+    "lost-ack-done-retry-once": true,
+    "lost-ack-refresh-recovers": true,
+    "lost-ack-refresh-retry-stored-payload": true,
+    "explicit-new-intent": true,
+    "identity-switch-isolates-intent": true,
+    "policy-manual": true
+  },
+  "failures": [],
+  "screenshots": [
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\01-manual-export-review.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\02-manual-mobile.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\03-manual-dark.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\04-policy-automated.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\06-auto-publish-success.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\07-auto-refresh-recovered.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\08-lost-ack-running-retry.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\09-lost-ack-done-retry.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\10-lost-ack-refresh-recovered.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\13-lost-ack-refresh-stored-payload.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\11-explicit-new-intent.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\12-identity-switch-isolated.png",
+    "C:\\Code\\Easel\\.claude\\worktrees\\original-web-task1-diagnostics\\docs\\evidence\\original-web-task-05c3\\r1\\browser\\05-policy-manual.png"
+  ]
+}
+TASK5C3_BROWSER_OK True
+EXIT:0

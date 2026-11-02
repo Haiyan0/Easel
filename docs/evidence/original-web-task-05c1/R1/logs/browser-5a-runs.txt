@@ -1,0 +1,15 @@
+﻿BROWSER_VERSION 151.0.7922.34
+TASK5A_BROWSER_RESULTS {'outputs_media_delete_light': True, 'profile_and_attachment': True, 'dark_mobile': True, 'logout_media_401': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05a\\browser\\01-outputs-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\02-media-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\03-html-preview-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\04-profile-edit-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\05-attachment-upload-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\06-outputs-dark.png', 'docs\\evidence\\original-web-task-05a\\browser\\07-outputs-mobile.png']
+TASK5A_BROWSER_OK True
+BROWSER_VERSION 151.0.7922.34
+TASK5A_BROWSER_RESULTS {'outputs_media_delete_light': True, 'profile_and_attachment': True, 'dark_mobile': True, 'logout_media_401': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05a\\browser\\01-outputs-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\02-media-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\03-html-preview-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\04-profile-edit-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\05-attachment-upload-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\06-outputs-dark.png', 'docs\\evidence\\original-web-task-05a\\browser\\07-outputs-mobile.png']
+TASK5A_BROWSER_OK True
+BROWSER_VERSION 151.0.7922.34
+TASK5A_BROWSER_RESULTS {'outputs_media_delete_light': True, 'profile_and_attachment': True, 'dark_mobile': True, 'logout_media_401': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05a\\browser\\01-outputs-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\02-media-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\03-html-preview-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\04-profile-edit-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\05-attachment-upload-light.png', 'docs\\evidence\\original-web-task-05a\\browser\\06-outputs-dark.png', 'docs\\evidence\\original-web-task-05a\\browser\\07-outputs-mobile.png']
+TASK5A_BROWSER_OK True

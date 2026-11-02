@@ -30,6 +30,16 @@ interface SidebarProps {
   apiDirect: boolean;
   agentRuntime: string;
   onOpenSettings: () => void;
+  mode?: 'local' | 'control';
+  identityLabel?: string;
+  onLogout?: () => void;
+  personasEnabled?: boolean;
+  personaCreateEnabled?: boolean;
+  showEmptySessions?: boolean;
+  statusText?: string;
+  statusOnline?: boolean;
+  hasMoreSessions?: boolean;
+  onLoadMoreSessions?: () => void;
 }
 
 // 主导航（精简）；热点雷达/选题库/内容日历/发布中心 收进「工作台」，不占侧栏
@@ -60,6 +70,16 @@ export default function Sidebar({
   apiDirect,
   agentRuntime,
   onOpenSettings,
+  mode = 'local',
+  identityLabel,
+  onLogout,
+  personasEnabled = true,
+  personaCreateEnabled = true,
+  showEmptySessions = false,
+  statusText,
+  statusOnline,
+  hasMoreSessions = false,
+  onLoadMoreSessions,
 }: SidebarProps) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -71,8 +91,17 @@ export default function Sidebar({
     setRenamingId(null);
   };
 
-  const active = sessions.filter((s) => !s.archived && (s.messages.length > 0 || s.id === activeSessionId));
+  const active = sessions.filter((s) => !s.archived && (
+    showEmptySessions || s.messages.length > 0 || s.id === activeSessionId));
   const archived = sessions.filter((s) => s.archived);
+  const online = statusOnline ?? gatewayStatus === 'connected';
+  const defaultStatus = gatewayStatus === 'connected'
+    ? (apiDirect ? '仅聊天模式已配置'
+      : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 已安装` : '网关已连接')
+    : gatewayStatus === 'disconnected'
+      ? (apiDirect ? 'API 配置不完整'
+        : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 未配置` : '网关离线')
+      : '连接中…';
 
   const renderItem = (s: ChatSession, isArchived: boolean) => {
     if (renamingId === s.id) {
@@ -122,21 +151,36 @@ export default function Sidebar({
           <h1>Easel</h1>
           <ThemeToggle />
         </div>
-        <select
-          className="persona-select"
-          value={selectedPersona}
-          onChange={(e) => {
-            if (e.target.value === '__new__') { onNewProfile(); return; }
-            onPersonaChange(e.target.value);
-          }}
-          title="选择用户画像（一个对话对应一个画像：切换会新建一个对话）"
-        >
-          <option value="">通用模式</option>
-          {personas.map((p) => (
-            <option key={p.name} value={p.name}>{p.name}</option>
-          ))}
-          <option value="__new__">+ 新建画像…</option>
-        </select>
+        {personasEnabled && (
+          <select
+            className="persona-select"
+            value={selectedPersona}
+            onChange={(e) => {
+              if (e.target.value === '__new__') { onNewProfile(); return; }
+              onPersonaChange(e.target.value);
+            }}
+            title="选择用户画像（一个对话对应一个画像：切换会新建一个对话）"
+          >
+            <option value="">通用模式</option>
+            {personas.map((p) => (
+              <option key={p.name} value={p.name}>{p.name}</option>
+            ))}
+            {personaCreateEnabled && <option value="__new__">+ 新建画像…</option>}
+          </select>
+        )}
+        {(mode === 'control' || !personasEnabled) && (
+          <div className={`sidebar-identity sidebar-identity-${mode}`}
+            title={identityLabel || '已登录'}>
+            <span className="sidebar-identity-name">
+              {identityLabel || '已登录'}
+            </span>
+            {onLogout && (
+              <button className="sidebar-logout" onClick={onLogout}>
+                退出
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <nav className="sidebar-nav">
@@ -170,15 +214,18 @@ export default function Sidebar({
             {showArchived && archived.map((s) => renderItem(s, true))}
           </>
         )}
+        {hasMoreSessions && onLoadMoreSessions && (
+          <button className="new-chat-btn" onClick={onLoadMoreSessions}>
+            加载更多会话
+          </button>
+        )}
       </div>
 
       <div className="sidebar-status">
-        <span className={`status-dot ${gatewayStatus === 'connected' ? '' : 'offline'}`} />
-        <span className="sidebar-status-text">{gatewayStatus === 'connected'
-          ? (apiDirect ? '仅聊天模式已配置' : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 已安装` : '网关已连接')
-          : gatewayStatus === 'disconnected'
-            ? (apiDirect ? 'API 配置不完整' : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 未配置` : '网关离线')
-            : '连接中…'}</span>
+        <span className={`status-dot ${online ? '' : 'offline'}`} />
+        <span className="sidebar-status-text">
+          {statusText ?? defaultStatus}
+        </span>
         <button className="settings-gear" onClick={onOpenSettings} title="设置（模型 · 环境 · 更多）">
           <IconGear size={13} /> 设置
         </button>

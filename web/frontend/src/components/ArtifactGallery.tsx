@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { artifactFromUrl, fitArtifact, mergeArtifacts } from '../lib/artifacts';
-import { fetchArtifactArchive, mediaUrl } from '../lib/api';
 import type { Artifact } from '../lib/artifacts';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { IconChevron, IconOutputs } from './icons';
 
 function HtmlArtifact({ artifact }: { artifact: Artifact }) {
+  const data = useWorkspaceData();
   const frame = useRef<HTMLIFrameElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const [source, setSource] = useState('');
@@ -14,9 +15,7 @@ function HtmlArtifact({ artifact }: { artifact: Artifact }) {
   const token = useRef(crypto.randomUUID());
   useEffect(() => {
     const controller = new AbortController();
-    void fetch(artifact.url, { signal: controller.signal }).then(async response => {
-      if (!response.ok) throw new Error('preview');
-      const html = await response.text();
+    void data.fetchText(artifact.url, controller.signal).then(html => {
       const base = new URL('.', new URL(artifact.url, window.location.origin)).href;
       const document = new DOMParser().parseFromString(html, 'text/html');
       document.querySelectorAll('base').forEach(element => element.remove());
@@ -39,7 +38,7 @@ function HtmlArtifact({ artifact }: { artifact: Artifact }) {
       if (!controller.signal.aborted) setError(true);
     });
     return () => controller.abort();
-  }, [artifact.url]);
+  }, [artifact.url, data]);
   useEffect(() => {
     const observer = new ResizeObserver(entries => {
       const rect = entries[0].contentRect;
@@ -81,6 +80,7 @@ function ArtifactPreview({ artifact }: { artifact: Artifact }) {
 }
 
 export default function ArtifactGallery({ artifacts, archives }: { artifacts: Artifact[]; archives?: string[] }) {
+  const data = useWorkspaceData();
   const [index, setIndex] = useState(0);
   const [archiveArtifacts, setArchiveArtifacts] = useState<Artifact[]>([]);
   useEffect(() => {
@@ -88,15 +88,15 @@ export default function ArtifactGallery({ artifacts, archives }: { artifacts: Ar
     setArchiveArtifacts([]);
     if (archives?.length) {
       void Promise.all(archives.slice(0, 8).map(path =>
-        fetchArtifactArchive(path, controller.signal).then(result =>
-          result.paths.map(path => artifactFromUrl(mediaUrl(path))).filter((artifact): artifact is Artifact => !!artifact),
+        data.fetchArtifactArchive(path, controller.signal).then(result =>
+          result.paths.map(path => artifactFromUrl(data.mediaUrl(path))).filter((artifact): artifact is Artifact => !!artifact),
         ).catch(() => []),
       )).then(groups => {
         if (!controller.signal.aborted) setArchiveArtifacts(mergeArtifacts(...groups));
       });
     }
     return () => controller.abort();
-  }, [archives]);
+  }, [archives, data]);
   const items = mergeArtifacts(artifacts, archiveArtifacts);
   const current = Math.min(index, items.length - 1);
   const artifact = items[current];

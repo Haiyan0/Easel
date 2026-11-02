@@ -1,0 +1,12 @@
+实现前运行：
+python -m pytest tests/multiuser/test_gateway_workspace.py -q
+
+结果：
+30 failed, 8 passed in 0.90s
+
+失败覆盖：
+- 工作区 14 条精确路由无法转发（/api/status、personas、persona files/file、
+  outputs、archive、output、media GET/HEAD、upload、upload/limits）
+- media HEAD/Range 206、304 条件响应、上传原始 body/上限
+- traversal/内部目录/方法错误均为 404/未分类，而非 400/405
+- workspace 403 被当作 gateway 失败

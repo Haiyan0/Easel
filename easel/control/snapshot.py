@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 _MANAGED_FIELDS = frozenset({"revision", "agent", "broker"})
 _AGENT_FIELDS = frozenset({
-    "runtime", "command", "model", "sandbox", "timeout",
+    "runtime", "command", "model", "models", "sandbox", "timeout",
     "codex_auto_approve"})
 _LEGACY_BROKER_FIELDS = frozenset({"url", "channel"})
 _SIDECAR_BROKER_FIELDS = frozenset({"mode", "channel"})
@@ -85,6 +85,77 @@ def _command(value: object) -> list[str]:
     return list(value)
 
 
+def _model_catalog(value: object) -> list[str]:
+    """受管 Harness 模型目录：有界、唯一、无控制字符的公开模型 ID。"""
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        raise ValueError("managed agent models must be a non-empty list")
+    normalized: list[str] = []
+    for item in value:
+        if (not isinstance(item, str) or not item or len(item) > 256
+                or any(ord(character) < 32 for character in item)):
+            raise ValueError("managed agent model is invalid")
+        if item in normalized:
+            raise ValueError("managed agent model is duplicated")
+        normalized.append(item)
+    return normalized
+
+
+MANAGED_PROFILE_SCHEMA = "easel.managed-acp-profile/1"
+MANAGED_PROVIDER_ID = "easel-broker"
+MANAGED_PROVIDER_API = "openai-completions"
+_MAX_MANAGED_PROFILE_BYTES = 64 * 1024
+
+
+def _harness_commit(value: object) -> str:
+    if (not isinstance(value, str) or len(value) != 40
+            or any(character not in "0123456789abcdef"
+                   for character in value)):
+        raise ValueError("managed profile harness commit is invalid")
+    return value
+
+
+def load_managed_profile_models(
+        path: str | Path, *,
+        expected_commit: str | None = None) -> tuple[str, ...]:
+    """从与目标 worker 镜像同源的受管 manifest 读取可信模型目录。
+
+    运行时 ``managed-agent.json`` 的 ``agent.models`` 只能在这个目录内收窄；
+    manifest 缺失、schema/provider/commit 不合法或与期望目标版本不一致时
+    明确失败，不能由运行时自报镜像不支持的模型。
+    """
+    profile_path = Path(path)
+    raw = profile_path.read_bytes()
+    if len(raw) > _MAX_MANAGED_PROFILE_BYTES:
+        raise ValueError("managed profile is too large")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("managed profile must be a JSON object") from None
+    if not isinstance(payload, dict):
+        raise ValueError("managed profile must be a JSON object")
+    if payload.get("manifest") != MANAGED_PROFILE_SCHEMA:
+        raise ValueError("managed profile schema is invalid")
+    harness = payload.get("harness")
+    if not isinstance(harness, dict):
+        raise ValueError("managed profile harness is invalid")
+    commit = _harness_commit(harness.get("commit"))
+    if expected_commit is not None:
+        expected = _harness_commit(expected_commit)
+        if commit != expected:
+            raise ValueError(
+                "managed profile commit does not match the target")
+    provider = payload.get("provider")
+    if not isinstance(provider, dict):
+        raise ValueError("managed profile provider is invalid")
+    if (provider.get("id") != MANAGED_PROVIDER_ID
+            or provider.get("api") != MANAGED_PROVIDER_API):
+        raise ValueError("managed profile provider is invalid")
+    models = _model_catalog(provider.get("models"))
+    if provider.get("model") not in models:
+        raise ValueError("managed profile default model is not in the catalog")
+    return tuple(models)
+
+
 def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
     """读取受保护的受管 Agent 配置，返回 ``(revision, agent, broker)``。
 
@@ -126,6 +197,13 @@ def load_managed_agent_config(path: str | Path) -> tuple[int, dict, dict]:
                 or any(ord(character) < 32 for character in model)):
             raise ValueError("managed agent model is invalid")
         normalized["model"] = model
+    models = None
+    if "models" in agent:
+        models = _model_catalog(agent["models"])
+        normalized["models"] = models
+    if ("model" in normalized and models is not None
+            and normalized["model"] not in models):
+        raise ValueError("managed agent model is not in the catalog")
     if "sandbox" in agent:
         if agent["sandbox"] not in _SANDBOXES:
             raise ValueError("managed agent sandbox is invalid")

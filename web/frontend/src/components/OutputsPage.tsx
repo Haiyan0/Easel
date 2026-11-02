@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { CSSProperties } from 'react';
-import { fetchOutputs, fetchOutputContent, mediaUrl, deleteOutput } from '../lib/api';
 import type { OutputNode, OutputMeta } from '../lib/api';
+import { workspaceErrorMessage } from '../lib/workspaceData';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconOutputs, IconImage, IconVideo, IconMusic, IconFile, IconFolder, IconRefresh, IconChevron, IconTrash } from './icons';
 
@@ -70,8 +71,9 @@ function resolvePath(roots: OutputNode[], names: string[]): OutputNode[] {
 }
 
 function Thumb({ f, big }: { f: OutputNode | null; big?: boolean }) {
-  if (f && f.kind === 'image') return <img src={mediaUrl(f.path)} alt="" loading="lazy" />;
-  if (f && f.kind === 'video') return <video src={mediaUrl(f.path)} preload="metadata" muted />;
+  const data = useWorkspaceData();
+  if (f && f.kind === 'image') return <img src={data.mediaUrl(f.path)} alt="" loading="lazy" />;
+  if (f && f.kind === 'video') return <video src={data.mediaUrl(f.path)} preload="metadata" muted />;
   return <div className="gcard-ph">{kindIcon(f?.kind, big ? 34 : 30)}</div>;
 }
 
@@ -82,6 +84,7 @@ interface OutputsPageProps {
 }
 
 export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProps) {
+  const data = useWorkspaceData();
   const [roots, setRoots] = useState<OutputNode[]>([]);
   const [treeError, setTreeError] = useState('');
   const [stack, setStack] = useState<string[]>([]);   // 当前所在的文件夹名称路径
@@ -93,8 +96,10 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
 
   const load = useCallback(() => {
     setTreeError('');
-    fetchOutputs().then(setRoots).catch(() => setTreeError('加载产物列表失败'));
-  }, []);
+    data.fetchOutputs().then(setRoots).catch((error: unknown) => {
+      setTreeError(workspaceErrorMessage(error, '加载产物列表失败'));
+    });
+  }, [data]);
   useEffect(() => { load(); }, [load]);
 
   const currentNodes = useMemo(() => resolvePath(roots, stack), [roots, stack]);
@@ -132,13 +137,13 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
     const label = isDir ? `项目/文件夹「${node.meta?.title || node.name}」及其全部内容` : `文件「${node.name}」`;
     if (!window.confirm(`确定删除${label}？\n此操作不可恢复。`)) return;
     try {
-      await deleteOutput(node.path);
+      await data.deleteOutput(node.path);
       setSelected((cur) => (cur?.path === node.path ? null : cur));
       load();
     } catch (err) {
-      alert((err as Error).message || '删除失败');
+      alert(workspaceErrorMessage(err, '删除失败'));
     }
-  }, [load]);
+  }, [data, load]);
 
   const open = useCallback(async (f: OutputNode) => {
     const seq = ++reqSeq.current;
@@ -146,11 +151,15 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
     if (f.kind === 'text' && !isHtml(f.name)) {
       setLoading(true);
       try {
-        const res = await fetchOutputContent(f.path);
+        const res = await data.fetchOutputContent(f.path);
         if (seq === reqSeq.current) setContent(res.isBinary ? '' : res.content);
+      } catch (error) {
+        if (seq === reqSeq.current) {
+          setTreeError(workspaceErrorMessage(error, '读取产物失败'));
+        }
       } finally { if (seq === reqSeq.current) setLoading(false); }
     }
-  }, []);
+  }, [data]);
 
   // 等内容树加载后区分文件与目录；文件链接直接打开预览。
   useEffect(() => {
@@ -175,7 +184,7 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
 
   const preview = () => {
     if (!selected) return null;
-    const url = mediaUrl(selected.path);
+    const url = data.mediaUrl(selected.path);
     if (selected.kind === 'image') return <img src={url} alt={selected.name} style={{ maxWidth: '100%', borderRadius: 'var(--radius)' }} />;
     if (selected.kind === 'video') return <video src={url} controls style={{ maxWidth: '100%', borderRadius: 'var(--radius)' }} />;
     if (selected.kind === 'audio') return <audio src={url} controls style={{ width: '100%' }} />;

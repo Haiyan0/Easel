@@ -1,0 +1,4 @@
+﻿CONTAINER_IMAGES {'control': 'easel-control:task5a-20261030', 'gateway': 'easel-gateway:task5a-20261030', 'worker': 'easel-worker-execution:task5a-20261030'}
+CONTAINER_CHECK {'status': True, 'personas': True, 'outputs': True, 'text': True, 'media_head_range': True, 'upload': True, 'persona_write': True, 'delete': True, 'anonymous_401': True}
+TASK5A_CONTAINER_OK True
+CLEANUP_ERRORS []

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -37,6 +38,7 @@ from .config import (
     run_snapshot_fingerprint,
     verify_run_snapshot,
 )
+from .browser_tasks import BROWSER_TASK_TYPES, execute_browser_task
 from .fsutil import best_effort_fchmod, fsync_directory
 from .sessions import (
     MAX_ATTACHMENTS,
@@ -54,6 +56,60 @@ SHUTDOWN_GRACE_ENV = "EASEL_WORKER_DRAIN_TIMEOUT"
 DEFAULT_SHUTDOWN_GRACE = 15.0
 MAX_SHUTDOWN_GRACE = 120.0
 _SHUTDOWN_CANCEL_TIMEOUT = 5.0
+
+_LOGGER = logging.getLogger(__name__)
+
+# 用户可见诊断只使用固定词表；不拼接异常 message、stderr、prompt 或路径。
+_STAGE_LABELS = {
+    "cli_start": "启动 Agent 进程",
+    "initialize": "初始化 Agent 协议",
+    "session": "建立或恢复会话",
+    "model": "选择模型",
+    "prompt": "执行本轮对话",
+    "rpc": "Agent 协议通信",
+    "unknown": "未知阶段",
+}
+_CATEGORY_LABELS = {
+    "auth": "上游鉴权失败",
+    "rate_limited": "上游限速",
+    "request_rejected": "上游拒绝请求",
+    "service_unavailable": "上游服务不可用",
+    "unknown": "未知原因（未获得可分类的上游证据）",
+}
+
+
+def _failure_diagnostic(error: BaseException
+                        ) -> tuple[str, str, int | None, str]:
+    """把适配器异常收敛为固定阶段/类别/状态码与可追踪 reason。"""
+    stage = getattr(error, "stage", None)
+    if type(stage) is not str or stage not in _STAGE_LABELS:
+        stage = "unknown"
+    category = getattr(error, "category", None)
+    if type(category) is not str or category not in _CATEGORY_LABELS:
+        category = "unknown"
+    status = getattr(error, "status", None)
+    if type(status) is not int or not 100 <= status <= 599:
+        status = None
+    reason = "agent_failed" if category == "unknown" else \
+        f"harness_{category}"
+    return stage, category, status, reason
+
+
+def _display_run_id(run_id: object) -> str:
+    if (not isinstance(run_id, str) or not run_id or len(run_id) > 128
+            or any(not (character.isalnum()
+                        or character in "-_.:")
+                   for character in run_id)):
+        return "unknown"
+    return run_id
+
+
+def _failure_message(run_id: str, stage: str, category: str,
+                     status: int | None) -> str:
+    evidence = f"状态码：{status}；" if status is not None else ""
+    return (f"Agent 执行失败（阶段：{_STAGE_LABELS[stage]}；"
+            f"类别：{_CATEGORY_LABELS[category]}；{evidence}"
+            f"任务：{_display_run_id(run_id)}）")
 
 
 def shutdown_grace_from_env(environ: Mapping[str, str] | None = None) -> float:
@@ -196,6 +252,18 @@ def _sandbox(value: object) -> str:
     if value not in ("read-only", "workspace-write", "danger-full-access"):
         raise _invalid("agent_config_invalid")
     return str(value)
+
+
+def _model_list(value: object) -> list[str]:
+    """签名快照中的模型目录/允许列表：有界、唯一、无控制字符。"""
+    if (not isinstance(value, list) or not 1 <= len(value) <= 64
+            or any(not isinstance(item, str) or not item
+                   or len(item) > 256
+                   or any(ord(character) < 32 for character in item)
+                   for item in value)
+            or len(set(value)) != len(value)):
+        raise _invalid("agent_config_invalid")
+    return list(value)
 
 
 def _command(value: object, runtime: str) -> tuple[str, ...]:
@@ -394,6 +462,7 @@ CREATE TABLE IF NOT EXISTS run_admissions (
     state TEXT NOT NULL,
     reason TEXT,
     finalizing INTEGER NOT NULL DEFAULT 0,
+    committing INTEGER NOT NULL DEFAULT 0,
     snapshot_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -439,6 +508,10 @@ class RunRegistry:
             if "finalizing" not in columns:
                 connection.execute(
                     "ALTER TABLE run_admissions ADD COLUMN finalizing"
+                    " INTEGER NOT NULL DEFAULT 0")
+            if "committing" not in columns:
+                connection.execute(
+                    "ALTER TABLE run_admissions ADD COLUMN committing"
                     " INTEGER NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
@@ -581,7 +654,7 @@ class RunRegistry:
                     return False
                 connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?",
                     (state, reason, now, self.workspace_id, run_id))
                 data: dict[str, object] = {"state": state}
@@ -616,7 +689,7 @@ class RunRegistry:
             try:
                 cursor = connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?"
                     " AND finalizing = 0 AND state IN"
                     f" ({_placeholders(ACTIVE_STATES)})",
@@ -684,7 +757,7 @@ class RunRegistry:
                     return False
                 connection.execute(
                     "UPDATE run_admissions SET state = ?, reason = ?,"
-                    " finalizing = 0, updated_at = ?"
+                    " finalizing = 0, committing = 0, updated_at = ?"
                     " WHERE workspace_id = ? AND run_id = ?",
                     (state, reason, now, self.workspace_id, run_id))
                 data: dict[str, object] = {"state": state}
@@ -710,6 +783,48 @@ class RunRegistry:
                 " WHERE workspace_id = ? AND finalizing = 1",
                 (self.workspace_id,)).fetchall()
         return [str(row["run_id"]) for row in rows]
+
+    # -- 外部副作用提交栅栏 ------------------------------------------------
+    #
+    # 凭证验证在受控线程里完成后才能落盘；停止必须先取得终态。用一个与
+    # finalizing 分离的短栅栏把「检查 Run 仍活跃 → 写 YAML/登录标记 → 放行
+    # 结果」变成一个停止可见的原子段：stop 在 committing=1 时等待，提交
+    # 结束后再读取真实终态，避免 cancelled 与迟到成功并存。
+
+    def begin_commit(self, run_id: str) -> bool:
+        """声明一次外部副作用提交；仅活跃且未收尾/未提交的 Run 可取得。"""
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE run_admissions SET committing = 1,"
+                    " updated_at = ? WHERE workspace_id = ? AND run_id = ?"
+                    " AND committing = 0 AND finalizing = 0 AND state IN"
+                    f" ({_placeholders(ACTIVE_STATES)})",
+                    (now, self.workspace_id, run_id, *ACTIVE_STATES))
+                connection.execute("COMMIT")
+                return cursor.rowcount == 1
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def end_commit(self, run_id: str) -> None:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "UPDATE run_admissions SET committing = 0, updated_at = ?"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (now, self.workspace_id, run_id))
+
+    def committing(self, run_id: str) -> bool:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT committing FROM run_admissions"
+                " WHERE workspace_id = ? AND run_id = ?",
+                (self.workspace_id, run_id)).fetchone()
+        return bool(row is not None and row["committing"])
 
     def append_event(self, run_id: str, event: str, data: object) -> int | None:
         """终态后冻结业务事件；返回 None 表示被终态拦截。"""
@@ -956,7 +1071,7 @@ class RunRegistry:
                     run_id = str(row["run_id"])
                     connection.execute(
                         "UPDATE run_admissions SET state = 'interrupted',"
-                        " reason = ?, updated_at = ?"
+                        " reason = ?, committing = 0, updated_at = ?"
                         " WHERE workspace_id = ? AND run_id = ?",
                         (reason, now, self.workspace_id, run_id))
                     self._append_locked(
@@ -1001,6 +1116,7 @@ class RunManager:
     def __init__(self, *, workspace_id: str, paths: WorkspacePaths,
                  public_key, sessions: WorkspaceSessionStore | None = None,
                  executor: Executor | None = None,
+                 browser_executor: Executor | None = None,
                  base_env: Mapping[str, str] | None = None,
                  clock: Callable[[], float] = time.time,
                  native_binding_version: int = 1,
@@ -1025,6 +1141,8 @@ class RunManager:
             paths.state_root, workspace_id)
         self._custom_executor = executor is not None
         self._executor = executor or _harness_executor
+        # 浏览器/分析任务仍走同一 RunManager；只替换执行器，不另建账本。
+        self._browser_executor = browser_executor or execute_browser_task
         self._base_env = dict(base_env if base_env is not None else os.environ)
         self._clock = clock
         self._native_version = native_binding_version
@@ -1064,6 +1182,15 @@ class RunManager:
 
     def state(self, run_id: str) -> str | None:
         return self.registry.state(run_id)
+
+    def begin_commit(self, run_id: str) -> bool:
+        return self.registry.begin_commit(run_id)
+
+    def end_commit(self, run_id: str) -> None:
+        self.registry.end_commit(run_id)
+
+    def committing(self, run_id: str) -> bool:
+        return self.registry.committing(run_id)
 
     def admission(self, run_id: str) -> dict | None:
         return self.registry.admission(run_id)
@@ -1172,9 +1299,81 @@ class RunManager:
         task.add_done_callback(_cleanup)
         return {"runId": run_id, "state": "running", "duplicate": False}
 
+    def _prepare_browser(self, snapshot: RunSnapshot, request: dict
+                         ) -> tuple[RunContext, RunRequest]:
+        """浏览器/分析任务不启动 Agent，只固定本人路径与受管时限。
+
+        描述正文由 control 生成并已进入签名输入摘要；这里不读取 persona、
+        附件或 Agent 命令，避免把浏览器输入升级为任意进程调用。
+        """
+        if (request.get("persona") is not None
+                or request.get("attachments")):
+            raise _invalid("browser_task_input_invalid")
+        conversation_id = request["sessionId"]
+        if conversation_id in self._active_conversations:
+            holder = self._active_conversations[conversation_id]
+            holder_task = self._tasks.get(holder)
+            if holder_task is None or holder_task.done():
+                self._active_conversations.pop(conversation_id, None)
+            else:
+                raise DomainError("conversation_busy", 409)
+        agent = snapshot.agent
+        timeout = agent.get("timeout")
+        timeout = 300 if timeout is None else _timeout(timeout)
+        # 浏览器任务没有 Agent 原生会话，但结果仍要按既有会话快照落盘；
+        # 建立独立的 "browser" 绑定，不复用或改写任何 Agent native id。
+        binding = self._sessions.binding(conversation_id)
+        if not binding:
+            # "api" 是既有受支持绑定类型中唯一无原生 Agent 会话的标签；
+            # 浏览器任务会话只用于承载结果快照，不与聊天会话共享。
+            self._sessions.bind(
+                conversation_id, "api", "", self._native_version,
+                cwd=str(self._paths.workspace_root))
+        elif (binding.get("runtime") != "api"
+              or binding.get("native_id")):
+            raise DomainError("session_binding_conflict", 409)
+        config = WorkerConfigSnapshot(
+            workspace_id=snapshot.workspace_id,
+            run_id=snapshot.run_id,
+            revision=snapshot.revision,
+            routes=snapshot.routes,
+            agent=snapshot.agent,
+            nonce=snapshot.nonce,
+            expires_at=snapshot.expires_at,
+        )
+        env = build_run_env(self._paths, config, self._base_env)
+        run_request = RunRequest(
+            prompt=request["message"],
+            cwd=self._paths.workspace_root,
+            env=env,
+            native_id="",
+            model="",
+            sandbox="read-only",
+            timeout=timeout,
+            command=(),
+            session_key=conversation_id,
+            workspace_id=self.workspace_id,
+            code_root=self._paths.code_root,
+        )
+        context = RunContext(
+            workspace_id=self.workspace_id,
+            run_id=snapshot.run_id,
+            conversation_id=conversation_id,
+            task_type=snapshot.task_type,
+            snapshot=snapshot,
+            runtime="browser",
+            native_id="",
+            persona=None,
+            attachments=(),
+        )
+        self._active_conversations[conversation_id] = snapshot.run_id
+        return context, run_request
+
     def _prepare(self, snapshot: RunSnapshot, request: dict
                  ) -> tuple[RunContext, RunRequest]:
         agent = snapshot.agent
+        if snapshot.task_type in BROWSER_TASK_TYPES:
+            return self._prepare_browser(snapshot, request)
         runtime = agent.get("runtime")
         if runtime not in SUPPORTED_RUNTIMES:
             raise _invalid("agent_runtime_unsupported")
@@ -1199,6 +1398,19 @@ class RunManager:
         if model is not None and (not isinstance(model, str)
                                   or len(model) > 256):
             raise _invalid("agent_config_invalid")
+        models = agent.get("models")
+        allowed_models = agent.get("allowed_models")
+        if models is not None:
+            models = _model_list(models)
+            if model is not None and model not in models:
+                raise _invalid("agent_config_invalid")
+        if allowed_models is not None:
+            allowed_models = _model_list(allowed_models)
+            if not model or model not in allowed_models:
+                raise _invalid("agent_config_invalid")
+            if models is not None and any(
+                    item not in models for item in allowed_models):
+                raise _invalid("agent_config_invalid")
         sandbox = _sandbox(agent.get("sandbox"))
         timeout = _timeout(agent.get("timeout"))
         auto_approve = agent.get("codex_auto_approve")
@@ -1349,8 +1561,11 @@ class RunManager:
         ask = self._ask_for(context)
 
         try:
+            executor = (self._browser_executor
+                        if context.task_type in BROWSER_TASK_TYPES
+                        else self._executor)
             result = await asyncio.wait_for(
-                self._executor(request, context, bind, emit, ask),
+                executor(request, context, bind, emit, ask),
                 timeout=request.timeout)
         except asyncio.CancelledError:
             self.registry.finish_if_active(run_id, "cancelled", "stopped")
@@ -1358,7 +1573,8 @@ class RunManager:
             self._release(context)
             raise
         except asyncio.TimeoutError:
-            emit("error", "Agent 执行超时，已终止本轮进程")
+            emit("error", "Agent 执行超时，已终止本轮进程"
+                          f"（任务：{_display_run_id(run_id)}）")
             self.registry.finish_if_active(run_id, "failed", "timeout")
             self._release(context)
             return
@@ -1368,9 +1584,15 @@ class RunManager:
                 run_id, "failed", error.code)
             self._release(context)
             return
-        except Exception:  # noqa: BLE001 - 适配器边界统一收敛失败
-            emit("error", "Agent 执行失败，请检查本机 CLI、登录和模型配置")
-            self.registry.finish_if_active(run_id, "failed", "agent_failed")
+        except Exception as error:  # noqa: BLE001 - 适配器边界统一收敛失败
+            stage, category, status, reason = _failure_diagnostic(error)
+            # 运维日志只保留可追踪分类，不写 message/stderr/prompt/路径/命令。
+            _LOGGER.warning(
+                "run failure run_id=%s stage=%s category=%s status=%s"
+                " error_type=%s", _display_run_id(run_id), stage, category,
+                status, type(error).__name__)
+            emit("error", _failure_message(run_id, stage, category, status))
+            self.registry.finish_if_active(run_id, "failed", reason)
             self._release(context)
             return
 
@@ -1542,6 +1764,20 @@ class RunManager:
             raise DomainError("run_not_found", 404)
         if state in TERMINAL_STATES:
             return {"runId": run_id, "state": state}
+        if self.registry.committing(run_id):
+            # 外部副作用正在提交：等提交边界结束再决定停止，不能把已提交
+            # 的凭证 Run 事后标成 cancelled，也不能在提交中途取消执行器。
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while self.registry.committing(run_id):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.01, remaining))
+            state = self.registry.state(run_id)
+            if state is None:
+                raise DomainError("run_not_found", 404)
+            if state in TERMINAL_STATES:
+                return {"runId": run_id, "state": state}
         self.registry.finish_if_active(run_id, "cancelled", "stop_requested")
         task = self._tasks.get(run_id)
         if task is not None and not task.done():

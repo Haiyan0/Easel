@@ -46,9 +46,68 @@ def test_manifest_selects_fixed_harness_acp_and_easel_broker():
         "--patch", "/opt/easel/managed/acp.patch.yml"]
     assert data["provider"] == {
         "id": "easel-broker", "api": "openai-completions",
-        "model": "deepseek-chat"}
+        "model": "deepseek-chat",
+        "models": ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro"]}
     # 明确是 Easel manifest，不冒充 Harness profile schema。
     assert "dsh" not in data
+
+
+def test_patch_declares_every_manifest_model():
+    """Harness 的实际模型目录必须与受管 manifest 的信任目录一致。"""
+    manifest = _manifest()
+    patch = PATCH.read_text(encoding="utf-8")
+    assert _patch_models(patch) == manifest["provider"]["models"]
+
+
+def _patch_models(patch_text: str) -> list[str]:
+    """从 llm-pi-ai 的 models 段解析模型 ID（不依赖第三方 YAML）。"""
+    lines = patch_text.splitlines()
+    start = None
+    indent = None
+    for index, line in enumerate(lines):
+        if line.strip() == "models:" and "llm-pi-ai" in "\n".join(
+                lines[max(0, index - 20):index]):
+            start = index
+            indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return []
+    models: list[str] = []
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        stripped = line.strip()
+        if stripped.startswith("- id: "):
+            models.append(stripped[len("- id: "):])
+    return models
+
+
+def test_validator_rejects_patch_not_matching_manifest_catalog(tmp_path):
+    manifest = _manifest()
+    (tmp_path / "acp-profile.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    patch = PATCH.read_text(encoding="utf-8")
+    (tmp_path / "acp.patch.yml").write_text(
+        patch.replace(
+            "          - id: deepseek-flash\n"
+            "            name: DeepSeek Flash (Easel broker)\n"
+            "            contextWindow: 65536\n"
+            "            maxTokens: 4096\n"
+            "            reasoningEfforts: false\n", ""),
+        encoding="utf-8")
+    with pytest.raises(managed.ProfileError):
+        managed.validate_manifest(manifest, patch_root=tmp_path)
+
+
+def test_validator_rejects_default_model_outside_manifest_catalog(tmp_path):
+    manifest = copy.deepcopy(_manifest())
+    manifest["provider"]["model"] = "deepseek-other"
+    (tmp_path / "acp-profile.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "acp.patch.yml").write_text(
+        PATCH.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(managed.ProfileError):
+        managed.validate_manifest(manifest, patch_root=tmp_path)
 
 
 def test_patch_is_harness_native_and_uses_run_scoped_broker_env():

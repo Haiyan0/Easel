@@ -1,6 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
-import { fetchTrends, createIdea } from '../lib/api';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { TrendGroup } from '../lib/api';
+import {
+  useWorkspaceData,
+} from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { IconFire, IconRefresh, IconBookmark, IconCheck } from './icons';
 
 interface TrendsPageProps {
@@ -17,32 +20,68 @@ const ALL_PLATFORMS: { key: string; label: string }[] = [
 ];
 
 export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
+  const data = useWorkspaceData();
   const [selected, setSelected] = useState<string[]>(['weibo', 'douyin', 'zhihu']);
   const [groups, setGroups] = useState<TrendGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [saveError, setSaveError] = useState('');
   const [updated, setUpdated] = useState(0);
+  const [stale, setStale] = useState(false);
   const [saved, setSaved] = useState<Set<string>>(new Set());
+  const request = useRef<AbortController | null>(null);
 
   const save = async (title: string, source: string) => {
     if (saved.has(title)) return;
+    setSaveError('');
     try {
-      await createIdea({ title, source: `${source}热搜`, status: 'pending' });
+      await data.createIdea(
+        { title, source: `${source}热搜`, status: 'pending' });
       setSaved((prev) => new Set(prev).add(title));
-    } catch { /* ignore */ }
+    } catch (error) {
+      setSaveError(workspaceErrorMessage(error, '收藏选题失败，请重试。'));
+    }
   };
 
   const load = useCallback((pfs: string[]) => {
-    if (pfs.length === 0) { setGroups([]); return; }
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    if (pfs.length === 0) {
+      setGroups([]);
+      setUpdated(0);
+      setStale(false);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError('');
-    fetchTrends(pfs.join(','), 15)
-      .then((d) => { setGroups(d.trends); setUpdated(d.updated); })
-      .catch(() => setError('热点拉取失败——请确认已配置外网代理（EASEL_PROXY）。'))
-      .finally(() => setLoading(false));
-  }, []);
+    setStale(false);
+    data.fetchTrends(pfs.join(','), 15, controller.signal)
+      .then((d) => {
+        if (controller.signal.aborted) return;
+        setGroups(d.trends);
+        setUpdated(d.updated);
+        setStale(d.stale === true
+          || d.trends.some((group) => group.stale === true));
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setGroups([]);
+        setUpdated(0);
+        setStale(false);
+        setError(workspaceErrorMessage(
+          error, '热点拉取失败——请确认已配置外网代理（EASEL_PROXY）。'));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+  }, [data]);
 
-  useEffect(() => { load(selected); }, [load, selected]);
+  useEffect(() => {
+    load(selected);
+    return () => request.current?.abort();
+  }, [load, selected]);
 
   const toggle = (k: string) =>
     setSelected((prev) => prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]);
@@ -54,7 +93,16 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
           <h1 className="page-title"><IconFire size={22} /> 热点雷达</h1>
           <p className="page-subtitle">
             多平台实时热搜，挑值得蹭的选题，一键交给 AI 做成你的内容。
-            {updated > 0 && <span style={{ color: 'var(--text-tertiary)' }}> · {new Date(updated * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 更新</span>}
+            {updated > 0 && (
+              <span style={{ color: 'var(--text-tertiary)' }}>
+                {' · '}
+                {stale ? '刷新失败，显示缓存 ' : ''}
+                {new Date(updated * 1000).toLocaleTimeString('zh-CN', {
+                  hour: '2-digit', minute: '2-digit',
+                })}
+                {stale ? '' : ' 更新'}
+              </span>
+            )}
           </p>
         </div>
         <button className="btn btn-sm" onClick={() => load(selected)} disabled={loading}>
@@ -70,13 +118,24 @@ export default function TrendsPage({ onUseTopic }: TrendsPageProps) {
       </div>
 
       {error && <div className="notice-error">{error}</div>}
+      {saveError && <div className="notice-error" role="alert">{saveError}</div>}
+      {loading && groups.length === 0 && <div className="dash-empty">热点加载中…</div>}
 
       <div className="trend-grid">
         {groups.map((g) => (
           <div key={g.platform} className="card trend-col">
-            <div className="trend-col-head">{g.label}<span className="trend-count">{g.items.length}</span></div>
+            <div className="trend-col-head">
+              {g.label}
+              <span className="trend-count">{g.items.length}</span>
+              {g.stale && (
+                <span className="trend-count" style={{ color: 'var(--red)' }}
+                  title="本次刷新失败，显示旧缓存">
+                  旧数据{g.cached_at ? ` ${new Date(g.cached_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` : ''}
+                </span>
+              )}
+            </div>
             <div className="trend-list">
-              {g.items.length === 0 && !loading && (
+              {g.items.length === 0 && !loading && !error && (
                 <div className="trend-empty">
                   {g.ok === false ? '该平台暂时取不到（数据源不可用）' : '暂无数据'}
                 </div>

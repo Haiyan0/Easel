@@ -116,6 +116,10 @@ class RuntimeManager:
         # 保持在异步层，不能占用数据库线程或事务。
         self._db_runner = db_runner
         self._gateway_required = bool(gateway_required)
+        # 同一 workspace 的 ensure_ready 串行化：并发首屏请求会同时触发
+        # 冷启动/gateway 刷新，CAS 落败方不应以 worker_start_superseded
+        # 打断正在进行的启动。跨 manager 的租约竞争仍由 CAS 处理。
+        self._ensure_locks: dict[str, asyncio.Lock] = {}
 
     async def _db(self, function, *args, **kwargs):
         """在 Store 所属线程执行一个短同步数据库步骤。"""
@@ -129,6 +133,13 @@ class RuntimeManager:
 
     async def ensure_ready(self, workspace_id: str,
                            config_version: int) -> WorkerHandle:
+        """同一 manager 内按 workspace 串行启动/刷新，避免并发首屏互斥失败。"""
+        lock = self._ensure_locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            return await self._ensure_ready(workspace_id, config_version)
+
+    async def _ensure_ready(self, workspace_id: str,
+                            config_version: int) -> WorkerHandle:
         """返回已就绪、身份已核验的句柄；不可用时抛 ``RuntimeUnavailable``。"""
         self._validate_request(workspace_id, config_version)
         deadline = self._clock() + self._ready_timeout

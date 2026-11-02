@@ -7,6 +7,9 @@ export interface ChatMessage {
   attachments?: UploadedFile[]; // 结构化附件引用；仅用于请求/重试，不在消息气泡展示
   thinking?: string;   // 模型思考过程（隐思考），流式结束后持久保留
   activity?: string;   // 工具/执行活动步骤（换行分隔），持久保留
+  pending?: boolean;   // control 待确认发送：服务端快照确认前临时展示
+  failed?: boolean;    // control 发送失败：保留文本供同一 turnId 重试
+  turnId?: string;     // control 幂等请求键；重试复用同一值
 }
 
 export interface ChatSession {
@@ -18,6 +21,7 @@ export interface ChatSession {
   sessionKey?: string;  // OpenClaw 的 session key，用于后端删除
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
+  remote?: boolean;     // control 服务端会话：即使消息未加载也显示在侧栏
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */
@@ -27,6 +31,7 @@ export interface StreamState {
   activity: string;
   stillWorking?: string;   // 防呆心跳提示（未卡住）；独立于 activity，不覆盖真实状态
   questions: ChatQuestion[];   // ask_user 问答题卡片（进行中）
+  questionPending?: boolean;   // control：问题事件已消费，状态仍在核对，禁止提交
 }
 
 /** 发布中心草稿：持久化到 localStorage，切页/刷新都不丢。 */
@@ -36,9 +41,17 @@ export interface PublishDraft {
   platforms: string[];
   overrides: Record<string, string>;
   tags: string;   // 话题标签，逗号分隔（小红书绑话题；其它平台按需写入）
+  // 媒体与画像也随草稿保存，刷新后才能看见上次的选择；旧版草稿没有
+  // 这两个字段，保留为 undefined 以区分“刷新丢失”和“用户主动清空”。
+  media?: string[];
+  persona?: string;
 }
 const PUBLISH_KEY = 'easel_publish_draft';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
+
+function publishKey(scope?: string): string {
+  return scope ? `${PUBLISH_KEY}:${scope}` : PUBLISH_KEY;
+}
 
 function readMigratedLocalValue(key: string, suffix: string): string | null {
   const current = localStorage.getItem(key);
@@ -55,17 +68,145 @@ function readMigratedLocalValue(key: string, suffix: string): string | null {
 const PUBLISH_DEFAULT: PublishDraft = {
   title: '', body: '', platforms: ['xiaohongshu', 'douyin'], overrides: {}, tags: '',
 };
-export function loadPublishDraft(): PublishDraft {
+function readPublishDraftRaw(scope?: string): string | null {
+  // control 必须按 identity/workspace 分组，不能读取旧全局草稿；
+  // local 保持原全局键与历史迁移行为。
+  return scope
+    ? localStorage.getItem(publishKey(scope))
+    : readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+}
+
+export function loadPublishDraft(scope?: string): PublishDraft {
   try {
-    const raw = readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+    const raw = readPublishDraftRaw(scope);
     if (!raw) return { ...PUBLISH_DEFAULT };
-    return { ...PUBLISH_DEFAULT, ...(JSON.parse(raw) as PublishDraft) };
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...PUBLISH_DEFAULT };
+    }
+    const draft = { ...PUBLISH_DEFAULT, ...(parsed as Partial<PublishDraft>) };
+    const fields = parsed as Record<string, unknown>;
+    if (!Array.isArray(fields.media)
+        || !(fields.media as unknown[]).every(
+          (item) => typeof item === 'string')) {
+      delete draft.media;
+    }
+    if (typeof fields.persona !== 'string') delete draft.persona;
+    return draft;
   } catch {
     return { ...PUBLISH_DEFAULT };
   }
 }
-export function savePublishDraft(d: PublishDraft): void {
-  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(d)); } catch { /* quota */ }
+export function savePublishDraft(d: PublishDraft, scope?: string): void {
+  try {
+    // 人工审核页只保存文案字段；不能因此抹掉自动发布页已保存的
+    // 媒体/画像来源，否则刷新后的意图恢复会退化成“丢失选择”。
+    let previous: Partial<PublishDraft> = {};
+    try {
+      const raw = readPublishDraftRaw(scope);
+      const parsed = raw ? JSON.parse(raw) as unknown : null;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        previous = parsed as Partial<PublishDraft>;
+      }
+    } catch { /* 旧值损坏：按本次字段写入 */ }
+    localStorage.setItem(publishKey(scope), JSON.stringify({
+      ...d,
+      media: d.media !== undefined ? d.media : previous.media,
+      persona: d.persona !== undefined ? d.persona : previous.persona,
+    }));
+  } catch { /* quota */ }
+}
+
+/** 意图对应的完整发布输入；刷新/切身份后必须能据此重试原请求。 */
+export interface PublishIntentPayload {
+  title: string;
+  body: string;
+  media: string[];
+  tags: string;
+  persona: string;
+}
+
+/** 一次用户发布意图：同稿重试/刷新复用 requestId，新稿才换新值。 */
+export interface PublishIntent {
+  requestId: string;
+  fingerprint: string;
+  payload?: PublishIntentPayload;
+}
+const PUBLISH_INTENT_KEY = 'easel_publish_intent';
+
+function publishIntentKey(scope: string): string {
+  return `${PUBLISH_INTENT_KEY}:${scope}`;
+}
+
+/** 意图只能按 identity/workspace 保存；无 scope 的 local 模式不落盘。 */
+export function loadPublishIntents(
+  scope?: string,
+): Record<string, PublishIntent> {
+  if (!scope) return {};
+  try {
+    const raw = localStorage.getItem(publishIntentKey(scope));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, PublishIntent> = {};
+    for (const [platform, value] of Object.entries(
+      parsed as Record<string, unknown>,
+    )) {
+      if (!value || typeof value !== 'object') continue;
+      const item = value as {
+        requestId?: unknown; fingerprint?: unknown; payload?: unknown;
+      };
+      if (typeof item.requestId !== 'string' || !item.requestId
+          || typeof item.fingerprint !== 'string') continue;
+      const intent: PublishIntent = {
+        requestId: item.requestId, fingerprint: item.fingerprint,
+      };
+      const payload = item.payload;
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const fields = payload as Record<string, unknown>;
+        if (typeof fields.title === 'string'
+            && typeof fields.body === 'string'
+            && Array.isArray(fields.media)
+            && fields.media.every((item) => typeof item === 'string')
+            && typeof fields.tags === 'string'
+            && typeof fields.persona === 'string') {
+          intent.payload = {
+            title: fields.title, body: fields.body,
+            media: fields.media as string[], tags: fields.tags,
+            persona: fields.persona,
+          };
+        }
+      }
+      result[platform] = intent;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+export function savePublishIntents(
+  intents: Record<string, PublishIntent>, scope?: string,
+): void {
+  if (!scope) return;
+  try {
+    localStorage.setItem(publishIntentKey(scope), JSON.stringify(intents));
+  } catch { /* quota */ }
+}
+
+export function clearPublishIntent(
+  platform: string, scope?: string, requestId?: string,
+): void {
+  if (!scope) return;
+  const intents = loadPublishIntents(scope);
+  const current = intents[platform];
+  if (!current) return;
+  // 迟到的旧 Run 只能清除它自己的意图，不能删掉用户随后发起的新意图。
+  if (requestId && current.requestId !== requestId) return;
+  delete intents[platform];
+  savePublishIntents(intents, scope);
 }
 
 const STORAGE_KEY = 'easel_sessions';

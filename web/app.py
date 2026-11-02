@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -46,7 +47,9 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
 from easel.gateway_endpoint import chat_completions_url, healthz_url, port_source
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
-                           profile_exists, valid_persona_name, _FILE_ORDER)
+                           profile_exists, safe_profile_dir, safe_profile_file,
+                           valid_persona_name, _FILE_ORDER)
+from easel import persona as _persona_module
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from easel.manual_publish import build_package, publishing_mode
 from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
@@ -323,6 +326,9 @@ def _qbridge_warn_once(key: str, message: str) -> None:
 
 # 代码/技能来自只读 code_root；产物/画像写 workspace_root；状态写 state_root。
 PROFILES_DIR = _RUNTIME_PATHS.workspace_root / "profiles"
+# worker 每进程只服务一个 workspace；共享画像助手必须跟随显式 workspace 根，
+# 不能继续读镜像内（code_root）/profiles。local 模式下二者相同，行为不变。
+_persona_module.PROFILES_DIR = PROFILES_DIR
 SKILLS_DIR = _RUNTIME_PATHS.code_root / "skills"
 OUTPUTS_DIR = _RUNTIME_PATHS.workspace_root / "outputs"
 
@@ -465,6 +471,15 @@ SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结�
 SYSTEM_TOPLEVEL_DIRS = {"analytics", "wechat"}
 LOGIN_TIMEOUT = 240
 LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
+# 受管浏览器任务实际启动的子进程（whoami/analytics）；取消或超时时按进程树
+# 终止，不能只取消 asyncio 任务而把 Chromium 留在后台。
+_BROWSER_PROCESSES: dict[tuple[str, str], subprocess.Popen] = {}
+_BROWSER_PROCESS_LOCK = threading.Lock()
+# 受管发布 Run → 本次运行自己的验证码文件；共享 _publish/{platform}.code
+# 没有 Run 归属，不能交给新任务。
+_MANAGED_PUBLISH_JOBS: dict[str, dict] = {}
+# 凭证校验的 Run 交接：AppSecret 只经一次短请求进入本进程，不写 Run 快照。
+_CREDENTIAL_JOBS: dict[tuple[str, str], asyncio.Future] = {}
 
 # whoami 真校验（起 headless 浏览器，数秒）的进程内缓存：避免账号页 + 工作台重复起浏览器。
 WHOAMI_TTL = 600  # 秒
@@ -537,6 +552,97 @@ async def _stop_login_process(proc) -> None:
         raise HTTPException(409, '登录进程仍在退出，请稍后重试注销') from None
     except OSError:
         pass
+
+
+def _kill_process_tree(proc, timeout: float = 5.0) -> None:
+    """终止整个进程树并等待退出；用于取消/超时，不删除 profile 或锁。"""
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+async def settle_login_process(process_key: str,
+                               timeout: float = 15.0) -> None:
+    """登录成功后等 runner 自行退出；超时则按进程树终止，避免遗留浏览器。"""
+    proc = LOGIN_PROCESSES.pop(process_key, None)
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        await asyncio.to_thread(proc.wait, timeout)
+    except subprocess.TimeoutExpired:
+        await asyncio.to_thread(_kill_process_tree, proc)
+
+
+async def cancel_browser_task(kind: str, platform: str) -> None:
+    """取消受管浏览器任务：终止正在运行的子进程树并等待退出。
+
+    只处理进程与内部交接，不删除 profile、不删除锁对象；注销仍走原
+    ``api_logout`` 的持锁删除边界。
+    """
+    with _BROWSER_PROCESS_LOCK:
+        proc = _BROWSER_PROCESSES.get((kind, platform))
+    if proc is not None:
+        await asyncio.to_thread(_kill_process_tree, proc)
+    if kind == "login":
+        process_key = platform
+    elif kind == "mp-login":
+        process_key = "wechat-oa-mp"
+    else:
+        process_key = ""
+    if process_key:
+        pending = LOGIN_PROCESSES.pop(process_key, None)
+        if pending is not None:
+            await asyncio.to_thread(_kill_process_tree, pending)
+
+
+async def _run_tracked_subprocess(kind: str, platform: str,
+                                  cmd: list[str], env: dict[str, str],
+                                  timeout: int) -> subprocess.CompletedProcess:
+    """运行有界子进程并登记；取消/超时按进程树终止。"""
+    proc = subprocess.Popen(
+        cmd, cwd=str(PROJECT_ROOT), env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", start_new_session=os.name != "nt")
+    key = (kind, platform)
+    with _BROWSER_PROCESS_LOCK:
+        _BROWSER_PROCESSES[key] = proc
+    try:
+        try:
+            stdout, stderr = await asyncio.to_thread(
+                proc.communicate, timeout=timeout)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(_kill_process_tree, proc)
+            raise
+        except subprocess.TimeoutExpired:
+            await asyncio.to_thread(_kill_process_tree, proc)
+            raise
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout or "", stderr or "")
+    finally:
+        with _BROWSER_PROCESS_LOCK:
+            if _BROWSER_PROCESSES.get(key) is proc:
+                _BROWSER_PROCESSES.pop(key, None)
 
 
 LOGIN_RUNNERS: dict[str, dict] = {
@@ -617,6 +723,11 @@ def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", autho
     tmp = config_path.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     os.replace(tmp, config_path)
+    try:
+        # 受管凭证文件只允许本人进程读取；worker 状态根本身已在私有 HOME。
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
 
 
 def _wechat_clear_credentials() -> None:
@@ -647,23 +758,34 @@ def _wechat_clear_credentials() -> None:
             pass
 
 
-def _wechat_verify_token() -> tuple[bool, str]:
-    """用当前 accounts.web 凭证调官方 token 接口验证。返回 (ok, message)。
-    在子进程里跑，避免把 skill 的 import 副作用带进 web 进程。"""
+def _wechat_verify_credentials(app_id: str, app_secret: str) -> tuple[bool, str]:
+    """用候选 AppID/AppSecret 调官方 token 接口验证；返回固定分类而非原始报错。
+
+    凭证经 stdin 传入子进程，不出现在 argv、日志或 Run 事件中。只有验证
+    通过后调用方才允许原子保存，失败不会覆盖原有有效配置。
+    """
     code = (
-        "import sys; sys.path.insert(0, %r)\n"
-        "from config import set_account\n"
-        "from wechat_token import get_access_token\n"
-        "set_account(%r)\n"
+        "import json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from wechat_token import _fetch_token_with_retry\n"
+        "data = json.load(sys.stdin)\n"
         "try:\n"
-        "    t = get_access_token(force_refresh=True)\n"
-        "    print('OK' if t else 'EMPTY')\n"
-        "except Exception as e:\n"
-        "    print('ERR:' + str(e))\n"
-    ) % (str(WECHAT_SKILL_SCRIPTS), WECHAT_WEB_ACCOUNT)
+        "    _fetch_token_with_retry(data['app_id'], data['app_secret'], 'web', retries=0)\n"
+        "    print('OK')\n"
+        "except Exception as error:\n"
+        "    text = str(error)\n"
+        "    code = ('ip_whitelist' if '40164' in text else\n"
+        "            'invalid_secret' if '40125' in text else\n"
+        "            'invalid_appid' if '40013' in text else\n"
+        "            'platform_or_network')\n"
+        "    print('ERR:' + code)\n"
+    )
     try:
-        proc = subprocess.run([sys.executable, "-c", code], cwd=str(WECHAT_SKILL_SCRIPTS),
-                              env=_wechat_env(), capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(WECHAT_SKILL_SCRIPTS)],
+            cwd=str(WECHAT_SKILL_SCRIPTS), env=_wechat_env(),
+            input=json.dumps({"app_id": app_id, "app_secret": app_secret}),
+            capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return False, "验证超时（网络或 IP 白名单问题）"
     out = (proc.stdout or "").strip().splitlines()
@@ -671,9 +793,92 @@ def _wechat_verify_token() -> tuple[bool, str]:
     if last == "OK":
         return True, ""
     if last.startswith("ERR:"):
-        return False, last[4:].strip()[:200]
-    err = (proc.stderr or "").strip().splitlines()[-1:] or ["验证失败"]
-    return False, err[0][:200]
+        category = last[4:].strip()
+        return False, {
+            "ip_whitelist": "服务器出口 IP 不在公众号 IP 白名单（40164）",
+            "invalid_secret": "AppSecret 无效（40125）",
+            "invalid_appid": "AppID 无效（40013）",
+            "platform_or_network": "微信平台拒绝或网络不可用",
+        }.get(category, "验证失败")
+    return False, "验证失败"
+
+
+def _credentials_job_key(platform: str, run_id: str) -> tuple[str, str]:
+    return (platform, run_id)
+
+
+async def wait_credentials_job(platform: str, run_id: str,
+                               timeout: float = 45.0) -> dict:
+    """受管凭证 Run 等待一次短请求交接；超时由 RunManager 收敛为失败。"""
+    key = _credentials_job_key(platform, run_id)
+    loop = asyncio.get_running_loop()
+    future = _CREDENTIAL_JOBS.get(key)
+    if future is None or future.done():
+        future = loop.create_future()
+        _CREDENTIAL_JOBS[key] = future
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout)
+    finally:
+        if _CREDENTIAL_JOBS.get(key) is future:
+            _CREDENTIAL_JOBS.pop(key, None)
+
+
+async def _await_credentials_job(platform: str, run_id: str,
+                                 timeout: float = 2.0):
+    """短请求可能略早于执行器登记；只等待这个短窗口，不接受无 Run 的凭证。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    key = _credentials_job_key(platform, run_id)
+    while True:
+        future = _CREDENTIAL_JOBS.get(key)
+        if future is not None and not future.done():
+            return future
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(0.02)
+
+
+def _verification_failure(message: str) -> dict:
+    # 失败不写 YAML：旧的有效凭证继续可用，避免一次输错覆盖可工作配置。
+    return {"ok": False,
+            "message": f"凭证未保存，验证未通过：{message}。原有配置保持不变。"}
+
+
+def _commit_credentials(platform: str, app_id: str, app_secret: str,
+                        name: str, author: str) -> dict:
+    """验证通过后的唯一落盘提交点；调用方必须已持有 Run 提交栅栏。"""
+    try:
+        _wechat_save_credentials(app_id, app_secret, name=name, author=author)
+    except OSError:
+        return {"ok": False, "message": "验证通过但凭证保存失败，请稍后重试。"}
+    with _WHOAMI_LOCK:
+        _WHOAMI_CACHE.pop(platform, None)
+    _write_login_marker(platform, 'success', name or '微信公众号')
+    return {"ok": True, "message": "公众号凭证已保存并验证通过"}
+
+
+def _verify_and_save_credentials(platform: str, app_id: str, app_secret: str,
+                                 name: str, author: str) -> dict:
+    """local 模式：验证后直接提交；worker 受管链路使用拆分后的栅栏流程。"""
+    ok, message = _wechat_verify_credentials(app_id, app_secret)
+    if not ok:
+        return _verification_failure(message)
+    return _commit_credentials(platform, app_id, app_secret, name, author)
+
+
+async def _wait_credentials_terminal(run_id: str, timeout: float = 5.0) -> None:
+    """提交栅栏内等待 supervisor 提交真实终态；有界，绝不无限等平台。"""
+    manager = _RUNS
+    if manager is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while manager.state(run_id) not in (
+            "done", "failed", "interrupted", "cancelled"):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.01, remaining))
 
 
 def _k(env, label, required=True, secret=True, aliases=None):
@@ -898,11 +1103,11 @@ def list_personas() -> list[dict]:
         return []
     result = []
     for d in sorted(PROFILES_DIR.iterdir()):
-        if not d.is_dir() or not valid_persona_name(d.name):
+        if safe_profile_dir(d.name) is None:
             continue
         desc = ''
-        identity = d / 'identity.md'
-        if identity.is_file():
+        identity = safe_profile_file(d.name, 'identity.md')
+        if identity is not None:
             for line in identity.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith('#') and not line.startswith('<!--'):
@@ -1594,7 +1799,20 @@ def _is_login_qr(relative: Path) -> bool:
             and relative.stem in set(LOGIN_RUNNERS) | {"wechat-oa-mp"})
 
 
-def _safe_output_path(rel: str, *, allow_login_qr: bool = False) -> Path:
+_MANUAL_EXPORT_NAME = re.compile(
+    r"^easel-(" + "|".join(sorted(LOGIN_RUNNERS)) + r")-[0-9a-f]{12}\.zip$")
+
+
+def _is_manual_export(relative: Path) -> bool:
+    """仅放行人工导出包的精确形状；其余 _publish 内容仍是内部状态。"""
+    parts = relative.parts
+    return (len(parts) == 3 and parts[0] == "_publish"
+            and parts[1] == "manual"
+            and _MANUAL_EXPORT_NAME.fullmatch(parts[2]) is not None)
+
+
+def _safe_output_path(rel: str, *, allow_login_qr: bool = False,
+                      allow_export: bool = False) -> Path:
     '把相对路径解析到 outputs/ 内，防路径穿越与内部状态泄漏。'
     full = (OUTPUTS_DIR / rel).resolve()
     root = OUTPUTS_DIR.resolve()
@@ -1605,7 +1823,8 @@ def _safe_output_path(rel: str, *, allow_login_qr: bool = False) -> Path:
         raise HTTPException(403, '系统状态不可作为通用产物读取')
     relative = full.relative_to(root)
     if (_internal_output_path(relative)
-            and not (allow_login_qr and _is_login_qr(relative))):
+            and not (allow_login_qr and _is_login_qr(relative))
+            and not (allow_export and _is_manual_export(relative))):
         raise HTTPException(403, '系统状态不可作为通用产物读取')
     if not full.is_file():
         raise HTTPException(404, '文件不存在')
@@ -1787,29 +2006,47 @@ def _valid_persona_name(name: str) -> bool:
 
 
 def _persona_file_path(name: str, filename: str) -> Path:
-    """校验画像名/文件名，返回 profiles/<name>/<filename> 的安全路径。"""
+    """校验画像名/文件名，返回真实画像目录内的安全写入路径。"""
     if not _valid_persona_name(name):
         raise HTTPException(400, "画像名非法")
-    if not filename.endswith(".md") or "/" in filename or "\\" in filename or filename.startswith("."):
+    if (not filename.endswith(".md") or "/" in filename
+            or "\\" in filename or filename.startswith(".")):
         raise HTTPException(400, "文件名非法")
-    pd = (PROFILES_DIR / name).resolve()
-    fp = (pd / filename).resolve()
-    if pd != fp.parent or PROFILES_DIR.resolve() not in pd.parents:
+    pd = safe_profile_dir(name)
+    if pd is None:
+        raise HTTPException(404, "画像不存在")
+    fp = pd / filename
+    if fp.is_symlink():
         raise HTTPException(403, "非法路径")
+    if fp.exists():
+        safe = safe_profile_file(name, filename)
+        if safe is None:
+            raise HTTPException(403, "非法路径")
+        return safe
     return fp
 
 
 @app.get("/api/persona/{name}/files")
 async def api_persona_files(name: str):
-    """返回画像六维文件原文（按固定顺序 + 其余 .md），供在线编辑。"""
-    if not profile_exists(name):
+    """返回画像六维文件原文（按固定顺序 + 其余 .md），供在线编辑。
+
+    目录链接越界的画像在 ``safe_profile_dir`` 处即被拒绝；单个文件链接
+    由 ``safe_profile_file`` 拒绝，不会把根外 sentinel 当作画像内容。
+    """
+    pd = safe_profile_dir(name)
+    if pd is None:
         raise HTTPException(404, "画像不存在")
-    pd = PROFILES_DIR / name
-    ordered = list(_FILE_ORDER) + sorted(f.name for f in pd.glob("*.md") if f.name not in _FILE_ORDER)
+    ordered = list(_FILE_ORDER) + sorted(
+        f.name for f in pd.glob("*.md")
+        if f.name not in _FILE_ORDER
+        and safe_profile_file(name, f.name) is not None)
     files = []
     for fn in ordered:
-        fp = pd / fn
-        files.append({"filename": fn, "content": fp.read_text(encoding="utf-8") if fp.is_file() else ""})
+        fp = safe_profile_file(name, fn)
+        files.append({
+            "filename": fn,
+            "content": fp.read_text(encoding="utf-8") if fp is not None else "",
+        })
     return {"name": name, "files": files}
 
 
@@ -1824,7 +2061,7 @@ async def api_persona_file_save(name: str, req: PersonaFileRequest):
     if not profile_exists(name):
         raise HTTPException(404, "画像不存在")
     fp = _persona_file_path(name, req.filename)
-    tmp = fp.with_suffix(".md.tmp")
+    tmp = fp.parent / f".{req.filename}.{uuid.uuid4().hex}.tmp"
     tmp.write_text(req.content, encoding="utf-8")
     tmp.replace(fp)
     return {"ok": True, "filename": req.filename}
@@ -1835,8 +2072,8 @@ async def api_persona_delete(name: str):
     """删除整个画像目录。"""
     if not _valid_persona_name(name):
         raise HTTPException(400, "画像名非法")
-    pd = (PROFILES_DIR / name).resolve()
-    if PROFILES_DIR.resolve() not in pd.parents or not pd.is_dir():
+    pd = safe_profile_dir(name)
+    if pd is None:
         raise HTTPException(404, "画像不存在")
     import shutil
     shutil.rmtree(pd)
@@ -4533,6 +4770,35 @@ class SkillRequest(BaseModel):
     persona: str | None = None
 
 
+class SkillPrepareRequest(BaseModel):
+    skill: str
+    input: str
+    persona: str | None = None
+
+
+@app.post("/api/skill/prepare")
+async def api_skill_prepare(req: SkillPrepareRequest):
+    """只校验技能并返回受管 prompt；执行由 control 的 Run 账本接纳。"""
+    if not req.input.strip():
+        raise HTTPException(400, "技能输入不能为空")
+    if len(req.input.encode("utf-8")) > 64 * 1024:
+        raise HTTPException(413, "技能输入过大")
+    skill_full = find_skill(req.skill)
+    if skill_full is None:
+        raise HTTPException(404, f"SKILL '{req.skill}' 不存在")
+    message = (f"{_persona_prefix(req.persona)}请执行 /{skill_full}，"
+               f"内容如下：\n\n{req.input}")
+    needs_api = skill_full in SKILL_API_REQUIREMENTS
+    env = _read_env()
+    return {
+        "skill": skill_full,
+        "prompt": message,
+        "needsApi": needs_api,
+        "apiConfigured": _skill_api_configured(skill_full, env)
+        if needs_api else True,
+    }
+
+
 @app.post("/api/skill")
 async def api_skill(req: SkillRequest):
     if _direct_api_enabled():
@@ -4611,7 +4877,7 @@ async def api_output(path: str):
 @app.api_route("/api/media/{path:path}", methods=["GET", "HEAD"])
 async def api_media(path: str):
     """原样输出媒体文件（图片/视频/音频/HTML/PDF），供 <img>/<video>/iframe/下载。"""
-    full = _safe_output_path(path, allow_login_qr=True)
+    full = _safe_output_path(path, allow_login_qr=True, allow_export=True)
     media_type = _media_type(full)
     headers: dict[str, str] = {}
     # HTML 预览会在本地被就地重新生成（如 gzh-design 重排/内联图片），必须禁缓存，
@@ -4700,6 +4966,20 @@ async def api_output_delete(path: str):
     return {"ok": True, "deleted": path, "kind": "dir" if is_dir else "file"}
 
 
+def _upload_names(files: list[UploadFile]) -> list[str]:
+    """在写盘前校验整批文件名/扩展名，避免部分成功留下孤儿附件。"""
+    if not files:
+        raise HTTPException(400, '没有文件')
+    names: list[str] = []
+    for f in files:
+        name = Path(f.filename or "file").name
+        ext = Path(name).suffix.lower()
+        if ext not in UPLOAD_EXTS:
+            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
+        names.append(name)
+    return names
+
+
 @app.post("/api/upload")
 async def api_upload(
     files: list[UploadFile] = File(...),
@@ -4708,21 +4988,18 @@ async def api_upload(
     """Store chat attachments in a session-scoped inbox and return opaque refs."""
     scope = _attachment_scope(sessionId)
     _check_worker_upload_count(files)
+    names = _upload_names(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)
     saved = []
-    for f in files:
-        name = Path(f.filename or "file").name
-        ext = Path(name).suffix.lower()
-        if ext not in UPLOAD_EXTS:
-            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
-        # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
-        cap = MAX_UPLOAD_MB * 1024 * 1024
-        target = _unique_upload_path(dest, name)
-        size = 0
-        try:
+    try:
+        for f, name in zip(files, names):
+            # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
+            # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
+            cap = MAX_UPLOAD_MB * 1024 * 1024
+            target = _unique_upload_path(dest, name)
+            size = 0
             with open(target, 'wb') as out:
                 while True:
                     chunk = await f.read(1024 * 1024)
@@ -4730,18 +5007,18 @@ async def api_upload(
                         break
                     size += len(chunk)
                     if size > cap:
-                        raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+                        raise HTTPException(
+                            413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
                     out.write(chunk)
-        except HTTPException:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-            raise
-        rel = f"_inbox/{scope}/{batch}/{target.name}"
-        saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
-    if not saved:
-        raise HTTPException(400, '没有文件')
+            rel = f"_inbox/{scope}/{batch}/{target.name}"
+            saved.append({"id": _attachment_id(scope, rel),
+                          "name": target.name, "path": rel})
+        if not saved:
+            raise HTTPException(400, '没有文件')
+    except BaseException:
+        # 超限、损坏、客户端取消或后续文件非法：整批删除，不返回伪成功。
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return {"ok": True, "files": saved}
 
 
@@ -4760,26 +5037,28 @@ async def api_upload_local(
     产出与 /api/upload 同构的附件引用（id/name/path），附件校验与清单链路零改动。"""
     scope = _attachment_scope(sessionId)
     _check_worker_upload_count(files)
+    names = _upload_names(files)
     batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
     dest = OUTPUTS_DIR / "_inbox" / scope / batch
     dest.mkdir(parents=True, exist_ok=True)
     saved = []
-    for f in files:
-        name = Path(f.filename or "file").name
-        ext = Path(name).suffix.lower()
-        if ext not in UPLOAD_EXTS:
-            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        target = _unique_upload_path(dest, name)
-        with open(target, 'wb') as out:
-            while True:
-                chunk = await f.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-        rel = f"_inbox/{scope}/{batch}/{target.name}"
-        saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
-    if not saved:
-        raise HTTPException(400, '没有文件')
+    try:
+        for f, name in zip(files, names):
+            target = _unique_upload_path(dest, name)
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            rel = f"_inbox/{scope}/{batch}/{target.name}"
+            saved.append({"id": _attachment_id(scope, rel),
+                          "name": target.name, "path": rel})
+        if not saved:
+            raise HTTPException(400, '没有文件')
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return {"ok": True, "files": saved}
 
 
@@ -4866,13 +5145,18 @@ def _login_status(platform: str) -> dict:
 
 @app.get("/api/accounts")
 async def api_accounts():
-    return [
-        {'platform': pf, 'name': cfg['name'], 'backend': cfg['backend'],
-         'supported': cfg['backend'] != 'unsupported',
-         'loggedIn': _account_logged_in(pf, cfg),
-         'note': cfg.get('note', '')}
-        for pf, cfg in LOGIN_RUNNERS.items()
-    ]
+    items = []
+    for pf, cfg in LOGIN_RUNNERS.items():
+        item = {'platform': pf, 'name': cfg['name'], 'backend': cfg['backend'],
+                'supported': cfg['backend'] != 'unsupported',
+                'loggedIn': _account_logged_in(pf, cfg),
+                'note': cfg.get('note', '')}
+        if cfg['backend'] == 'wechat-oa':
+            # 两种公众号登录态分开报告：后台扫码会话 vs AppID/AppSecret 凭证。
+            item['mpLoggedIn'] = _mp_login_status().get('state') == 'success'
+            item['credentialConfigured'] = _wechat_has_credentials()
+        items.append(item)
+    return items
 
 
 @app.post("/api/login/{platform}")
@@ -4946,7 +5230,8 @@ async def _start_login(platform: str, restart: bool = False):
     login_env['PYTHONUTF8'] = '1'
     try:
         proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=login_env,
-                                stdout=log_file, stderr=subprocess.STDOUT)
+                                stdout=log_file, stderr=subprocess.STDOUT,
+                                start_new_session=os.name != "nt")
     finally:
         log_file.close()
     LOGIN_PROCESSES[platform] = proc
@@ -4974,6 +5259,11 @@ class SmsCodeRequest(BaseModel):
     code: str
 
 
+class PublishSmsCodeRequest(BaseModel):
+    code: str
+    runId: str = ''
+
+
 @app.post("/api/login/{platform}/sms")
 async def api_login_sms(platform: str, req: SmsCodeRequest):
     """回填短信验证码：写入 runner 轮询的一次性验证码文件（见 login_state.read_sms_code）。
@@ -4996,6 +5286,7 @@ class WechatCredentials(BaseModel):
     appSecret: str = ''
     name: str = ''
     author: str = ''
+    runId: str = ''
 
 
 @app.get("/api/accounts/{platform}/credentials")
@@ -5016,24 +5307,60 @@ async def api_get_credentials(platform: str):
 
 @app.post("/api/accounts/{platform}/credentials")
 async def api_save_credentials(platform: str, req: WechatCredentials):
-    """保存凭证式平台（公众号）的 AppID/AppSecret，写入 skill 配置并调官方接口验证。"""
+    """验证后原子保存公众号凭证；worker 必须绑定已接纳的凭证 Run。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get('backend') != 'wechat-oa':
         raise HTTPException(404, '该平台不使用凭证登录')
     app_id = (req.appId or '').strip()
     app_secret = (req.appSecret or '').strip()
+    name = (req.name or '').strip()
+    author = (req.author or '').strip()
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
-    _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    # 验证要真连微信接口（最长 30s）：丢线程池，避免卡住整个事件循环
-    ok, msg = await asyncio.to_thread(_wechat_verify_token)
-    with _WHOAMI_LOCK:
-        _WHOAMI_CACHE.pop(platform, None)
-    if ok:
-        _write_login_marker(platform, 'success', req.name.strip() or '微信公众号')
-        return {'ok': True, 'message': '公众号凭证已保存并验证通过'}
-    # 校验失败：凭证已存（下次改正后可直接重试），但明确告知失败原因（常见 40164 IP 白名单 / 40125 密钥错误）
-    return {'ok': False, 'message': f'凭证已保存但验证未通过：{msg}。若是 40164 请把服务器出口 IP 加入公众号 IP 白名单。'}
+    if (len(app_id) > 128 or len(app_secret) > 512
+            or len(name) > 200 or len(author) > 200
+            or any(ord(character) < 32 for character in
+                   app_id + app_secret + name + author)):
+        raise HTTPException(400, '凭证或名称格式非法')
+    run_id = (req.runId or '').strip()
+    if _SERVICE_MODE != "worker":
+        # local 单用户模式没有 Run 账本，保持原有直接验证/保存语义。
+        return await asyncio.to_thread(
+            _verify_and_save_credentials, platform, app_id, app_secret,
+            name, author)
+    # 只接受 control 为本平台已接纳的凭证 Run；直接调用不会获得交接槽。
+    if (not run_id or len(run_id) > 128
+            or any(ord(character) < 32 for character in run_id)):
+        raise HTTPException(409, '凭证校验未获接纳')
+    key = _credentials_job_key(platform, run_id)
+    future = await _await_credentials_job(platform, run_id)
+    manager = _RUNS
+    if future is None or manager is None:
+        raise HTTPException(409, '凭证校验未获接纳')
+
+    # 验证可以慢、可以在线程/子进程里跑；提交必须回到事件循环重新确认
+    # 当前 Run/交接槽仍有效。检查与落盘之间不 await，因此 stop 无法在
+    # 检查通过后、写盘前插入并把提交留下。
+    ok, message = await asyncio.to_thread(
+        _wechat_verify_credentials, app_id, app_secret)
+    if _CREDENTIAL_JOBS.get(key) is not future or future.done():
+        raise HTTPException(409, '凭证校验已取消，未保存')
+    if not manager.begin_commit(run_id):
+        raise HTTPException(409, '凭证校验已取消，未保存')
+    try:
+        if not ok:
+            result = _verification_failure(message)
+        else:
+            result = _commit_credentials(
+                platform, app_id, app_secret, name, author)
+        if not future.done():
+            future.set_result(result)
+        # 让 stop 在 committing=1 期间等待，并观察提交后的真实终态；
+        # 已提交的 Run 不应再被标成 cancelled。
+        await _wait_credentials_terminal(run_id)
+    finally:
+        manager.end_commit(run_id)
+    return result
 
 
 def _mp_login_status() -> dict:
@@ -5100,7 +5427,8 @@ async def api_mp_login_start(platform: str):
     env = _proxy_env()
     env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env,
-                            stdout=log_file, stderr=subprocess.STDOUT)
+                            stdout=log_file, stderr=subprocess.STDOUT,
+                            start_new_session=os.name != "nt")
     log_file.close()
     LOGIN_PROCESSES["wechat-oa-mp"] = proc
     status = _mp_login_status()
@@ -5115,6 +5443,36 @@ async def api_mp_login_status(platform: str):
     if not cfg or cfg.get("backend") != "wechat-oa":
         raise HTTPException(404, "该平台不使用公众号后台登录")
     return {"mode": "qr", **_mp_login_status()}
+
+
+def _login_qr_response(path: Path):
+    """只返回固定登录二维码文件；resolve 后仍必须位于本人 _login 根。"""
+    try:
+        resolved = path.resolve()
+        root = LOGIN_DIR.resolve()
+    except OSError:
+        raise HTTPException(404, '二维码不存在') from None
+    if (resolved.parent != root or resolved.name != path.name
+            or not resolved.is_file()):
+        raise HTTPException(404, '二维码不存在')
+    return FileResponse(
+        resolved, media_type="image/png",
+        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/accounts/{platform}/qr")
+async def api_account_qr(platform: str):
+    """扫码登录二维码；只允许固定平台与固定文件名，不接受任意路径。"""
+    if platform not in LOGIN_RUNNERS:
+        raise HTTPException(404, '未知平台')
+    return _login_qr_response(LOGIN_DIR / f'{platform}.png')
+
+
+@app.get("/api/accounts/{platform}/mp-login/qr")
+async def api_mp_login_qr(platform: str):
+    if platform != "wechat-oa":
+        raise HTTPException(404, '该平台不使用公众号后台登录')
+    return _login_qr_response(LOGIN_DIR / 'wechat-oa-mp.png')
 
 
 @app.get("/api/accounts/{platform}/whoami")
@@ -5191,21 +5549,23 @@ async def _check_account_whoami(platform: str, force: bool = False):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
                '--platform', cfg['wp']]
     try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                                       capture_output=True, text=True, encoding='utf-8',
-                                       timeout=35 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
+        completed = await _run_tracked_subprocess(
+            "whoami", platform, cmd, _proxy_env(),
+            35 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '校验超时（浏览器起不来或网络慢）')
+    stdout = completed.stdout or ""
+    returncode = completed.returncode
     data = {'loggedIn': False, 'name': '', 'avatar': ''}
     confident = False
-    for line in reversed((proc.stdout or '').strip().splitlines()):
+    for line in reversed(stdout.strip().splitlines()):
         line = line.strip()
         if line.startswith('{'):
             try:
                 d = json.loads(line)
                 data = {'loggedIn': bool(d.get('loggedIn')), 'name': d.get('name') or '', 'avatar': d.get('avatar') or ''}
                 # 有 error 字段 = 校验本身失败（浏览器起不来/网络抖动/崩溃），不是可信的「未登录」结论
-                confident = proc.returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
+                confident = returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
                 break
             except Exception:
                 continue
@@ -5295,10 +5655,14 @@ ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-cha
 _analytics_inflight: dict[str, asyncio.Task] = {}
 
 
-def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
+def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int,
+                           track_key: tuple[str, str] | None = None):
     process = subprocess.Popen(
         cmd, cwd=str(PROJECT_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
+    if track_key is not None:
+        with _BROWSER_PROCESS_LOCK:
+            _BROWSER_PROCESSES[track_key] = process
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
@@ -5322,6 +5686,11 @@ def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
             process.stderr.close()
             process.wait(timeout=5)
         raise
+    finally:
+        if track_key is not None:
+            with _BROWSER_PROCESS_LOCK:
+                if _BROWSER_PROCESSES.get(track_key) is process:
+                    _BROWSER_PROCESSES.pop(track_key, None)
 
 
 @app.get("/api/analytics/platforms")
@@ -5373,7 +5742,9 @@ async def _fetch_analytics(platform: str):
     ana_env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
         proc = await asyncio.to_thread(
-            _run_analytics_command, cmd, ana_env, 180 if platform == "wechat-oa" else 90)
+            _run_analytics_command, cmd, ana_env,
+            180 if platform == "wechat-oa" else 90,
+            ("analytics", platform))
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "抓取超时，已停止浏览器；请检查网络，关闭正在进行的登录或校验后重试")
     for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -5463,19 +5834,23 @@ def _read_publish_status(platform: str) -> dict:
 
 
 def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = '',
-                               tags: str = '', ptype: str = '') -> None:
+                               tags: str = '', ptype: str = '') -> bool:
+    """发布成功后回流一次日历；失败只返回 False，不影响平台结果。"""
     try:
         scripts_dir = str(SHARED_SCRIPTS)
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
         import calendar_ops
         with _schedule_lock():
-            calendar_ops.record_publish(cfg['name'], title, note=body[:200],
-                                        tags=tags, ptype=ptype,
-                                        source='publish-page', profile=profile,
-                                        data_path=SCHEDULE_FILE, forward_log=True)
+            # 损坏/链接文件不能被发布回流当成空列表覆盖。
+            _read_schedule()
+            return bool(calendar_ops.record_publish(
+                cfg['name'], title, note=body[:200],
+                tags=tags, ptype=ptype,
+                source='publish-page', profile=profile,
+                data_path=_schedule_path(), forward_log=True))
     except Exception:
-        pass
+        return False
 
 
 def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
@@ -5530,6 +5905,393 @@ def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: d
     return {'async': True, 'pending': True, 'message': '发布已启动，请稍候…'}
 
 
+# ---- Task 5C3：受管发布执行（RunManager 执行器调用） --------------------
+
+_MANAGED_MEDIA_LIMIT = 2 * 1024**3
+_SAFE_MEDIA_NAME = re.compile(r"[^0-9A-Za-z一-鿿._-]+")
+_MANAGED_RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _safe_media_name(name: str) -> str:
+    cleaned = _SAFE_MEDIA_NAME.sub("_", name).lstrip(".") or "media"
+    return cleaned[:120]
+
+
+def _publish_media_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_EXTS:
+        return "image"
+    if suffix in VIDEO_EXTS:
+        return "video"
+    raise HTTPException(400, "媒体类型不受支持")
+
+
+def _ensure_publish_directory(*parts: str) -> Path:
+    """发布运行目录必须落在本人 outputs 内，链接目录不能逃逸。"""
+    root = OUTPUTS_DIR.resolve()
+    path = PUBLISH_DIR.joinpath(*parts)
+    resolved = path.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise HTTPException(403, "发布目录越界")
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+    if resolved == root or root not in resolved.parents:
+        raise HTTPException(403, "发布目录越界")
+    if not resolved.is_dir():
+        raise HTTPException(500, "发布目录不可用")
+    return resolved
+
+
+async def _stage_managed_media(media: list[str], run_id: str) -> tuple[list[Path], Path]:
+    """在 Run 开始时快照媒体，后续原文件变化不影响本次发布。"""
+    if not isinstance(run_id, str) or not _MANAGED_RUN_ID.fullmatch(run_id):
+        raise HTTPException(400, "任务标识非法")
+    sources: list[Path] = []
+    total = 0
+    for relative in media:
+        full = _safe_output_path(relative)
+        _publish_media_kind(full)
+        total += full.stat().st_size
+        if total > _MANAGED_MEDIA_LIMIT:
+            raise HTTPException(400, "素材超过 2GB，请分批发布")
+        sources.append(full)
+    runs = _ensure_publish_directory("runs")
+    run_dir = runs / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    media_dir = run_dir / "media"
+    media_dir.mkdir(parents=True)
+    staged: list[Path] = []
+    try:
+        for index, source in enumerate(sources, 1):
+            destination = media_dir / f"{index:02d}_{_safe_media_name(source.name)}"
+            await asyncio.to_thread(shutil.copy2, source, destination)
+            staged.append(destination)
+    except BaseException:
+        await asyncio.to_thread(shutil.rmtree, run_dir, True)
+        raise
+    return staged, run_dir
+
+
+async def _build_publish_command(
+        platform: str, title: str, body: str, tags: str,
+        media_paths: list[Path], *, status_dir: Path | None = None) -> dict:
+    """按原平台白名单构造命令；不接受客户端传入命令/URL/路径。"""
+    cfg = LOGIN_RUNNERS.get(platform)
+    if not cfg:
+        raise HTTPException(404, "未知平台")
+    if cfg["backend"] == "unsupported":
+        raise HTTPException(400, f"{cfg['name']} 暂不支持一键发布")
+    imgs = [path for path in media_paths
+            if path.suffix.lower() in IMAGE_EXTS]
+    vids = [path for path in media_paths
+            if path.suffix.lower() in VIDEO_EXTS]
+    if len(imgs) + len(vids) != len(media_paths):
+        raise HTTPException(400, "媒体类型不受支持")
+    if platform in MEDIA_REQUIRED and not imgs and not vids:
+        raise HTTPException(400, f"{cfg['name']} 需附带图片或视频")
+    if imgs and vids:
+        raise HTTPException(400, "同一条内容不能同时发图片和视频，请二选一")
+    if platform in VIDEO_ONLY_PUBLISH and not vids:
+        raise HTTPException(400, f"{cfg['name']} 只能发视频，请附带一个视频文件")
+    title = title.strip() or body.strip()[:20]
+    tags = tags or ""
+    publish_type = "视频" if vids else (
+        "文章" if platform == "wechat-oa" else "图文")
+    py = sys.executable
+    status_file = code_file = None
+    is_async = False
+    if platform == "xiaohongshu":
+        base = [py, str(SHARED_SCRIPTS / "xhs_publish.py")]
+        cmd = (base + ["publish-video", "--no-proxy", "--video", str(vids[0])]
+               if vids else
+               base + ["publish", "--no-proxy", "--images",
+                       ",".join(str(path) for path in imgs)])
+        cmd += ["--title", title, "--content", body, "--tags", tags, "--exec"]
+    elif platform == "bilibili":
+        bili_tag = tags.replace("#", "").replace("，", ",").strip().strip(",") or "日常"
+        cmd = ["biliup", "-u", str(_bili_cookie_path()), "upload",
+               str(vids[0]), "--title", title[:80], "--tid", "36",
+               "--copyright", "1", "--tag", bili_tag]
+        if body.strip():
+            cmd += ["--desc", body[:2000]]
+    elif platform == "douyin":
+        base = [py, str(SHARED_SCRIPTS / "douyin_publish.py")]
+        cmd = (base + ["publish-video", "--no-proxy", "--video", str(vids[0])]
+               if vids else
+               base + ["publish", "--no-proxy", "--images",
+                       ",".join(str(path) for path in imgs)])
+        cmd += ["--title", title, "--content", body, "--tags", tags, "--exec"]
+        status_dir = status_dir or PUBLISH_DIR
+        status_dir.mkdir(parents=True, exist_ok=True)
+        status_file = status_dir / "douyin.json"
+        code_file = status_dir / "douyin.code"
+        cmd += ["--status-file", str(status_file),
+                "--sms-code-file", str(code_file)]
+        is_async = True
+    elif platform == "wechat-oa":
+        if _mp_login_status().get("state") != "success":
+            raise HTTPException(
+                400, "公众号后台未登录：请先在账号页点「登录公众号后台」扫码")
+        if not imgs:
+            raise HTTPException(400, "公众号文章需要一张封面图，请附带至少一张图片")
+        if vids:
+            raise HTTPException(
+                400, "公众号发图文文章，请附带封面/正文图片而非视频")
+        cover = str(imgs[0])
+        status_dir = status_dir or PUBLISH_DIR
+        status_dir.mkdir(parents=True, exist_ok=True)
+        stamp = uuid.uuid4().hex[:12]
+        md_path = status_dir / f"wechat-oa-{stamp}.md"
+        html_path = status_dir / f"wechat-oa-{stamp}.html"
+        body_md = body or ""
+        extra_imgs = imgs[1:]
+        if extra_imgs:
+            body_md += "\n\n" + "\n\n".join(f'![]({path})' for path in extra_imgs)
+        md_path.write_text(f"# {title}\n\n{body_md}\n", encoding="utf-8")
+        conv = await asyncio.to_thread(
+            subprocess.run,
+            [py, str(WECHAT_SKILL_SCRIPTS / "html_converter.py"),
+             str(md_path), "-o", str(html_path)],
+            cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=60)
+        if conv.returncode != 0 or not html_path.is_file():
+            raise HTTPException(
+                500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
+        wx_proxy = (os.environ.get("EASEL_PROXY")
+                    or os.environ.get("https_proxy") or "")
+        cmd = [py, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "publish",
+               "--proxy", wx_proxy, "--html", str(html_path),
+               "--cover", cover, "--title", title,
+               "--digest", (body or "").strip()[:100], "--author", ""]
+    else:
+        cmd = [py, str(SHARED_SCRIPTS / "web_publisher.py"), "publish",
+               "--platform", cfg["wp"], "--title", title, "--desc", body,
+               "--tags", tags, "--exec"]
+        media = vids[0] if vids else (imgs[0] if imgs else None)
+        if media is not None:
+            cmd += ["--media", str(media)]
+    env = _proxy_env() if platform == "wechat-oa" else _publish_env()
+    return {
+        "cmd": cmd, "env": env, "title": title,
+        "timeout": 900 if is_async else 600,
+        "async": is_async, "status_file": status_file,
+        "code_file": code_file, "publish_type": publish_type,
+    }
+
+
+def _read_managed_status(path: Path | None) -> dict | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    state = value.get("state")
+    message = value.get("message")
+    return {
+        "state": state if isinstance(state, str) and state else "unknown",
+        "message": message if isinstance(message, str) else "",
+    }
+
+
+def _clean_publish_message(value: object, maximum: int = 2000) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = "".join(character for character in value
+                   if ord(character) >= 32 or character in "\n\r\t")
+    return text[:maximum]
+
+
+def _managed_public_status(state: object, message: object) -> str:
+    """只公开固定状态文案或受控短信提示，不把脚本路径/上游原文带给页面。"""
+    value = state if isinstance(state, str) and state else "unknown"
+    text = _clean_publish_message(message)
+    if value in ("sms_required", "verifying"):
+        return text or ("请输入验证码" if value == "sms_required"
+                        else "正在验证验证码…")
+    if value == "success":
+        return "发布成功"
+    if value == "error":
+        if any(word in text for word in
+               ("未确认", "未核验", "未知", "核对", "读回")):
+            return "发布未确认，请到平台核对。"
+        return "发布失败"
+    return "发布中…"
+
+
+def _managed_publish_result(platform: str, outcome: dict) -> dict:
+    del platform
+    status = outcome.get("status")
+    status = status if isinstance(status, dict) else {}
+    message = _managed_public_status(
+        status.get("state"), status.get("message"))
+    state = status.get("state")
+    if outcome.get("timed_out"):
+        return {"state": "unknown", "ok": False,
+                "message": "发布超时，平台结果未知，请到平台核对，勿自动重发。"}
+    if state == "success":
+        return {"state": "success", "ok": True,
+                "message": message or "发布成功"}
+    if state == "error":
+        if any(word in message for word in
+               ("未确认", "未核验", "未知", "核对", "读回")):
+            return {"state": "unknown", "ok": False,
+                    "message": message or "发布未确认，请到平台核对。"}
+        return {"state": "error", "ok": False,
+                "message": message or "发布失败"}
+    if state in ("sms_required", "verifying"):
+        return {"state": "unknown", "ok": False,
+                "message": "发布未完成，平台结果未知，请到平台核对。"}
+    if outcome.get("returncode") == 0:
+        return {"state": "success", "ok": True,
+                "message": message or "发布成功"}
+    if outcome.get("returncode") in (3, 5):
+        return {"state": "unknown", "ok": False,
+                "message": message or "发布未确认，请到平台核对，勿自动重发。"}
+    if outcome.get("returncode") is None:
+        return {"state": "unknown", "ok": False,
+                "message": "发布进程已结束，平台结果未知，请到平台核对。"}
+    return {"state": "error", "ok": False,
+            "message": message or "发布失败"}
+
+
+async def _execute_managed_publish(
+        platform: str, cmd: list[str], env: dict[str, str],
+        status_file: Path | None, code_file: Path | None,
+        timeout: int, emit) -> dict:
+    """运行平台子进程；取消/超时按进程树终止，只上报本 Run 自己的状态。"""
+    proc = subprocess.Popen(
+        cmd, cwd=str(PROJECT_ROOT), env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=os.name != "nt")
+    key = ("publish", platform)
+    with _BROWSER_PROCESS_LOCK:
+        _BROWSER_PROCESSES[key] = proc
+    latest = None
+    timed_out = False
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            current = _read_managed_status(status_file)
+            if current is not None:
+                current = {
+                    "state": current["state"],
+                    "message": _managed_public_status(
+                        current["state"], current["message"]),
+                }
+            if current is not None and current != latest:
+                latest = current
+                emit("activity", json.dumps(
+                    {"event": "browser_status", **current},
+                    ensure_ascii=False))
+            if proc.poll() is not None:
+                break
+            if time.monotonic() >= deadline:
+                await asyncio.to_thread(_kill_process_tree, proc)
+                timed_out = True
+                break
+            await asyncio.sleep(0.25)
+        return {"returncode": proc.poll(), "status": latest,
+                "timed_out": timed_out}
+    except asyncio.CancelledError:
+        await asyncio.to_thread(_kill_process_tree, proc)
+        raise
+    finally:
+        with _BROWSER_PROCESS_LOCK:
+            if _BROWSER_PROCESSES.get(key) is proc:
+                _BROWSER_PROCESSES.pop(key, None)
+        if code_file is not None:
+            try:
+                code_file.unlink()
+            except OSError:
+                pass
+
+
+def _append_managed_publish_log(platform: str, run_id: str,
+                                state: str) -> None:
+    """只记归属与终态，不写标题/正文/路径/凭证或上游原文。"""
+    try:
+        with (OUTPUTS_DIR / "_publish.log").open("a", encoding="utf-8") as log:
+            log.write(
+                f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"publish platform={platform} run={run_id} state={state} "
+                "=====\n")
+    except OSError:
+        pass
+
+
+async def run_managed_publish(descriptor: dict, run_id: str, emit) -> str:
+    """RunManager 发布执行器：快照媒体 → 固定命令 → 子进程 → 明确结果。"""
+    platform = descriptor["platform"]
+    persona = descriptor.get("persona") or ""
+    if persona and (not valid_persona_name(persona)
+                    or not profile_exists(persona)):
+        raise HTTPException(400, "选择的画像不存在或名称非法")
+    run_dir: Path | None = None
+    try:
+        staged, run_dir = await _stage_managed_media(
+            list(descriptor["media"]), run_id)
+        job = await _build_publish_command(
+            platform, descriptor["title"], descriptor["body"],
+            descriptor["tags"], staged, status_dir=run_dir)
+        if job["code_file"] is not None:
+            with _BROWSER_PROCESS_LOCK:
+                _MANAGED_PUBLISH_JOBS[run_id] = {
+                    "platform": platform, "code_file": job["code_file"]}
+        emit("activity", json.dumps(
+            {"event": "browser_status", "state": "starting",
+             "message": "发布中…"}, ensure_ascii=False))
+        outcome = await _execute_managed_publish(
+            platform, job["cmd"], job["env"], job["status_file"],
+            job["code_file"], job["timeout"], emit)
+        result = _managed_publish_result(platform, outcome)
+        if result["state"] == "success":
+            recorded = _record_successful_publish(
+                job["title"], descriptor["body"],
+                LOGIN_RUNNERS[platform],
+                descriptor.get("persona") or "",
+                descriptor["tags"], job["publish_type"])
+            result["calendarRecorded"] = bool(recorded)
+            if not recorded:
+                result["calendarError"] = "发布成功，但日历记录失败"
+        _append_managed_publish_log(platform, run_id, result["state"])
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        with _BROWSER_PROCESS_LOCK:
+            _MANAGED_PUBLISH_JOBS.pop(run_id, None)
+        if run_dir is not None:
+            await asyncio.to_thread(shutil.rmtree, run_dir, True)
+
+
+async def run_managed_manual_export(descriptor: dict, run_id: str,
+                                    emit) -> str:
+    """在本人 outputs 内生成人工交接包；绝不访问平台或标记 published。"""
+    del run_id
+    platform = descriptor["platform"]
+    try:
+        package = await asyncio.to_thread(
+            build_package, OUTPUTS_DIR, platform, descriptor["title"],
+            descriptor["body"], descriptor["tags"],
+            list(descriptor["media"]), descriptor.get("reviewed"))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
+    except OSError:
+        raise HTTPException(500, "导出包生成失败") from None
+    try:
+        relative = package.resolve().relative_to(
+            OUTPUTS_DIR.resolve()).as_posix()
+    except ValueError:
+        raise HTTPException(500, "导出包路径无效") from None
+    emit("activity", json.dumps(
+        {"event": "browser_status", "state": "success",
+         "message": "稿件包已生成"}, ensure_ascii=False))
+    return json.dumps({"path": relative, "filename": package.name,
+                       "published": False}, ensure_ascii=False)
+
+
 @app.get("/api/publish/{platform}/status")
 async def api_publish_status(platform: str):
     """轮询异步发布状态：starting/sms_required/verifying/success/error。"""
@@ -5539,14 +6301,25 @@ async def api_publish_status(platform: str):
 
 
 @app.post("/api/publish/{platform}/sms")
-async def api_publish_sms(platform: str, req: SmsCodeRequest):
-    """发布触发短信墙时回填验证码（写发布 runner 轮询的一次性验证码文件）。"""
-    _require_automated_publishing()
+async def api_publish_sms(platform: str, req: PublishSmsCodeRequest):
+    """回填发布短信验证码；受管 Run 只写自己的一次性验证码文件。"""
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
     if not (4 <= len(code) <= 8):
         raise HTTPException(400, '验证码应为 4-8 位数字')
+    managed_run = (req.runId or '').strip()
+    if managed_run:
+        # 受管链路已由 control 校验策略；这里只确认 Run 归属与平台一致。
+        with _BROWSER_PROCESS_LOCK:
+            job = _MANAGED_PUBLISH_JOBS.get(managed_run)
+        if job is None or job.get('platform') != platform:
+            raise HTTPException(409, '验证码不属于当前发布任务')
+        code_file = job['code_file']
+        code_file.parent.mkdir(parents=True, exist_ok=True)
+        code_file.write_text(code, encoding='utf-8')
+        return {'ok': True}
+    _require_automated_publishing()
     PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
     (PUBLISH_DIR / f'{platform}.code').write_text(code, encoding='utf-8')
     return {'ok': True}
@@ -5567,89 +6340,23 @@ async def api_publish(platform: str, req: PublishRequest):
         raise HTTPException(400, '选择的画像不存在或名称非法')
     if not req.title.strip() and not req.body.strip():
         raise HTTPException(400, '标题/正文不能为空')
-    imgs, vids = [], []
-    for rel in req.media or []:
-        full = _safe_output_path(rel)
-        ext = full.suffix.lower()
-        if ext in VIDEO_EXTS:
-            vids.append(str(full))
-        elif ext in IMAGE_EXTS:
-            imgs.append(str(full))
-    if platform in MEDIA_REQUIRED and not imgs and not vids:
-        raise HTTPException(400, f"{cfg['name']} 需附带图片或视频")
-    if imgs and vids:
-        raise HTTPException(400, '同一条内容不能同时发图片和视频，请二选一')
-    if platform in VIDEO_ONLY_PUBLISH and not vids:
-        raise HTTPException(400, f"{cfg['name']} 只能发视频，请附带一个视频文件")
-    title = req.title.strip() or req.body.strip()[:20]
+    media_paths = [
+        _safe_output_path(rel) for rel in (req.media or [])
+    ]
+    job = await _build_publish_command(
+        platform, req.title, req.body, req.tags or '', media_paths)
+    title = job['title']
     tags = req.tags or ''
-    publish_type = '视频' if vids else ('文章' if platform == 'wechat-oa' else '图文')
-    py = sys.executable
-    if platform == 'xiaohongshu':
-        base = [py, str(SHARED_SCRIPTS / 'xhs_publish.py')]
-        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0]] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs)]
-        cmd += ['--title', title, '--content', req.body, '--tags', tags, '--exec']
-    elif platform == 'bilibili':
-        # B站投稿：直接调 biliup CLI（需 cookies.json，PATH 上有 biliup）。必须视频；
-        # tid=36「知识」；B站投稿必须≥1 标签，无则兜底「日常」。
-        bili_tag = tags.replace('#', '').replace('，', ',').strip().strip(',') or '日常'
-        cmd = ['biliup', '-u', str(_bili_cookie_path()), 'upload', vids[0],
-               '--title', title[:80], '--tid', '36', '--copyright', '1', '--tag', bili_tag]
-        if req.body.strip():
-            cmd += ['--desc', req.body[:2000]]
-    elif platform == 'douyin':
-        base = [py, str(SHARED_SCRIPTS / 'douyin_publish.py')]
-        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0]] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs)]
-        cmd += ['--title', title, '--content', req.body, '--tags', tags, '--exec']
-        # 抖音发布可能触发风控短信墙——异步跑 + 状态/验证码文件，前端轮询到 sms_required 时弹输入框
-        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
-        status_file = PUBLISH_DIR / 'douyin.json'
-        code_file = PUBLISH_DIR / 'douyin.code'
-        cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
-        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file,
-                                    profile, tags, publish_type)
-    elif platform == 'wechat-oa':
-        # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
-        # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
-        if _mp_login_status().get('state') != 'success':
-            raise HTTPException(400, '公众号后台未登录：请先在账号页点「登录公众号后台」扫码')
-        if not imgs:
-            raise HTTPException(400, '公众号文章需要一张封面图，请附带至少一张图片')
-        if vids:
-            raise HTTPException(400, '公众号发图文文章，请附带封面/正文图片而非视频')
-        cover = imgs[0]
-        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = uuid.uuid4().hex[:12]
-        md_path = PUBLISH_DIR / f'wechat-oa-{stamp}.md'
-        html_path = PUBLISH_DIR / f'wechat-oa-{stamp}.html'
-        body_md = req.body or ''
-        extra_imgs = imgs[1:]
-        if extra_imgs:
-            body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
-        md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
-        conv = await asyncio.to_thread(
-            subprocess.run, [py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
-                             str(md_path), '-o', str(html_path)],
-            cwd=str(PROJECT_ROOT), env=_proxy_env(),
-            capture_output=True, text=True, timeout=60)
-        if conv.returncode != 0 or not html_path.is_file():
-            raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
-        wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
-        cmd = [py, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'publish', '--proxy', wx_proxy,
-               '--html', str(html_path), '--cover', cover, '--title', title,
-               '--digest', (req.body or '').strip()[:100], '--author', '']
-    else:
-        cmd = [py, str(SHARED_SCRIPTS / 'web_publisher.py'), 'publish',
-               '--platform', cfg['wp'], '--title', title, '--desc', req.body,
-               '--tags', tags, '--exec']
-        media = vids[0] if vids else (imgs[0] if imgs else None)
-        if media:
-            cmd += ['--media', media]
-    # 公众号走后台会话（Playwright，脚本自带 --proxy，默认直连）；其余平台走 _publish_env
-    pub_env = _proxy_env() if platform == 'wechat-oa' else _publish_env()
+    publish_type = job['publish_type']
+    if job['async']:
+        return _start_async_publish(
+            platform, job['cmd'], title, req.body, cfg, job['status_file'],
+            job['code_file'], profile, tags, publish_type)
+    cmd = job['cmd']
+    pub_env = job['env']
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=pub_env,
-                                       capture_output=True, text=True, timeout=600)
+                                       capture_output=True, text=True, timeout=job['timeout'])
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '发布超时（媒体处理慢或流程卡住）')
     ok = proc.returncode == 0
@@ -5707,6 +6414,89 @@ async def api_profile_build(req: ProfileBuildRequest):
     threading.Thread(target=_enhance, daemon=True).start()
     # 基线已写、画像立即可用；增强在后台，前端轮询状态
     return {'created': pd.is_dir(), 'name': name, 'async': True, 'status': 'running'}
+
+
+class ProfileBaselineRequest(BaseModel):
+    name: str
+    form: dict = {}
+    reuse: bool = False
+
+
+def _profile_target(name: str) -> Path:
+    """验证画像名并返回 profiles 根内候选路径；现有链接一律拒绝。"""
+    if (not valid_persona_name(name) or len(name) > 200
+            or name != name.strip()):
+        raise HTTPException(400, "画像名非法")
+    root = PROFILES_DIR
+    if not _real_directory(root.parent):
+        raise HTTPException(500, "画像存储不可用")
+    if not _real_directory(root):
+        try:
+            root.mkdir()
+        except OSError:
+            raise HTTPException(500, "画像存储不可用") from None
+        if not _real_directory(root):
+            raise HTTPException(500, "画像存储不可用")
+    target = root / name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target
+    except OSError:
+        raise HTTPException(500, "画像存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if target.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "画像存储不可用")
+    return target
+
+
+@app.post("/api/profile/baseline")
+async def api_profile_baseline(req: ProfileBaselineRequest):
+    """确定性写入画像六维基线；不启动后台线程，AI 增强由 control Run 接纳。"""
+    name = req.name.strip()
+    form = req.form or {}
+    if not isinstance(form, dict):
+        raise HTTPException(400, "画像表单非法")
+    try:
+        encoded = json.dumps(form, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "画像表单非法") from None
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        raise HTTPException(413, "画像表单过大")
+    target = _profile_target(name)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not target.is_dir() or safe_profile_dir(name) is None:
+            if target.is_dir():
+                raise HTTPException(500, "画像存储不可用")
+            raise HTTPException(409, f'画像「{name}」已存在，请换一个名字')
+        if not req.reuse:
+            raise HTTPException(409, f'画像「{name}」已存在，请换一个名字')
+        return {
+            "created": False, "name": name,
+            "instruction": _form_to_instruction(name, form),
+        }
+    try:
+        target.mkdir()
+    except FileExistsError:
+        raise HTTPException(409, f'画像「{name}」已存在，请换一个名字') from None
+    except OSError:
+        raise HTTPException(500, "画像存储不可用") from None
+    try:
+        if safe_profile_dir(name) is None:
+            raise HTTPException(500, "画像存储不可用")
+        _write_baseline_profile(name, form)
+    except BaseException:
+        import shutil as _shutil
+        _shutil.rmtree(target, ignore_errors=True)
+        raise
+    return {
+        "created": True, "name": name,
+        "instruction": _form_to_instruction(name, form),
+    }
 
 
 def _profile_status_file(name: str) -> Path:
@@ -5932,53 +6722,200 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
     now = time.time()
     loop = asyncio.get_event_loop()
     result = []
+    updated_candidates: list[float] = []
+    stale_any = False
+    failed: list[str] = []
     for pf in pfs:
         c = _TREND_CACHE.get(pf)
+        cached_at = 0.0
+        stale = False
         if c and now - c[0] < 300:
+            # 有效期内缓存是正常数据，但 updated 必须保留实际取数时间。
             items = c[1]
+            cached_at = c[0]
+            ok = True
         else:
             items = await loop.run_in_executor(None, _fetch_platform, pf)
             if items:
                 _TREND_CACHE[pf] = (now, items)
+                cached_at = now
+                ok = True
             elif c:
+                # 上游失败但保留旧缓存：明确标记 stale，updated 不能是本次请求时间。
                 items = c[1]
-        result.append({
+                cached_at = c[0]
+                ok = False
+                stale = True
+                stale_any = True
+                failed.append(pf)
+            else:
+                items = []
+                ok = False
+                failed.append(pf)
+        if cached_at > 0:
+            updated_candidates.append(cached_at)
+        group = {
             "platform": pf,
             "label": TREND_LABELS.get(pf, pf),
             "items": items[:max(1, min(limit, 30))],
-            "ok": bool(items),
-        })
-    return {"trends": result, "updated": int(now)}
+            "ok": ok,
+        }
+        if cached_at > 0:
+            group["cached_at"] = int(cached_at)
+        if stale:
+            group["stale"] = True
+        result.append(group)
+    payload = {
+        "trends": result,
+        "updated": int(max(updated_candidates)) if updated_candidates else 0,
+    }
+    if stale_any:
+        payload["stale"] = True
+        payload["failed_platforms"] = failed
+    return payload
 
 
-SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
 SCHEDULE_KINDS = {"content", "event"}
+_WORKBENCH_FILE_ATTRIBUTE_REPARSE = 0x400
+
+
+def _real_directory(path: Path) -> bool:
+    """验证目录本身及父链解析后仍是原路径；不存在返回 False。"""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if path.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "工作台存储不可用")
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path.absolute() or not resolved.is_dir():
+            raise HTTPException(500, "工作台存储不可用")
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    return True
+
+
+def _workbench_root(*, create: bool) -> Path:
+    """验证 outputs 根及其父链；仅在合法父目录下允许首次创建 outputs。"""
+    root = OUTPUTS_DIR
+    if not _real_directory(root.parent):
+        raise HTTPException(500, "工作台存储不可用")
+    if not _real_directory(root):
+        if not create:
+            return root
+        try:
+            root.mkdir()
+        except OSError:
+            raise HTTPException(500, "工作台存储不可用") from None
+        if not _real_directory(root):
+            raise HTTPException(500, "工作台存储不可用")
+    return root.resolve()
+
+
+def _workbench_file(name: str) -> Path:
+    """返回本人 outputs 下的真实数据文件；拒绝链接、目录和越界解析。"""
+    root = _workbench_root(create=False)
+    target = root / name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    if target.is_symlink() or attributes & _WORKBENCH_FILE_ATTRIBUTE_REPARSE:
+        raise HTTPException(500, "工作台存储不可用")
+    try:
+        resolved = target.resolve(strict=True)
+        if (resolved != target.absolute()
+                or resolved.parent != root
+                or not resolved.is_file()):
+            raise HTTPException(500, "工作台存储不可用")
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, "工作台存储不可用") from None
+    return resolved
+
+
+def _read_workbench_json(name: str, label: str) -> list[dict]:
+    path = _workbench_file(name)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+            RecursionError):
+        raise HTTPException(500, f"{label}存储不可用") from None
+    if (not isinstance(data, list)
+            or any(not isinstance(item, dict) for item in data)):
+        raise HTTPException(500, f"{label}存储不可用")
+    return data
+
+
+def _write_workbench_json(name: str, label: str, items: list[dict]) -> None:
+    if (not isinstance(items, list)
+            or any(not isinstance(item, dict) for item in items)):
+        raise HTTPException(500, f"{label}存储不可用")
+    target = OUTPUTS_DIR / name
+    try:
+        root = _workbench_root(create=True)
+        target = _workbench_file(name)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{name}.", suffix=".tmp", dir=str(root))
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(500, f"{label}存储不可用") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(items, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise HTTPException(500, f"{label}存储不可用") from None
+
+
+def _schedule_path() -> Path:
+    return _workbench_file("_schedule.json")
+
+
+def _ideas_path() -> Path:
+    return _workbench_file("_ideas.json")
+
 
 # _schedule.json 读-改-写串行化：发布回流（后台线程 _run_publish_bg + 事件循环上的
 # api_publish 成功路径）与增删改端点并发时，不加锁会互相覆盖丢记录。
 _SCHEDULE_LOCK = threading.Lock()
+_IDEAS_LOCK = threading.Lock()
 
 
 def _schedule_lock() -> threading.Lock:
     return _SCHEDULE_LOCK
 
 
+def _ideas_lock() -> threading.Lock:
+    return _IDEAS_LOCK
+
+
 def _read_schedule() -> list[dict]:
-    if not SCHEDULE_FILE.is_file():
-        return []
-    try:
-        d = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    return _read_workbench_json("_schedule.json", "排期")
 
 
 def _write_schedule(items: list[dict]) -> None:
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SCHEDULE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SCHEDULE_FILE)
+    _write_workbench_json("_schedule.json", "排期", items)
 
 
 class ScheduleItem(BaseModel):
@@ -6063,38 +7000,39 @@ async def api_schedule_delete(sid: str):
 @app.get("/api/schedule/context")
 async def api_schedule_context(days: int = 14):
     """规划摘要（发布节奏/断更缺口 + 待发排期 + 临近节点 + 建议）——薄封装 calendar_ops，
-    前端页头「近期节点/建议」与 Agent 读回共用同一逻辑。失败返回空摘要不抛错。"""
+    前端页头「近期节点/建议」与 Agent 读回共用同一逻辑。
+
+    命令、脚本路径和本人数据文件均固定；浏览器只能影响有界 days。损坏
+    存储、脚本失败或无效输出明确报错，不能伪装成空摘要成功。
+    """
+    _read_schedule()
     cmd = [sys.executable, str(SHARED_SCRIPTS / "calendar_ops.py"),
-           "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
+           "--data", str(_schedule_path()), "context",
+           "--days", str(max(1, min(days, 90)))]
     try:
         # 冷启动要起一个 Python 子进程（最长 20s）：丢线程池，避免卡住事件循环
         proc = await asyncio.to_thread(
             subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
             capture_output=True, text=True, timeout=20)
-        return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise ValueError("calendar context failed")
+        payload = json.loads(proc.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("calendar context invalid")
+        return payload
     except Exception:
-        return {}
+        raise HTTPException(503, "日历摘要暂不可用") from None
 
 
-IDEAS_FILE = OUTPUTS_DIR / "_ideas.json"
 IDEA_STATUSES = {"pending", "doing", "done"}
 
 
 def _read_ideas() -> list[dict]:
-    if not IDEAS_FILE.is_file():
-        return []
-    try:
-        d = json.loads(IDEAS_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    return _read_workbench_json("_ideas.json", "选题")
 
 
 def _write_ideas(items: list[dict]) -> None:
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = IDEAS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(IDEAS_FILE)
+    _write_workbench_json("_ideas.json", "选题", items)
 
 
 class IdeaItem(BaseModel):
@@ -6111,44 +7049,47 @@ async def api_ideas_list():
 
 @app.post("/api/ideas")
 async def api_ideas_create(req: IdeaItem):
-    items = _read_ideas()
-    st = req.status if req.status in IDEA_STATUSES else "pending"
-    item = {
-        "id": uuid.uuid4().hex[:12],
-        "title": req.title.strip() or "未命名选题",
-        "note": req.note,
-        "source": req.source,
-        "status": st,
-        "created": int(time.time()),
-    }
-    items.insert(0, item)
-    _write_ideas(items)
+    with _ideas_lock():
+        items = _read_ideas()
+        st = req.status if req.status in IDEA_STATUSES else "pending"
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": req.title.strip() or "未命名选题",
+            "note": req.note,
+            "source": req.source,
+            "status": st,
+            "created": int(time.time()),
+        }
+        items.insert(0, item)
+        _write_ideas(items)
     return item
 
 
 @app.put("/api/ideas/{iid}")
 async def api_ideas_update(iid: str, req: IdeaItem):
-    items = _read_ideas()
-    for it in items:
-        if it.get("id") == iid:
-            it.update({
-                "title": req.title.strip() or it.get("title", "未命名选题"),
-                "note": req.note,
-                "source": req.source,
-                "status": req.status if req.status in IDEA_STATUSES else it.get("status", "pending"),
-            })
-            _write_ideas(items)
-            return it
+    with _ideas_lock():
+        items = _read_ideas()
+        for it in items:
+            if it.get("id") == iid:
+                it.update({
+                    "title": req.title.strip() or it.get("title", "未命名选题"),
+                    "note": req.note,
+                    "source": req.source,
+                    "status": req.status if req.status in IDEA_STATUSES else it.get("status", "pending"),
+                })
+                _write_ideas(items)
+                return it
     raise HTTPException(404, "选题不存在")
 
 
 @app.delete("/api/ideas/{iid}")
 async def api_ideas_delete(iid: str):
-    items = _read_ideas()
-    new = [it for it in items if it.get("id") != iid]
-    if len(new) == len(items):
-        raise HTTPException(404, "选题不存在")
-    _write_ideas(new)
+    with _ideas_lock():
+        items = _read_ideas()
+        new = [it for it in items if it.get("id") != iid]
+        if len(new) == len(items):
+            raise HTTPException(404, "选题不存在")
+        _write_ideas(new)
     return {"ok": True, "deleted": iid}
 
 

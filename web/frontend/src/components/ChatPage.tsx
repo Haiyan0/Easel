@@ -3,8 +3,11 @@ import MessageBubble from './MessageBubble';
 import QuestionCards from './QuestionCards';
 import BrushEntry from './BrushEntry';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
-import { uploadFiles, adoptOversize } from '../lib/api';
-import type { UploadedFile } from '../lib/api';
+import type { ChatQuestion, UploadedFile } from '../lib/api';
+import {
+  oversizeUploadMessage, partitionUploads, workspaceErrorMessage,
+} from '../lib/workspaceData';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 
 interface ChatPageProps {
@@ -13,13 +16,30 @@ interface ChatPageProps {
   stream?: StreamState;          // 进行中的流式态（来自 App，切页也不丢）
   onSend: (displayText: string, attachments?: UploadedFile[]) => void;
   onStop: () => void;
-  onResend: (
+  onResend?: (
     userIndex: number,
     displayText: string,
     attachments?: UploadedFile[],
     legacyAgentText?: string,
-  ) => void; // 重试：仅对最后一轮
+  ) => void; // 重试：仅对最后一轮；control 暂不提供
   onQuestionAnswered?: (questionId: string) => void;   // 某道问答题提交成功（App 记录答过，重放不再出现）
+  mode?: 'local' | 'control';
+  initialInput?: string;
+  onInitialInputConsumed?: () => void;
+  attachmentsEnabled?: boolean;
+  attachmentRequiresText?: boolean;  // control 附件必须随文字提交
+  identityKey?: string;          // 身份切换时清理本页草稿/附件/上传状态
+  notice?: string;
+  retryAvailable?: boolean;
+  onRetrySend?: () => void;
+  reconnectAvailable?: boolean;
+  onReconnect?: () => void;
+  hasOlder?: boolean;
+  loadingOlder?: boolean;
+  onLoadOlder?: () => void;
+  onAnswerQuestion?: (
+    question: ChatQuestion, answers: Record<string, string[]>,
+  ) => Promise<{ ok: boolean; error?: string }>;
 }
 
 // 空态推荐（贴合 Easel 社媒创作场景）
@@ -36,12 +56,20 @@ function greeting(): string {
   return `${g}，想创作点什么？`;
 }
 
-export default function ChatPage({ apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered }: ChatPageProps) {
+export default function ChatPage({
+  apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered,
+  initialInput, onInitialInputConsumed,
+  attachmentsEnabled = true, attachmentRequiresText = false,
+  identityKey, notice, retryAvailable, onRetrySend, reconnectAvailable,
+  onReconnect, hasOlder, loadingOlder, onLoadOlder, onAnswerQuestion,
+}: ChatPageProps) {
+  const data = useWorkspaceData();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [maxMb, setMaxMb] = useState(50);
+  const [uploadNotice, setUploadNotice] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -51,25 +79,49 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
   const isEmpty = session.messages.length === 0 && !isStreaming;
 
   useEffect(() => {
-    fetch('/api/upload/limits').then((r) => r.json())
-      .then((d) => { if (d?.max_mb) setMaxMb(d.max_mb); }).catch(() => {});
-  }, []);
+    if (!attachmentsEnabled) return;
+    data.uploadLimits()
+      .then((d) => { if (d.max_mb > 0) setMaxMb(d.max_mb); })
+      .catch(() => { /* 保持保守默认 50MB */ });
+  }, [attachmentsEnabled, data]);
+
+  // 身份切换时清理本页草稿/附件/上传状态，不能只清父会话数组。
+  useEffect(() => {
+    setInput('');
+    setAttachments([]);
+    setUploading(false);
+    setDragOver(false);
+    setUploadNotice('');
+  }, [identityKey]);
+
+  // 热点/选题跳转只预填，等待用户确认后再走既有会话/Run 接纳。
+  useEffect(() => {
+    if (!initialInput) return;
+    setInput(initialInput);
+    onInitialInputConsumed?.();
+  }, [initialInput, onInitialInputConsumed]);
 
   const doUpload = async (fs: FileList | File[]) => {
+    if (!attachmentsEnabled) return;
     const arr = Array.from(fs);
     if (!arr.length) return;
-    const cap = maxMb * 1024 * 1024;
-    const big = arr.filter((f) => f.size > cap);
-    const small = arr.filter((f) => f.size <= cap);
+    setUploadNotice('');
+    const parts = partitionUploads(arr, maxMb);
+    const big = arr.filter((file) => parts.oversize.includes(file));
+    const small = arr.filter((file) => parts.accepted.includes(file));
 
     if (big.length) {
-      // 超限：不走上传通道，复制进收件箱后作为普通附件（界面零新增元素）
+      if (data.oversizeMode === 'reject' || !data.adoptOversize) {
+        setUploadNotice(oversizeUploadMessage(maxMb, 'reject'));
+        return;
+      }
+      // local 单机保留原通道：复制进本地素材目录后作为普通附件。
       setUploading(true);
       try {
-        const saved = await adoptOversize(big, session.id);
+        const saved = await data.adoptOversize(big, session.id);
         setAttachments((a) => [...a, ...saved]);
       } catch (err) {
-        alert((err as Error).message || '超限文件处理失败');
+        setUploadNotice(workspaceErrorMessage(err, '超限文件处理失败'));
       } finally {
         setUploading(false);
       }
@@ -77,20 +129,25 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
     if (!small.length) return;
     setUploading(true);
     try {
-      const saved = await uploadFiles(small, session.id);
+      const saved = await data.uploadFiles(small, session.id);
       setAttachments((a) => [...a, ...saved]);
     } catch (err) {
-      alert((err as Error).message || '上传失败');
+      setUploadNotice(workspaceErrorMessage(err, '上传失败'));
     } finally {
       setUploading(false);
     }
   };
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault(); setDragOver(false);
-    if (e.dataTransfer.files?.length) doUpload(e.dataTransfer.files);
+    if (attachmentsEnabled && e.dataTransfer.files?.length) {
+      doUpload(e.dataTransfer.files);
+    }
   };
   const onPaste = (e: React.ClipboardEvent) => {
-    if (e.clipboardData.files?.length) { e.preventDefault(); doUpload(e.clipboardData.files); }
+    if (!attachmentsEnabled) return;
+    if (e.clipboardData.files?.length) {
+      e.preventDefault(); doUpload(e.clipboardData.files);
+    }
   };
   const removeAttachment = (path: string) => setAttachments((a) => a.filter((x) => x.path !== path));
 
@@ -109,10 +166,15 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
   const handleSend = () => {
     const trimmed = input.trim();
     if ((!trimmed && attachments.length === 0) || isStreaming || uploading) return;
+    if (attachmentRequiresText && attachments.length > 0 && !trimmed) {
+      setUploadNotice('请先输入文字，再发送附件。');
+      return;
+    }
     // 附件通过结构化字段发送；用户消息气泡只显示用户实际输入的文字。
     onSend(trimmed, attachments);
     setInput('');
     setAttachments([]);
+    setUploadNotice('');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -125,11 +187,30 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
     }
   };
 
+  const statusBanner = (notice || retryAvailable || reconnectAvailable) ? (
+    <div className="chat-banner" role="status">
+      {notice && <span className="chat-banner-text">{notice}</span>}
+      {retryAvailable && onRetrySend && (
+        <button className="chat-banner-action" onClick={onRetrySend}>
+          重试同一请求
+        </button>
+      )}
+      {reconnectAvailable && onReconnect && (
+        <button className="chat-banner-action" onClick={onReconnect}>
+          重连（只回放）
+        </button>
+      )}
+    </div>
+  ) : null;
+
   const inputBox = (hero: boolean) => (
     <div className={`composer ${hero ? 'composer-hero' : ''} ${dragOver ? 'composer-drag' : ''}`}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={(e) => { e.preventDefault(); setDragOver(false); }}
       onDrop={onDrop}>
+      {uploadNotice && (
+        <div className="composer-notice" role="status">{uploadNotice}</div>
+      )}
       {attachments.length > 0 && (
         <div className="composer-attachments">
           {attachments.map((a) => (
@@ -158,12 +239,24 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
           autoFocus={hero}
         />
       </div>
-      <input ref={fileInputRef} type="file" multiple hidden
-        onChange={(e) => { if (e.target.files) doUpload(e.target.files); e.target.value = ''; }} />
+      {attachmentsEnabled && (
+        <input ref={fileInputRef} type="file" multiple hidden
+          onChange={(e) => {
+            if (e.target.files) doUpload(e.target.files);
+            e.target.value = '';
+          }} />
+      )}
       <div className="composer-bar">
-        <button className="composer-attach-btn" onClick={() => fileInputRef.current?.click()}
-          disabled={isStreaming || uploading} title={`添加素材（图片/文档）；超过 ${maxMb}MB 的大文件将自动存为本地素材（不走上传）`}>
-          <IconPlus size={15} /> {uploading ? '上传中…' : '素材'}
+        <button className="composer-attach-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={!attachmentsEnabled || isStreaming || uploading}
+          title={attachmentsEnabled
+            ? (data.oversizeMode === 'adopt'
+              ? `添加素材（图片/文档）；超过 ${maxMb}MB 的大文件将自动存为本地素材（不走上传）`
+              : `添加素材（图片/文档）；单个文件上限 ${maxMb}MB`)
+            : '登录工作区的附件上传暂未开放'}>
+          <IconPlus size={15} /> {!attachmentsEnabled
+            ? '素材（暂未开放）' : uploading ? '上传中…' : '素材'}
         </button>
         <span className="composer-hint">{isStreaming ? '生成中…' : 'Enter 发送 · Shift+Enter 换行'}</span>
         {isStreaming ? (
@@ -187,6 +280,7 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
           <h1 className="chat-hero-title">{greeting()}</h1>
           <p className="chat-hero-sub">{apiDirect ? 'API 直连：写文案、策划选题、分析附件。本机工具和自动发布未启用。'
             : '从选题到发布，一站式帮你把想法做成能发的内容。'}</p>
+          {statusBanner}
           {inputBox(true)}
           <div className="suggestions">
             {SUGGESTIONS.filter((s) => !apiDirect || ['写小红书文案', '口播脚本'].includes(s.title)).map((s) => (
@@ -213,6 +307,13 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
     <div className="chat-page">
       <div className="chat-messages">
         <div className="chat-thread">
+          {statusBanner}
+          {hasOlder && onLoadOlder && (
+            <button className="chat-older" disabled={loadingOlder}
+              onClick={onLoadOlder}>
+              {loadingOlder ? '加载中…' : '加载更早历史'}
+            </button>
+          )}
           {displayMessages.map((msg, i) => {
             const isLast = i === displayMessages.length - 1;
             const live = isStreaming && isLast && msg.role === 'assistant';
@@ -225,7 +326,7 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
               if (msg.role === 'user') {
                 actions = {
                   onCopy: copy,
-                  onRetry: isLastFinal
+                  onRetry: (isLastFinal && onResend)
                     ? () => onResend(i, msg.content, msg.attachments, msg.agentContent)
                     : undefined,
                   canModify: !isStreaming,
@@ -235,7 +336,7 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
                 const prevUser = pi >= 0 && session.messages[pi]?.role === 'user' ? session.messages[pi] : null;
                 actions = {
                   onCopy: copy,
-                  onRetry: (isLastFinal && prevUser)
+                  onRetry: (isLastFinal && prevUser && onResend)
                     ? () => onResend(pi, prevUser.content, prevUser.attachments, prevUser.agentContent)
                     : undefined,
                   canModify: !isStreaming,
@@ -251,11 +352,15 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
                 activity={live ? stream!.activity : ''}
                 stillWorking={live ? stream!.stillWorking : ''}
                 actions={actions}
+                mediaEnabled
               />
             );
           })}
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (
-            <QuestionCards questions={stream!.questions || []} onDone={(qid) => onQuestionAnswered?.(qid)} />
+            <QuestionCards questions={stream!.questions || []}
+              pending={stream!.questionPending === true}
+              onDone={(qid) => onQuestionAnswered?.(qid)}
+              onAnswer={onAnswerQuestion} />
           )}
           <div ref={messagesEndRef} />
         </div>

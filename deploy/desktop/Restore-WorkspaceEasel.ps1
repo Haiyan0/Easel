@@ -89,6 +89,14 @@ try {
             throw 'backup_manifest_invalid'
         }
     }
+    # 备份若登记了受管发布策略，恢复后的正式启动也要沿用；旧备份没有
+    # 该字段时仍由 Start 的显式迁移规则处理。
+    $restoredPublishMode = (
+        [string]$manifest.deployment.publish_mode).ToLowerInvariant()
+    if ($restoredPublishMode -and
+        $restoredPublishMode -notin @('automated', 'manual')) {
+        throw 'backup_manifest_invalid'
+    }
     if ($manifest.deployment.workspace_root) {
         $sourceWorkspace = [IO.Path]::GetFullPath(
             [string]$manifest.deployment.workspace_root)
@@ -335,7 +343,14 @@ try {
     Write-Output "restored_schema=$([int]$manifest.schema_version)"
     Write-Output "restored_workspaces=$workspaceCount"
     Write-Output "recovery_invite_file=$inviteFile"
-    Write-Output "next=Start-WorkspaceEasel.ps1 -ProjectName $ProjectName -PublicOrigin $PublicOrigin -Image $Image -WorkerImage $WorkerImage -GatewayImage $GatewayImage -Port $Port -DataRoot $DataRoot -WorkspaceRoot $WorkspaceRoot"
+    $publishArgument = if ($restoredPublishMode) {
+        " -PublishMode $restoredPublishMode"
+    }
+    else { '' }
+    Write-Output ("next=Start-WorkspaceEasel.ps1 -ProjectName $ProjectName" +
+        " -PublicOrigin $PublicOrigin -Image $Image -WorkerImage $WorkerImage" +
+        " -GatewayImage $GatewayImage -Port $Port -DataRoot $DataRoot" +
+        " -WorkspaceRoot $WorkspaceRoot" + $publishArgument)
     exit 0
 }
 catch {

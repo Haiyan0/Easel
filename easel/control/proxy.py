@@ -51,6 +51,19 @@ _ALLOWED_TASK_FIELDS = frozenset(
     {"sessionId", "turnId", "message", "attachments", "persona"})
 _MAX_IDENTIFIER = 256
 _MAX_PERSONA = 200
+# 这些已启用任务实际走 chat broker 通道；签发路由也必须覆盖其 Agent 快照。
+BROKER_MODEL_TASK_TYPES = frozenset(("chat", "skill", "profile"))
+# 浏览器/分析任务不调用模型；不需要 broker token，但复用同一 Run 容量/终态。
+_BROWSER_TASK_TYPES = frozenset(("browser", "analytics", "publish"))
+_BROWSER_ACTION_TIMEOUTS = {
+    "login": 600,
+    "mp-login": 600,
+    "whoami": 90,
+    "analytics": 300,
+    "credentials": 90,
+    "publish": 900,
+    "manual-export": 600,
+}
 # 这些错误表示 gateway/worker 暂时不可用，不能作为“实例已消失”的结算依据。
 _GATEWAY_TRANSIENT = frozenset({
     "worker_not_ready", "worker_wiring_mismatch",
@@ -187,6 +200,16 @@ def _safe_code(value: object, fallback: str) -> str:
             for character in value):
         return value
     return fallback
+
+
+def _browser_action_timeout(message: str) -> int:
+    """按固定动作给 Run 时限；未知动作仍受默认上限约束。"""
+    try:
+        value = json.loads(message)
+    except (TypeError, ValueError):
+        return 300
+    action = value.get("action") if isinstance(value, dict) else None
+    return _BROWSER_ACTION_TIMEOUTS.get(action, 300)
 
 
 def _query_pairs(text: str) -> list[tuple[str, str]]:
@@ -373,28 +396,37 @@ class WorkerRelay:
             raise
 
     async def _run_routes(self, actor: Identity, run: RunRecord,
-                          config: PinnedRunConfig) -> Mapping[str, object]:
-        """固定该 Run 的最小 broker 路由。
+                          config: PinnedRunConfig
+                          ) -> tuple[Mapping[str, object], object | None]:
+        """固定该 Run 的最小 broker 路由与同一事务的路由快照。
 
-        正式装配在接纳后调用 ``BrokerService.issue``，token 只绑定本人的
-        workspace/run/channel；签发失败（未配置该 channel 等）明确 503，
-        不以空 routes 接纳一个看似可运行的在线任务。签发与配置快照在同一
-        数据库事务内完成，重试/重启复用原签名包，不会换 token。
+        正式装配在接纳后调用 ``BrokerService.issue_with_route``，token 与
+        有效路由来自同一写事务；返回的路由用于签名 Agent 的模型选择，避免
+        token 固定新版本而 Agent 仍用旧版。测试替身若只实现 ``issue``，
+        仍保持旧的静态 Agent 行为。
         """
         if config.broker is None:
-            return config.routes
+            return config.routes, None
         if self._broker is None:
             raise DomainError("capability_unavailable", 503)
         try:
-            token = await self._db(
-                self._broker.issue, actor, run.id, config.broker.channel)
+            issuer = getattr(self._broker, "issue_with_route", None)
+            if issuer is not None:
+                issued = await self._db(
+                    issuer, actor, run.id, config.broker.channel)
+                token = issued.token
+                route = issued.route
+            else:
+                token = await self._db(
+                    self._broker.issue, actor, run.id, config.broker.channel)
+                route = None
         except DomainError as error:
             if error.status in (400, 404, 503):
                 raise DomainError("capability_unavailable", 503) from None
             raise
-        return {**config.routes,
-                "broker_url": config.broker.url,
-                "broker_token": token}
+        return ({**config.routes,
+                 "broker_url": config.broker.url,
+                 "broker_token": token}, route)
 
     async def _duplicate(self, actor: Identity, run: RunRecord) -> dict:
         state = await self._db(
@@ -404,12 +436,22 @@ class WorkerRelay:
 
     def _sign(self, run: RunRecord, config: PinnedRunConfig,
               request: Mapping[str, object], task_type: str,
-              routes: Mapping[str, object] | None = None) -> str:
+              routes: Mapping[str, object] | None = None,
+              route: object | None = None) -> str:
         digest = run_input_digest(
             conversation_id=run.conversation_id, task_type=task_type,
             message=str(request["message"]),
             attachments=list(request["attachments"]),
             persona=request.get("persona"))
+        agent = dict(config.agent)
+        if task_type in _BROWSER_TASK_TYPES:
+            agent["timeout"] = _browser_action_timeout(str(request["message"]))
+        if route is not None and task_type in BROKER_MODEL_TASK_TYPES:
+            # 实际经 chat 通道执行的受管任务共用同一份有效路由；签名
+            # Agent 必须固定同一模型与允许目录，不能回退到静态默认值。
+            # 只扩到本阶段已启用的类型，账号/发布等后续能力不借此放行。
+            agent["model"] = route.model
+            agent["allowed_models"] = list(route.allowed_models)
         envelope = sign_run_snapshot(
             self._signing_key,
             workspace_id=run.workspace_id,
@@ -419,7 +461,7 @@ class WorkerRelay:
             task_type=task_type,
             revision=run.config_version,
             routes=dict(config.routes if routes is None else routes),
-            agent=dict(config.agent),
+            agent=agent,
             expires_at=int(self._clock()) + self._snapshot_ttl,
             nonce=secrets.token_urlsafe(24))
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
@@ -476,9 +518,12 @@ class WorkerRelay:
             return await self._duplicate(actor, existing)
 
         config = await self._pinned(actor)
-        # 能力检查先于启动 worker 与占用容量：缺受管 broker 路由时明确
-        # 503，不留下一个永远无法派发的 reserved Run。
-        await self._ensure_broker_capability(actor, config)
+        # 浏览器/分析任务不调用模型：跳过 broker 能力与逐 Run token，仍
+        # 使用同一 Store.reserve_run/容量/签名/终态收尾。
+        if task_type not in _BROWSER_TASK_TYPES:
+            # 能力检查先于启动 worker 与占用容量：缺受管 broker 路由时明确
+            # 503，不留下一个永远无法派发的 reserved Run。
+            await self._ensure_broker_capability(actor, config)
         handle = await self._ensure_workspace_ready(
             actor.workspace_id, config.revision)
         run = await self._db(
@@ -506,12 +551,16 @@ class WorkerRelay:
             return await self._duplicate(actor, run)
 
         try:
-            routes = await self._run_routes(actor, run, config)
+            if task_type in _BROWSER_TASK_TYPES:
+                # 不签发模型 token，也不把受管模型路由塞进浏览器任务快照。
+                routes, route = {}, None
+            else:
+                routes, route = await self._run_routes(actor, run, config)
         except DomainError:
             # 只有准备所有者、且尚未派发时才能补偿；非所有者不会走到这里
             await self._converge(actor, run, "interrupted")
             raise
-        signed = self._sign(run, config, request, task_type, routes)
+        signed = self._sign(run, config, request, task_type, routes, route)
         stored = await self._db(
             self._store.save_run_snapshot, actor, run.id, signed)
         if stored != signed:

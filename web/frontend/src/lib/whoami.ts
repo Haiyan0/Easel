@@ -12,6 +12,12 @@ export function getWhoamiCache(): Record<string, WhoamiEntry> {
   try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
 }
 
+/** 撤销/切换身份时清空本人 whoami 缓存，阻止迟到结果写回。 */
+export function clearWhoamiCache(): void {
+  for (const key of Object.keys(versions)) versions[key] += 1;
+  try { localStorage.removeItem(KEY); } catch { /* 忽略 */ }
+}
+
 /** 写缓存；r 为 null 则删除该平台条目。附带 ts 供 TTL 判定（旧格式无 ts→视为过期）。 */
 export function setWhoamiCache(platform: string, r: AccountWhoami | null): void {
   versions[platform] = (versions[platform] || 0) + 1;
@@ -26,6 +32,81 @@ export function setWhoamiCache(platform: string, r: AccountWhoami | null): void 
 function isFresh(e: WhoamiEntry | undefined, ttlMs: number): boolean {
   const lifetime = e?.loggedIn && (!e.name || !e.avatar) ? Math.min(ttlMs, 60_000) : ttlMs;
   return !!e && typeof e.ts === 'number' && (Date.now() - e.ts) < lifetime;
+}
+
+export interface WhoamiStorage {
+  get(): Record<string, WhoamiEntry>;
+  set(value: Record<string, WhoamiEntry>): void;
+}
+
+export interface WhoamiStoreOptions {
+  fetcher: (platform: string, force?: boolean) => Promise<AccountWhoami>;
+  storage: WhoamiStorage;
+  concurrency?: number;
+}
+
+export interface WhoamiStore {
+  get(): Record<string, WhoamiEntry>;
+  set(platform: string, value: AccountWhoami | null): void;
+  clear(): void;
+  verifyStale(platforms: string[], opts?: VerifyOpts): void;
+}
+
+/**
+ * 可注入缓存的 whoami 小状态机：local 用 localStorage，control 用适配器
+ * 实例内存（随身份重建/撤销丢弃），组件不直接接触存储实现。
+ */
+export function createWhoamiStore(options: WhoamiStoreOptions): WhoamiStore {
+  const versions: Record<string, number> = {};
+  const fetcher = options.fetcher;
+  const storage = options.storage;
+  const concurrency = Math.max(1, options.concurrency ?? WHOAMI_CONCURRENCY);
+
+  const get = (): Record<string, WhoamiEntry> => {
+    try {
+      const value = storage.get();
+      return value && typeof value === 'object' ? value : {};
+    } catch { return {}; }
+  };
+  const set = (platform: string, r: AccountWhoami | null): void => {
+    versions[platform] = (versions[platform] || 0) + 1;
+    try {
+      const cache = get();
+      if (r) cache[platform] = { ...r, ts: Date.now() };
+      else delete cache[platform];
+      storage.set(cache);
+    } catch { /* 配额 / 隐私模式：忽略 */ }
+  };
+  const clear = (): void => {
+    for (const key of Object.keys(versions)) versions[key] += 1;
+    try { storage.set({}); } catch { /* 忽略 */ }
+  };
+  const verifyStale = (platforms: string[], opts: VerifyOpts = {}): void => {
+    const ttlMs = opts.ttlMs ?? WHOAMI_TTL_MS;
+    const cache = get();
+    const todo = opts.force ? platforms : platforms.filter((p) => !isFresh(cache[p], ttlMs));
+    if (!todo.length) return;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < todo.length) {
+        if (opts.alive && !opts.alive()) return;
+        const p = todo[next++];
+        const version = versions[p] || 0;
+        try {
+          const r = await fetcher(p, opts.force === true);
+          if ((versions[p] || 0) !== version) continue;
+          set(p, r);
+          if (!opts.alive || opts.alive()) opts.onUpdate?.(p, r);
+        } catch {
+          // 校验失败（超时/网络）：保留既有缓存，跳过该平台
+        }
+      }
+    };
+    void Promise.all(
+      Array.from({ length: Math.min(concurrency, todo.length) }, () => worker()),
+    );
+  };
+  return { get, set, clear, verifyStale };
 }
 
 interface VerifyOpts {

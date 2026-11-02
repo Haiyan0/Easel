@@ -1,0 +1,60 @@
+﻿docker : #0 building with "desktop-linux" instance using docker driver
+At line:1 char:660
++ ... TEXITCODE"; docker build -f tests/multiuser/Dockerfile.worker-task5a  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+#1 [internal] load build definition from Dockerfile.worker-task5a
+#1 transferring dockerfile: 429B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/easel-worker-execution:a4
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 1.27kB done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 DONE 0.0s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 resolve docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc
+61f4f24
+#5 resolve docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8fcc
+61f4f24 0.0s done
+#5 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 75.14MB 5.0s
+#4 transferring context: 170.26MB 10.0s
+#4 transferring context: 211.67MB 12.8s done
+#4 DONE 12.9s
+
+#5 [1/4] FROM docker.io/library/easel-worker-execution:a4@sha256:39f7c847d931c91f486c06e867eab799f2db38ef72854a4f0564b8
+fcc61f4f24
+#5 CACHED
+
+#6 [2/4] COPY easel /opt/easel/easel
+#6 DONE 0.6s
+
+#7 [3/4] COPY web /opt/easel/web
+#7 DONE 1.2s
+
+#8 [4/4] RUN chown -R root:root /opt/easel && chmod -R a-w /opt/easel
+#8 DONE 5.2s
+
+#9 exporting to image
+#9 exporting layers
+#9 exporting layers 7.3s done
+#9 exporting manifest sha256:a45d6063c8d9ee7c785dac34811629df818a43d25a91a8bd3d0affe26a10e344 0.0s done
+#9 exporting config sha256:abdf9e1ac6e36cd9f2882f4f176b7bd7c9bff252938ccc9506b9a5737593d5ee 0.0s done
+#9 exporting attestation manifest sha256:c223a1a7b4bbeaf187cf21572653f3f8c3bf257d0adf178d9f204f74b9fc1abe 0.0s done
+#9 exporting manifest list sha256:2189817cd38a5135d33d6af1fbb8bab240188a8f107e22f2200b0403b67f793d 0.0s done
+#9 naming to docker.io/library/easel-worker-execution:task5a-20261030 done
+#9 unpacking to docker.io/library/easel-worker-execution:task5a-20261030
+#9 unpacking to docker.io/library/easel-worker-execution:task5a-20261030 2.0s done
+#9 DONE 9.4s

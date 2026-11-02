@@ -1,0 +1,216 @@
+﻿FFFFFEE                                                                  [100%]
+=================================== ERRORS ====================================
+___________ ERROR at setup of test_chain_capacity_restart_and_stop ____________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_chain_capacity_restart_an0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF8E7A00>
+
+    @pytest.fixture
+    def chain(tmp_path, monkeypatch):
+>       instance = Chain(tmp_path, monkeypatch)
+
+tests\multiuser\test_task5c2_chain.py:296: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <tests.multiuser.test_task5c2_chain.Chain object at 0x00000218AF8E7A30>
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_chain_capacity_restart_an0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF8E7A00>
+
+    def __init__(self, tmp_path: Path, monkeypatch) -> None:
+        self.root = tmp_path
+        self.workspace_root = tmp_path / "workspace"
+        for name in ("outputs", "profiles", "state", "home"):
+            (self.workspace_root / name).mkdir(parents=True)
+        monkeypatch.setattr(worker, "OUTPUTS_DIR",
+                            self.workspace_root / "outputs")
+        monkeypatch.setattr(worker, "PROFILES_DIR",
+                            self.workspace_root / "profiles")
+        monkeypatch.setattr(worker, "LOGIN_DIR",
+                            self.workspace_root / "outputs" / "_login")
+        monkeypatch.setattr(worker, "_SERVICE_MODE", "worker")
+        monkeypatch.setattr(worker, "_RUNS", None)
+        from easel import persona
+        monkeypatch.setattr(persona, "PROFILES_DIR", worker.PROFILES_DIR)
+        self.fake = FakePlatform(
+            worker.LOGIN_DIR, worker.OUTPUTS_DIR / "_analytics")
+        monkeypatch.setattr(worker, "_start_login", self.fake.start_login)
+        monkeypatch.setattr(worker, "_login_status", self.fake.login_status)
+        monkeypatch.setattr(
+            worker, "_check_account_whoami", self.fake.whoami)
+        monkeypatch.setattr(worker, "_fetch_analytics", self.fake.analytics)
+>       monkeypatch.setattr(
+            worker, "_wechat_verify_credentials",
+            lambda app_id, secret: (True, ""))
+E       AttributeError: <module 'web.app' from 'C:\\Code\\Easel\\.claude\\worktrees\\_baseline_5c2\\web\\app.py'> has no attribute '_wechat_verify_credentials'
+
+tests\multiuser\test_task5c2_chain.py:183: AttributeError
+_ ERROR at setup of test_real_chain_login_sms_whoami_analytics_credentials_logout _
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_real_chain_login_sms_whoa0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF958730>
+
+    @pytest.fixture
+    def chain(tmp_path, monkeypatch):
+>       instance = Chain(tmp_path, monkeypatch)
+
+tests\multiuser\test_task5c2_chain.py:296: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <tests.multiuser.test_task5c2_chain.Chain object at 0x00000218AF9586D0>
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_real_chain_login_sms_whoa0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF958730>
+
+    def __init__(self, tmp_path: Path, monkeypatch) -> None:
+        self.root = tmp_path
+        self.workspace_root = tmp_path / "workspace"
+        for name in ("outputs", "profiles", "state", "home"):
+            (self.workspace_root / name).mkdir(parents=True)
+        monkeypatch.setattr(worker, "OUTPUTS_DIR",
+                            self.workspace_root / "outputs")
+        monkeypatch.setattr(worker, "PROFILES_DIR",
+                            self.workspace_root / "profiles")
+        monkeypatch.setattr(worker, "LOGIN_DIR",
+                            self.workspace_root / "outputs" / "_login")
+        monkeypatch.setattr(worker, "_SERVICE_MODE", "worker")
+        monkeypatch.setattr(worker, "_RUNS", None)
+        from easel import persona
+        monkeypatch.setattr(persona, "PROFILES_DIR", worker.PROFILES_DIR)
+        self.fake = FakePlatform(
+            worker.LOGIN_DIR, worker.OUTPUTS_DIR / "_analytics")
+        monkeypatch.setattr(worker, "_start_login", self.fake.start_login)
+        monkeypatch.setattr(worker, "_login_status", self.fake.login_status)
+        monkeypatch.setattr(
+            worker, "_check_account_whoami", self.fake.whoami)
+        monkeypatch.setattr(worker, "_fetch_analytics", self.fake.analytics)
+>       monkeypatch.setattr(
+            worker, "_wechat_verify_credentials",
+            lambda app_id, secret: (True, ""))
+E       AttributeError: <module 'web.app' from 'C:\\Code\\Easel\\.claude\\worktrees\\_baseline_5c2\\web\\app.py'> has no attribute '_wechat_verify_credentials'
+
+tests\multiuser\test_task5c2_chain.py:183: AttributeError
+================================== FAILURES ===================================
+________________ test_gateway_allows_only_exact_account_routes ________________
+
+    def test_gateway_allows_only_exact_account_routes():
+>       assert _matched("GET", "/api/accounts").path == "/api/accounts"
+
+tests\multiuser\test_task5c2_security.py:24: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\multiuser\test_task5c2_security.py:20: in _matched
+    return _match_path(path.encode("ascii"), method, LIMITS)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+raw_path = b'/api/accounts', method = 'GET'
+limits = GatewayLimits(max_header_bytes=65536, max_body_bytes=67108864, connect_timeout=10.0, io_timeout=120.0, max_concurrent_requests=8, max_concurrent_streams=7, max_path_bytes=2048, max_query_bytes=4096, max_assertion_bytes=4096)
+
+    def _match_path(raw_path: bytes, method: str,
+                    limits: GatewayLimits) -> _Route:
+        path = _validate_raw_path(raw_path, limits)
+        parts = path.split("/")[1:]
+        # 只有 answer 路由的 question_id 段允许百分号编码；其他段一律拒绝，
+        # 避免编码字面量形成同一路由的别名。
+        question_index = None
+        if (len(parts) == 6 and parts[0] == "internal" and parts[1] == "runs"
+                and parts[3] == "questions" and parts[5] == "answer"):
+            question_index = 4
+        if parts and parts[0] == "internal":
+            for index, segment in enumerate(parts):
+                if "%" in segment and index != question_index:
+                    raise _invalid_path()
+        if parts and parts[0] == "api":
+            route = _workspace_route(parts, method)
+            if route is None:
+>               raise _not_found()
+E               easel.gateway.auth.GatewayError: gateway_not_found
+
+easel\gateway\app.py:533: GatewayError
+_______________ test_worker_qr_serves_only_fixed_platform_file ________________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_worker_qr_serves_only_fix0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF8E6BF0>
+
+    def test_worker_qr_serves_only_fixed_platform_file(tmp_path, monkeypatch):
+        login_dir = tmp_path / "_login"
+        login_dir.mkdir()
+        png = login_dir / "xiaohongshu.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        monkeypatch.setattr(worker, "LOGIN_DIR", login_dir)
+>       response = asyncio.run(worker.api_account_qr("xiaohongshu"))
+E       AttributeError: module 'web.app' has no attribute 'api_account_qr'. Did you mean: 'api_accounts'?
+
+tests\multiuser\test_task5c2_security.py:67: AttributeError
+_____________________ test_worker_qr_rejects_link_escape ______________________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_worker_qr_rejects_link_es0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF95BA00>
+
+    def test_worker_qr_rejects_link_escape(tmp_path, monkeypatch):
+        login_dir = tmp_path / "_login"
+        login_dir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "xiaohongshu.png").write_bytes(b"\x89PNG\r\n\x1a\noutside")
+        linked = login_dir / "xiaohongshu.png"
+        if os.name == "nt":
+            # Unix symlink 在无特权 Windows 上通常不可用；用 junction 覆盖同一
+            # resolve() 越界判定。
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(linked), str(outside)],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                pytest.skip("当前环境不允许创建目录 junction")
+        else:
+            try:
+                linked.symlink_to(outside)
+            except OSError:
+                pytest.skip("当前环境不允许创建 symlink")
+        monkeypatch.setattr(worker, "LOGIN_DIR", login_dir)
+        with pytest.raises(HTTPException) as rejected:
+>           asyncio.run(worker.api_account_qr("xiaohongshu"))
+E           AttributeError: module 'web.app' has no attribute 'api_account_qr'. Did you mean: 'api_accounts'?
+
+tests\multiuser\test_task5c2_security.py:109: AttributeError
+__________ test_credentials_verify_before_save_preserves_old_config ___________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_credentials_verify_before0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF8E5D50>
+
+    def test_credentials_verify_before_save_preserves_old_config(
+            tmp_path, monkeypatch):
+        config_path = tmp_path / "wechat.yaml"
+        config_path.write_text(
+            "accounts:\n  web:\n    name: 旧号\n    app_id: old-app\n"
+            "    app_secret: old-secret\n", encoding="utf-8")
+        monkeypatch.setattr(worker, "_wechat_config_path", lambda: config_path)
+        saved = []
+        monkeypatch.setattr(worker, "_wechat_save_credentials",
+                            lambda *args, **kwargs: saved.append((args, kwargs)))
+>       monkeypatch.setattr(worker, "_wechat_verify_credentials",
+                            lambda app_id, secret: (False, "invalid_secret"))
+E       AttributeError: <module 'web.app' from 'C:\\Code\\Easel\\.claude\\worktrees\\_baseline_5c2\\web\\app.py'> has no attribute '_wechat_verify_credentials'
+
+tests\multiuser\test_task5c2_security.py:123: AttributeError
+________ test_credentials_handoff_requires_active_run_and_masks_secret ________
+
+tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-4089/test_credentials_handoff_requi0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000218AF95A4A0>
+
+    def test_credentials_handoff_requires_active_run_and_masks_secret(
+            tmp_path, monkeypatch):
+        config_path = tmp_path / "wechat.yaml"
+        monkeypatch.setattr(worker, "_wechat_config_path", lambda: config_path)
+        monkeypatch.setattr(worker, "_SERVICE_MODE", "worker")
+>       monkeypatch.setattr(worker, "_wechat_verify_credentials",
+                            lambda app_id, secret: (True, ""))
+E       AttributeError: <module 'web.app' from 'C:\\Code\\Easel\\.claude\\worktrees\\_baseline_5c2\\web\\app.py'> has no attribute '_wechat_verify_credentials'
+
+tests\multiuser\test_task5c2_security.py:146: AttributeError
+=========================== short test summary info ===========================
+FAILED tests/multiuser/test_task5c2_security.py::test_gateway_allows_only_exact_account_routes
+FAILED tests/multiuser/test_task5c2_security.py::test_worker_qr_serves_only_fixed_platform_file
+FAILED tests/multiuser/test_task5c2_security.py::test_worker_qr_rejects_link_escape
+FAILED tests/multiuser/test_task5c2_security.py::test_credentials_verify_before_save_preserves_old_config
+FAILED tests/multiuser/test_task5c2_security.py::test_credentials_handoff_requires_active_run_and_masks_secret
+ERROR tests/multiuser/test_task5c2_chain.py::test_chain_capacity_restart_and_stop
+ERROR tests/multiuser/test_task5c2_chain.py::test_real_chain_login_sms_whoami_analytics_credentials_logout
+5 failed, 2 errors in 1.06s

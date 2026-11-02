@@ -1,0 +1,19 @@
+python.exe : Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+At line:1 char:302
++ ... tch {} } }; & 'C:\Users\hyh\anaconda3\envs\Agent\python.exe' -W ignor ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Exception in ca...tion_lost(None):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost(None)>
+Traceback (most recent call last):
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+BROWSER_VERSION 151.0.7922.34
+TASK5B_BROWSER_RESULTS {'workbench_flow': True, 'identity_isolation': True, 'member_no_accounts': True, 'dark_mobile': True}
+FAILURES []
+SCREENSHOTS ['docs\\evidence\\original-web-task-05b\\browser\\01-dashboard-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\02-trends-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\03-ideas-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\04-calendar-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\05-topic-draft-light.png', 'docs\\evidence\\original-web-task-05b\\browser\\06-identity-b.png', 'docs\\evidence\\original-web-task-05b\\browser\\07-accounts-unavailable.png', 'docs\\evidence\\original-web-task-05b\\browser\\08-dashboard-dark.png', 'docs\\evidence\\original-web-task-05b\\browser\\09-dashboard-mobile.png']
+TASK5B_BROWSER_OK True

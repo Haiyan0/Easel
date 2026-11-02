@@ -12,37 +12,35 @@ import type {
 } from '../lib/controlSettings';
 
 const panelStyle = {
-  padding: '24px',
   display: 'grid',
   gap: '16px',
   alignContent: 'start',
   maxWidth: '1080px',
-  minHeight: '100vh',
 } as const;
 
 const cardStyle = {
-  border: '1px solid #242a35',
-  background: '#12151b',
-  borderRadius: '12px',
+  border: '1px solid var(--border)',
+  background: 'var(--surface)',
+  borderRadius: 'var(--radius-lg)',
   padding: '16px',
   display: 'grid',
   gap: '10px',
 } as const;
 
 const buttonStyle = {
-  border: '1px solid #333a47',
-  background: '#1b1f28',
-  color: '#e7e9ee',
-  borderRadius: '9px',
+  border: '1px solid var(--border)',
+  background: 'var(--bg-elev)',
+  color: 'var(--text)',
+  borderRadius: 'var(--radius)',
   padding: '8px 10px',
   cursor: 'pointer',
   fontSize: '13px',
 } as const;
 
 const inputStyle = {
-  background: '#0f1115',
-  color: '#e7e9ee',
-  border: '1px solid #333a47',
+  background: 'var(--bg-elev)',
+  color: 'var(--text)',
+  border: '1px solid var(--border)',
   borderRadius: '8px',
   padding: '8px 10px',
   fontSize: '13px',
@@ -53,11 +51,16 @@ const inputStyle = {
 interface Props {
   ctx: AuthContext;
   call: ControlCall;
+  section?: 'all' | 'defaults' | 'members';
 }
 
 type GuardedResult<T> = { ok: true; value: T } | { ok: false };
 
-export default function AdminSettingsPage({ ctx, call }: Props) {
+export default function AdminSettingsPage({
+  ctx, call, section = 'all',
+}: Props) {
+  const showDefaults = section !== 'members';
+  const showMembers = section !== 'defaults';
   const [managed, setManaged] = useState<ManagedSettings | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [invites, setInvites] = useState<AdminInvite[]>([]);
@@ -425,7 +428,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
     return (
       <section style={panelStyle} aria-label="管理员设置">
         <h1 style={{ margin: 0, fontSize: '20px' }}>全体默认</h1>
-        <div role="alert" style={{ color: '#ff9b9b', fontSize: '14px' }}>
+        <div role="alert" style={{ color: 'var(--red)', fontSize: '14px' }}>
           无权访问管理员设置。
         </div>
       </section>
@@ -433,6 +436,10 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   }
 
   const entry = managed?.defaults[channel];
+  const chatEntry = managed?.defaults.chat;
+  const chatReady = !!chatEntry && !!chatEntry.provider
+    && !!chatEntry.model && chatEntry.credential_configured;
+  const heading = showMembers && !showDefaults ? '成员与邀请' : '全体默认';
   const memberOptions = users.filter((item) =>
     item.role === 'member' && !item.disabled);
   const selectedUser = users.find((item) => item.userId === inviteUserId);
@@ -446,38 +453,70 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
   return (
     <section style={panelStyle} aria-label="管理员设置">
       <header style={{ display: 'grid', gap: '6px' }}>
-        <h1 style={{ margin: 0, fontSize: '20px' }}>全体默认</h1>
-        <p style={{ margin: 0, color: '#9aa3b2', fontSize: '13px' }}>
-          这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。
+        <h1 style={{ margin: 0, fontSize: '20px' }}>{heading}</h1>
+        <p style={{ margin: 0, color: 'var(--text-secondary)', fontSize: '13px' }}>
+          {showDefaults && showMembers
+            ? '这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。'
+            : showDefaults
+              ? '主聊天与能力模型的全体默认；未配置主聊天时成员无法开始对话。'
+              : '创建成员、禁用账号、撤销登录与签发一次性邀请。'}
         </p>
       </header>
 
       {loadError ? (
-        <div role="alert" style={{ color: '#ff9b9b', fontSize: '14px' }}>
+        <div role="alert" style={{ color: 'var(--red)', fontSize: '14px' }}>
           {loadError}
         </div>
       ) : null}
       {loading ? (
-        <p style={{ color: '#9aa3b2', fontSize: '13px' }}>读取管理员设置…</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>读取管理员设置…</p>
       ) : null}
       {notice ? (
         <div role="status" style={{
           color: notice.includes('失败') || notice.includes('冲突')
-            ? '#ff9b9b' : '#8fd7a7',
+            ? 'var(--red)' : 'var(--green)',
           fontSize: '13px',
         }}>{notice}</div>
       ) : null}
 
-      {managed ? (
-        <section style={cardStyle} aria-label="全体默认配置">
+      {showDefaults && managed ? (
+        <div className={`settings-guide${
+          chatReady ? ' settings-guide--ok' : ''}`}
+        role="status" aria-label="主聊天状态">
+          <strong>{chatReady ? '主聊天已配置' : '主聊天尚未配置'}</strong>
+          <span>
+            {chatReady
+              ? `当前受管模型：${chatEntry?.model}。配置已保存；`
+                + '实际可用性以运行时结果为准。'
+              : '成员登录后将无法开始对话。请选择「主聊天」通道，'
+                + '填写受管模型与凭证，再保存全体默认。'}
+          </span>
+          {!chatReady ? (
+            <button className="btn btn-sm btn-primary"
+              disabled={busy || loading}
+              onClick={() => chooseChannel('chat')}>
+              配置主聊天
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {showDefaults && managed ? (
+        <section className="settings-section" style={cardStyle}
+          aria-label="全体默认配置">
           <h2 style={{ margin: 0, fontSize: '16px' }}>
             受管默认模型 · 版本 {managed.version}
           </h2>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             {ADMIN_CHANNELS.map((item) => (
-              <button key={item} style={{
+              <button key={item} className="settings-choice" style={{
                 ...buttonStyle,
-                borderColor: item === channel ? '#8b5cf6' : '#333a47',
+                borderColor: item === channel
+                  ? 'var(--accent-end)' : 'var(--border)',
+                background: item === channel
+                  ? 'var(--accent-soft)' : 'var(--bg-elev)',
+                color: item === channel
+                  ? 'var(--accent-end)' : 'var(--text)',
               }} aria-pressed={item === channel}
               disabled={busy || loading}
               onClick={() => chooseChannel(item)}>
@@ -485,7 +524,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
               </button>
             ))}
           </div>
-          <div style={{ fontSize: '12px', color: '#9aa3b2' }}>
+          <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
             {entry
               ? `${entry.provider}/${entry.model} · 凭证${
                   entry.credential_configured ? '已配置' : '缺失'}`
@@ -548,12 +587,12 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
               onChange={(event) => updateForm({
                 allowedModels: event.target.value })} />
           </label>
-          <p style={{ margin: 0, color: '#6f7785', fontSize: '12px' }}>
+          <p style={{ margin: 0, color: 'var(--text-tertiary)', fontSize: '12px' }}>
             留空 Key 仅在已有该通道、同供应商/地址/协议时复用原受管凭证；
             新增通道或更换作用域必须显式输入。
           </p>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-            <button style={{ ...buttonStyle, borderColor: '#8b5cf6' }}
+            <button style={{ ...buttonStyle, borderColor: 'var(--accent-end)' }}
               disabled={busy || loading}
               onClick={() => { void saveDefaults(); }}>
               保存全体默认
@@ -566,7 +605,9 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
         </section>
       ) : null}
 
-      <section style={cardStyle} aria-label="成员与邀请">
+      {showMembers ? (
+      <section className="settings-section" style={cardStyle}
+        aria-label="成员与邀请">
         <h2 style={{ margin: 0, fontSize: '16px' }}>成员与邀请</h2>
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
           <input aria-label="新成员显示名" style={{ ...inputStyle, flex: 1 }}
@@ -582,10 +623,10 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
           {users.map((item) => (
             <div key={item.userId} style={{
               display: 'flex', gap: '8px', alignItems: 'center',
-              flexWrap: 'wrap', fontSize: '13px', color: '#cfd5df',
+              flexWrap: 'wrap', fontSize: '13px', color: 'var(--text-secondary)',
             }}>
               <span style={{ minWidth: '120px' }}>{item.displayName}</span>
-              <span style={{ color: '#9aa3b2' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>
                 {item.role === 'admin' ? '管理员' : '成员'}
                 {item.disabled ? ' · 已禁用' : ''}
               </span>
@@ -634,15 +675,15 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
 
         {issued ? (
           <section style={{
-            border: '1px solid #4b3b7a', background: '#191625',
+            border: '1px solid var(--border-strong)', background: 'var(--surface-2)',
             borderRadius: '10px', padding: '12px', display: 'grid',
             gap: '8px',
           }} aria-label="邀请签发结果">
-            <div style={{ fontSize: '13px', color: '#d8d2ea' }}>
+            <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
               邀请明文只显示这一次：
             </div>
             <code style={{
-              wordBreak: 'break-all', fontSize: '13px', color: '#f0b45a',
+              wordBreak: 'break-all', fontSize: '13px', color: 'var(--amber)',
             }}>{issued.token}</code>
             <div style={{ display: 'flex', gap: '8px' }}>
               <button style={buttonStyle}
@@ -657,7 +698,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
           {invites.map((item) => (
             <div key={item.id} style={{
               display: 'flex', gap: '8px', alignItems: 'center',
-              fontSize: '13px', color: '#9aa3b2', flexWrap: 'wrap',
+              fontSize: '13px', color: 'var(--text-secondary)', flexWrap: 'wrap',
             }}>
               <span>{item.id.slice(0, 8)}</span>
               <span>{item.userId.slice(0, 8)}</span>
@@ -679,6 +720,7 @@ export default function AdminSettingsPage({ ctx, call }: Props) {
           ) : null}
         </div>
       </section>
+      ) : null}
     </section>
   );
 }

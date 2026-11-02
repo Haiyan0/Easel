@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { fetchSchedule, createSchedule, updateSchedule, deleteSchedule, fetchScheduleContext } from '../lib/api';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ScheduleItem, ScheduleInput, ScheduleContext } from '../lib/api';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { IconCalendar, IconTrash, IconChevron } from './icons';
 
 const STATUS_META: Record<string, { label: string; color: string }> = {
@@ -29,6 +30,7 @@ const EMPTY: ScheduleInput = {
 };
 
 export default function CalendarPage() {
+  const data = useWorkspaceData();
   const today = useMemo(() => new Date(), []);
   const [cursor, setCursor] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
   const [items, setItems] = useState<ScheduleItem[]>([]);
@@ -39,12 +41,39 @@ export default function CalendarPage() {
   const [ctx, setCtx] = useState<ScheduleContext | null>(null);
   const [showSuggest, setShowSuggest] = useState(true);
   const [dayView, setDayView] = useState<string | null>(null);   // 展开查看某天全部（date，null=关闭）
+  const [error, setError] = useState('');
+  const [formError, setFormError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const request = useRef<AbortController | null>(null);
 
   const load = useCallback(() => {
-    fetchSchedule().then(setItems).catch(() => {});
-    fetchScheduleContext(14).then(setCtx).catch(() => {});
-  }, []);
-  useEffect(() => { load(); }, [load]);
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setError('');
+    const schedule = data.fetchSchedule(controller.signal)
+      .then((list) => { if (!controller.signal.aborted) setItems(list); })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(workspaceErrorMessage(error, '日历读取失败，请重试。'));
+        }
+      });
+    const context = data.fetchScheduleContext(14, controller.signal)
+      .then((value) => { if (!controller.signal.aborted) setCtx(value); })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(workspaceErrorMessage(error, '日历摘要读取失败，请重试。'));
+        }
+      });
+    void Promise.allSettled([schedule, context]).then(() => {
+      if (!controller.signal.aborted) setLoading(false);
+    });
+  }, [data]);
+  useEffect(() => {
+    load();
+    return () => request.current?.abort();
+  }, [load]);
 
   const visible = useMemo(
     () => (filter === 'all' ? items : items.filter((it) => kindOf(it) === filter)),
@@ -73,10 +102,11 @@ export default function CalendarPage() {
   const openNew = (date: string) => {
     setDayView(null);
     setEditing(null);
+    setFormError('');
     setForm({ ...EMPTY, date, kind: filter === 'event' ? 'event' : 'content' });
   };
-  const openEdit = (it: ScheduleItem) => { setDayView(null); setEditing(it); setForm({ ...EMPTY, ...it }); };
-  const close = () => { setForm(null); setEditing(null); };
+  const openEdit = (it: ScheduleItem) => { setDayView(null); setEditing(it); setFormError(''); setForm({ ...EMPTY, ...it }); };
+  const close = () => { setForm(null); setEditing(null); setFormError(''); };
 
   // 单条 chip（活动=色条，内容=按状态上色的圆点），日历格与当天详情共用
   const renderChip = (it: ScheduleItem) => {
@@ -104,18 +134,29 @@ export default function CalendarPage() {
   };
 
   const save = async () => {
-    if (!form || !form.title.trim() || !form.date) return;
+    if (!form || !form.title.trim() || !form.date || saving) return;
     setSaving(true);
+    setError('');
+    setFormError('');
     try {
-      if (editing) await updateSchedule(editing.id, form);
-      else await createSchedule(form);
+      if (editing) await data.updateSchedule(editing.id, form);
+      else await data.createSchedule(form);
       close(); load();
+    } catch (error) {
+      setFormError(`日历保存失败：${workspaceErrorMessage(error, '请重试。')}`);
     } finally { setSaving(false); }
   };
   const remove = async () => {
-    if (!editing) return;
+    if (!editing || saving) return;
     setSaving(true);
-    try { await deleteSchedule(editing.id); close(); load(); } finally { setSaving(false); }
+    setError('');
+    setFormError('');
+    try {
+      await data.deleteSchedule(editing.id);
+      close(); load();
+    } catch (error) {
+      setFormError(`日历删除失败：${workspaceErrorMessage(error, '请重试。')}`);
+    } finally { setSaving(false); }
   };
 
   const monthLabel = `${cursor.getFullYear()} 年 ${cursor.getMonth() + 1} 月`;
@@ -138,6 +179,9 @@ export default function CalendarPage() {
           <button className="btn btn-sm" onClick={() => shift(1)}><IconChevron size={14} /></button>
         </div>
       </div>
+
+      {error && <div className="notice-error" role="alert">{error}</div>}
+      {loading && items.length === 0 && <div className="dash-empty">日历加载中…</div>}
 
       {showSuggest && suggestions.length > 0 && (
         <div className="cal-suggest">
@@ -291,6 +335,7 @@ export default function CalendarPage() {
             <label className="field-label">备注</label>
             <textarea className="field" style={{ minHeight: 60 }} value={form.note}
               onChange={(e) => setForm({ ...form, note: e.target.value })} />
+            {formError && <div className="notice-error" role="alert">{formError}</div>}
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 18 }}>
               {editing
                 ? <button className="btn btn-sm btn-danger" onClick={remove} disabled={saving}><IconTrash size={13} /> 删除</button>

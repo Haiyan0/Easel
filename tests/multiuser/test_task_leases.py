@@ -191,10 +191,11 @@ def test_task_table_covers_every_policy_task_route():
     assert seen == set(table), "任务表与 policy 的 TASK 路由必须一一对应"
 
 
-def test_task_table_reports_missing_adapters():
+def test_task_table_covers_all_types_and_is_fully_implemented():
     implemented = {entry.task_type for entry in TASK_ENTRIES
                    if entry.implemented}
-    assert implemented == {"chat"}, "本轮只装配 chat；其余必须明确 503"
+    assert implemented == set(RUN_TASK_TYPES), (
+        "5C3 已装配 publish；所有登记类型都必须有真实业务适配器")
     assert {entry.task_type for entry in TASK_ENTRIES} == set(RUN_TASK_TYPES)
 
 
@@ -585,9 +586,11 @@ def test_unwired_task_routes_remain_503(tmp_path):
                     ("post", "/api/skill",
                      {"skill": "x", "input": "y"}),
                     ("post", "/api/profile/build", {"name": "p"}),
-                    ("post", "/api/publish/xiaohongshu", {"title": "t"}),
+                    ("post", "/api/publish/xiaohongshu", {
+                        "title": "t", "body": "b",
+                        "media": ["project/cover.png"], "requestId": "r"}),
                     ("post", "/api/login/xiaohongshu", {}),
-                    ("get", "/api/analytics/xiaohongshu", None)):
+                    ("post", "/api/analytics/xiaohongshu", {})):
                 if method == "get":
                     response = client.get(path, headers=headers)
                 else:

@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { fetchIdeas, createIdea, updateIdea, deleteIdea, createSchedule } from '../lib/api';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { Idea, IdeaInput } from '../lib/api';
+import { useWorkspaceData } from '../lib/workspaceDataContext';
+import { workspaceErrorMessage } from '../lib/workspaceData';
 import { IconIdea, IconEdit, IconTrash, IconChat, IconCalendar, IconChevron } from './icons';
 
 interface IdeasPageProps {
@@ -16,13 +17,38 @@ const NEXT: Record<string, string> = { pending: 'doing', doing: 'done', done: 'p
 const EMPTY: IdeaInput = { title: '', note: '', source: '', status: 'pending' };
 
 export default function IdeasPage({ onUseTopic }: IdeasPageProps) {
+  const data = useWorkspaceData();
   const [ideas, setIdeas] = useState<Idea[]>([]);
   const [form, setForm] = useState<IdeaInput | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
   const [toast, setToast] = useState('');
+  const [error, setError] = useState('');
+  const [formError, setFormError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const request = useRef<AbortController | null>(null);
 
-  const load = useCallback(() => { fetchIdeas().then(setIdeas).catch(() => {}); }, []);
-  useEffect(() => { load(); }, [load]);
+  const load = useCallback(() => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setError('');
+    data.fetchIdeas(controller.signal)
+      .then((list) => { if (!controller.signal.aborted) setIdeas(list); })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(workspaceErrorMessage(error, '选题读取失败，请重试。'));
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+  }, [data]);
+  useEffect(() => {
+    load();
+    return () => request.current?.abort();
+  }, [load]);
 
   const showToast = (m: string) => { setToast(m); setTimeout(() => setToast(''), 2200); };
   const byStatus = useMemo(() => {
@@ -31,21 +57,52 @@ export default function IdeasPage({ onUseTopic }: IdeasPageProps) {
     return g;
   }, [ideas]);
 
-  const openNew = () => { setEditId(null); setForm({ ...EMPTY }); };
-  const openEdit = (it: Idea) => { setEditId(it.id); setForm({ title: it.title, note: it.note, source: it.source, status: it.status }); };
+  const openNew = () => { setEditId(null); setFormError(''); setForm({ ...EMPTY }); };
+  const openEdit = (it: Idea) => { setEditId(it.id); setFormError(''); setForm({ title: it.title, note: it.note, source: it.source, status: it.status }); };
   const save = async () => {
-    if (!form || !form.title.trim()) return;
-    if (editId) await updateIdea(editId, form); else await createIdea(form);
-    setForm(null); setEditId(null); load();
+    if (!form || !form.title.trim() || saving) return;
+    setSaving(true);
+    setError('');
+    setFormError('');
+    try {
+      if (editId) await data.updateIdea(editId, form);
+      else await data.createIdea(form);
+      setForm(null); setEditId(null); load();
+    } catch (error) {
+      setFormError(`选题保存失败：${workspaceErrorMessage(error, '请重试。')}`);
+    } finally {
+      setSaving(false);
+    }
   };
-  const advance = async (it: Idea) => { await updateIdea(it.id, { ...it, status: NEXT[it.status] }); load(); };
-  const remove = async (it: Idea) => { await deleteIdea(it.id); load(); };
+  const advance = async (it: Idea) => {
+    setError('');
+    try {
+      await data.updateIdea(it.id, { ...it, status: NEXT[it.status] });
+      load();
+    } catch (error) {
+      setError(workspaceErrorMessage(error, '选题状态更新失败，请重试。'));
+    }
+  };
+  const remove = async (it: Idea) => {
+    setError('');
+    try {
+      await data.deleteIdea(it.id);
+      load();
+    } catch (error) {
+      setError(workspaceErrorMessage(error, '选题删除失败，请重试。'));
+    }
+  };
   const schedule = async (it: Idea) => {
     // 用本地日期（日历页按本地渲染）：toISOString 是 UTC，东八区 0-8 点会落到「昨天」
     const d = new Date();
     const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    await createSchedule({ title: it.title, date, platform: '', time: '', status: 'idea', note: it.note });
-    showToast('已加入日历（今天）');
+    setError('');
+    try {
+      await data.createSchedule({ title: it.title, date, platform: '', time: '', status: 'idea', note: it.note });
+      showToast('已加入日历（今天）');
+    } catch (error) {
+      setError(workspaceErrorMessage(error, '加入日历失败，请重试。'));
+    }
   };
 
   return (
@@ -57,6 +114,9 @@ export default function IdeasPage({ onUseTopic }: IdeasPageProps) {
         </div>
         <button className="btn btn-sm btn-primary" onClick={openNew}>+ 新建选题</button>
       </div>
+
+      {error && <div className="notice-error" role="alert">{error}</div>}
+      {loading && ideas.length === 0 && <div className="dash-empty">选题加载中…</div>}
 
       <div className="kanban">
         {COLUMNS.map((col) => (
@@ -113,9 +173,12 @@ export default function IdeasPage({ onUseTopic }: IdeasPageProps) {
                   onClick={() => setForm({ ...form, status: c.key })}>{c.label}</button>
               ))}
             </div>
+            {formError && <div className="notice-error" role="alert">{formError}</div>}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 18 }}>
-              <button className="btn btn-sm" onClick={() => setForm(null)}>取消</button>
-              <button className="btn btn-sm btn-primary" onClick={save} disabled={!form.title.trim()}>保存</button>
+              <button className="btn btn-sm" onClick={() => { setForm(null); setFormError(''); }}>取消</button>
+              <button className="btn btn-sm btn-primary" onClick={save} disabled={saving || !form.title.trim()}>
+                {saving ? '保存中…' : '保存'}
+              </button>
             </div>
           </div>
         </div>

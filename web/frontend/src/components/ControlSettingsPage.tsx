@@ -11,37 +11,35 @@ import type {
 } from '../lib/controlSettings';
 
 const panelStyle = {
-  padding: '24px',
   display: 'grid',
   gap: '16px',
   alignContent: 'start',
   maxWidth: '980px',
-  minHeight: '100vh',
 } as const;
 
 const cardStyle = {
-  border: '1px solid #242a35',
-  background: '#12151b',
-  borderRadius: '12px',
+  border: '1px solid var(--border)',
+  background: 'var(--surface)',
+  borderRadius: 'var(--radius-lg)',
   padding: '16px',
   display: 'grid',
   gap: '10px',
 } as const;
 
 const buttonStyle = {
-  border: '1px solid #333a47',
-  background: '#1b1f28',
-  color: '#e7e9ee',
-  borderRadius: '9px',
+  border: '1px solid var(--border)',
+  background: 'var(--bg-elev)',
+  color: 'var(--text)',
+  borderRadius: 'var(--radius)',
   padding: '8px 10px',
   cursor: 'pointer',
   fontSize: '13px',
 } as const;
 
 const inputStyle = {
-  background: '#0f1115',
-  color: '#e7e9ee',
-  border: '1px solid #333a47',
+  background: 'var(--bg-elev)',
+  color: 'var(--text)',
+  border: '1px solid var(--border)',
   borderRadius: '8px',
   padding: '8px 10px',
   fontSize: '13px',
@@ -215,21 +213,22 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
     <section style={panelStyle} aria-label="个人设置">
       <header style={{ display: 'grid', gap: '6px' }}>
         <h1 style={{ margin: 0, fontSize: '20px' }}>个人设置</h1>
-        <p style={{ margin: 0, color: '#9aa3b2', fontSize: '13px' }}>
+        <p style={{ margin: 0, color: 'var(--text-secondary)', fontSize: '13px' }}>
           只管理本人的能力模型覆盖；主聊天模型与受管底座由管理员统一配置。
         </p>
       </header>
 
-      <section style={cardStyle} aria-label="受管底座摘要">
+      <section className="settings-section" style={cardStyle}
+        aria-label="受管底座摘要">
         <h2 style={{ margin: 0, fontSize: '16px' }}>受管底座（只读）</h2>
         {harness ? (
           <>
-            <div style={{ fontSize: '13px', color: '#cfd5df' }}>
+            <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
               锁定：{harness.locked ? '是' : '否'} · 状态：
               {harness.configured ? '已配置' : '未配置'}
             </div>
             {harness.configured ? (
-              <div style={{ fontSize: '13px', color: '#9aa3b2' }}>
+              <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
                 {harness.runtime ? `运行时：${harness.runtime}` : null}
                 {harness.revision !== null
                   ? ` · 修订：${harness.revision}` : null}
@@ -237,37 +236,43 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                 {harness.sandbox ? ` · 沙箱：${harness.sandbox}` : null}
               </div>
             ) : (
-              <div style={{ fontSize: '13px', color: '#f0b45a' }}>
+              <div style={{ fontSize: '13px', color: 'var(--amber)' }}>
                 {harness.unavailableReason || '受管底座尚未装配。'}
               </div>
             )}
-            <p style={{ margin: 0, color: '#6f7785', fontSize: '12px' }}>
+            <p style={{ margin: 0, color: 'var(--text-tertiary)', fontSize: '12px' }}>
               安装、命令、环境、沙箱与重启由管理员负责；本页没有写入口。
             </p>
           </>
         ) : (
-          <p style={{ margin: 0, color: '#9aa3b2', fontSize: '13px' }}>
+          <p style={{ margin: 0, color: 'var(--text-secondary)', fontSize: '13px' }}>
             正在读取受管摘要…
           </p>
         )}
       </section>
 
       {loadError ? (
-        <div role="alert" style={{ color: '#ff9b9b', fontSize: '14px' }}>
+        <div role="alert" style={{ color: 'var(--red)', fontSize: '14px' }}>
           {loadError}
         </div>
       ) : null}
       {loading ? (
-        <p style={{ color: '#9aa3b2', fontSize: '13px' }}>读取个人设置…</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>读取个人设置…</p>
       ) : null}
 
       {settings ? (
-        <section style={cardStyle} aria-label="个人能力模型">
+        <section className="settings-section" style={cardStyle}
+          aria-label="个人能力模型">
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             {PERSONAL_CHANNELS.map((item) => (
-              <button key={item} style={{
+              <button key={item} className="settings-choice" style={{
                 ...buttonStyle,
-                borderColor: item === channel ? '#8b5cf6' : '#333a47',
+                borderColor: item === channel
+                  ? 'var(--accent-end)' : 'var(--border)',
+                background: item === channel
+                  ? 'var(--accent-soft)' : 'var(--bg-elev)',
+                color: item === channel
+                  ? 'var(--accent-end)' : 'var(--text)',
               }} aria-pressed={item === channel}
               disabled={busy || loading}
               onClick={() => chooseChannel(item)}>
@@ -278,10 +283,10 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
 
           {entry ? (
             <div style={{ display: 'grid', gap: '6px' }}>
-              <div style={{ fontSize: '14px', color: '#e7e9ee' }}>
+              <div style={{ fontSize: '14px', color: 'var(--text)' }}>
                 {channelLabel(channel)} · {sourceLabel(entry)}
               </div>
-              <div style={{ fontSize: '12px', color: '#9aa3b2' }}>
+              <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
                 {entry.configured
                   ? `生效来源：${entry.source === 'user' ? '个人配置' : '管理员默认'} · ` +
                     `版本 ${entry.version}`
@@ -289,10 +294,10 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                 {entry.provider ? ` · ${entry.provider}/${entry.model || ''}` : ''}
                 {entry.broker_supported
                   ? ' · 转发适配已声明'
-                  : ' · 当前无转发适配器'}
+                  : ' · 当前无受管转发'}
               </div>
-              <div style={{ fontSize: '12px', color: '#6f7785' }}>
-                broker_supported 只表示适配支持，不代表连接或凭证已测试通过。
+              <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                受管转发只表示适配支持；实际连接与凭证以保存后的配置为准。
               </div>
             </div>
           ) : null}
@@ -356,7 +361,7 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                   onChange={(event) => updateForm({
                     options: event.target.value })} />
               </label>
-              <p style={{ margin: 0, color: '#6f7785', fontSize: '12px' }}>
+              <p style={{ margin: 0, color: 'var(--text-tertiary)', fontSize: '12px' }}>
                 只选择管理员批准的模型与非敏感参数；地址与凭证仍来自当前受管版本。
               </p>
             </>
@@ -437,7 +442,7 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
                   onChange={(event) => updateForm({
                     options: event.target.value })} />
               </label>
-              <p style={{ margin: 0, color: '#6f7785', fontSize: '12px' }}>
+              <p style={{ margin: 0, color: 'var(--text-tertiary)', fontSize: '12px' }}>
                 {multifieldCredentials
                   ? '全部留空只复用本人同供应商、地址与协议的已有凭证；'
                     + '更换地址/协议/供应商或轮换时必须填写全部必需字段。'
@@ -448,7 +453,7 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
           )}
 
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-            <button style={{ ...buttonStyle, borderColor: '#8b5cf6' }}
+            <button style={{ ...buttonStyle, borderColor: 'var(--accent-end)' }}
               disabled={busy || loading}
               onClick={() => { void save(); }}>
               保存个人配置
@@ -466,7 +471,7 @@ export default function ControlSettingsPage({ ctx, call }: Props) {
           </div>
           {notice ? (
             <div role="status" style={{
-              color: notice.includes('失败') ? '#ff9b9b' : '#8fd7a7',
+              color: notice.includes('失败') ? 'var(--red)' : 'var(--green)',
               fontSize: '13px',
             }}>{notice}</div>
           ) : null}

@@ -174,6 +174,9 @@ if args[0] == "exec":
 
 if args[0] == "run":
     joined = " ".join(args)
+    if "test -e /data/control.sqlite3" in joined:
+        database = state / "volumes" / f"{project}-control" / "control.sqlite3"
+        raise SystemExit(0 if database.exists() else 1)
     if "initialize_state.py" in joined:
         # 直接执行真实只读探测脚本，测试与容器行为一致。
         index = args.index("/opt/easel/deploy/desktop/initialize_state.py")
@@ -217,6 +220,7 @@ if args[0] == "run":
     if "admin backup" in joined:
         fail("backup should not run before source-root binding")
     if "frontend/dist/index.html" in joined:
+        out("a" * 64)
         raise SystemExit(0)
     raise SystemExit(0)
 
@@ -352,12 +356,14 @@ def _fake_wsl(tmp_path: Path, env: dict[str, str]) -> None:
 
 
 def _seed_deployment(tmp_path: Path, env: dict[str, str], *,
-                     public: bool = True) -> tuple[Path, Path]:
+                     public: bool = True, deployment: bool = True,
+                     publish_mode: str | None = "automated"
+                     ) -> tuple[Path, Path]:
     data_root = tmp_path / "data"
     workspace_root = tmp_path / "workspaces"
     workspace_root.mkdir(parents=True)
     (data_root / "logs").mkdir(parents=True)
-    deployment = {
+    record = {
         "project": PROJECT,
         "origin": ORIGIN,
         "port": 7861,
@@ -373,8 +379,11 @@ def _seed_deployment(tmp_path: Path, env: dict[str, str], *,
         "workspace_root": str(workspace_root),
         "data_root": str(data_root),
     }
-    (data_root / "logs" / "deployment.json").write_text(
-        json.dumps(deployment), encoding="utf-8")
+    if publish_mode is not None:
+        record["publish_mode"] = publish_mode
+    if deployment:
+        (data_root / "logs" / "deployment.json").write_text(
+            json.dumps(record), encoding="utf-8")
     if public:
         public_dir = data_root / "public"
         public_dir.mkdir()
@@ -427,6 +436,7 @@ def _manifest() -> dict:
             "engine_context": "desktop-linux",
             "source_commit": "f" * 40,
             "harness_revision": "1" * 40,
+            "publish_mode": "automated",
             "workspace_root": str(Path("__WORKSPACE__")),
             "data_root": str(Path("__DATA__")),
         },
@@ -456,6 +466,31 @@ def test_backup_rejects_unregistered_workspace_root_before_container(tmp_path):
     assert not wsl_calls.exists()
 
 
+def test_start_rejects_upgrade_publish_mode_mismatch_before_compose_up(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode="automated")
+    backup = tmp_path / "upgrade-backup"
+    backup.mkdir()
+    manifest = _manifest()
+    manifest["deployment"]["workspace_root"] = str(workspace_root)
+    manifest["deployment"]["data_root"] = str(data_root)
+    manifest["deployment"]["publish_mode"] = "manual"
+    (backup / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    result = _run_ps(
+        START, *_start_args(
+            data_root, workspace_root, "-UpgradeFromBackup", str(backup)),
+        env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "upgrade_deployment_mismatch" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+    assert "verify-backup" not in _wsl_calls(tmp_path)
+
+
 def test_start_rejects_incomplete_upgrade_backup_before_compose_up(tmp_path):
     env = _base_env(tmp_path)
     _fake_docker(tmp_path, env)
@@ -482,6 +517,177 @@ def test_start_rejects_incomplete_upgrade_backup_before_compose_up(tmp_path):
     assert "verify-backup" in calls
     assert not any("compose" in line and "up" in line
                    for line in calls.splitlines())
+
+
+def _start_args(data_root: Path, workspace_root: Path,
+                *extra: str) -> tuple[str, ...]:
+    return (
+        "-PublicOrigin", ORIGIN, "-Image", IMAGE,
+        "-WorkerImage", WORKER, "-GatewayImage", GATEWAY,
+        "-ProjectName", PROJECT, "-Port", "7861",
+        "-DataRoot", str(data_root), "-WorkspaceRoot", str(workspace_root),
+        *extra,
+    )
+
+
+def _wsl_calls(tmp_path: Path) -> str:
+    path = tmp_path / "wsl-state" / "calls.log"
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def test_start_fresh_deployment_defaults_publish_mode_to_automated(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, deployment=False)
+    result = _run_ps(
+        START, *_start_args(data_root, workspace_root), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "automated"
+    assert "EASEL_PUBLISH_MODE=automated" in _wsl_calls(tmp_path)
+    assert (tmp_path / "wsl-state" / "compose-up").is_file()
+
+
+def test_start_legacy_deployment_without_mode_requires_migration(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode=None)
+    result = _run_ps(
+        START, *_start_args(data_root, workspace_root), env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "publish_mode_migration_required" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+    assert not any("compose" in line and "up" in line
+                   for line in _wsl_calls(tmp_path).splitlines())
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert "publish_mode" not in record
+
+
+def test_start_refuses_legacy_db_without_deployment_record(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, deployment=False)
+    control = (Path(env["FAKE_DOCKER_STATE"]) / "volumes" /
+               f"{PROJECT}-control")
+    control.mkdir(parents=True, exist_ok=True)
+    (control / "control.sqlite3").write_bytes(b"legacy")
+    result = _run_ps(
+        START, *_start_args(data_root, workspace_root), env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "publish_mode_migration_required" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+    # 显式迁移后允许启动并登记策略。
+    migrated = _run_ps(
+        START, *_start_args(
+            data_root, workspace_root, "-PublishMode", "manual"), env=env)
+    assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "manual"
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(tmp_path)
+
+
+def test_start_explicit_manual_migration_is_persisted(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode=None)
+    result = _run_ps(
+        START, *_start_args(
+            data_root, workspace_root, "-PublishMode", "manual"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "manual"
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(tmp_path)
+    assert (tmp_path / "wsl-state" / "compose-up").is_file()
+
+
+def test_start_normalizes_publish_mode_case(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode=None)
+    result = _run_ps(
+        START, *_start_args(
+            data_root, workspace_root, "-PublishMode", "Manual"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "manual"
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(tmp_path)
+
+    # 登记文件里人工写成混合大小写时同样归一化，不把 Manual 传给 argparse。
+    second = tmp_path / "registered"
+    second.mkdir(parents=True, exist_ok=True)
+    env2 = _base_env(second)
+    _fake_docker(second, env2)
+    _fake_wsl(second, env2)
+    data_root2, workspace_root2 = _seed_deployment(
+        second, env2, publish_mode="Manual")
+    result2 = _run_ps(
+        START, *_start_args(data_root2, workspace_root2), env=env2)
+    assert result2.returncode == 0, result2.stdout + result2.stderr
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(
+        tmp_path / "registered")
+
+
+def test_start_reuses_registered_manual_mode_without_silent_upgrade(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode="manual")
+    result = _run_ps(
+        START, *_start_args(data_root, workspace_root), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(
+        (data_root / "logs" / "deployment.json").read_text(encoding="utf-8"))
+    assert record["publish_mode"] == "manual"
+    assert "EASEL_PUBLISH_MODE=manual" in _wsl_calls(tmp_path)
+
+
+def test_start_rejects_invalid_registered_publish_mode(tmp_path):
+    env = _base_env(tmp_path)
+    _fake_docker(tmp_path, env)
+    _fake_wsl(tmp_path, env)
+    data_root, workspace_root = _seed_deployment(
+        tmp_path, env, publish_mode="open")
+    result = _run_ps(
+        START, *_start_args(data_root, workspace_root), env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "deployment_publish_mode_invalid" in output
+    assert not (tmp_path / "wsl-state" / "compose-up").exists()
+
+
+def test_backup_deployment_metadata_preserves_publish_mode(tmp_path):
+    from easel.control.cli import _validate_deployment_metadata
+    from easel.control.types import DomainError
+
+    base = dict(_manifest()["deployment"])
+    base.pop("publish_mode", None)
+    base["workspace_root"] = str(tmp_path / "workspaces")
+    base["data_root"] = str(tmp_path / "data")
+    meta = _validate_deployment_metadata(
+        {**base, "publish_mode": "manual"})
+    assert meta["publish_mode"] == "manual"
+    # 旧备份没有该字段仍可校验；出现时必须是精确受管值。
+    assert "publish_mode" not in _validate_deployment_metadata(base)
+    with pytest.raises(DomainError):
+        _validate_deployment_metadata({**base, "publish_mode": "open"})
 
 
 def _initialize_args(tmp_path: Path):
