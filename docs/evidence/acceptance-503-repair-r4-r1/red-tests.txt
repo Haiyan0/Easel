@@ -15,7 +15,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
             # 远程调用前已持久本轮精确 attempt，而不是残留旧 ready/旧 attempt。
 >           assert crashed.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -34,7 +34,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
             assert crashed is not None
 >           assert crashed.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -53,7 +53,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
             # 远程未执行，但预占已持久；不能永久停留在 starting。
 >           assert crashed.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -65,7 +65,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
     def test_ready_refresh_definite_failure_rolls_back_reservation(tmp_path):
         """确定失败撤销预占：恢复 ready/旧 attempt，不把刷新滞留在 starting。"""
         replacement = "f" * 64
-    
+
         async def scenario():
             store, service, gateway, workspace, lease, handle, original = \
                 helpers._seed_expired_ensure(tmp_path)
@@ -77,11 +77,11 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
                 adapter = helpers._lost_response_adapter(
                     service, handle, replacement, {"count": 0})
                 adapter.inspect = helpers._ready_inspect
-    
+
                 async def ensure(*args, **kwargs):
                     raise helpers.RuntimeUnavailable(
                         "worker_start_failed", 503, retry_after=5)
-    
+
                 adapter.ensure = ensure
                 manager = RuntimeManager(
                     store, adapter, owner_id="owner-c", gateway_required=True,
@@ -99,10 +99,10 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
                 # 预占已撤销，旧代次迟到写回同样不得命中新代次。
                 assert store.mark_worker_gateway_unavailable(
                     workspace, old_generation, 1201) is False
-    
+
 >       asyncio.run(scenario())
 
-tests\multiuser\test_attempt_ownership_r4r1_503.py:298: 
+tests\multiuser\test_attempt_ownership_r4r1_503.py:298:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -121,11 +121,11 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             adapter = helpers._lost_response_adapter(
                 service, handle, replacement, {"count": 0})
             adapter.inspect = helpers._ready_inspect
-    
+
             async def ensure(*args, **kwargs):
                 raise helpers.RuntimeUnavailable(
                     "worker_start_failed", 503, retry_after=5)
-    
+
             adapter.ensure = ensure
             manager = RuntimeManager(
                 store, adapter, owner_id="owner-c", gateway_required=True,
@@ -150,7 +150,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
     def test_ready_restore_definite_failure_rolls_back_reservation(tmp_path):
         """显式 restore 确定失败同样撤销预占，保留既有 worker 与 ready。"""
         replacement = "f" * 64
-    
+
         async def scenario():
             store, service, gateway, workspace, lease, handle, original = \
                 helpers._seed_expired_ensure(tmp_path)
@@ -160,11 +160,11 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
                 old_attempt = ready.attempt_id
                 adapter = helpers._lost_response_adapter(
                     service, handle, replacement, {"count": 0})
-    
+
                 async def restore_gateway(*args, **kwargs):
                     raise helpers.RuntimeUnavailable(
                         "gateway_recovery_failed", 503, retry_after=5)
-    
+
                 adapter.restore_gateway = restore_gateway
                 manager = RuntimeManager(
                     store, adapter, owner_id="owner-c", gateway_required=True,
@@ -179,10 +179,10 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-439
                 assert failed.pending_attempt_id == ""
                 assert failed.container_id == WORKER
                 assert gateway.stops == []
-    
+
 >       asyncio.run(scenario())
 
-tests\multiuser\test_attempt_ownership_r4r1_503.py:334: 
+tests\multiuser\test_attempt_ownership_r4r1_503.py:334:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -199,11 +199,11 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             old_attempt = ready.attempt_id
             adapter = helpers._lost_response_adapter(
                 service, handle, replacement, {"count": 0})
-    
+
             async def restore_gateway(*args, **kwargs):
                 raise helpers.RuntimeUnavailable(
                     "gateway_recovery_failed", 503, retry_after=5)
-    
+
             adapter.restore_gateway = restore_gateway
             manager = RuntimeManager(
                 store, adapter, owner_id="owner-c", gateway_required=True,
@@ -216,7 +216,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert failed.attempt_id == old_attempt
 >           assert failed.gateway_state == "unavailable"
 E           AssertionError: assert 'available' == 'unavailable'
-E             
+E
 E             - unavailable
 E             ? --
 E             + available
