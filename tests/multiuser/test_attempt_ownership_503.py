@@ -852,6 +852,39 @@ def test_ensure_ready_takeover_remote_failure_fails_closed_to_ready(tmp_path):
     asyncio.run(scenario())
 
 
+def test_ensure_ready_takeover_connect_failure_fails_closed_to_ready(tmp_path):
+    """连接阶段失败没有发出请求，仍按确定失败回退 ready/unavailable。"""
+
+    async def scenario() -> None:
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+
+        class Adapter:
+            async def commit_attempt(self, *args, **kwargs):
+                return await service.commit_attempt(*args, **kwargs)
+
+            async def abort(self, *args, **kwargs):
+                return await service.abort(*args, **kwargs)
+
+            async def ensure(self, *args, **kwargs):
+                raise RuntimeUnavailable(
+                    "provisioner_unavailable", 503, retry_after=5)
+
+        with store:
+            manager = RuntimeManager(
+                store, Adapter(), owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(RuntimeUnavailable) as error:
+                await manager.ensure_ready(workspace, 1)
+            assert error.value.code == "provisioner_unavailable"
+            failed = store.get_worker_lease(workspace)
+            assert failed is not None
+            assert failed.state == "ready"
+            assert failed.gateway_state == "unavailable"
+
+    asyncio.run(scenario())
+
+
 def test_ensure_ready_takeover_cancel_leaves_recoverable_starting(tmp_path):
     """B 在远程 ensure 中被取消：保留可接管的 starting，后续 owner 可恢复。"""
 
@@ -1118,6 +1151,49 @@ def test_lost_ensure_transport_error_recovers_through_first_screen(tmp_path):
         asyncio.run(service.stop(
             workspace, WORKER, replacement, protocol_version=2))
         assert gateway.stops == [(workspace, WORKER, replacement)]
+
+
+def test_lost_ensure_unknown_result_recovers_before_lease_expiry(tmp_path):
+    """未知结果应让下一次首屏立即接管恢复，而不是等满刷新租约。"""
+    replacement = "f" * 64
+    timeout = RuntimeUnavailable("provisioner_timeout", 503, retry_after=5)
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        lost = {"count": 1}
+        with store:
+            manager = RuntimeManager(
+                store, _lost_response_adapter(
+                    service, handle, replacement, lost, failure=timeout),
+                owner_id="owner-b", gateway_required=True,
+                clock=lambda: 1200)
+            with pytest.raises(RuntimeUnavailable):
+                await manager.ensure_ready(workspace, 1)
+            before = store.get_worker_lease(workspace)
+            assert before is not None
+            assert before.state == "starting"
+            # 未知结果保留归属，但租约应立即到期供下一所有者接管。
+            assert before.lease_expires_at <= 1201
+        return workspace, lost, handle
+
+    workspace, lost, handle = asyncio.run(first_loss())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        service = _service(tmp_path, FakeGateway(config_version=1))
+        manager = RuntimeManager(
+            store, _lost_response_adapter(service, handle, replacement, lost),
+            owner_id="owner-c", gateway_required=True, clock=lambda: 1201)
+
+        async def recover():
+            return await asyncio.wait_for(
+                manager.ensure_ready(workspace, 1), timeout=2)
+
+        final = asyncio.run(recover())
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
 
 
 def test_interrupted_lost_ensure_recovery_keeps_fenced_attempt(tmp_path):

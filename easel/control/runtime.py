@@ -38,7 +38,7 @@ CONFIRM_STOP_TIMEOUT_SECONDS = 15.0
 # 回退 ready 后另起 attempt。
 _UNKNOWN_ENSURE_OUTCOME_CODES = frozenset({
     "provisioner_timeout",
-    "provisioner_unavailable",
+    "provisioner_connection_lost",
     "provisioner_invalid_response",
     "worker_start_timeout",
 })
@@ -584,7 +584,12 @@ class RuntimeManager:
                 # 回复超时/连接中断是未知结果：远程可能已替换并持久化候选。
                 # 保留 starting 的 owner/generation/attempt 归属，下一次首屏
                 # 才能按精确 attempt 解析，而不是回退 ready 后被新 attempt
-                # 的 pending 记录永久挡住。
+                # 的 pending 记录永久挡住。缩短租约期限只让下一所有者立即
+                # 接管恢复，不改写身份/所有权，也不结算在途 Run。
+                await self._db(
+                    self._store.expire_worker_gateway_refresh,
+                    workspace_id, lease.generation, lease.owner_id,
+                    lease.attempt_id, self._now())
                 raise
             if lease.state == "starting":
                 await self._db(
@@ -1770,7 +1775,9 @@ class UnixProvisionerClient:
             raise RuntimeUnavailable("provisioner_timeout", 503,
                                      retry_after=5) from error
         except OSError as error:
-            raise RuntimeUnavailable("provisioner_unavailable", 503,
+            # 连接已建立后的写/读失败：请求可能已被远端处理，结果未知。
+            # 连接阶段的 OSError 仍在上面映射为确定失败。
+            raise RuntimeUnavailable("provisioner_connection_lost", 503,
                                      retry_after=5) from error
         finally:
             writer.close()

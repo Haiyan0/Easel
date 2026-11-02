@@ -1483,6 +1483,25 @@ class Store:
                 (int(now), _text(workspace_id), int(generation)))
         return cursor.rowcount == 1
 
+    def expire_worker_gateway_refresh(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, now: int) -> bool:
+        """未知结果后保留 starting 归属，但立即允许下一所有者接管恢复。
+
+        只把租约期限缩短到当前时刻，不改写 owner/generation/attempt，也不
+        结算 Run。响应丢失的 ensure 已不在本进程等待，继续占用完整刷新
+        租约只会让后续首屏在 claim 的 wait 分支空等。
+        """
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET lease_expires_at = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ? AND owner_id = ?"
+                " AND attempt_id = ? AND state = 'starting'"
+                " AND pending_attempt_id = ''",
+                (int(now), int(now), _text(workspace_id), int(generation),
+                 _text(owner_id), _text(attempt_id)))
+        return cursor.rowcount == 1
+
     def mark_worker_gateway_available(
             self, workspace_id: str, generation: int, now: int) -> bool:
         """物理 gateway 恢复且 boot/target 未变时，CAS 恢复 DB available。"""

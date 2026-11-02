@@ -1001,7 +1001,8 @@ class WorkerRelay:
         response = await self._worker_request(
             handle, "GET",
             f"/internal/sessions/{conversation.id}/messages"
-            f"?limit={int(limit)}&offset={int(offset)}", None)
+            f"?limit={int(limit)}&offset={int(offset)}", None,
+            require_admission=True)
         return self._json_object(response)
 
     # ------------------------------------------------------------------
@@ -1216,18 +1217,25 @@ class WorkerRelay:
         return value
 
     async def _worker_request(self, handle: WorkerHandle, method: str,
-                              path: str, payload: object) -> httpx.Response:
+                              path: str, payload: object, *,
+                              require_admission: bool = False
+                              ) -> httpx.Response:
         """在途短请求持有 workspace 租约；无论成败都在 finally 释放。
 
         租约只用于空闲回收判定：请求进行中不得回收该 worker。释放失败时
         保留至 TTL 过期，不覆盖原始异常，也不永久阻塞后续回收。
+
+        ``require_admission=True`` 只用于新 workspace 读取（如 messages）：
+        屏障检查与租约登记原子完成，屏障后不再起上游传输。已接纳 Run 的
+        stop/events/answer 与后台对账必须保持可收尾，不传该标志。
 
         gateway 断言因新 boot/实例失效被拒时，只为同一 worker 恢复
         gateway。GET 可在恢复后重试一次；POST 已经发出，绝不自动重发。
         """
         lease_id = await self._db(
             self._store.begin_worker_request_lease,
-            handle.workspace_id, self._request_lease_ttl)
+            handle.workspace_id, self._request_lease_ttl,
+            require_admission=require_admission)
         try:
             try:
                 return await self._send(handle, method, path, payload)
