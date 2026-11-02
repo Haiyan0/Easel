@@ -1483,23 +1483,30 @@ class Store:
                 (int(now), _text(workspace_id), int(generation)))
         return cursor.rowcount == 1
 
-    def expire_worker_gateway_refresh(
-            self, workspace_id: str, generation: int, owner_id: str,
-            attempt_id: str, now: int) -> bool:
-        """未知结果后保留 starting 归属，但立即允许下一所有者接管恢复。
+    def fence_unknown_gateway_refresh(
+            self, workspace_id: str, generation: int, expected_owner: str,
+            previous_attempt_id: str, owner_id: str, attempt_id: str,
+            now: int) -> bool:
+        """远程 ensure/restore 结果未知：持久本轮精确 attempt 并立即冻结。
 
-        只把租约期限缩短到当前时刻，不改写 owner/generation/attempt，也不
-        结算 Run。响应丢失的 ensure 已不在本进程等待，继续占用完整刷新
-        租约只会让后续首屏在 claim 的 wait 分支空等。
+        ready 与 starting 共用同一归属语义：只把本轮已发出的 attempt 写入
+        租约并转为立即到期的 ``starting``，不按目标猜测候选、不结算 Run。
+        下一所有者随后按 ``pending_attempt_id`` 槽位解析 provisioner 持久
+        的真实候选。代次递增使旧 owner 的迟到写回与清理 CAS 全部失效。
         """
+        if not isinstance(previous_attempt_id, str):
+            raise DomainError("invalid_argument", 400)
         with self._transaction():
             cursor = self._connection.execute(
-                "UPDATE worker_leases SET lease_expires_at = ?, updated_at = ?"
+                "UPDATE worker_leases SET state = 'starting', owner_id = ?,"
+                " generation = generation + 1, attempt_id = ?,"
+                " lease_expires_at = ?, updated_at = ?"
                 " WHERE workspace_id = ? AND generation = ? AND owner_id = ?"
-                " AND attempt_id = ? AND state = 'starting'"
+                " AND attempt_id = ? AND state IN ('ready', 'starting')"
                 " AND pending_attempt_id = ''",
-                (int(now), int(now), _text(workspace_id), int(generation),
-                 _text(owner_id), _text(attempt_id)))
+                (_text(owner_id), _text(attempt_id), int(now), int(now),
+                 _text(workspace_id), int(generation),
+                 _text(expected_owner), previous_attempt_id))
         return cursor.rowcount == 1
 
     def mark_worker_gateway_available(

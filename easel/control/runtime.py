@@ -42,6 +42,14 @@ _UNKNOWN_ENSURE_OUTCOME_CODES = frozenset({
     "provisioner_invalid_response",
     "worker_start_timeout",
 })
+# restore 入口的未知结果：客户端传输丢失码与 control 侧等待超时。后者
+# 可能发生在请求发出前后，保留精确 attempt 后下一所有者仍可安全推进。
+_UNKNOWN_RESTORE_OUTCOME_CODES = frozenset({
+    "provisioner_timeout",
+    "provisioner_connection_lost",
+    "provisioner_invalid_response",
+    "gateway_recovery_timeout",
+})
 # 非必要成功后收口的最小剩余预算；低于该值时直接留给下一次 ready 重试，
 # 不用一次注定超时的远程等待把当前响应拖到 deadline 之外。
 MIN_COMMIT_BUDGET_SECONDS = 0.02
@@ -576,20 +584,23 @@ class RuntimeManager:
                 workspace_id, config_version, deadline, lease,
                 attempt_id=attempt_id)
         except asyncio.CancelledError:
+            if dispatched:
+                # 取消同样可能发生在远端已持久候选之后；先保留本轮精确
+                # attempt 的可接管归属，再让取消传播。
+                await self._fence_unknown_gateway_refresh(
+                    workspace_id, lease, attempt_id)
             raise
         except Exception as error:
-            if (dispatched and lease.state == "starting"
-                    and isinstance(error, RuntimeUnavailable)
+            if (dispatched and isinstance(error, RuntimeUnavailable)
                     and error.code in _UNKNOWN_ENSURE_OUTCOME_CODES):
                 # 回复超时/连接中断是未知结果：远程可能已替换并持久化候选。
-                # 保留 starting 的 owner/generation/attempt 归属，下一次首屏
-                # 才能按精确 attempt 解析，而不是回退 ready 后被新 attempt
-                # 的 pending 记录永久挡住。缩短租约期限只让下一所有者立即
-                # 接管恢复，不改写身份/所有权，也不结算在途 Run。
-                await self._db(
-                    self._store.expire_worker_gateway_refresh,
-                    workspace_id, lease.generation, lease.owner_id,
-                    lease.attempt_id, self._now())
+                # 无论旧租约是 ready 还是 starting，都必须持久本轮精确
+                # attempt 并冻结为立即可接管的 starting；否则下一次首屏
+                # 会回退旧身份，被新 attempt 的 pending 记录永久挡住。
+                # 该路径不改写物理身份、不结算在途 Run，真实候选由下一
+                # 所有者按同一 takeover → resolve 路径解析。
+                await self._fence_unknown_gateway_refresh(
+                    workspace_id, lease, attempt_id)
                 raise
             if lease.state == "starting":
                 await self._db(
@@ -608,6 +619,20 @@ class RuntimeManager:
         return await self._commit_gateway_candidate(
             workspace_id, config_version, lease, candidate, attempt_id,
             deadline)
+
+    async def _fence_unknown_gateway_refresh(
+            self, workspace_id: str, lease: WorkerLease,
+            attempt_id: str) -> bool:
+        """把已发出但结果未知的远程尝试持久为可接管的精确归属。
+
+        仅当租约仍是本轮读到的 owner/generation/attempt 且没有待收口
+        槽位时成功；失败不覆盖已经接管的新代次。调用方不据返回值报成功，
+        只负责保证下一所有者能按 ``attempt_id`` 恢复。
+        """
+        return await self._db(
+            self._store.fence_unknown_gateway_refresh,
+            workspace_id, lease.generation, lease.owner_id,
+            lease.attempt_id, self.owner_id, attempt_id, self._now())
 
     async def restore_gateway(self, workspace_id: str, container_id: str,
                               config_version: int) -> WorkerHandle | None:
@@ -701,14 +726,37 @@ class RuntimeManager:
             return await self._commit_gateway_candidate(
                 workspace_id, config_version, lease, recovered,
                 attempt_id, deadline)
-        candidate = await self._restore_candidate(
-            workspace_id, container_id, config_version, deadline, attempt_id)
+        candidate = await self._restore_candidate_guarded(
+            workspace_id, config_version, lease, attempt_id, deadline)
         if candidate.container_id != lease.container_id:
             raise RuntimeUnavailable("worker_identity_mismatch", 503,
                                      retry_after=5)
         return await self._commit_gateway_candidate(
             workspace_id, config_version, lease, candidate, attempt_id,
             deadline)
+
+    async def _restore_candidate_guarded(
+            self, workspace_id: str, config_version: int, lease: WorkerLease,
+            attempt_id: str, deadline: float) -> WorkerHandle:
+        """restore 的未知结果与 ensure 共用精确 attempt 归属恢复。
+
+        超时/连接丢失/取消都可能发生在 provisioner 已创建并持久化新
+        gateway 之后；此时必须先把本轮 attempt 写入可接管的 starting，
+        否则下一次首屏只会按旧 G1 收口并被 pending 记录永久阻断。
+        """
+        try:
+            return await self._restore_candidate(
+                workspace_id, lease.container_id, config_version, deadline,
+                attempt_id)
+        except asyncio.CancelledError:
+            await self._fence_unknown_gateway_refresh(
+                workspace_id, lease, attempt_id)
+            raise
+        except RuntimeUnavailable as error:
+            if error.code in _UNKNOWN_RESTORE_OUTCOME_CODES:
+                await self._fence_unknown_gateway_refresh(
+                    workspace_id, lease, attempt_id)
+            raise
 
     async def _restore_candidate(self, workspace_id: str, container_id: str,
                                  config_version: int, deadline: float,

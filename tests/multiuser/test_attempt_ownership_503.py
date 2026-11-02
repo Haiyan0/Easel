@@ -1638,3 +1638,383 @@ def test_with_gateway_pure_reuse_records_completed_noop(tmp_path):
     assert record["attempt_id"] == "e" * 32
     assert record["scope"] == "none"
     assert record["status"] == "completed"
+
+
+# ----------------------------------------------------------------------
+# R4：正常 ready 刷新/显式恢复的未知结果归属
+# ----------------------------------------------------------------------
+
+async def _ready_inspect(workspace_id):
+    """worker 身份与就绪均正常，仅 gateway 不可用，进入正常刷新入口。"""
+    return {
+        "managed": True,
+        "workspace_id": workspace_id,
+        "config_version": 1,
+        "instance_id": WORKER,
+        "labels": {
+            "easel.managed": "true",
+            "easel.workspace-id": workspace_id,
+            "easel.config-version": "1",
+        },
+        "worker_ready": True,
+        "gateway_available": False,
+    }
+
+
+async def _make_normal_ready(store, service, workspace, handle):
+    """先由过期 starting 收口，得到真实正常 ready 租约。"""
+    adapter = _lost_response_adapter(service, handle, GATEWAY, {"count": 0})
+    manager = RuntimeManager(
+        store, adapter, owner_id="owner-b", gateway_required=True,
+        clock=lambda: 1200)
+    await manager.ensure_ready(workspace, 1)
+    ready = store.get_worker_lease(workspace)
+    assert ready is not None
+    assert ready.state == "ready"
+    assert ready.gateway_instance_id == GATEWAY
+    return ready
+
+
+def _write_lost_candidate(service, handle, workspace, replacement,
+                          attempt_id):
+    """模拟 provisioner 已持久化 G2/new-attempt/pending 后回复丢失。"""
+    candidate = dataclasses.replace(
+        handle, gateway_instance_id=replacement,
+        gateway_generation="e" * 32,
+        gateway_upstream="http://172.31.0.9:8897",
+        gateway_state="available", attempt_id=attempt_id,
+        worker_created=False, gateway_created=True)
+    service._record_attempt(
+        workspace, attempt_id, candidate,
+        worker_created=False, gateway_created=True)
+
+
+def _wrap_adapter_calls(adapter):
+    """统计恢复阶段是否重复发起远程 ensure/restore。"""
+    calls = {"ensure": 0, "restore": 0, "resolve": 0}
+    original_ensure = adapter.ensure
+    original_restore = adapter.restore_gateway
+    original_commit = adapter.commit_attempt
+
+    async def ensure(*args, **kwargs):
+        calls["ensure"] += 1
+        return await original_ensure(*args, **kwargs)
+
+    async def restore(*args, **kwargs):
+        calls["restore"] += 1
+        return await original_restore(*args, **kwargs)
+
+    async def commit(*args, **kwargs):
+        if kwargs.get("resolve"):
+            calls["resolve"] += 1
+        return await original_commit(*args, **kwargs)
+
+    adapter.ensure = ensure
+    adapter.restore_gateway = restore
+    adapter.commit_attempt = commit
+    return calls
+
+
+def _assert_recovered_gateway(tmp_path, workspace, handle, replacement,
+                              entry, calls):
+    """重开 DB/manager，按同一入口恢复并核验 G2 与正常 Stop。"""
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        gateway = FakeGateway(config_version=1)
+        service = _service(tmp_path, gateway)
+        adapter = _lost_response_adapter(
+            service, handle, replacement, {"count": 0})
+        counted = _wrap_adapter_calls(adapter)
+        manager = RuntimeManager(
+            store, adapter, owner_id="owner-d", gateway_required=True,
+            clock=lambda: 1300)
+        final = asyncio.run(entry(manager, workspace))
+        assert final is not None
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
+
+        async def no_worker(workspace_id):
+            return None
+
+        async def no_sidecar(workspace_id):
+            return None
+
+        service._inspect_raw = no_worker
+        service._stop_sidecar = no_sidecar
+        asyncio.run(service.stop(
+            workspace, WORKER, replacement, protocol_version=2))
+        assert gateway.stops == [(workspace, WORKER, replacement)]
+    assert counted["ensure"] == 0
+    assert counted["restore"] == 0
+    assert counted["resolve"] >= 1
+    if calls is not None:
+        calls.update(counted)
+
+
+@pytest.mark.parametrize(
+    "failure_code", ["provisioner_timeout", "provisioner_connection_lost"])
+def test_ready_refresh_lost_ensure_recovers_through_first_screen(
+        tmp_path, failure_code):
+    """正常 ready 刷新丢回复：持久新 attempt，下次首屏解析 G2。"""
+    replacement = "f" * 64
+    failure = RuntimeUnavailable(failure_code, 503, retry_after=5)
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        with store:
+            ready = await _make_normal_ready(
+                store, service, workspace, handle)
+            old_generation = ready.generation
+            old_attempt = ready.attempt_id
+            lost = {"count": 1}
+            adapter = _lost_response_adapter(
+                service, handle, replacement, lost, failure=failure)
+            adapter.inspect = _ready_inspect
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(RuntimeUnavailable) as error:
+                await manager.ensure_ready(workspace, 1)
+            assert error.value.code == failure_code
+            fenced = store.get_worker_lease(workspace)
+            assert fenced is not None
+            assert fenced.state == "starting"
+            assert fenced.attempt_id
+            assert fenced.attempt_id != old_attempt
+            assert fenced.generation > old_generation
+            assert fenced.lease_expires_at <= 1201
+            # 旧代次的迟到写回不得命中新代次。
+            assert store.mark_worker_gateway_unavailable(
+                workspace, old_generation, 1201) is False
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["attempt_id"] == fenced.attempt_id
+            assert record["status"] == "pending"
+            assert record["gateway_instance_id"] == replacement
+        return workspace, handle, fenced
+
+    workspace, handle, fenced = asyncio.run(first_loss())
+    assert fenced.lease_expires_at <= 1201
+
+    def enter(manager, workspace_id):
+        return manager.ensure_ready(workspace_id, 1)
+
+    calls = {}
+    _assert_recovered_gateway(
+        tmp_path, workspace, handle, replacement, enter, calls)
+    assert calls == {"ensure": 0, "restore": 0, "resolve": 1}
+
+
+def test_ready_refresh_cancel_keeps_recoverable_fence(tmp_path):
+    """正常 ready 刷新在远程 ensure 中被取消：新 attempt 仍可恢复。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        with store:
+            ready = await _make_normal_ready(
+                store, service, workspace, handle)
+            old_attempt = ready.attempt_id
+            adapter = _lost_response_adapter(
+                service, handle, replacement, {"count": 1})
+            adapter.inspect = _ready_inspect
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.ensure_ready(workspace, 1)
+            fenced = store.get_worker_lease(workspace)
+            assert fenced is not None
+            assert fenced.state == "starting"
+            assert fenced.attempt_id
+            assert fenced.attempt_id != old_attempt
+            assert fenced.lease_expires_at <= 1201
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["attempt_id"] == fenced.attempt_id
+            assert record["status"] == "pending"
+            assert record["gateway_instance_id"] == replacement
+        return workspace, handle
+
+    workspace, handle = asyncio.run(first_loss())
+
+    def enter(manager, workspace_id):
+        return manager.ensure_ready(workspace_id, 1)
+
+    calls = {}
+    _assert_recovered_gateway(
+        tmp_path, workspace, handle, replacement, enter, calls)
+    assert calls == {"ensure": 0, "restore": 0, "resolve": 1}
+
+
+def test_ready_refresh_interrupted_recovery_keeps_fenced_attempt(tmp_path):
+    """ready 丢回复后的恢复解析再次中断：保留 fencing，下一 owner 前进。"""
+    replacement = "f" * 64
+    failure = RuntimeUnavailable("provisioner_timeout", 503, retry_after=5)
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        with store:
+            await _make_normal_ready(store, service, workspace, handle)
+            adapter = _lost_response_adapter(
+                service, handle, replacement, {"count": 1},
+                failure=failure)
+            adapter.inspect = _ready_inspect
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(RuntimeUnavailable):
+                await manager.ensure_ready(workspace, 1)
+            fenced = store.get_worker_lease(workspace)
+            assert fenced is not None
+            assert fenced.state == "starting"
+            assert fenced.lease_expires_at <= 1201
+        return workspace, handle
+
+    workspace, handle = asyncio.run(first_loss())
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        service = _service(tmp_path, FakeGateway(config_version=1))
+        adapter = _lost_response_adapter(
+            service, handle, replacement, {"count": 0})
+        original_commit = adapter.commit_attempt
+        state = {"interrupt": True}
+
+        async def commit(*args, **kwargs):
+            if kwargs.get("resolve") and state["interrupt"]:
+                state["interrupt"] = False
+                raise RuntimeUnavailable(
+                    "gateway_commit_timeout", 503, retry_after=5)
+            return await original_commit(*args, **kwargs)
+
+        adapter.commit_attempt = commit
+        manager = RuntimeManager(
+            store, adapter, owner_id="owner-d", gateway_required=True,
+            clock=lambda: 1202)
+        with pytest.raises(RuntimeUnavailable) as error:
+            asyncio.run(manager.ensure_ready(workspace, 1))
+        assert error.value.code == "gateway_commit_timeout"
+        fenced = store.get_worker_lease(workspace)
+        assert fenced is not None
+        assert fenced.state == "starting"
+        assert fenced.pending_attempt_id != ""
+        second_expiry = fenced.lease_expires_at
+
+    with Store.open(tmp_path / "control.sqlite3") as store:
+        gateway = FakeGateway(config_version=1)
+        service = _service(tmp_path, gateway)
+        adapter = _lost_response_adapter(
+            service, handle, replacement, {"count": 0})
+        calls = _wrap_adapter_calls(adapter)
+        manager = RuntimeManager(
+            store, adapter, owner_id="owner-e", gateway_required=True,
+            clock=lambda: second_expiry + 1)
+        final = asyncio.run(manager.ensure_ready(workspace, 1))
+        assert final.gateway_instance_id == replacement
+        ready = store.get_worker_lease(workspace)
+        assert ready is not None
+        assert ready.state == "ready"
+        assert ready.gateway_instance_id == replacement
+    assert calls == {"ensure": 0, "restore": 0, "resolve": 1}
+    assert gateway.stops == []
+
+
+def test_ready_restore_lost_response_recovers_exact_attempt(tmp_path):
+    """正常 ready 显式 restore 丢回复：与刷新入口共用归属恢复。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        with store:
+            ready = await _make_normal_ready(
+                store, service, workspace, handle)
+            old_attempt = ready.attempt_id
+            adapter = _lost_response_adapter(
+                service, handle, replacement, {"count": 1})
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(asyncio.CancelledError):
+                await manager.restore_gateway(workspace, WORKER, 1)
+            fenced = store.get_worker_lease(workspace)
+            assert fenced is not None
+            assert fenced.state == "starting"
+            assert fenced.attempt_id
+            assert fenced.attempt_id != old_attempt
+            assert fenced.lease_expires_at <= 1201
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["attempt_id"] == fenced.attempt_id
+            assert record["status"] == "pending"
+            assert record["gateway_instance_id"] == replacement
+        return workspace, handle
+
+    workspace, handle = asyncio.run(first_loss())
+
+    def enter(manager, workspace_id):
+        return manager.restore_gateway(workspace_id, WORKER, 1)
+
+    calls = {}
+    _assert_recovered_gateway(
+        tmp_path, workspace, handle, replacement, enter, calls)
+    assert calls == {"ensure": 0, "restore": 0, "resolve": 1}
+
+
+@pytest.mark.parametrize(
+    "failure_code", ["gateway_recovery_timeout", "provisioner_timeout"])
+def test_ready_restore_unknown_result_fences_exact_attempt(
+        tmp_path, failure_code):
+    """显式 restore 的远程超时同样必须持久新 attempt 并可恢复。"""
+    replacement = "f" * 64
+
+    async def first_loss():
+        store, service, gateway, workspace, lease, handle, original = \
+            _seed_expired_ensure(tmp_path)
+        with store:
+            ready = await _make_normal_ready(
+                store, service, workspace, handle)
+            old_attempt = ready.attempt_id
+            adapter = _lost_response_adapter(
+                service, handle, replacement, {"count": 0})
+
+            async def restore_gateway(workspace_id, worker_container_id,
+                                      config_version, *, attempt_id=""):
+                _write_lost_candidate(
+                    service, handle, workspace_id, replacement, attempt_id)
+                raise RuntimeUnavailable(
+                    failure_code, 503, retry_after=5)
+
+            adapter.restore_gateway = restore_gateway
+            manager = RuntimeManager(
+                store, adapter, owner_id="owner-c", gateway_required=True,
+                clock=lambda: 1201)
+            with pytest.raises(RuntimeUnavailable) as error:
+                await manager.restore_gateway(workspace, WORKER, 1)
+            assert error.value.code == failure_code
+            fenced = store.get_worker_lease(workspace)
+            assert fenced is not None
+            assert fenced.state == "starting"
+            assert fenced.attempt_id
+            assert fenced.attempt_id != old_attempt
+            assert fenced.lease_expires_at <= 1201
+            record = service._load_attempt(workspace)
+            assert record is not None
+            assert record["attempt_id"] == fenced.attempt_id
+            assert record["status"] == "pending"
+            assert record["gateway_instance_id"] == replacement
+        return workspace, handle
+
+    workspace, handle = asyncio.run(first_loss())
+
+    def enter(manager, workspace_id):
+        return manager.restore_gateway(workspace_id, WORKER, 1)
+
+    calls = {}
+    _assert_recovered_gateway(
+        tmp_path, workspace, handle, replacement, enter, calls)
+    assert calls == {"ensure": 0, "restore": 0, "resolve": 1}
