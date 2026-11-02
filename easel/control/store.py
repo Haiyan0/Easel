@@ -1736,11 +1736,17 @@ class Store:
     # -- 短请求租约 ---------------------------------------------------------
 
     def begin_worker_request_lease(self, workspace_id: str, ttl_seconds: int,
-                                   *, now: int | None = None) -> str:
+                                   *, now: int | None = None,
+                                   require_admission: bool = False) -> str:
         """登记一条有期限的在途请求租约；调用方必须在 finally 释放。
 
         租约只证明“control 正在向该 workspace 转发一个同步短请求”，不授予
         任何业务权限。过期行在下次登记时顺带清理。
+
+        ``require_admission=True`` 用于新 workspace 请求：屏障检查与登记在
+        同一个 ``BEGIN IMMEDIATE`` 事务内完成。屏障前登记必然被更新计数看到，
+        屏障后登记必然被拒绝，二者之间不存在“零计数放行后再起流”的空窗。
+        既有 Run 的 stop/events/answer 收尾不传此标志，屏障不得阻止其完成。
         """
         workspace_id = _text(workspace_id)
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 3600:
@@ -1748,6 +1754,8 @@ class Store:
         stamp = _now() if now is None else int(now)
         lease_id = uuid.uuid4().hex
         with self._transaction():
+            if require_admission:
+                self._require_admission_open_locked()
             self._connection.execute(
                 "DELETE FROM request_leases WHERE expires_at <= ?", (stamp,))
             self._connection.execute(
