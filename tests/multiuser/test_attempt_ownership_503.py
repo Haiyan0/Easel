@@ -1366,7 +1366,19 @@ def test_recovered_gateway_is_used_by_normal_stop(tmp_path):
         asyncio.run(service.stop(
             workspace, WORKER, replacement, protocol_version=2))
         assert gateway.stops == [(workspace, WORKER, replacement)]
-        assert service._load_attempt(workspace) is None
+        # 恢复收口时 commit 的 takeover attempt 从未执行，已被精确围栏。
+        # Stop 清理 G2 后保留合法无资源记录，不恢复该 attempt 的执行权。
+        record = service._load_attempt(workspace)
+        assert record is not None
+        assert record["status"] == "completed"
+        assert record["scope"] == "none"
+        assert record["worker_created"] is False
+        assert record["gateway_created"] is False
+        assert record["fenced_attempts"]
+        for fenced in record["fenced_attempts"]:
+            with pytest.raises(provisioner.ProvisionerError) as refused:
+                service._ensure_attempt_available(workspace, fenced)
+            assert refused.value.code == "gateway_attempt_fenced"
 
 
 def test_pure_reuse_refresh_keeps_same_gateway_without_adoption(tmp_path):

@@ -2243,6 +2243,15 @@ class Provisioner:
         self._persist_attempt(workspace_id, record)
 
     @staticmethod
+    def _valid_fenced_attempts(value: object) -> list[str]:
+        """提取原始记录中的合法围栏 ID；坏项丢弃但不恢复执行权。"""
+        if not isinstance(value, list):
+            return []
+        return [item for item in value
+                if isinstance(item, str)
+                and re.fullmatch(r"[0-9a-f]{32}", item) is not None]
+
+    @staticmethod
     def _attempt_matches(record: dict, attempt_id: str,
                          handle: WorkerHandle, *, worker_created: bool,
                          gateway_created: bool) -> bool:
@@ -2380,6 +2389,32 @@ class Provisioner:
             return
         if gateway_instance_id and record["gateway_instance_id"] != \
                 gateway_instance_id:
+            return
+        fenced = list(record.get("fenced_attempts", ()))
+        if fenced:
+            # 物理资源已按精确实例停止，只证明记录所属 attempt 不再需要
+            # 清理承诺；清理不能恢复已被围栏的 A 的执行权，已停止实例的
+            # attempt 本身也不得迟到复活。保留合法无资源记录，让围栏跨
+            # Stop 与重启继续生效；新 attempt 仍可正常覆盖该记录。
+            if record["attempt_id"] not in fenced:
+                fenced.append(record["attempt_id"])
+            kept = {
+                "attempt_id": record["attempt_id"],
+                "worker_container_id": record["worker_container_id"],
+                "gateway_instance_id": record["gateway_instance_id"],
+                "worker_created": False,
+                "gateway_created": False,
+                "scope": "none",
+                "status": "completed",
+                "config_version": int(record.get("config_version", 0)),
+                "fenced_attempts": fenced,
+            }
+            try:
+                self._persist_attempt(workspace_id, kept)
+            except OSError:
+                # 落盘失败时原记录（含围栏）仍在，绝不能改为删除。
+                LOGGER.error(
+                    "gateway attempt 围栏记录持久化失败，保留原记录")
             return
         self._attempts.pop(workspace_id, None)
         try:
@@ -2947,6 +2982,12 @@ class Provisioner:
                 "scope": "gateway",
                 "status": "pending",
             }
+            fenced = self._valid_fenced_attempts(
+                raw.get("fenced_attempts"))
+            if fenced:
+                # 修复旧坏记录时不能丢掉已有的执行权事实；abort 收口后
+                # _abort_locked 会带着该列表写 completed。
+                reconstructed["fenced_attempts"] = fenced
             self._persist_attempt(workspace_id, reconstructed)
             await self._abort_locked(workspace_id, reconstructed)
 
