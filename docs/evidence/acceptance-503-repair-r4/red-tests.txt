@@ -12,7 +12,7 @@ failure_code = 'provisioner_timeout'
         """正常 ready 刷新丢回复：持久新 attempt，下次首屏解析 G2。"""
         replacement = "f" * 64
         failure = RuntimeUnavailable(failure_code, 503, retry_after=5)
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -47,10 +47,10 @@ failure_code = 'provisioner_timeout'
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle, fenced
-    
+
 >       workspace, handle, fenced = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:1799: 
+tests\multiuser\test_attempt_ownership_503.py:1799:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -80,7 +80,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -97,7 +97,7 @@ failure_code = 'provisioner_connection_lost'
         """正常 ready 刷新丢回复：持久新 attempt，下次首屏解析 G2。"""
         replacement = "f" * 64
         failure = RuntimeUnavailable(failure_code, 503, retry_after=5)
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -132,10 +132,10 @@ failure_code = 'provisioner_connection_lost'
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle, fenced
-    
+
 >       workspace, handle, fenced = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:1799: 
+tests\multiuser\test_attempt_ownership_503.py:1799:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -165,7 +165,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -177,7 +177,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
     def test_ready_refresh_cancel_keeps_recoverable_fence(tmp_path):
         """正常 ready 刷新在远程 ensure 中被取消：新 attempt 仍可恢复。"""
         replacement = "f" * 64
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -205,10 +205,10 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle
-    
+
 >       workspace, handle = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:1843: 
+tests\multiuser\test_attempt_ownership_503.py:1843:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -235,7 +235,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -248,7 +248,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
         """ready 丢回复后的恢复解析再次中断：保留 fencing，下一 owner 前进。"""
         replacement = "f" * 64
         failure = RuntimeUnavailable("provisioner_timeout", 503, retry_after=5)
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -268,10 +268,10 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
                 assert fenced.state == "starting"
                 assert fenced.lease_expires_at <= 1201
             return workspace, handle
-    
+
 >       workspace, handle = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:1879: 
+tests\multiuser\test_attempt_ownership_503.py:1879:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -297,7 +297,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -309,7 +309,7 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
     def test_ready_restore_lost_response_recovers_exact_attempt(tmp_path):
         """正常 ready 显式 restore 丢回复：与刷新入口共用归属恢复。"""
         replacement = "f" * 64
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -336,10 +336,10 @@ tmp_path = WindowsPath('C:/Users/hyh/AppData/Local/Temp/pytest-of-hyh/pytest-438
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle
-    
+
 >       workspace, handle = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:1957: 
+tests\multiuser\test_attempt_ownership_503.py:1957:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -365,7 +365,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -381,7 +381,7 @@ failure_code = 'gateway_recovery_timeout'
             tmp_path, failure_code):
         """显式 restore 的远程超时同样必须持久新 attempt 并可恢复。"""
         replacement = "f" * 64
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -391,14 +391,14 @@ failure_code = 'gateway_recovery_timeout'
                 old_attempt = ready.attempt_id
                 adapter = _lost_response_adapter(
                     service, handle, replacement, {"count": 0})
-    
+
                 async def restore_gateway(workspace_id, worker_container_id,
                                           config_version, *, attempt_id=""):
                     _write_lost_candidate(
                         service, handle, workspace_id, replacement, attempt_id)
                     raise RuntimeUnavailable(
                         failure_code, 503, retry_after=5)
-    
+
                 adapter.restore_gateway = restore_gateway
                 manager = RuntimeManager(
                     store, adapter, owner_id="owner-c", gateway_required=True,
@@ -418,10 +418,10 @@ failure_code = 'gateway_recovery_timeout'
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle
-    
+
 >       workspace, handle = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:2012: 
+tests\multiuser\test_attempt_ownership_503.py:2012:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -438,14 +438,14 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             old_attempt = ready.attempt_id
             adapter = _lost_response_adapter(
                 service, handle, replacement, {"count": 0})
-    
+
             async def restore_gateway(workspace_id, worker_container_id,
                                       config_version, *, attempt_id=""):
                 _write_lost_candidate(
                     service, handle, workspace_id, replacement, attempt_id)
                 raise RuntimeUnavailable(
                     failure_code, 503, retry_after=5)
-    
+
             adapter.restore_gateway = restore_gateway
             manager = RuntimeManager(
                 store, adapter, owner_id="owner-c", gateway_required=True,
@@ -457,7 +457,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 
@@ -473,7 +473,7 @@ failure_code = 'provisioner_timeout'
             tmp_path, failure_code):
         """显式 restore 的远程超时同样必须持久新 attempt 并可恢复。"""
         replacement = "f" * 64
-    
+
         async def first_loss():
             store, service, gateway, workspace, lease, handle, original = \
                 _seed_expired_ensure(tmp_path)
@@ -483,14 +483,14 @@ failure_code = 'provisioner_timeout'
                 old_attempt = ready.attempt_id
                 adapter = _lost_response_adapter(
                     service, handle, replacement, {"count": 0})
-    
+
                 async def restore_gateway(workspace_id, worker_container_id,
                                           config_version, *, attempt_id=""):
                     _write_lost_candidate(
                         service, handle, workspace_id, replacement, attempt_id)
                     raise RuntimeUnavailable(
                         failure_code, 503, retry_after=5)
-    
+
                 adapter.restore_gateway = restore_gateway
                 manager = RuntimeManager(
                     store, adapter, owner_id="owner-c", gateway_required=True,
@@ -510,10 +510,10 @@ failure_code = 'provisioner_timeout'
                 assert record["status"] == "pending"
                 assert record["gateway_instance_id"] == replacement
             return workspace, handle
-    
+
 >       workspace, handle = asyncio.run(first_loss())
 
-tests\multiuser\test_attempt_ownership_503.py:2012: 
+tests\multiuser\test_attempt_ownership_503.py:2012:
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 ..\..\..\..\anaconda3\envs\Agent\lib\asyncio\runners.py:44: in run
     return loop.run_until_complete(main)
@@ -530,14 +530,14 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             old_attempt = ready.attempt_id
             adapter = _lost_response_adapter(
                 service, handle, replacement, {"count": 0})
-    
+
             async def restore_gateway(workspace_id, worker_container_id,
                                       config_version, *, attempt_id=""):
                 _write_lost_candidate(
                     service, handle, workspace_id, replacement, attempt_id)
                 raise RuntimeUnavailable(
                     failure_code, 503, retry_after=5)
-    
+
             adapter.restore_gateway = restore_gateway
             manager = RuntimeManager(
                 store, adapter, owner_id="owner-c", gateway_required=True,
@@ -549,7 +549,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
             assert fenced is not None
 >           assert fenced.state == "starting"
 E           AssertionError: assert 'ready' == 'starting'
-E             
+E
 E             - starting
 E             + ready
 

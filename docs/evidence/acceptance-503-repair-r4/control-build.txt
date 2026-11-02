@@ -4,7 +4,7 @@ At line:1 char:302
 +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (#0 building wit...g docker driver:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 
 #1 [internal] load build definition from Dockerfile.control
 #1 transferring dockerfile: 2.98kB done
@@ -88,7 +88,7 @@ de79529d0c 0.0s done
 7,<1"       "pydantic>=2.7,<3"       "cryptography>=42"  && groupadd --gid 10001 easel  && useradd --uid 10001 --gid 10
 001 --home-dir /home/easel             --create-home --shell /usr/sbin/nologin easel  && mkdir -p /srv/easel/control  &
 & chown 10001:10001 /srv/easel/control /home/easel  && chown -R root:root /opt/easel  && chmod -R a-w /opt/easel  && ch
-mod 0555 /opt/easel/deploy/desktop/keygen.py                     /opt/easel/deploy/desktop/initialize_state.py         
+mod 0555 /opt/easel/deploy/desktop/keygen.py                     /opt/easel/deploy/desktop/initialize_state.py
             /opt/easel/deploy/desktop/read_stop_state.py                     /opt/easel/deploy/desktop/provisioner_iden
 tity.py
 #24 1.712 Collecting fastapi<1,>=0.115
