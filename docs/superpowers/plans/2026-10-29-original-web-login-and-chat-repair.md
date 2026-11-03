@@ -12,6 +12,24 @@
 
 ## 当前执行节点
 
+- 2026-11-03 本机维护收尾：用户关闭代理后确认聊天正常；验收分支 `6dde13e` 已经由 `bd93658` 合入主工作目录，运维手册提交 `1f92d8e` 已推送 `origin/feat/multiuser-task1-store`。主审合并后验证 1835 passed/7 skipped、前端 193 passed、build/lint 通过。验收部署已正常 Stop、完成完整备份校验并清理旧源码工作树；以后仅在 `C:\Code\Easel` 部署。下方各轮“未合并/未推送/待维护”为当时历史状态，不代表当前状态。Linux 生产与其他未执行门槛不因此关闭。
+
+- 2026-11-03 验收实例503修复组代码验收通过：最终tip `6dde13e`，R4-R3关闭Stop清理撤销执行围栏P1；主审553 passed/5 skipped、真实Unix Stop→重启契约通过，独立审查无本组阻塞。见 [503修复验收](../audits/2026-11-03-acceptance-503-repair-accepted.md)。本组不再下发代码返工；下一步为正式Update受控维护切换及用户验收。未合并/推送/更新用户实例，6A其他未完成项仍按原计划，不自动宣称整体生产可发布。
+
+- 2026-11-03 验收实例503修复R4-R2原活跃接管交错通过但清理仍有P1：tip `4dd3550`，主审546 passed/5 skipped、真实Unix契约通过；正式Stop删除记录连带撤销A围栏，重启迟到A能越过副作用准入。仅下发 [R4-R3清理一致性](../tasks/2026-11-03-acceptance-503-rework-r4-r3.md)，见 [复审](../audits/2026-11-03-acceptance-503-review-round-7.md)。用户实例不更新，其他关闭项不重开。
+
+- 2026-11-03 验收实例503修复R4-R1原崩溃窗口通过但仍有一项P1：tip `188f1c8`，主审349 passed/4 skipped、镜像runtime/store哈希一致。立即到期预占可被活跃并发请求接管，A迟到写pending后归属再次丢失；仅下发 [R4-R2活跃接管收口](../tasks/2026-11-03-acceptance-503-rework-r4-r2.md)，见 [复审](../audits/2026-11-03-acceptance-503-review-round-6.md)。用户实例仍不更新，不重开其他已关闭功能。
+
+- 2026-11-03 验收实例503修复R4仍有一项P1：tip `34ede47`，主审326 passed/4 skipped、镜像runtime/store哈希一致。异常/协作取消恢复有效，但子进程远端写pending后直接退出，重启跨期限仍503；仅下发 [R4-R1持久归属](../tasks/2026-11-03-acceptance-503-rework-r4-r1.md)，见 [R4复审](../audits/2026-11-03-acceptance-503-review-round-5.md)。用户实例仍不更新，其他关闭项不重开。
+
+- 2026-11-02 验收实例503修复R3两项通过：tip `ac863e2`，主审受影响248 passed/4 skipped，过期starting未知结果恢复与请求原子屏障关闭。但交付延后的正常ready刷新P1已独立复现，跨租约期限仍503；仅下发 [503 R4单项](../tasks/2026-11-02-acceptance-503-rework-r4.md)，见 [R3复审](../audits/2026-11-02-acceptance-503-review-round-4.md)。整体验收/用户实例更新暂缓，不重开R3已关闭项。
+
+- 2026-11-02 验收实例503修复R2暂不通过：tip `c9c0f0a`，主审398 passed/2 skipped，原探针与一次性取消变体确认修复；新增反例确认普通超时仍遗留pending，以及更新零计数后可晚登记媒体流。R2-01/04/05关闭，仅下发 [503 R3两项](../tasks/2026-11-02-acceptance-503-rework-r3.md)，见 [R2复审](../audits/2026-11-02-acceptance-503-review-round-3.md)。用户实例不更新，不重开前端/平台功能。
+
+- 2026-11-02 验收实例503修复R1暂不通过：生产 `23146a2`、tip `43e4cd0`。原三探针通过，但新增反例确认普通首屏仍提前commit、替换回复丢失后重启不能恢复；Update另缺活动工作检查、部分失败重试和本项目快照范围。仅下发 [503 R2](../tasks/2026-11-02-acceptance-503-rework-r2.md)，见 [R1复审](../audits/2026-11-02-acceptance-503-review-round-2.md)。参数/附加commit预算已关闭；不重开前端，用户实例仍不更新。
+
+- 2026-11-02 验收实例 503 修复首轮复审暂不通过：生产 `7d6599b`、tip `966d650`。主审后端278 passed/2 skipped、Node193及build/lint通过；独立反例确认接管前commit误报清理完成、附加commit超就绪预算，另正式更新模板未升级旧provisioner且Stop参数无效。仅下发 [503 R1](../tasks/2026-11-02-acceptance-503-rework-r1.md)，见 [审计](../audits/2026-11-02-acceptance-503-review-round-1.md)。用户实例不更新，既有6A整体验收仍未通过。
+
 - 2026-11-02 Task6A 首轮未整体通过：生产 `51aacfb`、证据 `b582d26`。主审 API/runtime 71 passed、1 skipped；独立复审发现串行锁排队未纳入就绪超时，另须补页面复跑、正式生命周期、受控账号/发布整合与受跟踪原始证据。仅下发 [6A R1](../tasks/2026-11-02-original-web-task-06a-rework-r1.md)，见 [审计](../audits/2026-11-02-original-web-task-06a-review-round-1.md)。手册候选暂不应用，用户实例不切换；真实模型/平台与维护窗口由用户分别选择。
 
 - 2026-11-02 Task5C3 R2验收通过：实现 `6b54e49`、tip `4382180862e28d43f2974e32a618093c847ec262` 关闭显式改素材被旧意图覆盖问题；主审Node190 passed、13组浏览器/build/lint、原改图与确认/刷新/丢ACK独立探针通过，见 [5C3验收](../audits/2026-11-02-original-web-task-05c3-accepted.md)。当前仅下发 [6A隔离整体验收与既有手册收口](../tasks/2026-11-02-original-web-task-06a-integration-operations.md)，用户实例/真实调用仍不授权自动执行。

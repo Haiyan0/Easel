@@ -63,3 +63,6 @@ skills/**/.pytest_cache/
 **/*.log
 
 PSScriptAnalyzerSettings.psd1
+
+# 本机代码索引不进入部署镜像上下文
+.codegraph/
