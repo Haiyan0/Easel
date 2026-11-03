@@ -222,10 +222,10 @@ class WorkspaceApi:
         self._request_lease_ttl = int(request_lease_ttl)
         self._max_upload_bytes = int(max_upload_bytes)
 
-    async def _db(self, function, *args):
+    async def _db(self, function, *args, **kwargs):
         if self._db_runner is None:
-            return function(*args)
-        return await self._db_runner(function, *args)
+            return function(*args, **kwargs)
+        return await self._db_runner(function, *args, **kwargs)
 
     async def _revision(self, workspace_id: str) -> int:
         """确认 workspace 真实存在，并返回受管配置的信任 revision。
@@ -296,7 +296,8 @@ class WorkspaceApi:
         lease_id = await self._db(
             self._store.begin_worker_request_lease,
             handle.workspace_id,
-            self._request_lease_ttl if lease_ttl is None else lease_ttl)
+            self._request_lease_ttl if lease_ttl is None else lease_ttl,
+            require_admission=True)
         try:
             response = await gateway.request(
                 handle, method, path, query=query, payload=payload,

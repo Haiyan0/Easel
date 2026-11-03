@@ -1,0 +1,2 @@
+{"activeRuns": 1, "settled": false, "barrier_present": true}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false

@@ -522,6 +522,60 @@ def test_drain_rejects_new_task_and_preserves_accepted_run(tmp_path):
     run_async(scenario())
 
 
+def test_update_barrier_rejects_late_messages_read(tmp_path):
+    """屏障后会话历史读取属于新 workspace 请求，必须拒绝且不调用上游。"""
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            conversation = store.create_conversation(user, "已接受")
+            clock = Clock()
+            transport = CountingTransport()
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(store, client, clock=clock)
+                await relay.submit(
+                    user, payload(conversation.id, "先接受", "turn-1"))
+                store.set_admission_barrier(
+                    "update-abcdef123456", "desktop-update",
+                    int(clock.value))
+                calls = len(transport.calls)
+                with pytest.raises(DomainError) as error:
+                    await relay.messages(user, conversation.id)
+                assert error.value.code == "admission_closed"
+                assert len(transport.calls) == calls
+                assert store.count_worker_request_leases(
+                    user.workspace_id, now=int(clock.value)) == 0
+
+    run_async(scenario())
+
+
+def test_update_barrier_keeps_admitted_run_relay(tmp_path):
+    """屏障阻止新 workspace 请求，但不得阻止已接纳 Run 的 events 收尾。"""
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            conversation = store.create_conversation(user, "已接受")
+            clock = Clock()
+            transport = CountingTransport()
+            async with httpx.AsyncClient(transport=transport) as client:
+                relay = make_relay(store, client, clock=clock)
+                accepted = await relay.submit(
+                    user, payload(conversation.id, "先接受", "turn-1"))
+                store.set_admission_barrier(
+                    "update-abcdef123456", "desktop-update",
+                    int(clock.value))
+                calls = len(transport.calls)
+                replay = await relay.events(
+                    user, accepted["runId"], after=0)
+                assert replay["runId"] == accepted["runId"]
+                assert len(transport.calls) == calls + 1
+                assert store.count_worker_request_leases(
+                    user.workspace_id, now=int(clock.value)) == 0
+
+    run_async(scenario())
+
+
 # --------------------------------------------------------------------------
 # control 公开入口只走 relay
 # --------------------------------------------------------------------------

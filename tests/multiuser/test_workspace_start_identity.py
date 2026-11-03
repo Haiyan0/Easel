@@ -186,6 +186,10 @@ function global:wsl.exe {{
         Write-Output '1000'
         return
     }}
+    if ($text -match 'sha256sum') {{
+        Write-Output ('a' * 64 + '  source.py')
+        return
+    }}
     return
 }}
 & '{START}' -PublicOrigin 'https://easel.test' -Image '{CONTROL}' `

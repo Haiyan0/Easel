@@ -1,0 +1,29 @@
+TREE: 75d6912
+COMMAND: MSYS_NO_PATHCONV=1 docker run --rm -i --network none -v C:/Code/Easel-acceptance:/src:ro easel-control:503-r4-r1-final python3 - < docs/evidence/acceptance-503-repair-r4-r3/provisioner_socket_contract.py
+----
+STOP_KEPT_FENCE {"fenced_attempts": ["11111111111111111111111111111111", "22222222222222222222222222222222"], "scope": "none", "status": "completed"}
+provisioner 请求失败
+Traceback (most recent call last):
+  File "/src/deploy/multiuser/provisioner.py", line 3315, in _handle_client
+    response = await self._dispatch(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/src/deploy/multiuser/provisioner.py", line 3334, in _dispatch
+    handle = await self.ensure(
+             ^^^^^^^^^^^^^^^^^^
+  File "/src/deploy/multiuser/provisioner.py", line 1987, in ensure
+    return await self._ensure_locked(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/src/deploy/multiuser/provisioner.py", line 2003, in _ensure_locked
+    paths = await asyncio.to_thread(
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<stdin>", line 120, in prepare_workspace
+AssertionError: prepare_workspace reachable
+RESTART_LATE_A_FENCED {"fenced_attempts": ["11111111111111111111111111111111", "22222222222222222222222222222222"], "fresh_reached_boundary": true, "rejected": "11111111111111111111111111111111"}
+UNIX_CONTRACT_OK
+EXIT=0

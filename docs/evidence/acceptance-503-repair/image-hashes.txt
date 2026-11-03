@@ -1,0 +1,24 @@
+commit=7d6599b845011e57b893baa5ffea0afbe84958ae
+base=665f7e8
+
+--- worktree source ---
+d4e157c1482edb78b67fcea05ee27edd38ce611914b9e6113db37ce7903599ba *deploy/multiuser/provisioner.py
+dfee655f19570f37edbfb85af099b4a0243a41c10f3552d057efa67017661cfe *easel/control/runtime.py
+9b18823828ceb995d3d6808fb78eafb231ff928dc3ed5fec814273c3cf6c4ef8 *web/frontend/src/lib/statusCopy.ts
+
+--- frontend dist ---
+ca8a69176d717ae8c62e12c785f19940fae0d28ccd82944391b16879ba63036e *web/frontend/dist/index.html
+7a64e48196c40b1506a6f1098338103f77508c26c7876dfb01669abf28e3e504 *web/frontend/dist/assets/index-D5UTpITU.js
+f5c7b6c1e9b131d94707f2b6e174bf60537ee9ea1c2dbec3afb33ee18c4d3b0e *web/frontend/dist/assets/index-Da4NYWkv.css
+
+--- images ---
+easel-control:503-fix sha256:2582886195031ac4d71746bbddf670270e47f21f09a2d0bf55d26d1d00011ac2
+easel-gateway:task6a-4382180 sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a
+easel-worker-execution:task5c3-20261101 sha256:d46f0dd1f17273e91f3d3cca7e68854ca1dc55231a64b446ef058ad7b5066ec8
+easel-worker:task6a-4382180 sha256:6f62af472c8b272c0d67a1aec26284cff8f8c9adacfaad48e6ba0ce64fbf0612
+
+--- control image files ---
+dfee655f19570f37edbfb85af099b4a0243a41c10f3552d057efa67017661cfe  /opt/easel/easel/control/runtime.py
+ca8a69176d717ae8c62e12c785f19940fae0d28ccd82944391b16879ba63036e  /opt/easel/web/frontend/dist/index.html
+7a64e48196c40b1506a6f1098338103f77508c26c7876dfb01669abf28e3e504  /opt/easel/web/frontend/dist/assets/index-D5UTpITU.js
+f5c7b6c1e9b131d94707f2b6e174bf60537ee9ea1c2dbec3afb33ee18c4d3b0e  /opt/easel/web/frontend/dist/assets/index-Da4NYWkv.css

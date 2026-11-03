@@ -1,0 +1,22 @@
+TREE: 75d6912
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_r4r3_503.py -v
+----
+============================= test session starts =============================
+platform win32 -- Python 3.10.12, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\hyh\anaconda3\envs\Agent\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Code\Easel-acceptance
+configfile: pytest.ini
+plugins: anyio-4.12.1, logfire-4.41.0, asyncio-1.4.0
+asyncio: mode=strict, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 7 items
+
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_preserves_fence_and_blocks_late_ensure_after_restart PASSED [ 14%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_fence_does_not_block_new_attempt_after_restart PASSED [ 28%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_without_fence_still_deletes_record PASSED [ 42%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_fence_record_is_idempotent PASSED [ 57%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_stop_instance_mismatch_keeps_fence_record PASSED [ 71%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_abort_completion_preserves_fence PASSED [ 85%]
+tests/multiuser/test_attempt_ownership_r4r3_503.py::test_recover_abort_preserves_fence PASSED [100%]
+
+============================== 7 passed in 0.39s ==============================
+EXIT=0

@@ -1,0 +1,7 @@
+TREE: 75d6912
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_store.py tests/multiuser/test_store_gateway.py tests/multiuser/test_lifecycle_lock.py tests/multiuser/test_lifecycle_rework.py -q
+----
+........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed in 15.86s
+EXIT=0

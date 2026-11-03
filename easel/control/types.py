@@ -146,6 +146,9 @@ class WorkerLease:
     gateway_upstream: str = ""
     gateway_state: str = "disabled"
     attempt_id: str = ""
+    # 接管 CAS 已 fencing、但仍需在 provisioner 按其精确 attempt 收口的
+    # 旧 attempt。非空时禁止进入候选 staging 或再次接管。
+    pending_attempt_id: str = ""
     cleanup_purpose: str = ""
     cleanup_scope: str = ""
     cleanup_worker_created: bool = False

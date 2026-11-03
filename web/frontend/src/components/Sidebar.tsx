@@ -9,6 +9,7 @@ import {
 } from './icons';
 import { IconGear } from './settingsIcons';
 import ThemeToggle from './ThemeToggle';
+import { sidebarStatusText } from '../lib/statusCopy';
 
 export type Page = 'dashboard' | 'chat' | 'trends' | 'ideas' | 'calendar' | 'publish' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile';
 
@@ -95,13 +96,7 @@ export default function Sidebar({
     showEmptySessions || s.messages.length > 0 || s.id === activeSessionId));
   const archived = sessions.filter((s) => s.archived);
   const online = statusOnline ?? gatewayStatus === 'connected';
-  const defaultStatus = gatewayStatus === 'connected'
-    ? (apiDirect ? '仅聊天模式已配置'
-      : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 已安装` : '网关已连接')
-    : gatewayStatus === 'disconnected'
-      ? (apiDirect ? 'API 配置不完整'
-        : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 未配置` : '网关离线')
-      : '连接中…';
+  const defaultStatus = sidebarStatusText(gatewayStatus, apiDirect, agentRuntime);
 
   const renderItem = (s: ChatSession, isArchived: boolean) => {
     if (renamingId === s.id) {

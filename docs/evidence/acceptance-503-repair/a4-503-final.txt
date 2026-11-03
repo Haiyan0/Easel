@@ -1,0 +1,11 @@
+A4_IMAGES {"control": "sha256:2582886195031ac4d71746bbddf670270e47f21f09a2d0bf55d26d1d00011ac2", "gateway": "sha256:0d30939d375c1e3bef616678f5e8d7b6fad687143817f7d6183579ca8e881f0a", "worker": "sha256:d46f0dd1f17273e91f3d3cca7e68854ca1dc55231a64b446ef058ad7b5066ec8"}
+A4_FIRST_SCREEN {"codes": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}}
+A4_HANDLES [{"gateway": "7d54af0ee3c5f3faf1fd9b1fbf3910385c5428c8b790bf25f1e22311bbf1a07c", "worker": "b838826b158d90a516b8823eaa9a067e0349facf877afbf2c7f5a777c4254307", "workspace": "af1881f17851425086b25104a058149f"}, {"gateway": "166c4d6728cbb9a088dc786be6ab429bf1cf82e4077bea771236c0f5cf3c8f65", "worker": "2f17b41fb1157cfcb077d5a0398ad0013581a9dfcc969e23305a7ce37c2d582b", "workspace": "fc69793d4b9e434eb28bc960d98f9763"}]
+A4_GATEWAY_RECOVERY {"gateway": "7d54af0ee3c5f3faf1fd9b1fbf3910385c5428c8b790bf25f1e22311bbf1a07c", "same_worker": true, "tokens_after": 1, "tokens_before": 1, "worker": "b838826b158d90a516b8823eaa9a067e0349facf877afbf2c7f5a777c4254307", "workspace": "af1881f17851425086b25104a058149f"}
+A4_FIRST_SCREEN_AFTER_RECOVERY {"codes": {"/api/accounts": 200, "/api/ideas": 200, "/api/outputs": 200, "/api/personas": 200, "/api/schedule": 200, "/api/status": 200}}
+A4_GATEWAY_REPLACEMENT {"new_gateway": "26a4185a67e77e5cd633aba048624fa94bede893e83b25006c025515f008e486", "old_gateway": "7d54af0ee3c5f3faf1fd9b1fbf3910385c5428c8b790bf25f1e22311bbf1a07c", "same_worker": true, "tokens": 1, "worker": "b838826b158d90a516b8823eaa9a067e0349facf877afbf2c7f5a777c4254307", "workspace": "af1881f17851425086b25104a058149f"}
+A4_PROVIDER {"cross_workspace": 404, "model": "deepseek-chat", "requests": 2, "sentinel_header_ok": true, "wrong_channel": 404}
+A4_REAL_PASS
+.
+1 passed in 91.96s (0:01:31)
+PYTEST_EXIT=0

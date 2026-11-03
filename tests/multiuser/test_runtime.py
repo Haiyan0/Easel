@@ -654,6 +654,83 @@ def test_unix_client_decodes_only_strict_protocol_responses(tmp_path):
     assert handle.service_token == "t"
 
 
+def test_unix_client_maps_transport_loss_to_unknown_outcome_codes(
+        monkeypatch, tmp_path):
+    """真实 Unix 客户端区分连接失败与已发出后的未知结果。"""
+    from easel.control.runtime import (
+        _UNKNOWN_ENSURE_OUTCOME_CODES, UnixProvisionerClient)
+
+    client = UnixProvisionerClient(tmp_path / "provisioner.sock")
+
+    async def unavailable(*args, **kwargs):
+        raise OSError("socket missing")
+
+    monkeypatch.setattr(
+        asyncio, "open_unix_connection", unavailable, raising=False)
+    with pytest.raises(RuntimeUnavailable) as error:
+        asyncio.run(client._call({"action": "inspect"}, 0.1))
+    # 连接阶段失败没有发出请求，属于确定失败，不能保留未知归属。
+    assert error.value.code == "provisioner_unavailable"
+    assert error.value.code not in _UNKNOWN_ENSURE_OUTCOME_CODES
+
+    class Reader:
+        def __init__(self, action: str) -> None:
+            self.action = action
+
+        async def readline(self):
+            if self.action == "timeout":
+                await asyncio.sleep(1)
+            if self.action == "reset":
+                raise ConnectionResetError("reset")
+            if self.action == "eof":
+                return b""
+            return b'{"ok": false, "error": "container_conflict"}'
+
+    class Writer:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    def serve(action: str):
+        async def open_connection(*args, **kwargs):
+            return Reader(action), Writer()
+
+        return open_connection
+
+    for action, code in (
+            ("timeout", "provisioner_timeout"),
+            ("eof", "provisioner_invalid_response"),
+            ("reset", "provisioner_connection_lost")):
+        monkeypatch.setattr(
+            asyncio, "open_unix_connection", serve(action), raising=False)
+        with pytest.raises(RuntimeUnavailable) as error:
+            asyncio.run(client._call({"action": "inspect"}, 0.01))
+        assert error.value.code == code
+        assert code in _UNKNOWN_ENSURE_OUTCOME_CODES
+
+    # provisioner 明确返回 ok=false 是确定失败，不属于未知结果。
+    monkeypatch.setattr(
+        asyncio, "open_unix_connection", serve("error"), raising=False)
+    with pytest.raises(RuntimeUnavailable) as error:
+        asyncio.run(client.ensure("a" * 32, 1))
+    assert error.value.code == "container_conflict"
+    assert error.value.code not in _UNKNOWN_ENSURE_OUTCOME_CODES
+    assert _UNKNOWN_ENSURE_OUTCOME_CODES == {
+        "provisioner_timeout",
+        "provisioner_connection_lost",
+        "provisioner_invalid_response",
+        "worker_start_timeout",
+    }
+
+
 def test_late_drain_reply_cannot_overwrite_new_generation(tmp_path):
     """旧 drain 的 stop 已发生但回复暂停；新代次就绪后旧回复不得改写。"""
     async def scenario():

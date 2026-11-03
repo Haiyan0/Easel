@@ -1,0 +1,11 @@
+$ docker image inspect easel-control:503-r4-final --format '{{.Id}}'
+sha256:0f9c337ef926f6bb3e300b7d90301552a652b1b78b84318f6a24c01f51d6cb69
+
+$ sha256sum easel/control/runtime.py easel/control/store.py
+c8c301d698a39f6dda00c7d08b04d35ca902237d68af71bc2e2af360a4f6b816 *easel/control/runtime.py
+4183d0a59520450b2ee349e75ed5d49f558f5a120cdbe6813d32f864a41eff2e *easel/control/store.py
+
+$ docker run --rm --entrypoint sha256sum easel-control:503-r4-final \
+    /opt/easel/easel/control/runtime.py /opt/easel/easel/control/store.py
+c8c301d698a39f6dda00c7d08b04d35ca902237d68af71bc2e2af360a4f6b816  /opt/easel/easel/control/runtime.py
+4183d0a59520450b2ee349e75ed5d49f558f5a120cdbe6813d32f864a41eff2e  /opt/easel/easel/control/store.py

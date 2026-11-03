@@ -1,0 +1,25 @@
+TREE: b686ea5
+
+WORKTREE BYTES (core.autocrlf=true, CRLF where applicable):
+6f54486b3f31097e5e97fb504dbb825c9480ab7aaa1702b6bc2b5c3fa7e19ee2 *deploy/multiuser/provisioner.py
+04a9f8be595160c3df99ef727349365024eb035e7ae63620bf3543d4ede35196 *easel/control/runtime.py
+0f9a2fa00c327a38340af3928514a17be9d941f567f79066175668dd595d34ae *easel/control/store.py
+
+LF-NORMALIZED (git blob content):
+768d886491fa11724898f87d4b64d4bc05ead8d8f0a6df3e592ff478308996a4 deploy/multiuser/provisioner.py
+0499a2035d5ec77ea1bfa711ad1fbf06032856e19846e8831393b7d55245ae9a easel/control/runtime.py
+560065e47cc00d58fa698b8334d652f66d9807302719dfe77126cc1eba6271d6 easel/control/store.py
+
+GIT DIFF STAT 188f1c8..HEAD:
+ deploy/multiuser/provisioner.py | 99 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 93 insertions(+), 6 deletions(-)
+GIT DIFF CHECK:
+clean
+
+COMMITS:
+b686ea5 test: 断言迟到请求的确定失败结果（R4-R2-01）
+72e4ca6 docs: 校正 R4-R2 报告提交引用
+94bfbb3 docs: 注明 R4-R2 生产与证据提交
+7a0ce2e docs: 补齐 R4-R2 验收证据
+174af97 fix: 旧坏记录收口同样围栏未知 attempt（R4-R2-01）
+8361ce5 fix: 精确围栏未执行 attempt 的执行权（R4-R2-01）

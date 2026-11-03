@@ -1,0 +1,5 @@
+COMMAND: C:/Users/hyh/anaconda3/envs/Agent/python.exe -m pytest tests/multiuser/test_store.py tests/multiuser/test_lifecycle_lock.py tests/multiuser/test_lifecycle_rework.py -q
+........................................................................ [ 80%]
+.................                                                        [100%]
+89 passed in 15.61s
+EXIT=0

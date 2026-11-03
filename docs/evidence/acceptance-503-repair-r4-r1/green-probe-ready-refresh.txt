@@ -1,0 +1,12 @@
+COMMAND: C:/Users/hyh/anaconda3/envs/Agent/python.exe C:/Code/Easel/docs/evidence/acceptance-503-review/probe_r4_ready_crash.py C:/Code/Easel-acceptance
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_ready_crash.py", line 57, in <module>
+    asyncio.run(recover(pathlib.Path(directory)))
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_ready_crash.py", line 41, in recover
+    raise AssertionError('意外恢复成功')
+AssertionError: 意外恢复成功
+EXIT=1

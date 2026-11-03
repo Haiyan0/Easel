@@ -94,6 +94,9 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
         ("workerPublicSha256", ("keys", "workerPublicSha256")),
         ("gatewayPublicSha256", ("keys", "gatewayPublicSha256")),
         ("policySha256", ("policySha256",)),
+        # 配置身份相同不代表运行的是新代码；源码摘要与所需动作能力
+        # 都必须由实际进程回报。
+        ("provisionerSourceSha256", ("sourceSha256",)),
     )
     for field, path in checks:
         wanted = expected.get(field)
@@ -121,6 +124,14 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
             mismatches.append("allowedUid")
     if identity.get("protocol") != 2:
         mismatches.append("protocol")
+    required_actions = expected.get("provisionerActions")
+    if required_actions is not None:
+        observed_actions = identity.get("actions")
+        if (not isinstance(required_actions, list)
+                or not isinstance(observed_actions, list)
+                or any(action not in observed_actions
+                       for action in required_actions)):
+            mismatches.append("provisionerActions")
     return mismatches
 
 

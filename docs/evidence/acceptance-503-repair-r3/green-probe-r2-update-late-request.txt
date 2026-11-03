@@ -1,0 +1,23 @@
+before_update_start={"activeLeases": [{"state": "ready", "workspaceId": "d5ecb3bb2c2543d9bffcf8b11eab723e"}], "activeRequests": 0, "activeRuns": 0, "settled": false}
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r2_update_late_request.py", line 87, in <module>
+    asyncio.run(scenario())
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r2_update_late_request.py", line 72, in scenario
+    stream = await asyncio.wait_for(task, 2)
+  File "C:\Users\hyh\anaconda3\envs\Agent\lib\asyncio\tasks.py", line 445, in wait_for
+    return fut.result()
+  File "C:\Code\Easel-acceptance\easel\control\workspace_api.py", line 354, in open_stream
+    response, lease_id = await self._request_with_handle(
+  File "C:\Code\Easel-acceptance\easel\control\workspace_api.py", line 296, in _request_with_handle
+    lease_id = await self._db(
+  File "C:\Code\Easel-acceptance\easel\control\workspace_api.py", line 227, in _db
+    return function(*args, **kwargs)
+  File "C:\Code\Easel-acceptance\easel\control\store.py", line 1777, in begin_worker_request_lease
+    self._require_admission_open_locked()
+  File "C:\Code\Easel-acceptance\easel\control\store.py", line 647, in _require_admission_open_locked
+    raise DomainError("admission_closed", 503, retry_after=1)
+easel.control.types.DomainError: admission_closed

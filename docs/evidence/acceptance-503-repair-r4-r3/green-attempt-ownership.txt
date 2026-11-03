@@ -1,0 +1,6 @@
+TREE: 75d6912
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_503.py tests/multiuser/test_attempt_ownership_r4r1_503.py tests/multiuser/test_attempt_ownership_r4r2_503.py tests/multiuser/test_attempt_ownership_r4r3_503.py -q
+----
+..................................................................       [100%]
+66 passed in 4.12s
+EXIT=0

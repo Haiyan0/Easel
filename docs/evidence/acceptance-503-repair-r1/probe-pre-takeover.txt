@@ -1,0 +1,2 @@
+﻿{"cleanup_reported_success": false, "gateway_stop_count": 0, "database_state": "starting", "database_gateway_id_empty": false, "attempt_status": "committed"}
+TEMP_CLEANUP=ok; LIVE_RESOURCES_TOUCHED=false

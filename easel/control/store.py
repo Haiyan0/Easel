@@ -31,7 +31,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -64,8 +64,8 @@ _WORKER_LEASE_COLUMNS = (
     " started_at, owner_id, generation, lease_expires_at, updated_at,"
     " last_activity_at, active_requests, upstream, service_token,"
     " gateway_instance_id, gateway_generation, gateway_upstream,"
-    " gateway_state, attempt_id, cleanup_purpose, cleanup_scope,"
-    " cleanup_worker_created, cleanup_gateway_created")
+    " gateway_state, attempt_id, pending_attempt_id, cleanup_purpose,"
+    " cleanup_scope, cleanup_worker_created, cleanup_gateway_created")
 
 
 def _now() -> int:
@@ -402,6 +402,12 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             updated_at INTEGER NOT NULL
         )
         """,
+    ),
+    # 版本 15：接管时先把旧 attempt 持久 fencing。交接 CAS 完成后旧 owner
+    # 已无权 abort；新 owner 必须按该精确 attempt 在 provisioner 收口后，
+    # 才能 staging 新候选。进程崩溃也不会丢失待收口归属。
+    (
+        "ALTER TABLE worker_leases ADD COLUMN pending_attempt_id TEXT NOT NULL DEFAULT ''",
     ),
 )
 
@@ -1272,6 +1278,7 @@ class Store:
         attempt_id = _text(attempt_id)
         now = int(now)
         where = (" WHERE workspace_id = ? AND generation = ?"
+                 " AND pending_attempt_id = ''"
                  " AND (state = 'ready'"
                  "      OR (state = 'starting' AND container_id <> ''))")
         values: list[object] = [
@@ -1299,6 +1306,85 @@ class Store:
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0"
                 + where,
                 tuple(values))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
+    def takeover_worker_gateway_refresh(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, now: int, lease_seconds: int, *,
+            expected_owner: str, expected_attempt: str,
+            expires_at_or_before: int) -> WorkerLease | None:
+        """过期 starting 的 owner/generation/attempt 交接 CAS。
+
+        只有旧 owner/attempt 与过期时间全部匹配且没有待收口旧 attempt 时
+        才成功。成功后旧 owner 的 abort CAS 必然失败；旧 attempt 被持久
+        记录到 ``pending_attempt_id``，由新 owner 按其精确 ID 在
+        provisioner 收口后才能 staging 新候选。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        now = int(now)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'starting', owner_id = ?,"
+                " generation = generation + 1, heartbeat_at = ?,"
+                " lease_expires_at = ?, updated_at = ?, attempt_id = ?,"
+                " pending_attempt_id = attempt_id"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND state = 'starting' AND container_id <> ''"
+                " AND gateway_instance_id <> '' AND upstream <> ''"
+                " AND service_token <> '' AND pending_attempt_id = ''"
+                " AND owner_id = ? AND attempt_id = ?"
+                " AND lease_expires_at <= ?",
+                (_text(owner_id), now, now + lease_seconds, now,
+                 _text(attempt_id), _text(workspace_id), int(generation),
+                 _text(expected_owner), _text(expected_attempt),
+                 int(expires_at_or_before)))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
+    def clear_pending_attempt(self, workspace_id: str, generation: int,
+                              owner_id: str, attempt_id: str,
+                              now: int) -> bool:
+        """旧 attempt 已在 provisioner 精确收口后清空 fencing 槽位。"""
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET pending_attempt_id = '',"
+                " updated_at = ? WHERE workspace_id = ? AND generation = ?"
+                " AND owner_id = ? AND attempt_id = ? AND state = 'starting'"
+                " AND pending_attempt_id <> ''",
+                (int(now), _text(workspace_id), int(generation),
+                 _text(owner_id), _text(attempt_id)))
+        return cursor.rowcount == 1
+
+    def adopt_fenced_attempt(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, pending_attempt_id: str,
+            gateway_instance_id: str, gateway_generation: str,
+            gateway_upstream: str, gateway_state: str,
+            now: int) -> WorkerLease | None:
+        """恢复响应丢失：把 provisioner 持久化的真实候选写入 fencing 租约。
+
+        只允许当前 owner/generation/attempt 与 pending 槽位全部匹配时
+        替换 gateway 身份；CAS 失败说明另一管理者已接管，调用方必须
+        失败关闭而不是覆盖新代次。
+        """
+        if gateway_state not in ("staged", "available"):
+            raise DomainError("invalid_gateway_state", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET gateway_instance_id = ?,"
+                " gateway_generation = ?, gateway_upstream = ?,"
+                " gateway_state = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ?"
+                " AND owner_id = ? AND attempt_id = ?"
+                " AND pending_attempt_id = ? AND state = 'starting'",
+                (_text(gateway_instance_id), _text(gateway_generation),
+                 _text(gateway_upstream), gateway_state, int(now),
+                 _text(workspace_id), int(generation), _text(owner_id),
+                 _text(attempt_id), _text(pending_attempt_id)))
             if cursor.rowcount != 1:
                 return None
             return self._worker_lease_row(_text(workspace_id))
@@ -1374,7 +1460,8 @@ class Store:
                 "UPDATE worker_leases SET state = 'ready',"
                 " gateway_state = 'unavailable', gateway_instance_id = '',"
                 " gateway_generation = '', gateway_upstream = '',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " heartbeat_at = ?, lease_expires_at = ?, updated_at = ?"
                 " WHERE workspace_id = ? AND generation = ?"
@@ -1394,6 +1481,62 @@ class Store:
                 " WHERE workspace_id = ? AND generation = ?"
                 " AND state = 'starting' AND container_id <> ''",
                 (int(now), _text(workspace_id), int(generation)))
+        return cursor.rowcount == 1
+
+    def fence_unknown_gateway_refresh(
+            self, workspace_id: str, generation: int, expected_owner: str,
+            previous_attempt_id: str, owner_id: str, attempt_id: str,
+            now: int) -> WorkerLease | None:
+        """远程 ensure/restore 前或结果未知：持久本轮精确 attempt 并冻结。
+
+        ready 与 starting 共用同一归属语义：只把本轮将要发出/已发出的
+        attempt 写入租约并转为立即到期的 ``starting``，不按目标猜测候选、
+        不结算 Run。远程调用前先调用本方法；控制进程随后在任意时刻退出，
+        下一所有者都能按 ``pending_attempt_id`` 槽位解析 provisioner 持久
+        的真实候选。代次递增使旧 owner 的迟到写回与清理 CAS 全部失效，
+        CAS 失败返回 None，调用方不得覆盖已接管的新代次。
+        """
+        if not isinstance(previous_attempt_id, str):
+            raise DomainError("invalid_argument", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'starting', owner_id = ?,"
+                " generation = generation + 1, attempt_id = ?,"
+                " lease_expires_at = ?, updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ? AND owner_id = ?"
+                " AND attempt_id = ? AND state IN ('ready', 'starting')"
+                " AND pending_attempt_id = ''",
+                (_text(owner_id), _text(attempt_id), int(now), int(now),
+                 _text(workspace_id), int(generation),
+                 _text(expected_owner), previous_attempt_id))
+            if cursor.rowcount != 1:
+                return None
+            return self._worker_lease_row(_text(workspace_id))
+
+    def rollback_gateway_refresh_attempt(
+            self, workspace_id: str, generation: int, owner_id: str,
+            attempt_id: str, previous_attempt_id: str, now: int,
+            lease_seconds: int) -> bool:
+        """远程调用确定失败：撤销发出前的 attempt 预占并恢复 ready。
+
+        只匹配本次预占的 generation/owner/attempt 且没有待收口槽位；
+        CAS 失败说明已被其他管理者接管，调用方不得覆盖。恢复后旧 gateway
+        标记 unavailable，下一次首屏重新刷新；在途 Run 与实例身份不动。
+        """
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise DomainError("invalid_argument", 400)
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE worker_leases SET state = 'ready', attempt_id = ?,"
+                " gateway_state = 'unavailable', lease_expires_at = ?,"
+                " updated_at = ?"
+                " WHERE workspace_id = ? AND generation = ? AND owner_id = ?"
+                " AND attempt_id = ? AND state = 'starting'"
+                " AND pending_attempt_id = ''",
+                (_text(previous_attempt_id),
+                 int(now) + int(lease_seconds), int(now),
+                 _text(workspace_id), int(generation), _text(owner_id),
+                 _text(attempt_id)))
         return cursor.rowcount == 1
 
     def mark_worker_gateway_available(
@@ -1434,7 +1577,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ?"
                 " WHERE workspace_id = ? AND owner_id = ? AND generation = ?"
@@ -1469,7 +1613,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ? WHERE "
                 + where,
@@ -1551,7 +1696,8 @@ class Store:
                 " upstream = '', service_token = '', active_requests = 0,"
                 " gateway_instance_id = '', gateway_generation = '',"
                 " gateway_upstream = '', gateway_state = 'disabled',"
-                " attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+                " attempt_id = '', pending_attempt_id = '',"
+                " cleanup_purpose = '', cleanup_scope = '',"
                 " cleanup_worker_created = 0, cleanup_gateway_created = 0,"
                 " lease_expires_at = 0, updated_at = ? WHERE "
                 + where,
@@ -1646,11 +1792,17 @@ class Store:
     # -- 短请求租约 ---------------------------------------------------------
 
     def begin_worker_request_lease(self, workspace_id: str, ttl_seconds: int,
-                                   *, now: int | None = None) -> str:
+                                   *, now: int | None = None,
+                                   require_admission: bool = False) -> str:
         """登记一条有期限的在途请求租约；调用方必须在 finally 释放。
 
         租约只证明“control 正在向该 workspace 转发一个同步短请求”，不授予
         任何业务权限。过期行在下次登记时顺带清理。
+
+        ``require_admission=True`` 用于新 workspace 请求：屏障检查与登记在
+        同一个 ``BEGIN IMMEDIATE`` 事务内完成。屏障前登记必然被更新计数看到，
+        屏障后登记必然被拒绝，二者之间不存在“零计数放行后再起流”的空窗。
+        既有 Run 的 stop/events/answer 收尾不传此标志，屏障不得阻止其完成。
         """
         workspace_id = _text(workspace_id)
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 3600:
@@ -1658,6 +1810,8 @@ class Store:
         stamp = _now() if now is None else int(now)
         lease_id = uuid.uuid4().hex
         with self._transaction():
+            if require_admission:
+                self._require_admission_open_locked()
             self._connection.execute(
                 "DELETE FROM request_leases WHERE expires_at <= ?", (stamp,))
             self._connection.execute(
@@ -1715,10 +1869,11 @@ class Store:
             "  started_at, owner_id, generation, lease_expires_at, updated_at,"
             "  last_activity_at, active_requests, upstream, service_token,"
             "  gateway_instance_id, gateway_generation, gateway_upstream,"
-            "  gateway_state, attempt_id, cleanup_purpose, cleanup_scope,"
+            "  gateway_state, attempt_id, pending_attempt_id,"
+            "  cleanup_purpose, cleanup_scope,"
             "  cleanup_worker_created, cleanup_gateway_created)"
             " VALUES (?, '', ?, 'starting', ?, ?, ?, 1, ?, ?, ?, 0, '', '',"
-            "         '', '', '', 'disabled', '', '', '', 0, 0)"
+            "         '', '', '', 'disabled', '', '', '', '', 0, 0)"
             " ON CONFLICT(workspace_id) DO UPDATE SET"
             "  container_id = '', config_version = excluded.config_version,"
             "  state = 'starting', heartbeat_at = excluded.heartbeat_at,"
@@ -1730,7 +1885,8 @@ class Store:
             "  active_requests = 0, upstream = '', service_token = '',"
             "  gateway_instance_id = '', gateway_generation = '',"
             "  gateway_upstream = '', gateway_state = 'disabled',"
-            "  attempt_id = '', cleanup_purpose = '', cleanup_scope = '',"
+            "  attempt_id = '', pending_attempt_id = '',"
+            "  cleanup_purpose = '', cleanup_scope = '',"
             "  cleanup_worker_created = 0, cleanup_gateway_created = 0",
             (workspace_id, int(config_version), now, now, owner_id,
              now + lease_seconds, now, now))
@@ -3197,6 +3353,7 @@ def _worker_lease(row: sqlite3.Row | None) -> WorkerLease | None:
         gateway_upstream=row["gateway_upstream"],
         gateway_state=row["gateway_state"],
         attempt_id=row["attempt_id"],
+        pending_attempt_id=row["pending_attempt_id"],
         cleanup_purpose=row["cleanup_purpose"],
         cleanup_scope=row["cleanup_scope"],
         cleanup_worker_created=bool(row["cleanup_worker_created"]),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -11,6 +12,8 @@ from easel.control import cli
 from easel.control.runtime import RuntimeManager, RuntimeUnavailable
 from easel.control.store import Store
 from easel.control.types import DomainError, WorkerHandle
+from easel.control.workspace_api import WorkspaceApi
+from tests.multiuser.test_runtime_gateway import GatewayFake
 
 PROJECT = "easel-workspace-desktop"
 
@@ -297,3 +300,131 @@ def test_admin_drain_sets_barrier_and_resume_clears_it(tmp_path, monkeypatch,
     assert cli.cmd_admin_resume(resume) == 0
     with Store.open(control / "control.sqlite3") as store:
         assert store.admission_barrier() is None
+
+
+class _StreamResponse:
+    status_code = 200
+    headers = {}
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _StreamGateway:
+    """只观察是否真正开始上游流式传输。"""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def request(self, *args, **kwargs):
+        assert kwargs.get("stream") is True
+        self.started.set()
+        return _StreamResponse()
+
+
+class _GatedGatewayFake(GatewayFake):
+    """在 ready 校验的远程 inspect 处暂停，制造 claim 与登记之间的窗口。"""
+
+    def __init__(self, store) -> None:
+        super().__init__(store)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.block_inspect = False
+
+    async def inspect(self, workspace_id: str) -> dict:
+        if self.block_inspect:
+            self.entered.set()
+            await self.release.wait()
+        return await super().inspect(workspace_id)
+
+
+def test_update_barrier_rejects_request_that_passed_ready_claim(tmp_path):
+    """ready claim 后、登记前建立屏障：晚到请求必须拒绝且不起上游流。"""
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            provisioner = _GatedGatewayFake(store)
+            runtime = RuntimeManager(
+                store, provisioner, gateway_required=True,
+                poll_interval=0.01)
+            await runtime.ensure_ready(user.workspace_id, 0)
+            gateway = _StreamGateway()
+            api = WorkspaceApi(runtime, store, gateway, revision=0)
+            provisioner.block_inspect = True
+            task = asyncio.create_task(api.open_stream(
+                user, "GET", "/api/media/output/probe.txt"))
+            await asyncio.wait_for(provisioner.entered.wait(), 2)
+            assert not task.done()
+
+            barrier = store.set_admission_barrier(
+                "update-abcdef123456", "desktop-update", int(time.time()))
+            before = store.drain_status(int(time.time()))
+            assert before["activeRuns"] == 0
+            assert before["activeRequests"] == 0
+            assert before["activeLeases"][0]["state"] == "ready"
+
+            # Update 在零计数后进入 Start；释放请求后只能被拒绝。
+            provisioner.release.set()
+            try:
+                with pytest.raises(DomainError) as error:
+                    await asyncio.wait_for(task, 2)
+                assert error.value.code == "admission_closed"
+            finally:
+                if (task.done() and not task.cancelled()
+                        and task.exception() is None):
+                    await task.result().aclose()
+            assert not gateway.started.is_set()
+            assert store.admission_barrier()["id"] == barrier["id"]
+            assert store.drain_status(int(time.time()))["activeRequests"] == 0
+
+    _run(scenario())
+
+
+def test_update_barrier_counts_request_registered_before_barrier(tmp_path):
+    """屏障前已登记的请求计入活动工作；释放后更新才可继续。"""
+
+    async def scenario() -> None:
+        with Store.open(tmp_path / "db") as store:
+            user = store.create_user("A")
+            now = int(time.time())
+            lease_id = store.begin_worker_request_lease(
+                user.workspace_id, 60, now=now, require_admission=True)
+            store.set_admission_barrier(
+                "update-abcdef123456", "desktop-update", now)
+            assert store.drain_status(now)["activeRequests"] == 1
+            assert store.end_worker_request_lease(lease_id) is True
+            assert store.drain_status(now)["activeRequests"] == 0
+
+    _run(scenario())
+
+
+def test_admin_update_status_reports_active_work_and_workspaces(tmp_path,
+                                                               capsys):
+    """更新前事实读取区分活动 Run/请求与静态 worker lease。"""
+    control = tmp_path / "control"
+    control.mkdir()
+    with Store.open(control / "control.sqlite3") as store:
+        actor = store.create_user("A")
+        conversation = store.create_conversation(actor, "临时测试")
+        run = store.reserve_run(actor, conversation.id, "request-1",
+                               "digest-1", 1)
+        store.mark_running(actor, run.id)
+        barrier = store.set_admission_barrier(
+            "update-abcdef123456", "desktop-update", 1000)
+
+    args = SimpleNamespace(control_dir=str(control))
+    assert cli.cmd_admin_update_status(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["barrier"] == barrier
+    assert payload["activeRuns"] == 1
+    assert payload["activeRequests"] == 0
+    assert payload["activeLeaseCount"] == 0
+    assert payload["workspaceIds"] == [actor.workspace_id]
+
+    with Store.open(control / "control.sqlite3") as store:
+        store.finish_run(actor, run.id, "done")
+    assert cli.cmd_admin_update_status(args) == 0
+    settled = json.loads(capsys.readouterr().out)
+    assert settled["activeRuns"] == 0
+    assert settled["activeRequests"] == 0

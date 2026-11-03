@@ -1,0 +1,12 @@
+TREE: b686ea5
+COMMAND: timeout 25 C:\Users\hyh\anaconda3\envs\Agent\python.exe C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r1_live_takeover.py C:\Code\Easel-acceptance
+----
+EXIT=124
+----
+ACTUAL_STATE_AFTER_TIMEOUT (未修改主审探针；探针在自身 late_written 屏障等待)
+DB worker_leases:
+[('78d8d8917a5749068c713cb4baf6ed13', 'starting', 'live-b', 7, 'ac380ca9c69a4955be05bc0b4719d4cb', '')]
+provisioner attempt 记录:
+{"attempt_id":"d91c657e965c4602a1432713a7e05176","config_version":1,"fenced_attempts":["708d3b023d5346b58163afc2b06396ef"],"gateway_created":false,"gateway_generation":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","gateway_instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","gateway_upstream":"http://172.31.0.9:8897","scope":"none","status":"completed","worker_container_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","worker_created":false}
+说明: A 的迟到 attempt 已进入 fenced_attempts，写入在持久化前被拒绝；
+      DB 无 A pending，远端不是 A/pending，未进入红态永久 503。

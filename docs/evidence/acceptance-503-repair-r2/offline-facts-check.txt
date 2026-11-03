@@ -1,0 +1,22 @@
+R2 Update 控制库只读事实读取复核（手工隔离）
+日期：2026-11-02
+
+方法：
+1. 用工作树源码的 Store 在临时目录 C:\Easel\r2-offline-test 建立
+   schema v15 控制库，创建用户并写入 desktop-update 屏障；宿主进程
+   保持连接与 WAL 文件打开（-wal/-shm 存在）。
+2. 用 easel-control:503-r2 镜像、只读根文件系统、只读 bind mount 运行
+   Update 的只读 SQLite 事实脚本：
+   docker run --rm --network none --read-only --user 0:0 \
+     --entrypoint python -v C:/Easel/r2-offline-test:/srv/easel/control:ro \
+     easel-control:503-r2 -c "<offline facts code>" <epoch>
+
+结果（退出码 0）：
+{"activeLeaseCount":0,"activeRequests":0,"activeRuns":0,
+ "barrier":{"id":"update-abcdef123456","reason":"desktop-update",
+            "setAt":1793610859},
+ "workspaceIds":["0b0a2e14743b4171968d7d3ef1f3d69a"]}
+
+结论：在 WAL 仍有活动写者时，只读 SQLite 事实读取可返回屏障、活动
+Run/请求计数与 workspace 清单。临时数据库与目录已清理；未读取或修改
+用户实例。

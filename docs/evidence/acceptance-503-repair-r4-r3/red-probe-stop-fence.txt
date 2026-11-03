@@ -1,0 +1,7 @@
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe C:\Code\Easel\docs\evidence\acceptance-503-review\probe_r4_r2_stop_fence.py C:\Users\hyh\AppData\Local\Temp\easel-r4-r3-red
+BASELINE: 4dd3550 (parent of R4-R3 fix)
+----
+正式 stop 后 attempt 文件及旧 A 围栏均消失
+重启后迟到 A 的正式 ensure 已越过 admission，抵达 prepare_workspace 副作用
+同一旧 A 再次获准 gateway.ensure，并写回 A/pending: {'attempt_id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'worker_container_id': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'gateway_instance_id': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'gateway_generation': 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 'gateway_upstream': 'http://172.31.0.2:8897', 'worker_created': False, 'gateway_created': True, 'scope': 'gateway', 'status': 'pending', 'config_version': 3}
+EXIT=0

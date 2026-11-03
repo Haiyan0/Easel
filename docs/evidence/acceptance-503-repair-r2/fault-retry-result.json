@@ -1,0 +1,30 @@
+{
+  "result": "R2_FAULT_RETRY_PASS",
+  "project": "easel-r2f-beb9954d",
+  "barrier_id": "update-abcdef123456",
+  "managed_baseline_source": "existing",
+  "managed_baseline_count": 3,
+  "old_provisioner_pid": "59918",
+  "old_provisioner_stopped": true,
+  "update_exit": 0,
+  "resume_phase": true,
+  "old_identity_required": false,
+  "new_provisioner_pid": "61274",
+  "new_provisioner_cwd": "/mnt/c/Code/Easel/.claude/worktrees/acceptance-503-repair",
+  "control_image_before": "sha256:9272b5562d2d9bfbdeef1d60e3ccb910dc5f90ccc24e79802ad9178548d769d2",
+  "control_image_after": "sha256:fabe6b75835a93e31112f51b5508052a391a5f0d25dd827cbe048a6f95261964",
+  "control_runtime_sha256": "73702e19626fcd56159af65de4cdb0f95fa8eb30743afabbc3a26e6f1164b7ab",
+  "provisioner_source_sha256": "f229ec30e619030fe0082885d1006c36cc24b1853cc3b85a2dacb755b1042103",
+  "first_screen_status": {
+    "/api/accounts": 200,
+    "/api/ideas": 200,
+    "/api/outputs": 200,
+    "/api/personas": 200,
+    "/api/schedule": 200,
+    "/api/status": 200
+  },
+  "chat_state": "done",
+  "chat_marker": true,
+  "stop": "drain_verified=settled",
+  "cleanup": "containers/volumes/network/directories removed"
+}

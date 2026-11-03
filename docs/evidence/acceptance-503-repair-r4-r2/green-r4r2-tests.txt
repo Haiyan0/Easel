@@ -1,0 +1,26 @@
+TREE: b686ea5
+COMMAND: C:\Users\hyh\anaconda3\envs\Agent\python.exe -m pytest tests/multiuser/test_attempt_ownership_r4r2_503.py -v
+----
+============================= test session starts =============================
+platform win32 -- Python 3.10.12, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\hyh\anaconda3\envs\Agent\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Code\Easel-acceptance
+configfile: pytest.ini
+plugins: anyio-4.12.1, logfire-4.41.0, asyncio-1.4.0
+asyncio: mode=strict, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 11 items
+
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_commit_without_record_persists_execution_fence PASSED [  9%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_active_attempt_record_is_committed_not_fenced PASSED [ 18%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_fenced_attempt_cannot_create_gateway_side_effects PASSED [ 27%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_fence_survives_new_attempt_record PASSED [ 36%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_commit_of_unknown_attempt_keeps_committed_record PASSED [ 45%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_legacy_record_commit_fences_different_attempt PASSED [ 54%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_live_takeover_fences_late_ensure_before_side_effects PASSED [ 63%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_live_takeover_fences_late_restore_before_side_effects PASSED [ 72%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_unknown_result_before_takeover_fences_late_attempt PASSED [ 81%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_cancel_before_takeover_does_not_resurrect_late_attempt PASSED [ 90%]
+tests/multiuser/test_attempt_ownership_r4r2_503.py::test_interrupted_takeover_commit_fences_both_attempts PASSED [100%]
+
+============================= 11 passed in 0.61s ==============================
+EXIT=0

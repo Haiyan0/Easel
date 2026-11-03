@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_attempt_overwrite.py", line 61, in <module>
+    main()
+  File "C:\Code\Easel\docs\evidence\acceptance-503-review\probe_attempt_overwrite.py", line 41, in main
+    provisioner._record_attempt(
+  File "C:\Code\Easel\.claude\worktrees\acceptance-503-repair\deploy\multiuser\provisioner.py", line 2164, in _record_attempt
+    self._record_noop_attempt(
+  File "C:\Code\Easel\.claude\worktrees\acceptance-503-repair\deploy\multiuser\provisioner.py", line 2217, in _record_noop_attempt
+    raise ProvisionerError("gateway_cleanup_pending")
+acceptance_503_provisioner_probe.ProvisionerError: gateway_cleanup_pending

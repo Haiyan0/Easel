@@ -2388,6 +2388,32 @@ def cmd_admin_barrier_status(args) -> int:
     return 0
 
 
+def cmd_admin_update_status(args) -> int:
+    """只读输出更新决策所需的事实：屏障、活动工作与本项目 workspace。
+
+    活动 Run/请求决定替换前是否需要有界等待；worker lease 只作为诊断
+    信息，静态坏租约不能阻塞现场修复。
+    """
+    try:
+        with Store.open(_control_db(args.control_dir)) as store:
+            barrier = store.admission_barrier()
+            status = store.drain_status(int(time.time()))
+            workspace_ids = store.list_workspace_ids()
+    except DomainError as error:
+        return _report(error)
+    except Exception:  # noqa: BLE001 - 更新前事实读取失败必须失败关闭
+        print("错误：update_status_failed", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "barrier": barrier,
+        "activeRuns": status["activeRuns"],
+        "activeRequests": status["activeRequests"],
+        "activeLeaseCount": len(status["activeLeases"]),
+        "workspaceIds": workspace_ids,
+    }, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 def cmd_serve_control(args) -> int:
     """启动 control HTTP 服务；应用在 lifespan 中管理自己的数据库线程。"""
     try:
