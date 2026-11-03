@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <strong>简体中文</strong> · <a href="README_EN.md">English</a>
+  <strong>简体中文</strong> · <a href="docs/windows-desktop-operations.zh-CN.md">部署与运维</a>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 
 <p align="center">
   <a href="https://zju-real.github.io/Easel/"><img src="https://img.shields.io/badge/Easel-Project_Page-F05A3C?style=flat-square&logo=googlechrome&logoColor=white" alt="Easel Project Page"></a>
-  <img src="https://img.shields.io/badge/OpenClaw-powered-111827?style=flat-square" alt="Powered by OpenClaw">
+  <img src="https://img.shields.io/badge/Agent-Multi_Harness-111827?style=flat-square" alt="多执行引擎">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
   <a href="docs/skill-function-mapping.md"><img src="https://img.shields.io/badge/Skills-113-0F9D8A?style=flat-square" alt="113 Skills"></a>
   <a href="https://github.com/ZJU-REAL/Easel/stargazers"><img src="https://img.shields.io/github/stars/ZJU-REAL/Easel?style=flat-square&color=F6C344" alt="GitHub Stars"></a>
@@ -39,9 +39,23 @@
 
 ![Easel 产品宣传海报](assets/readme/poster.png)
 
+## 先从这里开始
+
+本仓库基于 [ZJU-REAL/Easel](https://github.com/ZJU-REAL/Easel) 迭代，加入多人登录、独立工作区、受管模型代理与 Docker Desktop 装配。当前多人功能分支是 **`feat/multiuser-task1-store`**，不要默认 `main` 或上游 release 包含这些改动。上方原项目演示与社区链接保留用于介绍来源。
+
+| 你想做什么 | 从哪里开始 |
+|---|---|
+| Windows 上部署多人实例 | [Windows Docker Desktop 手册](docs/windows-desktop-operations.zh-CN.md)：第 0～6 节 |
+| 已部署，想启停、查日志、备份或更新 | 同一手册第 7～10 节，更新在原源码目录完成 |
+| Linux 单人 Docker / 多人服务器准备 | [Linux Docker 手册](docs/linux-docker-operations.zh-CN.md)，注意两种模式的区别 |
+| 本机单人使用或更换执行引擎 | 下方快速开始与 [Agent 底座说明](docs/agent-harnesses.md) |
+| 验收多人功能 | [用户验收单](docs/windows-multiuser-acceptance.zh-CN.md) |
+
+**当前状态（2026-11-03）：** Windows Docker Desktop 的多人登录、真实 Harness 聊天、工作区隔离、故障恢复和运维流程已按组验证，验收修复已合并，用户确认本机聊天正常。原生 Linux 多人生命周期装配、目标宿主防火墙/IPv6、XFS 配额、容器 Chromium 沙箱等仍有未关闭门槛；不据此宣称生产环境可直接发布。技能和平台操作还取决于相应服务、凭证及授权，接口存在不代表所有外部平台都已实测。
+
 ## 🎨 Easel 是什么
 
-Easel 是一个面向社交媒体创作者的开源内容工作台。它把 OpenClaw Agent、账号画像、内容技能和真实的媒体工具接在一起，让 Agent 不只回答“应该怎么做”，而是直接把内容做出来并归档，且可实现直接/按需发布。
+Easel 是一个面向社交媒体创作者的开源内容工作台。它把 Agent 执行引擎、账号画像、内容技能和媒体工具接在一起，让 Agent 不只回答“应该怎么做”，而是直接把内容做出来并归档，且可实现直接/按需发布。
 
 你可以把它理解成一个会记住你的内容搭档：它了解账号定位、受众、风格、平台限制和历史表现，从热点发现一直陪你做到发布，再把结果带回下一次创作。
 
@@ -55,7 +69,7 @@ Easel 围绕五个连续工作流展开：**发现**适合账号的热点与机�
 #### 📌 使用提示与研究愿景
 
 > - **推荐使用 Web 前端**：前端提供完整的会话、素材、账号、画像、内容库和发布管理能力，体验和功能比单独使用 CLI 更全面，也是我们推荐的使用方式；部分终端专有的显示问题见[已知问题](docs/known-issues.md)。
-> - **谨慎自动发布到小红书**：小红书平台可能检测自动化操作，存在验证、限流或账号风控风险；建议使用预览与发布前检查，并由用户确认后手动发布，其他平台正常。
+> - **谨慎自动发布到小红书**：小红书平台可能检测自动化操作，存在验证、限流或账号风控风险；建议使用预览与发布前检查，并由用户确认后手动发布。其他平台也应先在本人授权账号上验证。
 > - **从研究走向真实生活**：Easel 是我们将研究成果应用到真实社媒创作场景的一次实践。后续我们会继续研究 AI 在社媒场景中的社交智能，让 Agent 更好地理解创作者、受众与真实互动。
 
 ## ✨ 为什么是 Easel
@@ -201,69 +215,82 @@ README 的品牌图、海报、案例图片和视频统一保存在 `assets/read
 
 ## 🚀 快速开始
 
-环境要求：Linux、macOS 或 Windows 10/11、Python 3.10 及以上、Python `venv` 模块和 `git`。安装向导会检查 Node.js 24.16+（24.x）、26.1+（26.x）或 27+（25.x 与 26.0 不兼容）、FFmpeg、Playwright/Chromium；缺少 Node.js 时会按系统给出安装引导。
+### 1. 获取当前代码：只保留一个仓库目录
 
-```bash
-git clone https://github.com/ZJU-REAL/Easel.git
-cd Easel
-bash setup.sh
-```
-
-Windows 原生安装请在 PowerShell 中执行（不需要 WSL）：
+新电脑的 PowerShell：
 
 ```powershell
-git clone https://github.com/ZJU-REAL/Easel.git
-cd Easel
+git clone --branch feat/multiuser-task1-store --single-branch https://github.com/Haiyan0/Easel.git C:\Code\Easel
+Set-Location C:\Code\Easel
+```
+
+已有 `C:\Code\Easel` 就直接进入，不再 clone，也不创建 `Easel-acceptance` / `Easel-next`。Linux 使用手册中的 `/srv/easel/src`。用 `git rev-parse --short HEAD` 记录实际版本。
+
+### 2. 多人使用：Docker Desktop 路线
+
+准备 Windows 11、Docker Desktop（Linux containers）、WSL2、Git 和 ngrok。按 [Windows 手册](docs/windows-desktop-operations.zh-CN.md) 顺序完成：
+
+1. 核对 Windows/WSL 使用同一个 Docker Engine。
+2. 在当前仓库构建 control、worker、gateway 三个镜像，记录固定镜像 ID。
+3. 初始化独立数据目录和专用卷，创建 master key / 签名 key。
+4. 启动服务，使用 ngrok HTTPS 地址登录。
+5. 创建首个管理员，由管理员配置模型并邀请成员。
+6. 验证一条新聊天、历史、停止操作与两用户隔离。
+
+Docker 镜像包含 Python、前端和受管 Harness；这条路线**不运行 `setup.ps1`，不需要项目内 `.venv`**。配置、数据和 Key 放在仓库外，不能提交到 GitHub。完整命令与参数以手册为准，不直接运行参考 Compose 代替初始化和身份校验。
+
+### 3. 单人使用：本机原生路线
+
+这是原有 local 模式，默认在 `http://localhost:7860` 使用，没有多人登录隔离。不要把无认证的 local 服务直接暴露公网。
+
+Windows PowerShell：
+
+```powershell
+Set-Location C:\Code\Easel
 Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
+.\.venv\Scripts\easel.exe doctor
+.\.venv\Scripts\easel.exe web
 ```
 
-Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.16+（24.x）、26.1+（26.x）或 27+、Git 和 FFmpeg；25.x 与 26.0 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
-
-安装器支持 Windows 自带的 PowerShell 5.1，安装后可直接运行 `.venv\Scripts\easel.exe web` 启动工作台。原生安装与 Web/CLI 入口已经提供；各技能及浏览器发布的 Windows 全链路兼容仍在持续完善。
-
-`bash setup.sh` 是可重复运行的引导式安装器，直接执行即可，不需要先手动安装 Easel 依赖。安装过程中会：
-
-1. 检查 Python、Python `venv`、Node.js 和 Git；FFmpeg 缺失时会尝试通过系统包管理器安装，装不上只会降级提示（视频/音频类技能不可用），不再中断安装。
-2. 询问是否创建或复用项目虚拟环境 `.venv/`；默认选择 `Y`。如果系统缺少 `venv`，会提示安装对应系统包（例如 Debian/Ubuntu 的 `python3-venv`）。
-3. 检查或安装 OpenClaw，并创建独立的 `easel` profile，不覆盖用户已有的 `~/.openclaw/`。
-4. 安装 Python、Web、媒体和浏览器发布依赖，构建 React Web 工作台并安装 Chromium。Python 依赖与前端构建失败会停止；Chromium 下载失败只降级提示（浏览器登录/发布不可用）。
-5. 同步 skills、校验 OpenClaw 配置并启动 gateway。
-
-**模型 API Key 在浏览器里配，安装器不再在终端询问。** 装完运行 `easel web`，首次打开会直接停在「设置 → 模型配置」，填入 Key 保存即可 —— Easel 会自动写好 OpenClaw 配置并重启 gateway，不需要再跑一遍 `setup.sh`。相比终端向导，这里还能拉取可用模型列表、做连通性自测。也可以直接编辑 `.env` 填好 Key，再运行 `easel doctor` 复检。
-
-安装器全程非交互（只有「是否创建 `.venv`」一问，非交互环境下按默认值），适合 CI 与自动化。非致命问题（FFmpeg、Chromium、gateway 启动、模型未配置等）会收集起来在结尾汇总，并写入 `outputs/_install/last-install.json` 供 `easel doctor` 复述，安装本身仍以 0 退出。若希望这些问题直接让安装失败，设 `EASEL_SETUP_STRICT=1`。
-
-安装完成后，`easel` 命令安装在项目的 `.venv` 中。先激活虚拟环境再运行（每次新开终端都要先激活）：
+Linux / macOS（已获取本仓库代码）：
 
 ```bash
-source .venv/bin/activate    # 激活后 easel 命令才可用（Windows：.venv\Scripts\activate）
-easel doctor                 # 检查运行环境
-easel ping                   # 实际测试 gateway 和 Agent
-easel web                    # 启动 Web 工作台
-# 或：easel chat              # 启动终端对话
-```
-
-> 如果提示 `easel: command not found`，就是虚拟环境没激活。也可以不激活、直接用完整路径运行，例如 `.venv/bin/easel doctor`（Windows：`.venv\Scripts\easel.exe doctor`）。
-
-启动 Web 工作台后访问 `http://localhost:7860`。安装完成后可以运行 `easel doctor` 检查环境，
-运行 `easel ping` 检查 gateway 和 Agent 连通性。
-
-如果 Easel 运行在 VSCode Remote SSH 连接的服务器上，需要在 VSCode 的“端口”面板
-转发服务器端口 `7860`，再打开面板显示的本地转发地址（本地端口可能不同）。
-服务器的 `localhost` 不是你电脑的 `localhost`；不要为了访问而把无认证的工作台暴露到公网。
-
-安装器会统一安装 Web、媒体处理和浏览器发布所需的 Python 依赖：
-
-```bash
-python3 -m venv .venv
+cd /path/to/Easel
+bash setup.sh
 source .venv/bin/activate
-python3 -m pip install -e .
-python3 -m playwright install chromium
-# 手动安装时仍需提前安装 ffmpeg
+easel doctor
+easel web
 ```
+
+原生安装器会准备项目虚拟环境、依赖与前端，默认装配独立 OpenClaw profile；媒体和浏览器技能另依赖 FFmpeg、Playwright/Chromium。缺失或不可用的能力按安装诊断排查。Codex、OpenCode、通用 ACP 与仅聊天模式的选择见 [Agent 底座说明](docs/agent-harnesses.md)。它们与 Docker 多人部署中管理员固定的受管 Harness 配置不同。
+
+### 4. 以后怎样更新
+
+**先正常停止和备份校验，再拉取代码**。运行中的 provisioner 使用源码目录，不能一边运行一边热改文件。确认没有未保存修改后，在同一仓库执行：
+
+```powershell
+Set-Location C:\Code\Easel
+git status --short
+git pull --ff-only origin feat/multiuser-task1-store
+```
+
+这两条 Git 命令只更新代码，**不会构建镜像、迁移数据或重启服务**。接着按 [Windows 手册第 10 节](docs/windows-desktop-operations.zh-CN.md#10-以后怎样更新停机--备份--拉取--构建--启动) 构建新版并用匹配备份启动。更新失败不要删卷、重新初始化 Key 或强行清屏障；回退代码也不等于回滚数据库。
 
 ## ⚙️ 配置说明
+
+### 多人 control 模式
+
+- 管理员在 Web 设置中发布全体默认模型，按能力允许成员使用个人覆盖；普通成员不能修改管理员配置。
+- Key 加密保存在 control 中；worker 通过本 workspace / 本 Run 的短期 broker token 调用模型，不接收供应商真实 Key。
+- 执行引擎、命令和模型目录由受管配置与固定 worker 镜像共同约束，不自动读取开发电脑的 `.env`、HOME 或 Harness 登录态。
+- `manual` / `automated` 发布策略是显式部署参数；先采用手册中的人工审核路线，平台登录与发布需本人授权。
+- `.env` 和已有 local 历史不会自动导入多人实例。显式迁移见 [多人部署与迁移说明](docs/multiuser-deployment.zh-CN.md)。
+
+### 单人 local 模式
+
+以下 `.env`、OpenClaw profile 和向量索引配置仅适用于本机 local 路线，不能用它们替代多人管理员配置。
+
 
 最小配置只需要在项目根目录 `.env` 中提供一个可用的 LLM：
 
@@ -356,30 +383,35 @@ Web 工作台提供同样的能力，并额外管理会话、素材、账号、�
 
 ## 🧬 账号画像
 
-一个画像对应 `profiles/<名字>/` 目录，包含六个维度：定位、风格、受众、平台、偏好与红线、长期记忆。
+local 模式下，一个画像对应 `profiles/<名字>/` 目录，包含六个维度：定位、风格、受众、平台、偏好与红线、长期记忆。
 
 ```bash
 cp -r profiles/_template "profiles/我的账号"
 ```
 
-在 Web 的“画像”页面可以直接创建和编辑；同一画像可以跨多个已登录平台使用。
+在 Web 的“画像”页面创建和编辑；同一画像可以跨多个已登录平台使用。多人模式的画像、内容与浏览器状态落在本人 workspace，不使用开发者仓库的个人目录。
 
 ## 🏗️ 项目结构
 
 ```text
 Easel/
-├── easel/                    Python CLI：chat / web / skill / doctor / ping
-├── web/                      FastAPI 后端与 React 工作台
-├── skills/builtin/           发现、策划、制作、发布、归因技能
-├── skills/shared/            跨技能脚本与参考资料
-├── assets/                   品牌、README 媒体与用户导入素材
-├── profiles/                 账号画像（每个画像一个目录）
-├── outputs/                  内容项目与最终产物
-├── agents/                   共享 Agent 工作区、底座配置与同步脚本
-└── docs/                     能力规范、能力地图与架构文档
+├── easel/control/           登录、权限、配置、会话、任务、broker 与 relay
+├── easel/worker/            隔离执行、持久历史、任务与浏览器状态
+├── easel/gateway/           control 到 worker 的验签与精确路由
+├── easel/harnesses/         OpenClaw / Codex / OpenCode / ACP 等适配
+├── web/                    后端与 React/TypeScript 工作台
+├── deploy/desktop/         Docker Desktop 初始化、启停、备份、恢复与更新
+├── deploy/multiuser/       worker 镜像、provisioner、sidecar 与出口策略
+├── skills/                 内置技能、共享脚本与参考资料
+├── tests/                  Python、前端与隔离集成验证
+├── docs/                   运维手册、设计、验收与开发参考
+├── profiles/               local 画像模板及本机画像
+└── outputs/                local 产物；多人产物存于外部 workspace
 ```
 
-Easel 使用独立的 `easel` OpenClaw profile，不会覆盖你本机已有的 OpenClaw 配置。Web 默认运行在 `7860`；gateway 端口由 OpenClaw 决定（非默认 profile 会分配哈希端口，如 `easel` → `37289`，不是 `18789`），Easel 会自动解析，无需手配。
+多人请求链路：浏览器 → HTTPS → control → gateway → worker；模型调用由 worker → sidecar → control broker → 供应商完成。Docker Desktop 上只有 control 发布回环端口，worker/gateway 不对宿主发布端口。这里的隔离 gateway 与 local OpenClaw gateway 是不同组件。
+
+源码与持久数据分开。数据库、master key、签名私钥、模型 Key、Cookie、邀请和浏览器 profile 不入 Git；备份包含敏感材料，需私密保存。不要用 `docker system prune --volumes` 作为重装方式。
 
 ## 📑 文档
 
@@ -392,14 +424,17 @@ Easel 使用独立的 `easel` OpenClaw profile，不会覆盖你本机已有的 
 - [已知问题](docs/known-issues.md)
 - [完整致谢](docs/ACKNOWLEDGMENTS.md)
 
-## 🗺️ 开发计划（Roadmap）
+## 🗺️ 当前进展与后续工作
 
-按优先级排列，欢迎在 Issue / PR 中认领或补充：
+- [x] 复用原工作台，接入邀请登录、身份切换与 workspace 隔离。
+- [x] 接通受管 Harness、会话历史、可恢复事件、权限回答及任务停止。
+- [x] Docker Desktop 的 control / gateway / worker / sidecar 装配与恢复。
+- [x] 完整备份校验、恢复、受控更新和中文运维文档。
+- [ ] 原生 Linux 多人启停与升级入口的等价验收。
+- [ ] 目标 Linux 的配额、防火墙、IPv6、Chromium 沙箱等生产门槛。
+- [ ] 按明确授权继续验证真实供应商与各平台登录/发布，并完善兼容性。
 
-- [ ] **1. 适配 Windows 系统** —— 完善原生 Windows 下安装、路径与编码、浏览器发布等全链路兼容。
-- [ ] **2. 安装简易化** —— 降低上手门槛，减少手动步骤，提供更顺滑的一键安装体验。
-- [ ] **3. 优化页面 Agent 交互** —— 改进 Web 工作台的对话交互、加载逻辑与流式反馈等体验细节。
-- [ ] **4. 适配更多 Agent Harness** —— 支持 OpenClaw 之外的更多 Agent 运行框架，例如 Claude Code、DeepSeek harness、Codex 等。
+开发前先看 [Agent 适配](docs/agent-harnesses.md)、[提示词分层](docs/prompt-stack.md) 和 [技能接口](docs/SKILL-SPEC.md)。历史故障材料位于 docs 的 evidence / 审计目录，不作为日常部署命令使用。
 
 ## 🙏 致谢
 
