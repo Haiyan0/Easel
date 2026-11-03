@@ -1,10 +1,10 @@
 # Easel Windows 多用户部署与运维手册
 
-适用：Windows 11 + Docker Desktop Linux containers + WSL2；命令在 PowerShell 执行。功能分组验收基线：`4382180862e28d43f2974e32a618093c847ec262`（2026-11-02）；本机整合分支为 `feat/multiuser-task1-store`，实际构建版本以 `git rev-parse HEAD` 为准。整合包含尚待复审的 6A 修复与证据，不代表正式发布验收通过。
+适用：Windows 11 + Docker Desktop Linux containers + WSL2；命令在 **PowerShell** 执行。2026-11-03 已合入并验证 acceptance 修复，用户已验证聊天。源码统一使用 `C:\Code\Easel`，远程为 `https://github.com/Haiyan0/Easel.git` 的 `feat/multiuser-task1-store` 分支。不要默认 main 包含这组功能。
 
-本文以邀请登录、独立 workspace、Harness 聊天为主线，按首次部署→日常运维→备份恢复→更新上线阅读。Desktop 功能/运维已在隔离环境按组验收；真实 DeepSeek 与真实平台发布仍需用你的受管配置和授权验证。原 Web 的对话、内容库、画像、技能、账号与发布/导出入口已接通；服务未配置或上游不可用时返回明确原因，不再以“功能未接通”占位。[Linux 服务器手册](linux-docker-operations.zh-CN.md)。
+**第一次使用按第 0～6 节；每天启停看第 7 节；以后更新只看第 10 节。** 不再创建 acceptance、next 或 worktree 代码副本。程序目录与数据目录分开：更新 Git 不会替你备份数据库。
 
-本轮 6A 整体验收尚未完成：启动并发故障超时、正式备份恢复升级和受控账号发布整合仍待收口。可先部署独立实例做[用户验收](windows-multiuser-acceptance.zh-CN.md)，不要直接升级承载既有数据的实例。本文第 8～10 节保留运维流程，当前版本的完整演练通过前，不视为生产迁移保证。
+原 Web 的登录、独立 workspace、聊天、内容库、画像、技能及账号/发布入口已分组验收。真实供应商及平台行为以本人受管配置和授权实测为准；Desktop 通过不等于 Linux 生产门槛通过。Linux 的 XFS、防火墙、IPv6、Chromium 沙箱等仍见 [Linux 手册](linux-docker-operations.zh-CN.md)，未通过项不冒充已通过。
 
 <a id="9-完整-desktop-多人已装配的正式路线"></a>
 <a id="9-windows-上的多人验证做到哪一步"></a>
@@ -25,27 +25,23 @@ wsl --install
 
 安装并启动 [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/)，使用 Linux containers，在 Settings → Resources → WSL Integration 中启用 Ubuntu。安装 Git 和 [ngrok](https://ngrok.com/docs/getting-started/)，按官方账号引导完成认证；authtoken 不写进文档、Git 或截图。
 
-新电脑获取维护者交付的源码：
+**这台电脑已经有 `C:\Code\Easel`，不要再次 clone，直接进入该目录。** 只有新电脑才执行：
 
 ```powershell
-git clone https://github.com/Haiyan0/Easel.git C:\Code\Easel
-Set-Location C:\Code\Easel
-git fetch origin
-git checkout --detach 4382180862e28d43f2974e32a618093c847ec262
-if ($LASTEXITCODE -ne 0) { throw '远端尚未提供此提交，请向维护者获取源码/分支' }
+git clone --branch feat/multiuser-task1-store --single-branch https://github.com/Haiyan0/Easel.git C:\Code\Easel
+if ($LASTEXITCODE -ne 0) { throw '下载失败，请检查 GitHub 网络或权限' }
 ```
 
-用途：获取明确版本，不默认 main 已有多人功能。已有仓库先核对 `git status --short` 和 `git rev-parse HEAD`，不覆盖未提交改动。
-
-本机已有 `C:\Code\Easel` 时，跳过 clone/fetch/checkout。维护者将实施分支合并到 `feat/multiuser-task1-store` 后，直接在根目录核对源码；不再需要创建 `Easel-acceptance` worktree：
+已有目录只检查，不覆盖本地文件：
 
 ```powershell
 Set-Location C:\Code\Easel
-git branch --show-current
-git rev-parse HEAD
-git merge-base --is-ancestor b582d262e6b99f2ea2e5a8a697b5248bd8506e19 HEAD
-if ($LASTEXITCODE -ne 0) { throw '当前源码尚未包含 6A 交付，请先完成本地分支合并' }
+git branch --show-current   # 应为 feat/multiuser-task1-store
+git status --short         # 更新前必须确认没有未保存的修改
+git rev-parse --short HEAD # 当前代码版本，排错时保留这个值
 ```
+
+更新代码按第 10 节做，**运行中不要直接 pull**：provisioner 从源码目录运行，必须先正常 Stop。
 
 安装 WSL 宿主依赖并核对 Engine：
 
@@ -62,19 +58,17 @@ wsl -d $Distro -- docker info --format '{{.ID}}'
 
 ## 1. 变量与前置条件
 
-先完成第 0 节的源码核对。Windows 当前目录与 WSL 的 `$WslRepo` 必须指向同一份源码；`C:\Code\Easel` 对应 `/mnt/c/Code/Easel`。验收隔离通过下面的新 project/端口/数据目录实现，不要求另建源码 worktree。
-
 ```powershell
 Set-Location C:\Code\Easel
 $EaselPython = 'C:\Users\hyh\anaconda3\envs\Agent\python.exe'
-$ProjectName = 'easel-acceptance'
-$DataRoot = 'C:\Easel\acceptance-data'
-$WorkspaceRoot = 'C:\Easel\acceptance-workspaces'
+$ProjectName = 'easel-main'
+$DataRoot = 'C:\Easel\main-data'
+$WorkspaceRoot = 'C:\Easel\main-workspaces'
 $Port = 7863
-$PublicOrigin = 'https://acts-revise-unrented.ngrok-free.dev'
+$PublicOrigin = 'https://替换为你的实际域名.ngrok-free.dev'
 $PublishMode = 'manual'                  # 先做聊天/文件/人工导出；真实自动发布验收前再显式切换
 $Distro = 'Ubuntu-26.04'                  # 实际发行版
-$WslRepo = '/mnt/c/Code/Easel'             # 与上方 Windows 源码目录一致
+$WslRepo = '/mnt/c/Code/Easel'  # 与 Windows 源码路径对应
 $ProvisionerGid = [int]((wsl -d $Distro -- id -g).Trim())
 $DshCommit = '687f282e8625c6b8d11ff58211a90524be2e4317'
 $Release = (git rev-parse HEAD).Trim()
@@ -276,12 +270,12 @@ if ($LASTEXITCODE -ne 0) { throw '邀请签发失败，检查容器/管理员状
 
 ## 7. 日常 start/stop/status/logs
 
-新终端先设置仅当前窗口有效的执行策略，再恢复参数；第 1 节的 Process 策略在关闭窗口后失效，不会自动带到新终端。升级后进入新源码目录，不再从旧目录运行：
+新终端先设置仅当前窗口有效的执行策略，再恢复参数；第 1 节的 Process 策略在关闭窗口后失效，不会自动带到新终端。始终在同一源码目录运行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 Set-Location C:\Code\Easel
-$DataRoot = 'C:\Easel\acceptance-data'  # 必须是本次实例目录，不要加载旧实例参数
+$DataRoot = 'C:\Easel\main-data'  # 必须是本次实例目录，不要加载旧实例参数
 $StartArgs = Import-Clixml (Join-Path $DataRoot 'config\start-args.xml')
 $Repo = (Get-Content (Join-Path $DataRoot 'config\source-root.txt') -Raw).Trim()
 Set-Location $Repo
@@ -398,82 +392,99 @@ if ($LASTEXITCODE -ne 0) { throw '恢复实例启动失败' }
 
 读取恢复邀请文件后登录管理员，重新给成员签发邀请。旧 Cookie 应 401；新 Origin 不匹配的写请求应 403。恢复副本启动后先验证 A/B 历史、配置解密、sentinel 和同会话新 Harness 消息；确认后先 Stop 恢复副本，才允许源再次 Start。
 
-## 10. 固定版本升级与失败回滚
+## 10. 以后怎样更新：停机 → 备份 → 拉取 → 构建 → 启动
 
-### 10.1 获取新代码并提前构建
+这是**原目录更新**路线。第一次部署不用执行这一节。更新期间服务会暂停，先告知其他使用者退出并保存工作。全程在 PowerShell 的 `C:\Code\Easel` 执行。代码仍只保留一份；保留旧镜像和数据备份是为了恢复，不是再复制一个仓库。
 
-先构建/测试再停机；运行中的 provisioner 使用源码目录，不要在原目录直接 checkout/pull 新版本。新目录必须不存在：
+### 10.1 读取自己的部署参数
+
+只需填写你的 DataRoot（第 1 节设置的那个），其余读取上次保存值：
 
 ```powershell
-$OldRepo = (Get-Location).Path
-$NewRelease = '替换为维护者批准的完整提交SHA'
-$NewRepo = 'C:\Code\Easel-next'
-git fetch origin
-if ($LASTEXITCODE -ne 0) { throw '获取新版本失败' }
-git worktree add --detach $NewRepo $NewRelease
-if ($LASTEXITCODE -ne 0) { throw '新版本目录创建失败' }
-Set-Location $NewRepo
-$NewTag = (git rev-parse --short=12 HEAD).Trim()
+Set-Location C:\Code\Easel
+$ErrorActionPreference = 'Stop'
+$DataRoot = 'C:\Easel\main-data'
+$StartArgs = Import-Clixml (Join-Path $DataRoot 'config\start-args.xml')
+$ProjectName = $StartArgs.ProjectName
+$WorkspaceRoot = $StartArgs.WorkspaceRoot
+$Distro = $StartArgs.Distro
+$WslRepo = '/mnt/c/Code/Easel'
+$OldControlImage = $StartArgs.Image
+$OldRevision = (git rev-parse HEAD).Trim()
+git status --short
+```
+
+有本地修改时先保存并处理，不能用 `reset --hard` 或 `clean -fd` 清掉。不要打印或上传 key、Cookie、邀请文件。
+
+### 10.2 正常停止，再备份并验证
+
+```powershell
+.\deploy\desktop\Stop-WorkspaceEasel.ps1 -ProjectName $ProjectName `
+  -DataRoot $DataRoot -Distro $Distro -WslRepo $WslRepo
+if ($LASTEXITCODE -ne 0) { throw '停止未完成，不能继续拉代码' }
+
+$Backup = Join-Path $DataRoot ('backups\before-update-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+.\deploy\desktop\Backup-WorkspaceEasel.ps1 -ProjectName $ProjectName `
+  -DataRoot $DataRoot -WorkspaceRoot $WorkspaceRoot -Image $OldControlImage `
+  -Destination $Backup -Distro $Distro -WslRepo $WslRepo
+if ($LASTEXITCODE -ne 0) { throw '备份失败，停止更新' }
+.\deploy\desktop\Verify-WorkspaceEasel.ps1 -Backup $Backup -Image $OldControlImage -Distro $Distro
+if ($LASTEXITCODE -ne 0) { throw '备份校验失败，停止更新' }
+$OldRevision | Set-Content (Join-Path $DataRoot 'config\previous-revision.txt')
+$StartArgs | Export-Clixml (Join-Path $DataRoot 'config\previous-start-args.xml')
+$Backup | Set-Content (Join-Path $DataRoot 'config\upgrade-backup-path.txt')
+```
+
+预期看到 `drained=True`、`clean_stop=true`、`verified_backup=...`。任一失败就停在当前步骤，不用 Force，也不手工清屏障。
+
+### 10.3 在同一目录获取 GitHub 新版
+
+```powershell
+git switch feat/multiuser-task1-store
+if ($LASTEXITCODE -ne 0) { throw '切换分支失败' }
+git pull --ff-only origin feat/multiuser-task1-store
+if ($LASTEXITCODE -ne 0) { throw '拉取失败或分支分叉，请保留现场排查' }
+$Release = (git rev-parse HEAD).Trim()
+$Tag = $Release.Substring(0, 12)
+```
+
+`--ff-only` 的意思是只接受能直接前进的更新，不会偷偷替你合并冲突。GitHub 网络失败时可重试这一步；不要删除数据库、卷或整个仓库。
+
+### 10.4 构建新版安装包
+
+```powershell
 $DshCommit = '687f282e8625c6b8d11ff58211a90524be2e4317'
-docker build -f deploy/desktop/Dockerfile.control -t "easel-control:$NewTag" .
-if ($LASTEXITCODE -ne 0) { throw '新 control 构建失败' }
-docker build -f deploy/desktop/Dockerfile.gateway -t "easel-gateway:$NewTag" .
-if ($LASTEXITCODE -ne 0) { throw '新 gateway 构建失败' }
-docker build -f deploy/multiuser/Dockerfile.worker `
-  --build-arg "DSH_COMMIT=$DshCommit" -t "easel-worker:$NewTag" .
-if ($LASTEXITCODE -ne 0) { throw '新 worker 构建失败' }
-$NewControlImage = (docker image inspect "easel-control:$NewTag" --format '{{.Id}}').Trim()
-$NewWorkerImage = (docker image inspect "easel-worker:$NewTag" --format '{{.Id}}').Trim()
-$NewGatewayImage = (docker image inspect "easel-gateway:$NewTag" --format '{{.Id}}').Trim()
-Set-Location $OldRepo
+docker build -f deploy/desktop/Dockerfile.control -t "easel-control:$Tag" .
+if ($LASTEXITCODE -ne 0) { throw 'control 构建失败' }
+docker build -f deploy/desktop/Dockerfile.gateway -t "easel-gateway:$Tag" .
+if ($LASTEXITCODE -ne 0) { throw 'gateway 构建失败' }
+docker build -f deploy/multiuser/Dockerfile.worker --build-arg "DSH_COMMIT=$DshCommit" -t "easel-worker:$Tag" .
+if ($LASTEXITCODE -ne 0) { throw 'worker 构建失败' }
+$StartArgs.Image = (docker image inspect "easel-control:$Tag" --format '{{.Id}}').Trim()
+$StartArgs.WorkerImage = (docker image inspect "easel-worker:$Tag" --format '{{.Id}}').Trim()
+$StartArgs.GatewayImage = (docker image inspect "easel-gateway:$Tag" --format '{{.Id}}').Trim()
+$StartArgs.WslRepo = $WslRepo
 ```
 
-用途：准备新版本程序，未改 Harness 时保留 DshCommit。先用独立项目/端口/数据根测试，或恢复备份做灰度；两个项目不能同时写同一 workspace 根。保留旧镜像/源码用于回滚。
+第一次较慢，以后 Docker 会复用缓存。不要随意改 DshCommit，不要加 `--no-cache`，也不要删旧镜像。构建失败时旧数据和备份还在，修正网络/构建问题后重试。
 
-### 10.2 停机、备份和切换
-
-升级顺序（不能跳过备份）：
-
-1. 记录旧版本：`Status-WorkspaceEasel.ps1` 的 `version_*`。
-2. `Stop-WorkspaceEasel.ps1` 完成 drain/停止。
-3. `Backup-WorkspaceEasel.ps1` + `Verify-WorkspaceEasel.ps1`。
-4. 核验目标镜像存在且摘要匹配；可先用坏镜像演练失败（应 `worker_or_gateway_image_mismatch`，数据/Key 不变、屏障保持）。
-5. 用新镜像启动，并显式提供匹配备份：
+### 10.5 用备份证明允许升级，启动后检查
 
 ```powershell
-$OldStartArgs = @{} + $StartArgs
-$OldStartArgs | Export-Clixml (Join-Path $DataRoot 'config\previous-start-args.xml')
-(Get-Location).Path | Set-Content (Join-Path $DataRoot 'config\previous-source-root.txt') -Encoding UTF8
-Set-Location $NewRepo
-.\deploy\desktop\Start-WorkspaceEasel.ps1 `
-  -PublicOrigin $PublicOrigin `
-  -Image $NewControlImage `
-  -WorkerImage $NewWorkerImage `
-  -GatewayImage $NewGatewayImage `
-  -ProjectName $ProjectName -Port $Port `
-  -DataRoot $DataRoot -WorkspaceRoot $WorkspaceRoot `
-  -UpgradeFromBackup $Backup `
-  -PublishMode $PublishMode `
-  -Distro $Distro -WslRepo '/mnt/c/Code/Easel-next' -ProvisionerGid $ProvisionerGid
-if ($LASTEXITCODE -ne 0) { throw '升级失败，保留备份和原卷并排查或恢复' }
-```
-
-预期出现 `upgraded_from_backup=...` 与 `admission_barrier_reopened=...`。升级协议只接受旧 Stop 完成记录、旧配置摘要与备份 manifest 完全匹配；不会无条件 `resume`。在 **compose up 新 control 之前**，`Start` 会通过只读副本读取当前 barrier/Stop 完成记录与 key 指纹，要求备份 `runtime_state.stop` 精确匹配**当前同一轮 Stop**（屏障/项目/旧配置/完成时间）且 key 来源一致；再用只读容器执行完整 `verify-backup`。旧备份、只有 manifest、缺 key/DB、损坏数据或错版本都会在新程序打开/迁移正式 DB 之前失败。随后才启动 control、读取 stop 完成记录并执行 `upgrade-complete`。启动后验证登录、历史、配置解密和同会话新 Harness 消息。
-
-回滚：不要在原卷上强行降 schema。用升级前的匹配备份按第 9 节恢复到新项目/目录，使用旧镜像启动，验证历史和新消息，再停止。
-
-验收新版本后保存日常启动参数：
-
-```powershell
-$StartArgs.Image = $NewControlImage
-$StartArgs.WorkerImage = $NewWorkerImage
-$StartArgs.GatewayImage = $NewGatewayImage
-$StartArgs.WslRepo = '/mnt/c/Code/Easel-next'
+.\deploy\desktop\Start-WorkspaceEasel.ps1 @StartArgs -UpgradeFromBackup $Backup
+if ($LASTEXITCODE -ne 0) { throw '启动失败，保留屏障、数据和备份，查看日志' }
+.\deploy\desktop\Status-WorkspaceEasel.ps1 -ProjectName $StartArgs.ProjectName `
+  -DataRoot $DataRoot -Port $StartArgs.Port -Distro $Distro -ProvisionerGid $StartArgs.ProvisionerGid
+if ($LASTEXITCODE -ne 0) { throw '状态异常，暂不开放使用' }
 $StartArgs | Export-Clixml (Join-Path $DataRoot 'config\start-args.xml')
-$NewRepo | Set-Content (Join-Path $DataRoot 'config\source-root.txt') -Encoding UTF8
+'C:\Code\Easel' | Set-Content (Join-Path $DataRoot 'config\source-root.txt')
 ```
 
-以后从新源码目录操作。只更新 control 且配置摘要未变时可能走匹配的普通 reopen，不一定打印 upgraded_from_backup，应核对 Status 的实际镜像/版本。备份后重开再 Stop 必须重新备份。回滚回到备份时刻，不自动合并升级后新增数据；保留原卷/日志，不手改 schema 或停止记录。
+然后打开原 HTTPS 地址，检查登录、旧历史、一条新聊天、停止按钮。正常更新不重跑 Initialize，不生成新 Key，不重新兑换旧邀请。重开 PowerShell 后使用第 7 节的参数文件。
+
+**重试与回退：** 构建阶段失败可重试构建；启动已部分执行时先查 Status/Logs，不能强行清屏障或重新初始化。旧镜像不保证能打开新版 schema。需要恢复数据时按第 9 节，从升级前已验证备份恢复，原卷先保留；恢复副本与源不能同时写同一 workspace。Git 回到旧提交本身不等于数据库回滚。
+
+`Update-WorkspaceEasel.ps1` 是已有在线项目的受控 control/provisioner 维护入口，带屏障和身份校验；它不代替完整备份，不适合顺便换 worker、gateway 或 schema。初学者统一使用本节的停机更新路线即可。
 
 ## 11. 数据位置与哪些命令会改数据
 
@@ -512,3 +523,9 @@ $NewRepo | Set-Content (Join-Path $DataRoot 'config\source-root.txt') -Encoding 
 | `deployment_publish_mode_invalid`                                       | 登记值不是 manual/automated                         | 检查 deployment.json，不要写入未定义值                                        |
 | `control_port_in_use`                                                   | 无既有 control 时回环端口已被其它进程占用           | 停掉占用进程或换 `-Port`；不要杀未知进程                                    |
 | `control_health_timeout` / `control_unhealthy`                        | control 未健康                                      | 看 `Logs` 和 `docker inspect`；不要自动换替代实例                         |
+
+## 13. 本机验收实例收尾与聊天出口
+
+2026-11-03 验收修复已合入主工作目录。旧 `acceptance-data` / `acceptance-workspaces` 是持久数据，不是垃圾；如需旧聊天，可按第 9 节使用其完整备份恢复。新部署使用第 1 节的 `easel-main`、`main-data`、`main-workspaces`，不会覆盖旧数据；管理员和成员需要重新建立。旧验收服务停止后才使用同一端口启动新服务。
+
+若聊天报未知原因且 broker 返回 502，先查出口。Clash Fake-IP 可能把 `api.deepseek.com` 解析为 `198.18.*`，Easel 会按非公网地址拒绝。先关闭 Fake-IP/TUN 或为该域名配置精确排除，再测试；不要把整个测试网段加入 Easel 白名单。登录与 ngrok HTTPS 正常不代表模型出口正常。

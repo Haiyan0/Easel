@@ -1,6 +1,6 @@
 # Easel Linux Docker 部署与运维手册
 
-适用：Ubuntu 24.04 LTS、Bash、Docker Engine。核对版本：`1a8811096c7c86bb9079a5c88b92cd225d1907b1`，2026-10-29。[Windows 多用户手册](windows-desktop-operations.zh-CN.md)。
+适用：Ubuntu 24.04 LTS、Bash、Docker Engine。源码分支：`feat/multiuser-task1-store`（2026-11-03 更新），使用 `git rev-parse HEAD` 记录实际版本。[Windows 多用户手册](windows-desktop-operations.zh-CN.md)。
 
 ## 1. 先确认部署目标
 
@@ -21,7 +21,7 @@ Windows Desktop 功能验收不覆盖目标 Linux 的 XFS 配额、防火墙、I
 
 ```text
 /srv/easel/
-  src/版本号/       代码版本，每个版本一个目录
+  src/              唯一 Git 源码目录，更新在原目录拉取
   ops/              本文的 Dockerfile、Compose 和镜像记录
   local/            单人模式 outputs/profiles/home/apps（apps 内含 .env）
   control/          多人 control.sqlite3
@@ -67,36 +67,30 @@ sudo systemctl enable --now docker
 
 不是 Ubuntu 的主机使用对应发行版官方步骤。本文一直用 `sudo docker`，不要求把初级操作员加入等同于宿主高权限的 docker 组。Docker 发布端口与 UFW 的关系见官方文档，不要以为打开 UFW 就自动隔离了容器端口。
 
-### 2.3 把已验收的代码送到服务器
+### 2.3 从自己的 GitHub 获取源码（只保留一个目录）
 
-不要假设公开仓库 main 已含你的功能分支。可以在 **Windows PowerShell** 导出当前验收代码，不带未跟踪的密钥/个人数据：
-
-```powershell
-Set-Location 'C:\Code\Easel'
-$Revision = '1a8811096c7c86bb9079a5c88b92cd225d1907b1'
-$Archive = "C:\Code\easel-$Revision.tar"
-git archive --format=tar --output=$Archive $Revision
-if ($LASTEXITCODE -ne 0) { throw '源码归档失败' }
-Get-FileHash -Algorithm SHA256 $Archive
-# 把下面的服务器账户与地址替换成你自己的
-scp $Archive operator@YOUR_SERVER:/tmp/
-```
-
-`git archive` 是源码包，不包含未跟踪文件、构建后的 dist、模型 Key 或 Harness HOME；前端会在镜像里重新构建。两份新手手册若尚未提交，应另外复制留档。
-
-在 **Linux Bash** 解包到新版本目录：
+不再从 Windows 打包复制仓库，也不按每个版本创建源码目录。**在 Linux Bash** 中执行；下面 clone 只在首次运行，已有目录不能重复 clone：
 
 ```bash
-REV=1a8811096c7c86bb9079a5c88b92cd225d1907b1
-SRC=/srv/easel/src/$REV
+sudo install -d -o "$USER" -g "$(id -gn)" /srv/easel/src /srv/easel/ops
+git clone --branch feat/multiuser-task1-store --single-branch https://github.com/Haiyan0/Easel.git /srv/easel/src
+cd /srv/easel/src
+REV=$(git rev-parse HEAD)
+SRC=/srv/easel/src
 OPS=/srv/easel/ops
-sudo install -d -m 0755 "$SRC" "$OPS"
-sha256sum "/tmp/easel-$REV.tar"
-sudo tar -xf "/tmp/easel-$REV.tar" -C "$SRC"
-test -f "$SRC/pyproject.toml" && test -f "$SRC/web/app.py"
+git status --short
 ```
 
-核对 SHA-256 与发送端一致。解包目录必须是本次新建的代码目录；不要解到 `/` 或旧数据目录。后续新终端需要重新设置 `REV/SRC/OPS`。
+以后仍在 `/srv/easel/src` 更新。**多人服务必须由已配置的生命周期管理入口完成 drain/stop，确认没有活跃 Run 或 provisioner 后再 pull**，不能热改运行中的 provisioner 源码：
+
+```bash
+cd /srv/easel/src
+git status --short          # 有修改先保存处理，不能强制覆盖
+git pull --ff-only origin feat/multiuser-task1-store
+REV=$(git rev-parse HEAD)
+```
+
+更新完整顺序是：通知停机 → 正常停止 → 完整备份并 verify → 同目录 pull → 构建镜像 → 用原数据/Key 和匹配备份启动 → 检查登录/历史/新消息。原生 Linux 多人启停脚本尚未等价验收，不把上述拉取代码步骤当作完整生产部署命令；生命周期要求见第 9 节。单人 local 更新使用第 6 节。
 
 ## 3. 构建单人可用的 Docker 镜像
 
@@ -309,7 +303,7 @@ easel_restore logs --tail 80
 ### 6.3 版本升级
 
 1. 记录旧源码 SHA、`local.env` 里的镜像 ID、Compose 和 Harness 版本，执行冷备份。
-2. 用新源码归档解到新目录，按第 3.1 节构建新 tag；不要覆盖旧数据。
+2. 保持服务停止，在唯一源码目录 `/srv/easel/src` 执行 `git pull --ff-only origin feat/multiuser-task1-store`，按第 3.1 节构建新 tag；不要覆盖旧数据。
 3. 保存旧镜像/应用目录记录，从新镜像提取**新的应用目录**；不能只换镜像却继续挂着旧代码。以下先把 NEW_IMAGE/NEW_REV 改为实际新版本，APP_ROOT 指向当前旧应用目录：
 
 ```bash
@@ -366,8 +360,8 @@ easel_local logs --tail 100
 使用第 2 节的源码目录，而不是临时改变运行中 provisioner 使用的目录：
 
 ```bash
-REV=1a8811096c7c86bb9079a5c88b92cd225d1907b1
-SRC=/srv/easel/src/$REV
+REV=$(git -C /srv/easel/src rev-parse HEAD)
+SRC=/srv/easel/src
 OPS=/srv/easel/ops
 DSH_COMMIT=687f282e8625c6b8d11ff58211a90524be2e4317
 cd "$SRC"
