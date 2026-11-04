@@ -91,7 +91,7 @@ def test_validator_rejects_patch_not_matching_manifest_catalog(tmp_path):
         patch.replace(
             "          - id: deepseek-flash\n"
             "            name: DeepSeek Flash (Easel broker)\n"
-            "            contextWindow: 65536\n"
+            "            contextWindow: 262144\n"
             "            maxTokens: 4096\n"
             "            reasoningEfforts: false\n", ""),
         encoding="utf-8")

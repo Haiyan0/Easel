@@ -38,16 +38,16 @@
         models:
           - id: deepseek-chat
             name: DeepSeek Chat (Easel broker)
-            contextWindow: 65536
+            contextWindow: 262144
             maxTokens: 4096
             reasoningEfforts: false
           - id: deepseek-flash
             name: DeepSeek Flash (Easel broker)
-            contextWindow: 65536
+            contextWindow: 262144
             maxTokens: 4096
             reasoningEfforts: false
           - id: deepseek-v4-pro
             name: DeepSeek V4 Pro (Easel broker)
-            contextWindow: 65536
+            contextWindow: 262144
             maxTokens: 4096
             reasoningEfforts: false

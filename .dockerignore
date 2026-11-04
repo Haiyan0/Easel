@@ -64,5 +64,6 @@ skills/**/.pytest_cache/
 
 PSScriptAnalyzerSettings.psd1
 
-# 本机代码索引不进入部署镜像上下文
+# 本机代码索引与流式审计隔离 checkout 不进入部署镜像上下文
 .codegraph/
+.tmp-dsh-iso/
