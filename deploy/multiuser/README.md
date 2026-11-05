@@ -174,6 +174,58 @@ provisioner 拒绝启动。gateway 启用后，v1 ensure/stop/inspect 失败关�
 - 未知字段、非法 UUID、非法版本、未固定镜像在调用 Docker 前拒绝。
 - 成功响应只含 `ok` 与 `handle`/`report`；错误只返回稳定错误码。
 
+### database-query 数据库隧道（可选）
+
+启用 `database-query` 多人访问时，provisioner 启动参数增加
+`--database-query-secrets /srv/easel/secrets/database-query`。该参数只能在
+sidecar 三件套（`--sidecar-network`、`--sidecar-policy`、
+`--broker-upstream`）齐全时使用；目录缺 `database-query.env` 或 `keys/` 时
+provisioner 以 `database_query_secrets_invalid` 拒绝启动。启用后 worker 严格
+为 4 个挂载（多一个只读 `database-query.env`），sidecar 严格为 2 个挂载
+（多一个只读 `keys/`）并带 `db-tunnel` 网络别名；DSN 不进入容器环境变量，
+技能只通过 `--env-file` 读取。
+
+部署 runbook（按顺序执行，任一步失败不得继续）：
+
+1. 从 `skills/builtin/database-query/assets/tunnel.multiuser.example.yaml`
+   复制同目录的 `tunnel.multiuser.yaml`，填写真实数据库/跳板机主机、端口、
+   账号与密钥文件名。真实文件已被 `.gitignore` 排除，但必须位于构建上下文，
+   否则 sidecar 记录 `config_invalid` 且不启动任何 forward。
+2. 创建宿主 secrets 与权限：
+
+   ```bash
+   install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query
+   install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query/keys
+   install -o 10001 -g 10001 -m 0400 <私钥>        /srv/easel/secrets/database-query/keys/database-query_ed25519
+   install -o root  -g 10001 -m 0440 <known_hosts> /srv/easel/secrets/database-query/keys/known_hosts
+   install -o 10001 -g 10001 -m 0400 <env 文件>    /srv/easel/secrets/database-query/database-query.env
+   ```
+
+   跳板机账号应专用，并在 `authorized_keys` 限制为端口转发：
+   `command="",no-pty,no-agent-forwarding,no-x11-forwarding,permitopen="<db_host>:3306"`。
+3. 重建镜像；`tunnel.multiuser.yaml` 随 `COPY skills` 进入 worker/sidecar
+   镜像。禁止把真实文件或 secrets 写入镜像层以外的公开位置。
+4. drain + stop **所有** workspace（启用或停用 secrets 的必经步骤），再用
+   `--database-query-secrets` 重启 provisioner。旧形状容器会被静态验收
+   拒绝，必须先停，不能原地热改。
+5. 逐个 workspace 检查 sidecar 日志，每个启用 source 都应出现
+   `db-tunnel source=<id> mode=<direct|ssh> state=ready`。
+6. 在 worker 内对每个 source 执行：
+
+   ```bash
+   python /opt/easel/skills/builtin/database-query/scripts/db_query.py \
+     --config /opt/easel/skills/builtin/database-query/assets/config.multiuser.yaml \
+     --env-file /run/easel-secrets/database-query.env \
+     doctor --connect --project <精确项目 ID>
+   ```
+
+7. 记录执行时间、镜像摘要与输出；未全部通过前不得声明多人数据库查询可用。
+
+轮换 DSN 或私钥后必须 drain + stop 并重建对应 worker/sidecar；bind mount
+只在创建容器时生效，运行中的容器不会自动看到新内容。停用 secrets 同样先
+drain + stop。详细安全边界见
+[skills/builtin/database-query/references/security-and-limits.md](../../skills/builtin/database-query/references/security-and-limits.md)。
+
 ## 4. 启动 control
 
 ```bash

@@ -489,6 +489,35 @@ sudo docker exec "$CONTROL_ID" python -m easel admin bootstrap \
 
 用途：首次生成管理员 invite，打开 PublicOrigin 登录，再在界面创建成员、设置受管 chat 供应商/模型/协议/凭证。Key 不进入公开配置、命令行或 worker。浏览器 A/B 独立上下文测试隔离、权限、停止、重启历史；health 200 仅表示入口存活。
 
+### 9.3 database-query 多人连接（可选）
+
+多人数据库查询由每 workspace 的 sidecar 常驻转发，worker 不建隧道、不持有私钥。启用前置、secrets 权限、7 步上线 runbook 与轮换要求见 [多人部署手册](../deploy/multiuser/README.md)；第 9.1 节的 provisioner 命令需追加：
+
+```bash
+--database-query-secrets /srv/easel/secrets/database-query
+```
+
+启用后先检查每个 sidecar 的隧道日志（固定格式，不含 DSN/私钥与密钥路径）：
+
+```bash
+for SIDECAR in $(sudo docker ps -q --filter name=easel-sidecar-); do
+  echo "== $SIDECAR"
+  sudo docker logs "$SIDECAR" 2>&1 | grep 'db-tunnel' | tail -20
+done
+```
+
+每个已启用 source 应出现 `state=ready`。`state=failed` 的 `reason` 只使用固定错误码（`config_invalid`、`key_unreadable`、`host_key_mismatch`、`auth_failed`、`connect_failed`、`forward_failed`、`ssh_unavailable`）；按错误码先查 secrets 权限、known_hosts 与宿主出站，日志不会打印原始 ssh stderr。再在 worker 内逐 source 验证真实连接：
+
+```bash
+WORKER=$(sudo docker ps -q --filter name=easel-worker- | head -n 1)
+sudo docker exec "$WORKER" python /opt/easel/skills/builtin/database-query/scripts/db_query.py \
+  --config /opt/easel/skills/builtin/database-query/assets/config.multiuser.yaml \
+  --env-file /run/easel-secrets/database-query.env \
+  doctor --connect --project <精确项目 ID>
+```
+
+`doctor` 不连接数据库；`--connect` 才验证 `db-tunnel` 转发与数据库认证。轮换 DSN 或私钥后必须 drain + stop 并重建对应 worker/sidecar，运行中的容器不会自动看到新文件。Windows 桌面不运行该 sidecar，见 [Windows 手册](windows-desktop-operations.zh-CN.md)。
+
 ## 10. 多人日常停止、完整备份与恢复
 
 ### 10.1 成功 Stop 的顺序

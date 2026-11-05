@@ -6,6 +6,8 @@
 
 原 Web 的登录、独立 workspace、聊天、内容库、画像、技能及账号/发布入口已分组验收。真实供应商及平台行为以本人受管配置和授权实测为准；Desktop 通过不等于 Linux 生产门槛通过。Linux 的 XFS、防火墙、IPv6、Chromium 沙箱等仍见 [Linux 手册](linux-docker-operations.zh-CN.md)，未通过项不冒充已通过。
 
+多人 Docker 的 database-query 数据库隧道只支持 Linux 部署（由每 workspace 的 sidecar 常驻转发）；Windows 桌面多用户部署不运行该 sidecar，需要数据库查询时按 `skills/builtin/database-query/references/setup.md` 第 5 节手工建立 SSH 隧道。
+
 <a id="9-完整-desktop-多人已装配的正式路线"></a>
 <a id="9-windows-上的多人验证做到哪一步"></a>
 
