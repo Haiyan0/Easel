@@ -307,6 +307,29 @@ def test_start_without_keys_returns_no_tunnel(tmp_path):
     asyncio.run(scenario())
 
 
+def test_missing_tunnel_module_keeps_broker_serving(monkeypatch, capsys):
+    """最小镜像没有 db_tunnel（或 PyYAML）时，sidecar 仍须照常服务。"""
+    # 将 sys.modules 中的 db_tunnel 置空，使 `import db_tunnel` 抛 ImportError。
+    monkeypatch.setitem(sys.modules, "db_tunnel", None)
+
+    async def scenario():
+        broker, egress, tunnel = await sidecar._start(
+            "127.0.0.1", 0, 0, ("127.0.0.1", 1), EgressPolicy())
+        try:
+            assert tunnel is None
+            port = broker.sockets[0].getsockname()[1]
+            assert b"200" in await _broker_roundtrip(
+                port, _request("GET", "/healthz"))
+        finally:
+            broker.close()
+            egress.close()
+            await broker.wait_closed()
+            await egress.wait_closed()
+    asyncio.run(scenario())
+    assert ("db-tunnel source= mode= state=failed reason=config_invalid"
+            in capsys.readouterr().err)
+
+
 def test_invalid_tunnel_config_keeps_broker_serving(tmp_path, capsys):
     async def scenario():
         keys = tmp_path / "keys"

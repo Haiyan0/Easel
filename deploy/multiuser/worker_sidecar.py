@@ -16,6 +16,7 @@ import asyncio
 import signal
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,8 +36,10 @@ from easel.control.egress import (  # noqa: E402
     parse_proxy_authority,
 )
 from easel.providers.openai import BROKER_ROUTE_TABLE  # noqa: E402
-import db_tunnel  # noqa: E402
 import egress_proxy  # noqa: E402
+
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，运行期按需懒加载
+    import db_tunnel
 
 MAX_HEADER_BYTES = 64 * 1024
 MAX_BODY_BYTES = 64 * 1024 * 1024
@@ -239,8 +242,8 @@ async def _handle_broker(reader: asyncio.StreamReader,
 async def _start(
     host: str, broker_port: int, egress_port: int,
     upstream: tuple[str, int], policy: EgressPolicy, *,
-    tunnel_keys: Path = db_tunnel.DB_TUNNEL_KEYS,
-    tunnel_config: Path = db_tunnel.DB_TUNNEL_CONFIG,
+    tunnel_keys: Path | None = None,
+    tunnel_config: Path | None = None,
 ) -> tuple[asyncio.AbstractServer, asyncio.AbstractServer,
            db_tunnel.TunnelRuntime | None]:
     """先创建 broker/egress 监听，再启动隧道；测试用它取实际端口。"""
@@ -250,8 +253,20 @@ async def _start(
     egress_server = await asyncio.start_server(
         lambda reader, writer: egress_proxy._handle(reader, writer, policy),
         host, egress_port)
-    tunnel = await db_tunnel.start_tunnel(
-        keys_dir=tunnel_keys, config_path=tunnel_config)
+    try:
+        # 最小镜像（如 base 目标）可能不含 db_tunnel 或 PyYAML；隧道缺失
+        # 不能让 broker/egress 一起启动失败，只记录固定错误码后继续服务。
+        import db_tunnel
+    except ImportError:
+        print("db-tunnel source= mode= state=failed reason=config_invalid",
+              file=sys.stderr, flush=True)
+        tunnel = None
+    else:
+        tunnel = await db_tunnel.start_tunnel(
+            keys_dir=(db_tunnel.DB_TUNNEL_KEYS if tunnel_keys is None
+                      else tunnel_keys),
+            config_path=(db_tunnel.DB_TUNNEL_CONFIG if tunnel_config is None
+                         else tunnel_config))
     return broker_server, egress_server, tunnel
 
 
