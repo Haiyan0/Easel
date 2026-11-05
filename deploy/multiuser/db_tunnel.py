@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -271,3 +273,124 @@ def _bare_filename(value: Any) -> str:
     if Path(value).is_absolute() or Path(value).drive:
         raise TunnelConfigError()
     return value
+
+
+# ---------------------------------------------------------------------
+# direct 转发运行时
+# ---------------------------------------------------------------------
+
+DIRECT_CONNECT_TIMEOUT = 10.0
+DIRECT_MAX_CONNECTIONS = 64
+
+_PIPE_CHUNK_SIZE = 65536
+
+
+def log_state(source: str, mode: str, state: str,
+              reason: str = "") -> None:
+    """固定格式写 stderr；source/mode 为空时省略对应字段。"""
+    parts = ["db-tunnel"]
+    if source:
+        parts.append(f"source={source}")
+    if mode:
+        parts.append(f"mode={mode}")
+    parts.append(f"state={state}")
+    parts.append(f"reason={reason}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
+
+async def serve_direct(
+    forward: Forward, *,
+    host: str = "0.0.0.0",
+    connect_timeout: float = DIRECT_CONNECT_TIMEOUT,
+    max_connections: int = DIRECT_MAX_CONNECTIONS,
+    emit=log_state,
+) -> asyncio.AbstractServer:
+    """启动 direct 转发；绑定失败时记录 failed 并抛 OSError。"""
+    forwarder = _DirectForward(
+        forward,
+        host=host,
+        connect_timeout=connect_timeout,
+        max_connections=max_connections,
+        emit=emit,
+    )
+    return await forwarder.serve()
+
+
+class _DirectForward:
+    """单个 direct forward：监听本地端口并双向转发到数据库。"""
+
+    def __init__(
+        self, forward: Forward, *, host: str, connect_timeout: float,
+        max_connections: int, emit,
+    ) -> None:
+        self._forward = forward
+        self._host = host
+        self._connect_timeout = connect_timeout
+        self._max_connections = max_connections
+        self._emit = emit
+        self._active = 0
+
+    async def serve(self) -> asyncio.AbstractServer:
+        """监听端口并返回 server；绑定失败记录 failed 后重新抛出。"""
+        source = self._forward.source
+        self._emit(source, "direct", "starting", "")
+        try:
+            server = await asyncio.start_server(
+                self._handle, self._host, self._forward.listen_port)
+        except OSError:
+            self._emit(source, "direct", "failed", "forward_failed")
+            raise
+        self._emit(source, "direct", "ready", "")
+        return server
+
+    async def _handle(
+        self, client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        if self._active >= self._max_connections:
+            # 超出并发上限：立即关闭，不建立上游连接。
+            client_writer.close()
+            return
+        self._active += 1
+        try:
+            try:
+                target_reader, target_writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        self._forward.database.host,
+                        self._forward.database.port),
+                    self._connect_timeout)
+            except (OSError, asyncio.TimeoutError):
+                await _close_writer(client_writer)
+                return
+            try:
+                await asyncio.gather(
+                    _pipe(client_reader, target_writer),
+                    _pipe(target_reader, client_writer),
+                    return_exceptions=True)
+            finally:
+                await asyncio.gather(
+                    _close_writer(client_writer),
+                    _close_writer(target_writer),
+                    return_exceptions=True)
+        finally:
+            self._active -= 1
+
+
+async def _pipe(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+) -> None:
+    """单向复制直到 EOF，随后关闭目标写端。"""
+    try:
+        while chunk := await reader.read(_PIPE_CHUNK_SIZE):
+            writer.write(chunk)
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass

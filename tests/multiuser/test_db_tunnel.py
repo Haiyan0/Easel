@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib.util
 import pathlib
+import socket
 import sys
 
 import pytest
@@ -144,3 +146,113 @@ def test_ssh_keys_must_exist_be_regular_and_not_symlinks(tmp_path):
         pytest.skip("当前环境不允许创建符号链接")
     with pytest.raises(db_tunnel.TunnelConfigError):
         db_tunnel.load_forwards(path, keys_dir=keys)
+
+
+async def _echo(reader, writer):
+    try:
+        while chunk := await reader.read(65536):
+            writer.write(chunk)
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+def _direct(listen_port, upstream_port):
+    return db_tunnel.Forward(
+        source="sales_readonly", mode="direct", listen_port=listen_port,
+        database=db_tunnel.DatabaseTarget("127.0.0.1", upstream_port),
+        ssh=None)
+
+
+def test_direct_forward_pipes_bytes_both_ways():
+    async def scenario():
+        echo = await asyncio.start_server(_echo, "127.0.0.1", 0)
+        upstream_port = echo.sockets[0].getsockname()[1]
+        server = await db_tunnel.serve_direct(
+            _direct(0, upstream_port), host="127.0.0.1")
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            payload = b"ping" * 4096
+            writer.write(payload)
+            await writer.drain()
+            assert await reader.readexactly(len(payload)) == payload
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+            echo.close()
+            await echo.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_direct_forward_caps_concurrent_connections():
+    async def scenario():
+        echo = await asyncio.start_server(_echo, "127.0.0.1", 0)
+        upstream_port = echo.sockets[0].getsockname()[1]
+        server = await db_tunnel.serve_direct(
+            _direct(0, upstream_port), host="127.0.0.1", max_connections=1)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            first_reader, first_writer = await asyncio.open_connection(
+                "127.0.0.1", port)
+            second_reader, second_writer = await asyncio.open_connection(
+                "127.0.0.1", port)
+            assert await asyncio.wait_for(second_reader.read(), 2) == b""
+            first_writer.close()
+            await first_writer.wait_closed()
+            second_writer.close()
+            await second_writer.wait_closed()
+            await first_reader.read()
+        finally:
+            server.close()
+            await server.wait_closed()
+            echo.close()
+            await echo.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_direct_forward_closes_client_when_upstream_refuses():
+    async def scenario():
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        refused_port = probe.getsockname()[1]
+        probe.close()
+        server = await db_tunnel.serve_direct(
+            _direct(0, refused_port), host="127.0.0.1")
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            assert await asyncio.wait_for(reader.read(), 2) == b""
+            writer.close()
+            await writer.wait_closed()
+            # 转发器仍存活，可接受下一次连接。
+            reader2, writer2 = await asyncio.open_connection("127.0.0.1", port)
+            assert await asyncio.wait_for(reader2.read(), 2) == b""
+            writer2.close()
+            await writer2.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_direct_forward_logs_starting_and_ready():
+    events = []
+
+    async def scenario():
+        echo = await asyncio.start_server(_echo, "127.0.0.1", 0)
+        upstream_port = echo.sockets[0].getsockname()[1]
+        server = await db_tunnel.serve_direct(
+            _direct(0, upstream_port), host="127.0.0.1",
+            emit=lambda *args: events.append(args))
+        server.close()
+        await server.wait_closed()
+        echo.close()
+        await echo.wait_closed()
+    asyncio.run(scenario())
+    assert events == [
+        ("sales_readonly", "direct", "starting", ""),
+        ("sales_readonly", "direct", "ready", ""),
+    ]
