@@ -245,8 +245,9 @@ def _start_mysql(*, name: str, network: str,
 
 
 def _start_probe(*, name: str, image: str, workspace: str) -> None:
+    # 3600s 覆盖慢速镜像构建与数据库初始化，避免探针先退出导致假失败。
     _docker("run", "-d", "--name", name, "--network", workspace,
-            image, "sleep", "600", timeout=300.0)
+            image, "sleep", "3600", timeout=300.0)
 
 
 def _start_sidecar(*, name: str, image: str, workspace: str,
@@ -464,8 +465,6 @@ def test_ssh_forward_reaches_mysql_from_probe(tunnel_image, tmp_path):
 
         _best_effort("rm", "-f", "dbq-mysql")
         _start_mysql(name=mysql, network=backend)
-        _start_probe(name=probe, image=tunnel_image,
-                     workspace=workspace)
 
         material = tmp_path / "key-material"
         material.mkdir()
@@ -494,6 +493,10 @@ def test_ssh_forward_reaches_mysql_from_probe(tunnel_image, tmp_path):
         _docker("network", "connect", control, sshd, timeout=120.0)
         _wait_mysql_ready(mysql)
         sshd_address = _network_ip(sshd, control)
+        # 探针在 sshd 镜像构建与 MySQL 就绪之后才启动，避免慢速构建先把
+        # 探针生命周期耗尽，导致后续 docker exec 假失败。
+        _start_probe(name=probe, image=tunnel_image,
+                     workspace=workspace)
 
         keys = tmp_path / "sidecar-keys"
         keys.mkdir()
