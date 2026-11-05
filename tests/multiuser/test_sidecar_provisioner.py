@@ -136,7 +136,9 @@ def _with_public_key(env: list[str]) -> list[str]:
 
 
 def _sidecar_container(policy: pathlib.Path,
-                       workspace: str = WORKSPACE) -> dict:
+                       workspace: str = WORKSPACE,
+                       mounts: list[dict] | None = None,
+                       aliases: list[str] | None = None) -> dict:
     return {
         "Id": "2" * 64,
         "Name": "/" + provisioner.sidecar_container_name(workspace),
@@ -169,12 +171,13 @@ def _sidecar_container(policy: pathlib.Path,
         "Mounts": [{
             "Type": "bind", "Source": str(policy),
             "Destination": provisioner.SIDECAR_POLICY_CONTAINER_PATH,
-            "RW": False}],
+            "RW": False}] if mounts is None else list(mounts),
         "NetworkSettings": {
             "Ports": {},
             "Networks": {
                 provisioner.network_name(workspace): {
-                    "IPAddress": "172.30.0.3"}},
+                    "IPAddress": "172.30.0.3",
+                    **({"Aliases": list(aliases)} if aliases else {})}},
         },
     }
 
@@ -257,8 +260,13 @@ class FakeDocker:
             sidecar = self.containers.get(name)
             if sidecar is None:
                 return _not_found(name)
-            sidecar["NetworkSettings"]["Networks"][network] = {
-                "IPAddress": "172.20.0.4"}
+            networks = sidecar["NetworkSettings"]["Networks"]
+            entry = networks.get(network)
+            if isinstance(entry, dict):
+                # 只补运行时地址，保留 run 时写入的网络别名。
+                entry["IPAddress"] = "172.20.0.4"
+            else:
+                networks[network] = {"IPAddress": "172.20.0.4"}
             return _ok()
         if args[:2] == ["container", "inspect"]:
             target = args[2]
@@ -272,8 +280,13 @@ class FakeDocker:
                 if self.sidecar_failure:
                     return subprocess.CompletedProcess(
                         argv, 1, "", "sidecar failed\n")
+                aliases = None
+                for index, value in enumerate(args):
+                    if value == "--network-alias":
+                        aliases = [args[index + 1]]
                 raw = _sidecar_container(
-                    self.policy, workspace=self.workspace)
+                    self.policy, workspace=self.workspace,
+                    mounts=_argv_mounts(args), aliases=aliases)
                 self.sidecar_runs += 1
                 if self.invalid_sidecar and self.sidecar_runs == 1:
                     raw["HostConfig"]["Privileged"] = True
@@ -937,3 +950,167 @@ def test_worker_static_requires_exact_mount_count_when_enabled(tmp_path):
     raw["Mounts"][-1]["RW"] = True
     assert not provisioner._verify_worker_static(
         raw, database_query_env_file=env_file, **kwargs)
+
+
+def test_sidecar_argv_adds_keys_mount_and_alias_only_when_enabled(tmp_path):
+    keys = (_secrets(tmp_path) / "keys").resolve()
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+    with_keys = provisioner.build_sidecar_run_argv(
+        image=IMAGE, workspace_id=WORKSPACE, policy_file=policy,
+        broker_upstream=UPSTREAM, database_query_keys=keys)
+    mounts = [with_keys[index + 1] for index, value in enumerate(with_keys)
+              if value == "--mount"]
+    assert len(mounts) == 2
+    assert f"type=bind,src={keys},dst={provisioner.DB_TUNNEL_KEYS_PATH},readonly" in mounts
+    assert with_keys[with_keys.index("--network-alias") + 1] == "db-tunnel"
+
+    without = provisioner.build_sidecar_run_argv(
+        image=IMAGE, workspace_id=WORKSPACE, policy_file=policy,
+        broker_upstream=UPSTREAM)
+    assert len([value for value in without if value == "--mount"]) == 1
+    assert "--network-alias" not in without
+
+
+def test_sidecar_inspect_requires_keys_mount_and_alias(tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+    keys = (_secrets(tmp_path) / "keys").resolve()
+    keys_mount = {"Type": "bind", "Source": str(keys),
+                  "Destination": provisioner.DB_TUNNEL_KEYS_PATH,
+                  "RW": False}
+    raw = _sidecar_container(policy)
+    raw["NetworkSettings"]["Networks"][SIDECAR_NETWORK] = {
+        "IPAddress": "172.20.0.4"}
+    kwargs = dict(workspace_id=WORKSPACE, image=IMAGE, policy_file=policy,
+                  sidecar_network=SIDECAR_NETWORK, broker_upstream=UPSTREAM)
+    assert provisioner.verify_sidecar_inspect(raw, **kwargs)
+    assert not provisioner.verify_sidecar_inspect(
+        raw, database_query_keys=keys, **kwargs)
+
+    raw["Mounts"].append(keys_mount)
+    assert not provisioner.verify_sidecar_inspect(
+        raw, database_query_keys=keys, **kwargs)
+    raw["NetworkSettings"]["Networks"][
+        provisioner.network_name(WORKSPACE)]["Aliases"] = ["db-tunnel"]
+    assert provisioner.verify_sidecar_inspect(
+        raw, database_query_keys=keys, **kwargs)
+    assert not provisioner.verify_sidecar_inspect(raw, **kwargs)
+
+
+def test_old_sidecar_is_recreated_with_keys(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=_secrets(tmp_path))
+    fake = FakeDocker(root, settings.sidecar_policy)
+    seeded = _sidecar_container(settings.sidecar_policy)
+    fake.containers[provisioner.sidecar_container_name(WORKSPACE)] = seeded
+    service = provisioner.Provisioner(settings, run=fake)
+
+    asyncio.run(service.ensure(WORKSPACE, 1))
+    sidecar = fake.containers[
+        provisioner.sidecar_container_name(WORKSPACE)]
+    assert len(sidecar["Mounts"]) == 2
+    assert "db-tunnel" in sidecar["NetworkSettings"]["Networks"][
+        provisioner.network_name(WORKSPACE)]["Aliases"]
+    assert (seeded["Id"] in fake.removed
+            or provisioner.sidecar_container_name(WORKSPACE) in fake.removed)
+
+
+def test_sidecar_is_recreated_without_keys_when_disabled(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    policy = tmp_path / "policies" / "egress.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text("{}", encoding="utf-8")
+    keys = (_secrets(tmp_path) / "keys").resolve()
+    seeded = _sidecar_container(
+        policy, mounts=[
+            {"Type": "bind", "Source": str(policy),
+             "Destination": provisioner.SIDECAR_POLICY_CONTAINER_PATH,
+             "RW": False},
+            {"Type": "bind", "Source": str(keys),
+             "Destination": provisioner.DB_TUNNEL_KEYS_PATH, "RW": False},
+        ],
+        aliases=["db-tunnel"])
+    fake = FakeDocker(root, policy)
+    fake.containers[provisioner.sidecar_container_name(WORKSPACE)] = seeded
+    service = provisioner.Provisioner(_settings(tmp_path), run=fake)
+
+    asyncio.run(service.ensure(WORKSPACE, 1))
+    sidecar = fake.containers[
+        provisioner.sidecar_container_name(WORKSPACE)]
+    assert len(sidecar["Mounts"]) == 1
+    assert "db-tunnel" not in sidecar["NetworkSettings"]["Networks"][
+        provisioner.network_name(WORKSPACE)].get("Aliases", [])
+
+
+def test_ensure_with_secrets_creates_four_mount_worker(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=_secrets(tmp_path))
+    fake = FakeDocker(root, settings.sidecar_policy)
+    service = provisioner.Provisioner(settings, run=fake)
+
+    asyncio.run(service.ensure(WORKSPACE, 1))
+    worker = fake.containers[provisioner.container_name(WORKSPACE)]
+    sidecar = fake.containers[
+        provisioner.sidecar_container_name(WORKSPACE)]
+    assert len(worker["Mounts"]) == 4
+    assert any(mount["Destination"] == provisioner.DB_QUERY_ENV_PATH
+               for mount in worker["Mounts"])
+    assert len(sidecar["Mounts"]) == 2
+
+    asyncio.run(service.ensure(WORKSPACE, 1))
+    assert len([c for c in fake.commands if _is_worker_run(c)]) == 1
+    assert len([c for c in fake.commands if _is_sidecar_run(c)]) == 1
+
+
+def test_old_three_mount_worker_is_conflict_when_secrets_enabled(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=_secrets(tmp_path))
+    fake = FakeDocker(root, settings.sidecar_policy)
+    fake.workspace_network = True
+    worker = _worker_container(root)
+    worker["Mounts"][2]["Source"] = str(
+        settings.worker_public_key.resolve())
+    fake.containers[provisioner.container_name(WORKSPACE)] = worker
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "container_conflict"
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is worker
+    assert fake.stopped == [] and fake.removed == []
+
+
+def test_exited_three_mount_worker_is_recreated_when_secrets_enabled(
+        tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=_secrets(tmp_path))
+    fake = FakeDocker(root, settings.sidecar_policy)
+    fake.workspace_network = True
+    worker = _worker_container(root)
+    worker["State"] = {"Running": False, "Status": "exited",
+                       "Health": {"Status": "unhealthy"}}
+    worker["Mounts"][2]["Source"] = str(
+        settings.worker_public_key.resolve())
+    fake.containers[provisioner.container_name(WORKSPACE)] = worker
+    service = provisioner.Provisioner(settings, run=fake)
+
+    asyncio.run(service.ensure(WORKSPACE, 1))
+    assert worker["Id"] in fake.removed
+    rebuilt = fake.containers[provisioner.container_name(WORKSPACE)]
+    assert len(rebuilt["Mounts"]) == 4

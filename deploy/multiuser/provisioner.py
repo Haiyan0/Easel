@@ -843,8 +843,9 @@ def validate_database_query_secrets(
 
 
 def build_sidecar_run_argv(*, image: str, workspace_id: str,
-                           policy_file: Path,
-                           broker_upstream: str) -> list[str]:
+                           policy_file: Path, broker_upstream: str,
+                           database_query_keys: Path | None = None
+                           ) -> list[str]:
     """受控 sidecar 的唯一 argv；worker 网络 + 受控出站网络由后续 connect 加入。"""
     if not isinstance(image, str) or _PINNED_IMAGE.fullmatch(image) is None:
         raise _reject("invalid_image")
@@ -863,9 +864,23 @@ def build_sidecar_run_argv(*, image: str, workspace_id: str,
         "--pids-limit=128",
         "--tmpfs", SIDECAR_TMPFS,
         "--network", network_name(workspace_id),
+    ])
+    if database_query_keys is not None:
+        # 隧道客户端经固定别名访问 sidecar 的受控出站代理。
+        argv.extend(["--network-alias", DB_TUNNEL_ALIAS])
+    argv.extend([
         "--mount",
         ("type=bind,src=" + _safe_path_text(policy_file)
          + ",dst=" + SIDECAR_POLICY_CONTAINER_PATH + ",readonly"),
+    ])
+    if database_query_keys is not None:
+        # SSH 私钥与 known_hosts 只以只读 bind 进入，argv 中不含密钥内容。
+        argv.extend([
+            "--mount",
+            ("type=bind,src=" + _safe_path_text(database_query_keys)
+             + ",dst=" + DB_TUNNEL_KEYS_PATH + ",readonly"),
+        ])
+    argv.extend([
         "--restart=no",
         "--stop-timeout=15",
         "--log-driver=local",
@@ -1243,7 +1258,8 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
 def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
                            image: str, policy_file: Path,
                            sidecar_network: str,
-                           broker_upstream: str) -> bool:
+                           broker_upstream: str,
+                           database_query_keys: Path | None = None) -> bool:
     """严格验收受控 sidecar：固定镜像、权限、资源、挂载与两条批准网络。"""
     if not isinstance(raw, dict):
         return False
@@ -1320,16 +1336,31 @@ def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
             set(str(tmpfs.get("/tmp") or "").split(","))):
         return False
     mounts = raw.get("Mounts")
-    if not isinstance(mounts, list) or len(mounts) != 1:
+    expected_mount_count = 1 if database_query_keys is None else 2
+    if (not isinstance(mounts, list)
+            or len(mounts) != expected_mount_count
+            or not all(isinstance(mount, dict) for mount in mounts)):
         return False
-    mount = mounts[0]
-    if not isinstance(mount, dict):
+    # 按 Destination 识别，不依赖 Docker 返回挂载的顺序；重复项一律拒绝。
+    by_destination: dict[str, dict] = {}
+    for mount in mounts:
+        destination = mount.get("Destination")
+        if not isinstance(destination, str) or destination in by_destination:
+            return False
+        by_destination[destination] = mount
+    policy_mount = by_destination.get(SIDECAR_POLICY_CONTAINER_PATH)
+    if (policy_mount is None
+            or policy_mount.get("Type") != "bind"
+            or policy_mount.get("Source") != str(policy_file)
+            or policy_mount.get("RW") is not False):
         return False
-    if (mount.get("Type") != "bind"
-            or mount.get("Source") != str(policy_file)
-            or mount.get("Destination") != SIDECAR_POLICY_CONTAINER_PATH
-            or mount.get("RW") is not False):
-        return False
+    if database_query_keys is not None:
+        keys_mount = by_destination.get(DB_TUNNEL_KEYS_PATH)
+        if (keys_mount is None
+                or keys_mount.get("Type") != "bind"
+                or keys_mount.get("Source") != str(database_query_keys)
+                or keys_mount.get("RW") is not False):
+            return False
     network_settings = raw.get("NetworkSettings")
     if not isinstance(network_settings, dict):
         return False
@@ -1339,6 +1370,14 @@ def verify_sidecar_inspect(raw: dict | None, *, workspace_id: str,
         return False
     if any(not isinstance(networks[name], dict)
            or not networks[name].get("IPAddress") for name in expected):
+        return False
+    # 别名与开关同向：隧道启用时必须存在，禁用时不得残留。
+    aliases = networks[network_name(workspace_id)].get("Aliases")
+    if aliases is None:
+        aliases = []
+    if not isinstance(aliases, list):
+        return False
+    if (DB_TUNNEL_ALIAS in aliases) != (database_query_keys is not None):
         return False
     if any(bool(bindings)
            for bindings in (network_settings.get("Ports") or {}).values()):
@@ -1862,7 +1901,10 @@ class Provisioner:
         return verify_sidecar_inspect(
             raw, workspace_id=workspace_id, image=self.settings.image,
             policy_file=policy, sidecar_network=network,
-            broker_upstream=upstream)
+            broker_upstream=upstream,
+            database_query_keys=(
+                self._database_query.keys_dir
+                if self._database_query else None))
 
     def _sidecar_host(self, workspace_id: str) -> str | None:
         if self._sidecar is None:
@@ -1927,7 +1969,10 @@ class Provisioner:
 
         argv = build_sidecar_run_argv(
             image=self.settings.image, workspace_id=workspace_id,
-            policy_file=policy, broker_upstream=upstream)
+            policy_file=policy, broker_upstream=upstream,
+            database_query_keys=(
+                self._database_query.keys_dir
+                if self._database_query else None))
         try:
             result = await self._docker(*argv, timeout=60.0)
             if result.returncode != 0:
@@ -2090,16 +2135,33 @@ class Provisioner:
                 raise ProvisionerError("config_version_conflict")
             # 标签与健康响应不能证明安全配置；不符时失败关闭，不自动
             # 删除来源不明的容器，交部署方核查。
+            database_query_env_file = (
+                self._database_query.env_file
+                if self._database_query else None)
             if not _verify_worker_static(
                     existing, workspace_id=workspace_id,
                     config_version=config_version,
                     image=self.settings.image, paths=paths,
                     public_key_file=self._worker_public_key,
-                    database_query_env_file=(
-                        self._database_query.env_file
-                        if self._database_query else None)):
-                raise ProvisionerError("container_conflict")
-            if not verify_worker_wiring(
+                    database_query_env_file=database_query_env_file):
+                # 已退出的“旧形状”实例才允许回收：除 secrets 开关带来的
+                # 挂载形状差异外，它必须在未启用 secrets 的严格验收下仍
+                # 合法。特权、端口、镜像等被篡改的实例无论状态都保留现场
+                # 失败关闭；Running/restarting/paused 也没有停止授权。
+                legacy_shape = (
+                    database_query_env_file is not None
+                    and _verify_worker_static(
+                        existing, workspace_id=workspace_id,
+                        config_version=config_version,
+                        image=self.settings.image, paths=paths,
+                        public_key_file=self._worker_public_key,
+                        database_query_env_file=None))
+                if not legacy_shape or not worker_confirmed_exited(existing):
+                    raise ProvisionerError("container_conflict")
+                await self._remove_instance(report["instance_id"],
+                                            workspace_id)
+                existing = None
+            elif not verify_worker_wiring(
                     existing, workspace_id=workspace_id,
                     sidecar_host=sidecar_host):
                 # 实际 Env 只在创建时读取。Docker 仍报告 Running（无论探针
