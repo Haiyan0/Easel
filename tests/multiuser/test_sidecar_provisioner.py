@@ -1114,3 +1114,30 @@ def test_exited_three_mount_worker_is_recreated_when_secrets_enabled(
     assert worker["Id"] in fake.removed
     rebuilt = fake.containers[provisioner.container_name(WORKSPACE)]
     assert len(rebuilt["Mounts"]) == 4
+
+
+def test_exited_tampered_worker_is_conflict_when_secrets_enabled(
+        tmp_path, monkeypatch):
+    """旧形状保护不能放宽到篡改项：exited 也不是自动删除授权。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    _fake_health(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=_secrets(tmp_path))
+    fake = FakeDocker(root, settings.sidecar_policy)
+    fake.workspace_network = True
+    worker = _worker_container(root)
+    worker["Mounts"][2]["Source"] = str(
+        settings.worker_public_key.resolve())
+    worker["State"] = {"Running": False, "Status": "exited",
+                       "Health": {"Status": "unhealthy"}}
+    worker["HostConfig"]["Privileged"] = True
+    fake.containers[provisioner.container_name(WORKSPACE)] = worker
+    service = provisioner.Provisioner(settings, run=fake)
+
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        asyncio.run(service.ensure(WORKSPACE, 1))
+    assert rejected.value.code == "container_conflict"
+    assert fake.containers[provisioner.container_name(WORKSPACE)] is worker
+    assert fake.stopped == [] and fake.removed == []
+    assert all(not _is_worker_run(c) for c in fake.commands)
