@@ -24,6 +24,8 @@ OPTIONAL_PATHS = {
     "skills/shared/scripts/models",
     "skills/shared/scripts/models/sh.rnnn",
     "skills/builtin/skill-wechat-publisher/wechat-publisher.yaml",
+    # 运行时配置由使用者在本地生成，仓库中刻意不存在。
+    "skills/builtin/database-query/config.yaml",
 }
 
 

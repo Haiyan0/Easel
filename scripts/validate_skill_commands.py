@@ -87,6 +87,11 @@ def main() -> int:
             if script is None:
                 continue
             if not script.is_file():
+                try:
+                    script.relative_to(ROOT)
+                except ValueError:
+                    # 容器内绝对路径（如 /opt/easel/...）不属于本机校验范围。
+                    continue
                 failures.append((doc, line, f"script does not exist: {script.relative_to(ROOT)}"))
                 continue
             args = invocation[1:]
