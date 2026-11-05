@@ -10,7 +10,9 @@ import yaml
 from dbquery.config import AppConfig
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-_CREDENTIAL_URL = re.compile(r"mysql(?:\+asyncmy)?://[^:\s/]+:[^@\s]+@")
+# 密码段排除字面 <>：文档中的占位符（如 <百分号编码口令>）不是真实凭据；
+# 真实 URL 中的 < > 会按 URL 规则百分号编码，排除字面量不降低扫描能力。
+_CREDENTIAL_URL = re.compile(r"mysql(?:\+asyncmy)?://[^:\s/]+:[^@\s<>]+@")
 _SCANNED_SUFFIXES = {".md", ".yaml", ".yml", ".txt", ".py", ".toml", ".ini"}
 _SKIP_DIRS = {"tests", "__pycache__", ".pytest_cache", "state", "outputs", ".git"}
 
@@ -66,6 +68,15 @@ def test_package_contains_no_secret_material() -> None:
         if _CREDENTIAL_URL.search(text):
             hits.append(str(path.relative_to(SKILL_ROOT)))
     assert hits == []
+
+
+def test_credential_scanner_ignores_placeholder_passwords() -> None:
+    # 占位符不得触发误报；真实 DSN 形式仍必须被识别。
+    assert _CREDENTIAL_URL.search(
+        "mysql+asyncmy://readonly:<百分号编码口令>@db-tunnel:13306/ymkj2.0"
+    ) is None
+    assert _CREDENTIAL_URL.search(
+        "mysql://u:real-password@host:3306/sales") is not None
 
 
 def test_requirements_record_validated_versions() -> None:
