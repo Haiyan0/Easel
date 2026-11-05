@@ -224,12 +224,13 @@ def test_direct_forward_closes_client_when_upstream_refuses():
         port = server.sockets[0].getsockname()[1]
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            assert await asyncio.wait_for(reader.read(), 2) == b""
+            # 本机环回连接拒绝约 2 秒才可见，5 秒仍低于默认 10 秒连接超时。
+            assert await asyncio.wait_for(reader.read(), 5) == b""
             writer.close()
             await writer.wait_closed()
             # 转发器仍存活，可接受下一次连接。
             reader2, writer2 = await asyncio.open_connection("127.0.0.1", port)
-            assert await asyncio.wait_for(reader2.read(), 2) == b""
+            assert await asyncio.wait_for(reader2.read(), 5) == b""
             writer2.close()
             await writer2.wait_closed()
         finally:
