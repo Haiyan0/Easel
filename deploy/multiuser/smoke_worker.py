@@ -63,6 +63,13 @@ REQUIRED_MODULES = (
     "cv2",
     "jieba",
     "playwright",
+    # data-analysis / database-query 技能运行依赖（见 requirements-worker.txt）
+    "yaml",
+    "openpyxl",
+    "xlrd",
+    "sqlalchemy",
+    "asyncmy",
+    "sqlglot",
 )
 
 FAKE_ACP_FLAG = "--fake-acp"

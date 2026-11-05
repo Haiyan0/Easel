@@ -1,6 +1,7 @@
 """Task 8 R1：最终 worker 镜像必须包含实际执行代码、依赖与构建期冒烟。"""
 from __future__ import annotations
 
+import ast
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -70,6 +71,34 @@ def test_build_smoke_checks_files_modules_worker_mode_and_fake_harness():
     assert "FAKE_ACP_FLAG" in text
     assert "--require-dsh" in text
     assert "acp-profile.json" in text
+
+
+def test_build_smoke_modules_cover_skill_runtime_dependencies():
+    """requirements-worker.txt 中新增技能依赖必须纳入构建期冒烟，避免漂移。"""
+    packages = {
+        line.strip().split("==", 1)[0]
+        for line in _text(REQUIREMENTS).splitlines()
+        if "==" in line and not line.strip().startswith("#")
+    }
+    tree = ast.parse(_text(SMOKE))
+    required = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name)
+                and target.id == "REQUIRED_MODULES"
+                for target in node.targets))
+    module_by_package = {
+        "PyYAML": "yaml",
+        "SQLAlchemy": "sqlalchemy",
+        "asyncmy": "asyncmy",
+        "sqlglot": "sqlglot",
+        "openpyxl": "openpyxl",
+        "xlrd": "xlrd",
+    }
+    for package, module in module_by_package.items():
+        assert package in packages, f"worker 依赖未声明：{package}"
+        assert module in required, f"构建冒烟未检查模块：{module}"
 
 
 def test_runtime_build_pins_node_pnpm_and_actually_builds_harness():

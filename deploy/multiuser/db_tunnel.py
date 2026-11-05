@@ -712,11 +712,15 @@ class TunnelRuntime:
 
     async def stop(self) -> None:
         """先停 ssh 监督器，再取消任务，最后关闭 direct 监听。"""
-        for supervisor, task in zip(self.supervisors, self.tasks):
-            if task.done():
-                # run() 的 finally 已回收子进程；重复 stop 时不再等待。
-                continue
-            await supervisor.stop()
+        # 并发停止所有监督器：单个 ssh 的 terminate/kill 已有界，串行等待会
+        # 让多个 forward 的总停机时间超过 sidecar 的 --stop-timeout。
+        active = [supervisor for supervisor, task
+                  in zip(self.supervisors, self.tasks) if not task.done()]
+        if active:
+            # return_exceptions：单个监督器故障不能阻止其余清理。
+            await asyncio.gather(
+                *(supervisor.stop() for supervisor in active),
+                return_exceptions=True)
         for task in self.tasks:
             if not task.done():
                 task.cancel()
@@ -735,8 +739,14 @@ async def start_tunnel(
     listen_host: str = "0.0.0.0",
 ) -> TunnelRuntime | None:
     """keys_dir 不存在返回 None；存在但配置非法返回空 runtime 并记录。"""
-    if not Path(keys_dir).is_dir():
+    keys_path = Path(keys_dir)
+    if not keys_path.exists():
+        # 未启用多人数据库隧道是预期状态，静默禁用。
         return None
+    if not keys_path.is_dir():
+        # 存在但不是目录属于配置错误，不能与“未启用”一样静默。
+        emit("", "", "failed", "config_invalid")
+        return TunnelRuntime(tasks=[], servers=[], supervisors=[])
     try:
         forwards = load_forwards(config_path, keys_dir=keys_dir)
     except TunnelConfigError:

@@ -459,3 +459,67 @@ def test_supervisor_terminates_then_kills_on_stop(tmp_path):
         assert process.terminated and process.killed
         assert ("tracking_readonly", "ssh", "stopped", "") in logs
     asyncio.run(scenario())
+
+
+class _FakeStopSupervisor:
+    """记录 stop 是否并发触发，并可模拟单个监督器失败。"""
+
+    def __init__(self, started, release, *, fail=False):
+        self._started = started
+        self._release = release
+        self._fail = fail
+
+    async def stop(self):
+        self._started.set()
+        await self._release.wait()
+        if self._fail:
+            raise RuntimeError("stop failed")
+
+
+def test_runtime_stops_supervisors_concurrently_and_tolerates_failure():
+    async def scenario():
+        started_a, started_b = asyncio.Event(), asyncio.Event()
+        release = asyncio.Event()
+        runtime = db_tunnel.TunnelRuntime(
+            tasks=[asyncio.create_task(asyncio.Event().wait()),
+                   asyncio.create_task(asyncio.Event().wait())],
+            servers=[],
+            supervisors=[
+                _FakeStopSupervisor(started_a, release, fail=True),
+                _FakeStopSupervisor(started_b, release),
+            ])
+        stop_task = asyncio.create_task(runtime.stop())
+        # 串行实现会阻塞在第一个 stop 的 release 上，第二个 started 不会置位。
+        await asyncio.wait_for(
+            asyncio.gather(started_a.wait(), started_b.wait()), 2)
+        release.set()
+        await asyncio.wait_for(stop_task, 2)
+        assert all(task.cancelled() for task in runtime.tasks)
+    asyncio.run(scenario())
+
+
+def test_start_tunnel_rejects_keys_path_that_is_not_a_directory(tmp_path):
+    async def scenario():
+        keys_file = tmp_path / "keys"
+        keys_file.write_text("not a directory", encoding="utf-8")
+        logs = []
+        runtime = await db_tunnel.start_tunnel(
+            keys_dir=keys_file, config_path=tmp_path / "missing.yaml",
+            emit=lambda *args: logs.append(args))
+        assert runtime is not None
+        assert runtime.tasks == [] and runtime.servers == []
+        assert runtime.supervisors == []
+        assert logs == [("", "", "failed", "config_invalid")]
+    asyncio.run(scenario())
+
+
+def test_start_tunnel_missing_keys_directory_is_silently_disabled(tmp_path):
+    async def scenario():
+        logs = []
+        runtime = await db_tunnel.start_tunnel(
+            keys_dir=tmp_path / "missing",
+            config_path=tmp_path / "missing.yaml",
+            emit=lambda *args: logs.append(args))
+        assert runtime is None
+        assert logs == []
+    asyncio.run(scenario())
