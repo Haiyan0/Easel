@@ -695,3 +695,69 @@ class SshForwardSupervisor:
         wait_task = self._wait_task
         if process is not None and wait_task is not None:
             await self._terminate(process, wait_task)
+
+
+# ---------------------------------------------------------------------
+# sidecar 集成：按固定拓扑启动 direct 与 ssh 转发
+# ---------------------------------------------------------------------
+
+
+@dataclass
+class TunnelRuntime:
+    """一次启动产生的转发资源；stop() 可安全重复调用。"""
+
+    tasks: list[asyncio.Task]
+    servers: list[asyncio.AbstractServer]
+    supervisors: list[SshForwardSupervisor]
+
+    async def stop(self) -> None:
+        """先停 ssh 监督器，再取消任务，最后关闭 direct 监听。"""
+        for supervisor, task in zip(self.supervisors, self.tasks):
+            if task.done():
+                # run() 的 finally 已回收子进程；重复 stop 时不再等待。
+                continue
+            await supervisor.stop()
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        for server in self.servers:
+            server.close()
+        for server in self.servers:
+            await server.wait_closed()
+
+
+async def start_tunnel(
+    *, keys_dir: Path = DB_TUNNEL_KEYS,
+    config_path: Path = DB_TUNNEL_CONFIG,
+    emit=log_state,
+    listen_host: str = "0.0.0.0",
+) -> TunnelRuntime | None:
+    """keys_dir 不存在返回 None；存在但配置非法返回空 runtime 并记录。"""
+    if not Path(keys_dir).is_dir():
+        return None
+    try:
+        forwards = load_forwards(config_path, keys_dir=keys_dir)
+    except TunnelConfigError:
+        # 数据库配置错误不能拖垮 broker/egress：只记录固定错误码。
+        emit("", "", "failed", "config_invalid")
+        return TunnelRuntime(tasks=[], servers=[], supervisors=[])
+
+    tasks: list[asyncio.Task] = []
+    servers: list[asyncio.AbstractServer] = []
+    supervisors: list[SshForwardSupervisor] = []
+    for forward in forwards:
+        if forward.mode == "direct":
+            try:
+                server = await serve_direct(
+                    forward, host=listen_host, emit=emit)
+            except OSError:
+                # serve_direct 已记录 failed/forward_failed；单条失败继续下一条。
+                continue
+            servers.append(server)
+        else:
+            supervisor = SshForwardSupervisor(forward, emit=emit)
+            supervisors.append(supervisor)
+            tasks.append(asyncio.create_task(supervisor.run()))
+    return TunnelRuntime(tasks=tasks, servers=servers, supervisors=supervisors)

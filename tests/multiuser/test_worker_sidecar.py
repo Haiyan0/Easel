@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import pathlib
+import socket
 import sys
 
 import pytest
@@ -21,6 +22,26 @@ sys.modules[spec.name] = sidecar
 spec.loader.exec_module(sidecar)
 
 from easel.control.egress import EgressPolicy  # noqa: E402
+
+
+async def _echo(reader, writer):
+    try:
+        while chunk := await reader.read(65536):
+            writer.write(chunk)
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+def _free_port(start=13300, end=13399) -> int:
+    for port in range(start, end + 1):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("端口段已耗尽")
 
 
 class FakeUpstream:
@@ -267,4 +288,106 @@ def test_sidecar_egress_uses_task5_private_target_denial():
         finally:
             server.close()
             await server.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_start_without_keys_returns_no_tunnel(tmp_path):
+    async def scenario():
+        policy = EgressPolicy()
+        servers = await sidecar._start(
+            "127.0.0.1", 0, 0, ("127.0.0.1", 1), policy,
+            tunnel_keys=tmp_path / "missing",
+            tunnel_config=tmp_path / "missing.yaml")
+        broker, egress, tunnel = servers
+        assert tunnel is None
+        broker.close()
+        egress.close()
+        await broker.wait_closed()
+        await egress.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_invalid_tunnel_config_keeps_broker_serving(tmp_path, capsys):
+    async def scenario():
+        keys = tmp_path / "keys"
+        keys.mkdir()
+        config = tmp_path / "tunnel.yaml"
+        config.write_text("version: 2\nforwards: []\n", encoding="utf-8")
+        broker, egress, tunnel = await sidecar._start(
+            "127.0.0.1", 0, 0, ("127.0.0.1", 1), EgressPolicy(),
+            tunnel_keys=keys, tunnel_config=config)
+        try:
+            assert tunnel is not None
+            port = broker.sockets[0].getsockname()[1]
+            assert b"200" in await _broker_roundtrip(
+                port, _request("GET", "/healthz"))
+            assert "state=failed reason=config_invalid" in capsys.readouterr().err
+        finally:
+            broker.close()
+            egress.close()
+            await broker.wait_closed()
+            await egress.wait_closed()
+            await tunnel.stop()
+    asyncio.run(scenario())
+
+
+def test_missing_tunnel_config_keeps_broker_serving(tmp_path, capsys):
+    async def scenario():
+        keys = tmp_path / "keys"
+        keys.mkdir()
+        broker, egress, tunnel = await sidecar._start(
+            "127.0.0.1", 0, 0, ("127.0.0.1", 1), EgressPolicy(),
+            tunnel_keys=keys, tunnel_config=tmp_path / "missing.yaml")
+        try:
+            assert tunnel is not None
+            port = broker.sockets[0].getsockname()[1]
+            assert b"200" in await _broker_roundtrip(
+                port, _request("GET", "/healthz"))
+            assert "state=failed reason=config_invalid" in capsys.readouterr().err
+        finally:
+            broker.close()
+            egress.close()
+            await broker.wait_closed()
+            await egress.wait_closed()
+            await tunnel.stop()
+    asyncio.run(scenario())
+
+
+def test_direct_forward_is_started_from_tunnel_config(tmp_path):
+    async def scenario():
+        echo = await asyncio.start_server(_echo, "127.0.0.1", 0)
+        upstream_port = echo.sockets[0].getsockname()[1]
+        keys = tmp_path / "keys"
+        keys.mkdir()
+        listen_port = _free_port()
+        config = tmp_path / "tunnel.yaml"
+        config.write_text(
+            "version: 1\nforwards:\n"
+            "  - source: sales_readonly\n"
+            "    mode: direct\n"
+            f"    listen_port: {listen_port}\n"
+            "    database:\n"
+            "      host: 127.0.0.1\n"
+            f"      port: {upstream_port}\n",
+            encoding="utf-8")
+        broker, egress, tunnel = await sidecar._start(
+            "127.0.0.1", 0, 0, ("127.0.0.1", 1), EgressPolicy(),
+            tunnel_keys=keys, tunnel_config=config)
+        try:
+            assert tunnel is not None and len(tunnel.servers) == 1
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", listen_port)
+            writer.write(b"ping")
+            await writer.drain()
+            assert await reader.readexactly(4) == b"ping"
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            broker.close()
+            egress.close()
+            await broker.wait_closed()
+            await egress.wait_closed()
+            await tunnel.stop()
+            echo.close()
+            await echo.wait_closed()
     asyncio.run(scenario())

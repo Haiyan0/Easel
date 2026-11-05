@@ -163,6 +163,7 @@ COPY deploy/multiuser/smoke_harness.py ./deploy/multiuser/smoke_harness.py
 COPY deploy/multiuser/verify_managed_profile.py ./deploy/multiuser/verify_managed_profile.py
 COPY deploy/multiuser/worker_sidecar.py ./deploy/multiuser/worker_sidecar.py
 COPY deploy/multiuser/egress_proxy.py ./deploy/multiuser/egress_proxy.py
+COPY deploy/multiuser/db_tunnel.py ./deploy/multiuser/db_tunnel.py
 RUN chown -R root:root /opt/easel \
  && chmod -R a-w /opt/easel
 # 构建期实际校验文件、模块、worker 沙箱参数和假 Harness 子进程；
@@ -179,6 +180,9 @@ FROM execution AS runtime
 ARG DSH_COMMIT=""
 
 USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/*
 COPY deploy/multiuser/managed /opt/easel/managed
 RUN test -n "${DSH_COMMIT}" \
       || { echo "DSH_COMMIT 必须固定为已验收的 Harness commit" >&2; exit 1; } \

@@ -118,6 +118,17 @@ def test_require_dsh_runs_real_acp_profile_and_native_runtime():
         assert marker in harness
 
 
+def test_worker_image_contains_tunnel_and_openssh_client():
+    text = _text(DOCKERFILE)
+    assert "COPY deploy/multiuser/db_tunnel.py" in text
+    assert "openssh-client" in text
+    execution = text.index("FROM execution AS runtime")
+    install = text.index("apt-get install -y --no-install-recommends openssh-client")
+    final_user = text.rindex("USER 10001:10001")
+    assert execution < install < final_user
+    assert "db_tunnel.py" in _text(SMOKE)
+
+
 def test_build_context_excludes_skill_secrets_tests_and_caches():
     lines = {line.strip() for line in _text(DOCKERIGNORE).splitlines()}
     for pattern in (

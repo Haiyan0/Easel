@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -34,6 +35,7 @@ from easel.control.egress import (  # noqa: E402
     parse_proxy_authority,
 )
 from easel.providers.openai import BROKER_ROUTE_TABLE  # noqa: E402
+import db_tunnel  # noqa: E402
 import egress_proxy  # noqa: E402
 
 MAX_HEADER_BYTES = 64 * 1024
@@ -234,18 +236,57 @@ async def _handle_broker(reader: asyncio.StreamReader,
             pass
 
 
-async def _serve(host: str, broker_port: int, egress_port: int,
-                 upstream: tuple[str, int], policy: EgressPolicy) -> None:
+async def _start(
+    host: str, broker_port: int, egress_port: int,
+    upstream: tuple[str, int], policy: EgressPolicy, *,
+    tunnel_keys: Path = db_tunnel.DB_TUNNEL_KEYS,
+    tunnel_config: Path = db_tunnel.DB_TUNNEL_CONFIG,
+) -> tuple[asyncio.AbstractServer, asyncio.AbstractServer,
+           db_tunnel.TunnelRuntime | None]:
+    """先创建 broker/egress 监听，再启动隧道；测试用它取实际端口。"""
     broker_server = await asyncio.start_server(
         lambda reader, writer: _handle_broker(reader, writer, upstream),
         host, broker_port)
     egress_server = await asyncio.start_server(
         lambda reader, writer: egress_proxy._handle(reader, writer, policy),
         host, egress_port)
-    async with broker_server, egress_server:
-        await asyncio.gather(
-            broker_server.serve_forever(),
-            egress_server.serve_forever())
+    tunnel = await db_tunnel.start_tunnel(
+        keys_dir=tunnel_keys, config_path=tunnel_config)
+    return broker_server, egress_server, tunnel
+
+
+async def _serve(host: str, broker_port: int, egress_port: int,
+                 upstream: tuple[str, int], policy: EgressPolicy) -> None:
+    broker_server, egress_server, tunnel = await _start(
+        host, broker_port, egress_port, upstream, policy)
+    stop_event = asyncio.Event()
+    try:
+        asyncio.get_running_loop().add_signal_handler(
+            signal.SIGTERM, stop_event.set)
+    except NotImplementedError:
+        # Windows 事件循环不支持信号处理器；依赖 KeyboardInterrupt/容器停止。
+        pass
+    broker_task = asyncio.create_task(broker_server.serve_forever())
+    egress_task = asyncio.create_task(egress_server.serve_forever())
+    stop_task = asyncio.create_task(stop_event.wait())
+    pending: set[asyncio.Task] = {broker_task, egress_task, stop_task}
+    try:
+        done, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is not stop_task:
+                # server 任务异常在此重新抛出，交由进程退出处理。
+                task.result()
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        broker_server.close()
+        egress_server.close()
+        await broker_server.wait_closed()
+        await egress_server.wait_closed()
+        if tunnel is not None:
+            await tunnel.stop()
 
 
 def main(argv: list[str] | None = None) -> int:

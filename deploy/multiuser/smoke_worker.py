@@ -33,6 +33,7 @@ REQUIRED_FILES = (
     "skills/builtin/paper-explainer/scripts/render_slides.py",
     "deploy/multiuser/worker_sidecar.py",
     "deploy/multiuser/egress_proxy.py",
+    "deploy/multiuser/db_tunnel.py",
 )
 
 FORBIDDEN_FILE_NAMES = {
