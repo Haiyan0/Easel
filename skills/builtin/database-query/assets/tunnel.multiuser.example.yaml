@@ -1,0 +1,26 @@
+version: 1
+forwards:
+  - source: yuanmeng_mall_tracking_readonly
+    mode: ssh
+    listen_port: 13306
+    database:
+      host: db-internal.example.com
+      port: 3306
+    ssh:
+      host: jump.example.com
+      port: 22
+      user: easel-tunnel
+      private_key: database-query_ed25519
+      known_hosts: known_hosts
+  - source: yuanmeng_space_readonly
+    mode: direct
+    listen_port: 13307
+    database:
+      host: db-public.example.com
+      port: 3306
+  - source: collectibles_readonly
+    mode: direct
+    listen_port: 13308
+    database:
+      host: db-public.example.com
+      port: 3306

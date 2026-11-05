@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import sys
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -8,6 +10,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 SKILL = ROOT / "skills" / "builtin" / "database-query"
 CONFIG = SKILL / "assets" / "config.multiuser.yaml"
+EXAMPLE = SKILL / "assets" / "tunnel.multiuser.example.yaml"
 SCRIPTS = SKILL / "scripts"
 
 EXPECTED_IDS = {
@@ -48,3 +51,27 @@ def test_multiuser_sources_cover_all_project_doc_bindings():
     config = _app_config().load(CONFIG)
     assert connection_ids == EXPECTED_IDS
     assert connection_ids <= {source.id for source in config.sources}
+
+
+def _db_tunnel():
+    spec = importlib.util.spec_from_file_location(
+        "db_tunnel_for_config_test",
+        ROOT / "deploy" / "multiuser" / "db_tunnel.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_enabled_sources_have_exactly_one_matching_forward():
+    config = _app_config().load(CONFIG)
+    forwards = _db_tunnel().load_forwards(EXAMPLE, allow_placeholders=True)
+    enabled = {source.id for source in config.sources if source.enabled}
+    counts = Counter(forward.source for forward in forwards)
+    assert set(counts) == enabled
+    assert all(count == 1 for count in counts.values())
+    assert len({forward.listen_port for forward in forwards}) == len(forwards)
+    assert all("PRIVATE KEY" not in path.read_text(encoding="utf-8")
+               for path in (CONFIG, EXAMPLE))
+    assert all("mysql+asyncmy://" not in path.read_text(encoding="utf-8")
+               for path in (CONFIG, EXAMPLE))
