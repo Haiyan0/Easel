@@ -43,6 +43,10 @@ FORBIDDEN_TOOL_TOKENS = (
 )
 # 来源与迁移记录允许保留旧平台名词，避免抹掉移植历史。
 HISTORY_FILES = {"PROVENANCE.md", "EASEL-META.md"}
+# 不得入库的缓存/秘密目录名；测试运行生成的同名本地产物不算。
+CACHE_DIR_NAMES = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".secrets",
+})
 
 
 def _load_validator():
@@ -86,8 +90,18 @@ def test_added_skill_excludes_platform_manifests_and_caches(name: str) -> None:
     root = SKILLS_ROOT / name
     assert not (root / "manifest.yaml").exists()
     assert not (root / "migration.json").exists()
-    for pattern in ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".secrets"):
-        assert not list(root.rglob(pattern)), f"{name} 不应包含 {pattern}"
+    # 测试运行会在技能目录生成 __pycache__ 等本地产物；它们已被 .gitignore
+    # 与 .dockerignore 排除，不应据此判失败。因此只校验真正入库、会进入
+    # 构建上下文的被跟踪文件。
+    result = subprocess.run(
+        ["git", "ls-files", "--", f"skills/builtin/{name}"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    tracked = result.stdout.splitlines()
+    assert tracked, f"{name} 没有任何入库文件"
+    for relative in tracked:
+        hits = CACHE_DIR_NAMES.intersection(relative.split("/"))
+        assert not hits, f"{relative} 不应包含 {sorted(hits)[0]}"
 
 
 def test_geo_skill_does_not_ship_the_tavily_secret() -> None:
