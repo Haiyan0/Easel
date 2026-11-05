@@ -19,10 +19,14 @@ EXPECTED_IDS = {
 
 def _app_config():
     sys.path.insert(0, str(SCRIPTS))
+    # 导入技能包时禁止写入 __pycache__，避免污染技能目录并触发缓存检查
+    original_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         from dbquery.config import AppConfig
     finally:
         sys.path.remove(str(SCRIPTS))
+        sys.dont_write_bytecode = original_dont_write_bytecode
     return AppConfig
 
 
