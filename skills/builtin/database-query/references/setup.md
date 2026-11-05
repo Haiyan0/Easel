@@ -2,7 +2,7 @@
 
 ## 1. 依赖
 
-需要 Python 3.10–3.12。Easel 已在 `pyproject.toml` 声明 `pydantic`、`PyYAML`、`SQLAlchemy`、`asyncmy`、`sqlglot`；优先使用项目 Python（本地默认 `python`，Docker 镜像内为镜像自带的虚拟环境）。单独安装时：
+需要 Python 3.10–3.12。Easel 已在 `pyproject.toml` 声明 `pydantic`、`PyYAML`、`SQLAlchemy`、`asyncmy`、`sqlglot`；优先使用项目 Python（本地默认 `python`，Docker 镜像内为镜像自带的 Python 环境）。单独安装时：
 
 ```powershell
 python -m pip install -r skills/builtin/database-query/requirements.txt
@@ -106,11 +106,11 @@ COLLECTIBLES_DATABASE_URL=mysql+asyncmy://readonly:<百分号编码口令>@db-tu
 权限（Linux 宿主）：
 
 ```bash
-install -d -o root   -g 10001 -m 0750 /srv/easel/secrets/database-query
-install -d -o root   -g 10001 -m 0750 /srv/easel/secrets/database-query/keys
-install -o 10001 -g 10001 -m 0400 <私钥>        /srv/easel/secrets/database-query/keys/database-query_ed25519
-install -o root  -g 10001 -m 0440 <known_hosts> /srv/easel/secrets/database-query/keys/known_hosts
-install -o 10001 -g 10001 -m 0400 <env 文件>    /srv/easel/secrets/database-query/database-query.env
+sudo install -d -o root   -g 10001 -m 0750 /srv/easel/secrets/database-query
+sudo install -d -o root   -g 10001 -m 0750 /srv/easel/secrets/database-query/keys
+sudo install -o 10001 -g 10001 -m 0400 <私钥>        /srv/easel/secrets/database-query/keys/database-query_ed25519
+sudo install -o root  -g 10001 -m 0440 <known_hosts> /srv/easel/secrets/database-query/keys/known_hosts
+sudo install -o 10001 -g 10001 -m 0400 <env 文件>    /srv/easel/secrets/database-query/database-query.env
 ```
 
 私钥必须无口令、由 UID 10001 拥有且组/其他用户不可读写，否则 OpenSSH 在 `BatchMode=yes` 下拒绝使用。跳板机账号应专用，并在 `authorized_keys` 中限制为端口转发：
@@ -128,7 +128,7 @@ python skills/builtin/database-query/scripts/db_query.py --config skills/builtin
 python skills/builtin/database-query/scripts/db_query.py --config skills/builtin/database-query/config.yaml doctor --connect --project <精确项目 ID>
 ```
 
-默认 `doctor` 只检查本地配置、依赖、项目目录、绑定、数据源状态与目录可写性；`--connect` 才会建立真实连接，并核验实际库名与 `allowed_schema` 一致。多人 Docker 使用第 2 节的固定命令（`config.multiuser.yaml` + `/run/easel-secrets/database-query.env`），逐 source 验收时再加 `--connect --project <精确项目 ID>`。
+默认 `doctor` 只检查本地配置、依赖、项目目录、绑定、数据源状态与目录可写性；`sources` 检查只展示启用/验证标记，`ok: true` **不代表**凭据已配置或可用于查询，实际连通性必须用 `--connect`。`--connect` 才会建立真实连接，并核验实际库名与 `allowed_schema` 一致。多人 Docker 使用第 2 节的固定命令（`config.multiuser.yaml` + `/run/easel-secrets/database-query.env`），逐 source 验收时再加 `--connect --project <精确项目 ID>`。
 
 ## 5. SSH 隧道
 

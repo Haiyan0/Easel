@@ -41,6 +41,13 @@ def test_worker_env_drops_dsn_but_env_file_doctor_passes(tmp_path):
     env_file = tmp_path / "database-query.env"
     env_file.write_text(
         f"SALES_READONLY_DATABASE_URL={SECRET}\n", encoding="utf-8")
+    # 不支持的方言用于证明 --env-file 中的 DSN 确实被技能读取并解析；
+    # doctor --connect 走到 DSN 解析即返回固定错误码，不会建立真实连接。
+    probe_env = tmp_path / "probe.env"
+    probe_env.write_text(
+        "SALES_READONLY_DATABASE_URL="
+        "postgresql://readonly:file-sentinel@db-tunnel:13300/sales\n",
+        encoding="utf-8")
 
     base = dict(os.environ)
     base["SALES_READONLY_DATABASE_URL"] = SECRET
@@ -66,3 +73,23 @@ def test_worker_env_drops_dsn_but_env_file_doctor_passes(tmp_path):
     assert '"ok": true' in result.stdout
     assert "dsn-sentinel" not in result.stdout
     assert "dsn-sentinel" not in result.stderr
+
+    # 不受支持的方言只有真正读取并解析 env 文件后才会出现；
+    # 该错误发生在建连前，因此无需可用数据库。
+    probe = subprocess.run(
+        [sys.executable, "-B", str(CLI), "--config", str(config),
+         "--env-file", str(probe_env), "doctor", "--connect",
+         "--project", "sales"],
+        capture_output=True, text=True, env=env, timeout=120)
+    probe_output = probe.stdout + probe.stderr
+    assert "database.unsupported_dialect" in probe_output, probe_output
+    assert "file-sentinel" not in probe_output
+
+    # 去掉 --env-file 后同一命令应报告凭据不可用，证明 DSN 来自该文件，
+    # 而不是 worker 进程环境。
+    missing = subprocess.run(
+        [sys.executable, "-B", str(CLI), "--config", str(config),
+         "doctor", "--connect", "--project", "sales"],
+        capture_output=True, text=True, env=env, timeout=120)
+    missing_output = missing.stdout + missing.stderr
+    assert "database.source_unavailable" in missing_output, missing_output

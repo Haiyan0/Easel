@@ -194,17 +194,17 @@ provisioner 以 `database_query_secrets_invalid` 拒绝启动。启用后 worker
 2. 创建宿主 secrets 与权限：
 
    ```bash
-   install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query
-   install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query/keys
-   install -o 10001 -g 10001 -m 0400 <私钥>        /srv/easel/secrets/database-query/keys/database-query_ed25519
-   install -o root  -g 10001 -m 0440 <known_hosts> /srv/easel/secrets/database-query/keys/known_hosts
-   install -o 10001 -g 10001 -m 0400 <env 文件>    /srv/easel/secrets/database-query/database-query.env
+   sudo install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query
+   sudo install -d -o root -g 10001 -m 0750 /srv/easel/secrets/database-query/keys
+   sudo install -o 10001 -g 10001 -m 0400 <私钥>        /srv/easel/secrets/database-query/keys/database-query_ed25519
+   sudo install -o root  -g 10001 -m 0440 <known_hosts> /srv/easel/secrets/database-query/keys/known_hosts
+   sudo install -o 10001 -g 10001 -m 0400 <env 文件>    /srv/easel/secrets/database-query/database-query.env
    ```
 
    跳板机账号应专用，并在 `authorized_keys` 限制为端口转发：
    `command="",no-pty,no-agent-forwarding,no-x11-forwarding,permitopen="<db_host>:3306"`。
 3. 重建镜像；`tunnel.multiuser.yaml` 随 `COPY skills` 进入 worker/sidecar
-   镜像。禁止把真实文件或 secrets 写入镜像层以外的公开位置。
+   镜像。DSN、私钥与 known_hosts 绝不写入镜像层或任何公开位置。
 4. drain + stop **所有** workspace（启用或停用 secrets 的必经步骤），再用
    `--database-query-secrets` 重启 provisioner。旧形状容器会被静态验收
    拒绝，必须先停，不能原地热改。
