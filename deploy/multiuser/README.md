@@ -63,6 +63,13 @@ docker build -f deploy/multiuser/Dockerfile.worker \
 - `.dockerignore` 排除 `.env*`、outputs、profiles、浏览器状态、数据库、
   HOME、审计/任务文档、tests，以及补 COPY `skills/` 后可能带入的旧公众号
   YAML、token、Cookie、缓存；构建上下文不含开发者数据。
+- 三个新增技能的公开骨架已入库：`skills/builtin/data-analysis/`、
+  `skills/builtin/geo-content-sop/` 与 `skills/builtin/project-docs/`（含
+  `references/projects.yaml` 与模板）。构建宿主必须预先放置
+  `skills/builtin/project-docs/references/<项目>/` 私密业务文档（已被
+  `.gitignore` 排除，不随仓库分发），否则 database-query 的
+  `catalog.document_path` 不可用。`config.multiuser.yaml` 的
+  `project_docs_root` 固定为镜像内 `/opt/easel/skills/builtin/project-docs`。
 - 禁止 COPY 任何 master key、服务 token、模型 Key、Cookie。
 
 构建后取摘要并部署，禁止用可变 tag 启动：
@@ -205,9 +212,11 @@ provisioner 以 `database_query_secrets_invalid` 拒绝启动。启用后 worker
    `command="",no-pty,no-agent-forwarding,no-x11-forwarding,permitopen="<db_host>:3306"`。
 3. 重建镜像；`tunnel.multiuser.yaml` 随 `COPY skills` 进入 worker/sidecar
    镜像。DSN、私钥与 known_hosts 绝不写入镜像层或任何公开位置。
-4. drain + stop **所有** workspace（启用或停用 secrets 的必经步骤），再用
-   `--database-query-secrets` 重启 provisioner。旧形状容器会被静态验收
-   拒绝，必须先停，不能原地热改。
+4. `running`/`restarting`/`paused` 的旧形状 workspace 必须 drain + stop
+   （启用或停用 secrets 的必经步骤），再用 `--database-query-secrets` 重启
+   provisioner；没有停止授权，不能原地热改。已明确 `exited` 且按禁用口径
+   静态验收仍合法的实例，会在下一次 `ensure` 自动按已核验实例 ID 重建；
+   被篡改的 exited 容器仍返回 `container_conflict`，保留现场交部署方核查。
 5. 逐个 workspace 检查 sidecar 日志，每个启用 source 都应出现
    `db-tunnel source=<id> mode=<direct|ssh> state=ready`。
 6. 在 worker 内对每个 source 执行：

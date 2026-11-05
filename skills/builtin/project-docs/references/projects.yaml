@@ -1,0 +1,38 @@
+version: 1
+projects:
+  - id: yuanmeng-mall-tracking
+    company: 元梦空间
+    name: 元梦商城用户观测
+    aliases: [元梦商城埋点, 商城用户观测, 商城埋点分析]
+    document: references/元梦空间/元梦商城用户观测/业务说明.md
+    connection_id: yuanmeng_mall_tracking_readonly
+  - id: yuanmeng-mall
+    company: 元梦空间
+    name: 元梦商城
+    aliases: [商城]
+    document: references/元梦空间/元梦商城/业务说明.md
+    connection_id: yuanmeng_space_readonly
+  - id: yuanmeng-rental
+    company: 元梦空间
+    name: 元租房
+    aliases: [租房]
+    document: references/元梦空间/元租房/业务说明.md
+    connection_id: yuanmeng_space_readonly
+  - id: yuanmeng-collectibles
+    company: 元梦空间
+    name: 数字藏品商城
+    aliases: [藏品商城, 数字藏品订单]
+    document: references/元梦空间/数字藏品/业务说明.md
+    connection_id: collectibles_readonly
+  - id: yuanmeng-collectibles-platform
+    company: 元梦空间
+    name: 数字藏品平台资产
+    aliases: [藏品持有, 数字藏品碎片]
+    document: references/元梦空间/数字藏品/业务说明.md
+    connection_id: yuanmeng_space_readonly
+  - id: yuanmeng-space
+    company: 元梦空间
+    name: 元梦空间
+    aliases: []
+    document: references/元梦空间/元梦空间/业务说明.md
+    connection_id: yuanmeng_space_readonly
