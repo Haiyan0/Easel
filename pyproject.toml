@@ -22,6 +22,11 @@ dependencies = [
     "rembg>=2.0,<3", "biliup>=1,<2", "jieba>=0.42,<1", "snownlp>=0.12,<1",
     "markdown>=3.5,<4",
     "requests>=2.32,<3", "beautifulsoup4>=4.12,<5",
+    # data-analysis 技能：Excel 文件读取（xlsx 用 openpyxl、xls 用 xlrd）
+    "openpyxl>=3.1,<4", "xlrd>=2,<3",
+    # database-query 技能：受控只读 MySQL 查询与 SQL 解析
+    "PyYAML>=6,<7", "SQLAlchemy>=2.0,<2.1",
+    "asyncmy>=0.2.9,<0.3", "sqlglot>=30.18,<31.0",
     # ask_user 问答题桥接（easel/gateway_questions.py）：连本地 gateway WS RPC + Ed25519 设备签名
     # 只用到 load_pem_private_key + Ed25519.sign（长期稳定 API），上界放宽避免与新版冲突
     "websocket-client>=1.7,<2",

@@ -1,0 +1,11 @@
+version: 1
+project_docs_root: ../project-docs
+state_dir: ./state
+output_dir: ./outputs
+sources:
+  - id: sales_readonly
+    secret_env: SALES_READONLY_DATABASE_URL
+    allowed_schema: sales
+    allowed_tables: [orders, customers]
+    readonly_account_verified: false
+    enabled: false
