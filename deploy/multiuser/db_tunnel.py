@@ -11,6 +11,7 @@ import asyncio
 import collections.abc
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -394,3 +395,303 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------
+# SSH 转发运行时：固定参数与失败码映射
+# ---------------------------------------------------------------------
+
+# 按优先级排列的 stderr 片段表；全部小写比较，只返回固定错误码。
+_SSH_FAILURE_PATTERNS = (
+    (("host key verification failed",), "host_key_mismatch"),
+    (("load key", "identity file", "bad permissions"), "key_unreadable"),
+    (("permission denied",), "auth_failed"),
+    (("local forwarding", "forwarding failed", "cannot listen"),
+     "forward_failed"),
+    (("connect to host", "connection refused", "timed out",
+      "could not resolve", "network is unreachable"), "connect_failed"),
+)
+
+
+def build_ssh_argv(forward: Forward) -> list[str]:
+    """返回固定顺序、固定选项的 ssh argv；forward.mode 必须是 ssh。"""
+    ssh = forward.ssh
+    if forward.mode != "ssh" or ssh is None:
+        raise TunnelConfigError()
+    argv = ["/usr/bin/ssh", "-F", "/dev/null", "-N", "-T",
+            "-i", str(ssh.private_key)]
+    # 严格按 spec §6.3 的顺序；任何一项都不得被配置覆盖（fail closed）。
+    for option in (
+        "IdentitiesOnly=yes",
+        "BatchMode=yes",
+        "PreferredAuthentications=publickey",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "IdentityAgent=none",
+        "ForwardAgent=no",
+        "StrictHostKeyChecking=yes",
+        f"UserKnownHostsFile={ssh.known_hosts}",
+        "GlobalKnownHostsFile=/dev/null",
+        "UpdateHostKeys=no",
+        "ExitOnForwardFailure=yes",
+        "ConnectTimeout=10",
+        "ServerAliveInterval=30",
+        "ServerAliveCountMax=3",
+        "ControlMaster=no",
+        "ControlPath=none",
+    ):
+        argv.extend(("-o", option))
+    argv.extend((
+        "-p", str(ssh.port),
+        "-L",
+        f"0.0.0.0:{forward.listen_port}:"
+        f"{forward.database.host}:{forward.database.port}",
+        f"{ssh.user}@{ssh.host}",
+    ))
+    return argv
+
+
+def classify_ssh_stderr(text: str) -> str:
+    """把 ssh stderr 映射为固定错误码；不返回原文。"""
+    lowered = text.lower()
+    for fragments, reason in _SSH_FAILURE_PATTERNS:
+        if any(fragment in lowered for fragment in fragments):
+            return reason
+    return "connect_failed"
+
+
+# ---------------------------------------------------------------------
+# SSH 转发运行时：常驻监督
+# ---------------------------------------------------------------------
+
+SSH_BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+SSH_STABLE_SECONDS = 120.0
+SSH_STOP_TIMEOUT = 5.0
+
+_SSH_READY_POLL = 0.1
+_SSH_READY_TIMEOUT = 10.0
+_SSH_STDERR_LIMIT = 65536
+_SSH_STDERR_TIMEOUT = 1.0
+
+
+async def _spawn_ssh(argv: list[str]) -> asyncio.subprocess.Process:
+    """以最小环境启动 ssh；不继承 worker/agent 环境。"""
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        env={"HOME": "/tmp", "LC_ALL": "C"},
+    )
+
+
+async def _probe_forward_port(port: int) -> bool:
+    """尝试连接本地转发端口；连上即视为就绪。"""
+    try:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    except OSError:
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
+class SshForwardSupervisor:
+    """常驻监督单个 ssh 转发：退出或失败后退避重启，直到 stop()。"""
+
+    def __init__(
+        self, forward: Forward, *, emit=log_state,
+        spawn=None, sleep=asyncio.sleep, clock=time.monotonic,
+        ready_probe=None, backoff: tuple[float, ...] = SSH_BACKOFF,
+        stable_after: float = SSH_STABLE_SECONDS,
+        stop_timeout: float = SSH_STOP_TIMEOUT,
+    ) -> None:
+        self._forward = forward
+        self._emit = emit
+        self._spawn = _spawn_ssh if spawn is None else spawn
+        self._sleep = sleep
+        self._clock = clock
+        self._ready_probe = (
+            _probe_forward_port if ready_probe is None else ready_probe)
+        self._backoff = tuple(backoff) or SSH_BACKOFF
+        self._stable_after = stable_after
+        self._stop_timeout = stop_timeout
+        self._stop_event = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._process = None
+        self._wait_task: asyncio.Task | None = None
+
+    async def run(self) -> None:
+        """常驻监督 ssh 子进程，直到 stop() 被调用。"""
+        self._task = asyncio.current_task()
+        argv = build_ssh_argv(self._forward)
+        source = self._forward.source
+        index = 0
+        try:
+            while not self._stop_event.is_set():
+                self._emit(source, "ssh", "starting", "")
+                started_at = self._clock()
+                try:
+                    process = await self._spawn(argv)
+                except FileNotFoundError:
+                    reason = "ssh_unavailable"
+                except OSError:
+                    reason = "connect_failed"
+                else:
+                    reason = ""
+                if reason:
+                    # 进程都没能启动：同样按退避重试。
+                    self._emit(source, "ssh", "failed", reason)
+                    if await self._wait_backoff(index):
+                        break
+                    index = self._next_index(index)
+                    continue
+
+                self._process = process
+                # 只创建一次 wait() 任务，之后只 await 该任务。
+                wait_task = asyncio.create_task(process.wait())
+                self._wait_task = wait_task
+                state = await self._wait_ready(wait_task)
+                if state == "stopped":
+                    break
+                if state == "ready":
+                    self._emit(source, "ssh", "ready", "")
+                    if await self._wait_exit_or_stop(wait_task):
+                        break
+                    reason = classify_ssh_stderr(
+                        await self._read_stderr(process))
+                elif state == "timeout":
+                    # 端口 10 秒未就绪：固定 forward_failed 并回收进程。
+                    reason = "forward_failed"
+                    await self._terminate(process, wait_task)
+                else:
+                    reason = classify_ssh_stderr(
+                        await self._read_stderr(process))
+                self._process = None
+                if self._stop_event.is_set():
+                    break
+                self._emit(source, "ssh", "failed", reason)
+                if self._clock() - started_at >= self._stable_after:
+                    index = 0
+                if await self._wait_backoff(index):
+                    break
+                index = self._next_index(index)
+        finally:
+            await self._shutdown()
+            self._emit(source, "ssh", "stopped", "")
+
+    async def stop(self) -> None:
+        """请求停止：先 SIGTERM 当前子进程，再等待 run 收尾。"""
+        self._stop_event.set()
+        process = self._process
+        if process is not None and process.returncode is None:
+            process.terminate()
+        task = self._task
+        if task is not None and task is not asyncio.current_task():
+            await task
+
+    def _next_index(self, index: int) -> int:
+        """前进到下一档退避，封顶为最后一档（30 秒）。"""
+        return min(index + 1, len(self._backoff) - 1)
+
+    async def _wait_ready(self, wait_task: asyncio.Task) -> str:
+        """竞速端口就绪与进程退出；返回 ready/exited/timeout/stopped。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SSH_READY_TIMEOUT
+        port = self._forward.listen_port
+        while True:
+            if self._stop_event.is_set():
+                return "stopped"
+            if wait_task.done():
+                return "exited"
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return "timeout"
+            try:
+                ready = await asyncio.wait_for(
+                    self._ready_probe(port),
+                    min(_SSH_READY_POLL, remaining))
+            except (asyncio.TimeoutError, OSError):
+                ready = False
+            if wait_task.done():
+                return "exited"
+            if self._stop_event.is_set():
+                return "stopped"
+            if ready:
+                return "ready"
+            # 未就绪：最多等一个轮询间隔，进程退出时立即返回。
+            await asyncio.wait({wait_task}, timeout=_SSH_READY_POLL)
+
+    async def _wait_exit_or_stop(self, wait_task: asyncio.Task) -> bool:
+        """等待子进程退出或停止信号；返回 True 表示因停止结束。"""
+        stop_task = asyncio.ensure_future(self._stop_event.wait())
+        try:
+            await asyncio.wait(
+                {wait_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+        return self._stop_event.is_set()
+
+    async def _wait_backoff(self, index: int) -> bool:
+        """可被停止中断的退避等待；返回 True 表示已收到停止。"""
+        if self._stop_event.is_set():
+            return True
+        sleep_task = asyncio.ensure_future(self._sleep(self._backoff[index]))
+        stop_task = asyncio.ensure_future(self._stop_event.wait())
+        try:
+            await asyncio.wait(
+                {sleep_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (sleep_task, stop_task):
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+        return self._stop_event.is_set()
+
+    async def _read_stderr(self, process) -> str:
+        """读取有限 stderr 供映射错误码；任何失败都视为空。"""
+        stream = getattr(process, "stderr", None)
+        if stream is None:
+            return ""
+        try:
+            chunk = await asyncio.wait_for(
+                stream.read(_SSH_STDERR_LIMIT), _SSH_STDERR_TIMEOUT)
+        except (asyncio.TimeoutError, OSError, ValueError):
+            return ""
+        if not isinstance(chunk, bytes):
+            return ""
+        return chunk.decode("utf-8", errors="replace")
+
+    async def _terminate(self, process, wait_task: asyncio.Task) -> None:
+        """先 SIGTERM，超时后 SIGKILL，并等待进程退出。"""
+        if process.returncode is not None:
+            return
+        process.terminate()
+        if await self._wait_task_done(wait_task):
+            return
+        if process.returncode is None:
+            process.kill()
+        await self._wait_task_done(wait_task)
+
+    async def _wait_task_done(self, wait_task: asyncio.Task) -> bool:
+        """等待 wait() 任务，最多 stop_timeout 秒；返回是否已退出。"""
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(wait_task), self._stop_timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _shutdown(self) -> None:
+        """run 收尾：回收仍存活的子进程。"""
+        process = self._process
+        wait_task = self._wait_task
+        if process is not None and wait_task is not None:
+            await self._terminate(process, wait_task)

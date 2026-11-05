@@ -257,3 +257,205 @@ def test_direct_forward_logs_starting_and_ready():
         ("sales_readonly", "direct", "starting", ""),
         ("sales_readonly", "direct", "ready", ""),
     ]
+
+
+# ---------------------------------------------------------------------
+# SSH 固定参数与失败码映射
+# ---------------------------------------------------------------------
+
+
+def _ssh_forward(tmp_path, port=13306):
+    keys = tmp_path / "keys"
+    keys.mkdir(exist_ok=True)
+    key = keys / "database-query_ed25519"
+    known = keys / "known_hosts"
+    key.write_text("key", encoding="utf-8")
+    known.write_text("", encoding="utf-8")
+    return db_tunnel.Forward(
+        source="tracking_readonly", mode="ssh", listen_port=port,
+        database=db_tunnel.DatabaseTarget("10.0.0.10", 3306),
+        ssh=db_tunnel.SshTarget(
+            host="jump.internal", port=2222, user="easel-tunnel",
+            private_key=key, known_hosts=known))
+
+
+def test_ssh_argv_is_fixed_and_fail_closed(tmp_path):
+    forward = _ssh_forward(tmp_path)
+    argv = db_tunnel.build_ssh_argv(forward)
+    assert argv[0] == "/usr/bin/ssh"
+    for option in (
+        "StrictHostKeyChecking=yes", "BatchMode=yes",
+        "PreferredAuthentications=publickey", "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no", "IdentitiesOnly=yes",
+        "IdentityAgent=none", "ForwardAgent=no", "ExitOnForwardFailure=yes",
+        "ConnectTimeout=10", "ServerAliveInterval=30",
+        "ServerAliveCountMax=3", "GlobalKnownHostsFile=/dev/null",
+        "UpdateHostKeys=no", "ControlMaster=no", "ControlPath=none",
+    ):
+        assert ["-o", option] == argv[argv.index(option) - 1:
+                                       argv.index(option) + 1]
+    assert f"UserKnownHostsFile={forward.ssh.known_hosts}" in argv
+    assert ["-i", str(forward.ssh.private_key)] == argv[argv.index("-i"):][:2]
+    assert f"0.0.0.0:{forward.listen_port}:10.0.0.10:3306" == (
+        argv[argv.index("-L") + 1])
+    assert argv[-1] == "easel-tunnel@jump.internal"
+    assert "-N" in argv and "-T" in argv and "-F" in argv
+    assert "/dev/null" in argv
+    assert "StrictHostKeyChecking=no" not in argv
+    assert "accept-new" not in " ".join(argv)
+    assert not any("/bin/sh" in part or "bash" in part for part in argv)
+
+
+@pytest.mark.parametrize("text,reason", [
+    ("Host key verification failed.", "host_key_mismatch"),
+    ('Load key "/run/easel-secrets/keys/id": bad permissions',
+     "key_unreadable"),
+    ("Warning: Identity file /x not accessible", "key_unreadable"),
+    ("Permission denied (publickey).", "auth_failed"),
+    ("Could not request local forwarding.", "forward_failed"),
+    ("cannot listen to port 13306", "forward_failed"),
+    ("ssh: connect to host jump port 22: Connection refused",
+     "connect_failed"),
+    ("ssh: Could not resolve hostname jump", "connect_failed"),
+    ("something unexpected", "connect_failed"),
+])
+def test_stderr_maps_to_fixed_reason(text, reason):
+    assert db_tunnel.classify_ssh_stderr(text) == reason
+
+
+# ---------------------------------------------------------------------
+# SSH 常驻监督：退避、稳定重置、停止
+# ---------------------------------------------------------------------
+
+
+class _FakeStderr:
+    def __init__(self, text=b""):
+        self._text = text
+
+    async def read(self, n=-1):
+        return self._text
+
+
+class FakeProcess:
+    def __init__(self, stderr_text=b"", duration=0.0, ignore_term=False,
+                 clock=None):
+        self._stderr = _FakeStderr(stderr_text)
+        self.returncode = None
+        self._duration = duration
+        self._ignore_term = ignore_term
+        self._clock = clock if clock is not None else [0.0]
+        self.terminated = False
+        self.killed = False
+        self._exited = asyncio.Event()
+
+    @property
+    def stderr(self):
+        return self._stderr
+
+    async def wait(self):
+        if self._ignore_term:
+            await self._exited.wait()
+            return -9
+        # 只推进注入时钟，不让测试真的等待 duration 秒。
+        self._clock[0] += self._duration
+        await asyncio.sleep(0)
+        self.returncode = 1
+        return 1
+
+    def terminate(self):
+        self.terminated = True
+        if not self._ignore_term:
+            self.returncode = -15
+            self._exited.set()
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self._exited.set()
+
+    def release(self):
+        self._exited.set()
+
+
+def test_supervisor_backs_off_and_stops(tmp_path):
+    async def scenario():
+        sleeps = []
+        logs = []
+        argvs = []
+        forward = _ssh_forward(tmp_path)
+
+        async def spawn(argv):
+            argvs.append(argv)
+            return FakeProcess(b"Permission denied (publickey).", 0)
+
+        supervisor = db_tunnel.SshForwardSupervisor(
+            forward,
+            spawn=spawn,
+            sleep=lambda delay: sleeps.append(delay) or asyncio.sleep(0),
+            ready_probe=lambda _port: asyncio.sleep(0, result=False),
+            emit=lambda *args: logs.append(args))
+        task = asyncio.create_task(supervisor.run())
+        for _ in range(100):
+            if len(sleeps) >= 4:
+                break
+            await asyncio.sleep(0.01)
+        await supervisor.stop()
+        await asyncio.wait_for(task, 2)
+        assert argvs[0] == db_tunnel.build_ssh_argv(forward)
+        assert sleeps[:4] == [1.0, 2.0, 4.0, 8.0]
+        assert ("tracking_readonly", "ssh", "failed", "auth_failed") in logs
+        assert ("tracking_readonly", "ssh", "stopped", "") in logs
+        assert all("Permission denied" not in str(entry) for entry in logs)
+    asyncio.run(scenario())
+
+
+def test_supervisor_resets_backoff_after_stable_run(tmp_path):
+    async def scenario():
+        sleeps = []
+        clock = [0.0]
+        durations = [0.0, 200.0, 10.0] + [0.0] * 100
+
+        async def spawn(_argv):
+            return FakeProcess(b"", durations.pop(0), clock=clock)
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+            clock[0] += delay
+
+        supervisor = db_tunnel.SshForwardSupervisor(
+            _ssh_forward(tmp_path), spawn=spawn, sleep=fake_sleep,
+            clock=lambda: clock[0],
+            ready_probe=lambda _p: asyncio.sleep(0, result=False))
+        task = asyncio.create_task(supervisor.run())
+        for _ in range(100):
+            if len(sleeps) >= 3:
+                break
+            await asyncio.sleep(0)
+        await supervisor.stop()
+        await asyncio.wait_for(task, 2)
+        assert sleeps[:3] == [1.0, 1.0, 2.0]
+    asyncio.run(scenario())
+
+
+def test_supervisor_terminates_then_kills_on_stop(tmp_path):
+    async def scenario():
+        process = FakeProcess(ignore_term=True)
+        logs = []
+
+        async def spawn(_argv):
+            return process
+
+        supervisor = db_tunnel.SshForwardSupervisor(
+            _ssh_forward(tmp_path), spawn=spawn,
+            ready_probe=lambda _p: asyncio.sleep(0, result=True),
+            stop_timeout=0.01, emit=lambda *args: logs.append(args))
+        task = asyncio.create_task(supervisor.run())
+        for _ in range(100):
+            if ("tracking_readonly", "ssh", "ready", "") in logs:
+                break
+            await asyncio.sleep(0.01)
+        await supervisor.stop()
+        await asyncio.wait_for(task, 2)
+        assert process.terminated and process.killed
+        assert ("tracking_readonly", "ssh", "stopped", "") in logs
+    asyncio.run(scenario())
