@@ -55,6 +55,18 @@ def _settings(tmp_path, *, sidecar=True):
         worker_public_key=_write_public_key(tmp_path / "worker.pub"))
 
 
+def _secrets(tmp_path):
+    root = tmp_path / "secrets"
+    (root / "keys").mkdir(parents=True)
+    (root / "database-query.env").write_text(
+        "SALES_READONLY_DATABASE_URL="
+        "mysql+asyncmy://readonly:secret@db-tunnel:13300/sales\n",
+        encoding="utf-8")
+    (root / "keys" / "id_ed25519").write_text("key", encoding="utf-8")
+    (root / "keys" / "known_hosts").write_text("", encoding="utf-8")
+    return root
+
+
 def _ok(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess([], 0, stdout, "")
 
@@ -71,7 +83,8 @@ def _write_cidfile(args: list[str], instance_id: str) -> None:
 
 
 def _worker_container(root: pathlib.Path, env: list[str] | None = None,
-                      workspace: str = WORKSPACE) -> dict:
+                      workspace: str = WORKSPACE,
+                      mounts: list[dict] | None = None) -> dict:
     paths = provisioner.prepare_workspace(root, workspace)
     public_key = _write_public_key(root.parent / "worker.pub")
     env_list = list(env or ["EASEL_SERVICE_TOKEN=old-token"])
@@ -108,7 +121,7 @@ def _worker_container(root: pathlib.Path, env: list[str] | None = None,
              "Destination": "/home/easel", "RW": True},
             {"Type": "bind", "Source": str(public_key),
              "Destination": "/keys/worker-public.key", "RW": False},
-        ],
+        ] if mounts is None else list(mounts),
         "NetworkSettings": {
             "Ports": {},
             "Networks": {
@@ -164,6 +177,29 @@ def _sidecar_container(policy: pathlib.Path,
                     "IPAddress": "172.30.0.3"}},
         },
     }
+
+
+def _argv_mounts(args: list[str]) -> list[dict]:
+    """把 docker run argv 的 --mount 三元组还原成 inspect 形状。"""
+    mounts: list[dict] = []
+    for index, value in enumerate(args):
+        if value != "--mount":
+            continue
+        fields: dict[str, str] = {}
+        options: set[str] = set()
+        for part in args[index + 1].split(","):
+            key, separator, field_value = part.partition("=")
+            if separator:
+                fields[key] = field_value
+            else:
+                options.add(part)
+        mounts.append({
+            "Type": fields.get("type", ""),
+            "Source": fields.get("src", ""),
+            "Destination": fields.get("dst", ""),
+            "RW": "readonly" not in options,
+        })
+    return mounts
 
 
 class FakeDocker:
@@ -253,7 +289,8 @@ class FakeDocker:
                 if value == "--env":
                     env.append(args[index + 1])
             raw = _worker_container(
-                self.root, env=env, workspace=self.workspace)
+                self.root, env=env, workspace=self.workspace,
+                mounts=_argv_mounts(args))
             self.containers[name] = raw
             _write_cidfile(args, raw["Id"])
             if "--cidfile" in args:
@@ -817,3 +854,86 @@ def test_incomplete_or_insecure_sidecar_config_is_rejected(tmp_path):
         provisioner.Provisioner(provisioner.ProvisionerSettings(
             **base, sidecar_network=SIDECAR_NETWORK,
             sidecar_policy=policy, broker_upstream="http://evil/path"))
+
+
+def test_database_query_secrets_require_sidecar(tmp_path):
+    settings = _settings(tmp_path, sidecar=False)
+    settings = dataclasses.replace(
+        settings, database_query_secrets=_secrets(tmp_path))
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        provisioner.Provisioner(settings)
+    assert rejected.value.code == "database_query_requires_sidecar"
+
+
+@pytest.mark.parametrize("damage", ["missing", "env_dir", "env_symlink",
+                                    "keys_missing", "keys_file"])
+def test_database_query_secrets_reject_invalid_layout(tmp_path, damage):
+    root = _secrets(tmp_path)
+    if damage == "missing":
+        root = tmp_path / "absent"
+    elif damage == "env_dir":
+        (root / "database-query.env").unlink()
+        (root / "database-query.env").mkdir()
+    elif damage == "env_symlink":
+        target = tmp_path / "real.env"
+        target.write_text("X=Y\n", encoding="utf-8")
+        (root / "database-query.env").unlink()
+        try:
+            (root / "database-query.env").symlink_to(target)
+        except OSError:
+            pytest.skip("当前环境不允许创建符号链接")
+    elif damage == "keys_missing":
+        (root / "keys" / "id_ed25519").unlink()
+        (root / "keys" / "known_hosts").unlink()
+        (root / "keys").rmdir()
+    elif damage == "keys_file":
+        (root / "keys" / "id_ed25519").unlink()
+        (root / "keys" / "known_hosts").unlink()
+        (root / "keys").rmdir()
+        (root / "keys").write_text("not a dir", encoding="utf-8")
+    settings = dataclasses.replace(
+        _settings(tmp_path), database_query_secrets=root)
+    with pytest.raises(provisioner.ProvisionerError) as rejected:
+        provisioner.Provisioner(settings)
+    assert rejected.value.code == "database_query_secrets_invalid"
+
+
+def test_worker_argv_adds_readonly_env_mount_without_dsn(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    secrets = _secrets(tmp_path)
+    env_file = (secrets / "database-query.env").resolve()
+    argv = provisioner.build_run_argv(
+        image=IMAGE, workspace_id=WORKSPACE, config_version=1, paths=paths,
+        env_file=tmp_path / "worker.env",
+        public_key_file=_write_public_key(tmp_path / "worker.pub"),
+        database_query_env_file=env_file)
+    mounts = [argv[index + 1] for index, value in enumerate(argv)
+              if value == "--mount"]
+    assert len(mounts) == 4
+    assert (f"type=bind,src={env_file},dst={provisioner.DB_QUERY_ENV_PATH},"
+            f"readonly") in mounts
+    assert "readonly:secret@" not in " ".join(argv)
+    assert "mysql+asyncmy://" not in " ".join(argv)
+
+
+def test_worker_static_requires_exact_mount_count_when_enabled(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    paths = provisioner.prepare_workspace(root, WORKSPACE)
+    secrets = _secrets(tmp_path)
+    env_file = (secrets / "database-query.env").resolve()
+    raw = _worker_container(root)
+    public_key = pathlib.Path(raw["Mounts"][2]["Source"])
+    kwargs = dict(workspace_id=WORKSPACE, config_version=1, image=IMAGE,
+                  paths=paths, public_key_file=public_key)
+    extra = {"Type": "bind", "Source": str(env_file),
+             "Destination": provisioner.DB_QUERY_ENV_PATH, "RW": False}
+    raw["Mounts"].append(extra)
+    assert provisioner._verify_worker_static(
+        raw, database_query_env_file=env_file, **kwargs)
+    assert not provisioner._verify_worker_static(raw, **kwargs)
+    raw["Mounts"][-1]["RW"] = True
+    assert not provisioner._verify_worker_static(
+        raw, database_query_env_file=env_file, **kwargs)

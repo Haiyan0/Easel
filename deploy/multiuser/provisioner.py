@@ -76,6 +76,10 @@ SIDECAR_MEMORY_BYTES = 512 * 1024 ** 2
 SIDECAR_NANO_CPUS = 1_000_000_000
 SIDECAR_TMPFS = "/tmp:rw,noexec,nosuid,nodev,size=64m"
 SIDECAR_POLICY_CONTAINER_PATH = "/etc/easel/egress-policy.json"
+# 数据库凭据只经只读 bind 进入容器；DSN 绝不进入 argv 或 --env。
+DB_QUERY_ENV_PATH = "/run/easel-secrets/database-query.env"
+DB_TUNNEL_KEYS_PATH = "/run/easel-secrets/keys"
+DB_TUNNEL_ALIAS = "db-tunnel"
 WORKER_COMMAND = (
     "python", "-m", "easel.worker.server",
     "serve", "--host", "0.0.0.0", "--port", str(WORKER_PORT),
@@ -708,7 +712,8 @@ def validate_worker_public_key(path: object) -> Path:
 def build_run_argv(*, image: str, workspace_id: str, config_version: int,
                    paths: RuntimePaths, env_file: Path,
                    public_key_file: Path,
-                   cidfile: Path | None = None) -> list[str]:
+                   cidfile: Path | None = None,
+                   database_query_env_file: Path | None = None) -> list[str]:
     """从批准配置构造唯一允许的 docker run argv。
 
     容器代码位于只读镜像 ``/opt/easel``；持久 bind 只有 ``/workspace`` 与
@@ -749,6 +754,15 @@ def build_run_argv(*, image: str, workspace_id: str, config_version: int,
         "--mount",
         (f"type=bind,src={_safe_path_text(public_key)},"
          f"dst={WORKER_PUBLIC_KEY_PATH},readonly"),
+    ])
+    if database_query_env_file is not None:
+        # DSN 只读文件挂载；绝不把内容或路径之外的凭据写进 argv。
+        argv.extend([
+            "--mount",
+            (f"type=bind,src={_safe_path_text(database_query_env_file)},"
+             f"dst={DB_QUERY_ENV_PATH},readonly"),
+        ])
+    argv.extend([
         "--env", f"EASEL_WORKER_PUBLIC_KEY_FILE={WORKER_PUBLIC_KEY_PATH}",
         "--env-file", _safe_path_text(env_file),
         "--restart=no",
@@ -792,6 +806,40 @@ def validate_sidecar_settings(settings: ProvisionerSettings
     if not resolved_policy.is_file():
         raise _reject("sidecar_policy_unavailable")
     return network, resolved_policy, upstream
+
+
+@dataclass(frozen=True)
+class DatabaseQuerySecrets:
+    """经启动校验的宿主 secrets；只允许以只读 bind 进入容器。"""
+
+    env_file: Path
+    keys_dir: Path
+
+
+def validate_database_query_secrets(
+        raw: Path | None,
+        sidecar: tuple[str, Path, str] | None) -> DatabaseQuerySecrets | None:
+    """None 直通；有值但 sidecar 未配置或目录不合法时抛 ProvisionerError。"""
+    if raw is None:
+        return None
+    if sidecar is None:
+        raise _reject("database_query_requires_sidecar")
+    root = Path(raw)
+    if root.is_symlink() or not root.is_dir():
+        raise _reject("database_query_secrets_invalid")
+    env_file = root / "database-query.env"
+    if env_file.is_symlink() or not env_file.is_file():
+        raise _reject("database_query_secrets_invalid")
+    keys_dir = root / "keys"
+    if keys_dir.is_symlink() or not keys_dir.is_dir():
+        raise _reject("database_query_secrets_invalid")
+    try:
+        # 经过校验后再解析一次，argv 与 inspect 只使用绝对真实路径。
+        resolved_env = env_file.resolve(strict=True)
+        resolved_keys = keys_dir.resolve(strict=True)
+    except OSError:
+        raise _reject("database_query_secrets_invalid") from None
+    return DatabaseQuerySecrets(env_file=resolved_env, keys_dir=resolved_keys)
 
 
 def build_sidecar_run_argv(*, image: str, workspace_id: str,
@@ -1017,7 +1065,8 @@ def verify_worker_wiring(raw: dict | None, *, workspace_id: str,
 def _verify_worker_static(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
                           paths: RuntimePaths,
-                          public_key_file: Path | None = None) -> bool:
+                          public_key_file: Path | None = None,
+                          database_query_env_file: Path | None = None) -> bool:
     """核对除运行接线外的静态安全配置。"""
     if not isinstance(raw, dict):
         return False
@@ -1090,7 +1139,8 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
         return False
 
     mounts = raw.get("Mounts")
-    if not isinstance(mounts, list) or len(mounts) != 3:
+    expected_mount_count = 3 if database_query_env_file is None else 4
+    if not isinstance(mounts, list) or len(mounts) != expected_mount_count:
         return False
     expected_mounts = {
         "/workspace": str(paths.workspace),
@@ -1100,6 +1150,7 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
         str(public_key_file) if public_key_file is not None else None)
     seen: dict[str, str] = {}
     key_seen = False
+    database_query_seen = False
     for mount in mounts:
         if not isinstance(mount, dict):
             return False
@@ -1114,6 +1165,17 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
                 return False
             key_seen = True
             continue
+        if destination == DB_QUERY_ENV_PATH:
+            # 按 destination 定位，不依赖 Docker 返回顺序；必须恰好一次。
+            if (database_query_env_file is None or database_query_seen
+                    or mount.get("Type") != "bind"
+                    or mount.get("RW") is not False
+                    or not isinstance(source, str) or not source
+                    or "docker.sock" in source
+                    or source != str(database_query_env_file)):
+                return False
+            database_query_seen = True
+            continue
         if (mount.get("Type") != "bind" or mount.get("RW") is not True
                 or destination not in expected_mounts
                 or source != expected_mounts[destination]
@@ -1121,6 +1183,8 @@ def _verify_worker_static(raw: dict | None, *, workspace_id: str,
             return False
         seen[destination] = str(source)
     if set(seen) != set(expected_mounts) or not key_seen:
+        return False
+    if database_query_env_file is not None and not database_query_seen:
         return False
 
     network_settings = raw.get("NetworkSettings")
@@ -1159,7 +1223,8 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
                           config_version: int, image: str,
                           paths: RuntimePaths,
                           sidecar_host: str | None = None,
-                          public_key_file: Path | None = None) -> bool:
+                          public_key_file: Path | None = None,
+                          database_query_env_file: Path | None = None) -> bool:
     """严格核对实际容器配置；复用、接管、inspect 与健康循环共用同一门槛。
 
     标签只表示归属，不能证明镜像、权限、资源、挂载、网络或运行接线仍是
@@ -1168,7 +1233,8 @@ def verify_worker_inspect(raw: dict | None, *, workspace_id: str,
     if not _verify_worker_static(
             raw, workspace_id=workspace_id,
             config_version=config_version, image=image, paths=paths,
-            public_key_file=public_key_file):
+            public_key_file=public_key_file,
+            database_query_env_file=database_query_env_file):
         return False
     return verify_worker_wiring(
         raw, workspace_id=workspace_id, sidecar_host=sidecar_host)
@@ -1583,6 +1649,7 @@ class ProvisionerSettings:
     sidecar_policy: Path | None = None
     broker_upstream: str = ""
     worker_public_key: Path | None = None
+    database_query_secrets: Path | None = None
     gateway_image: str = ""
     gateway_control_network: str = ""
     gateway_public_key: Path | None = None
@@ -1599,6 +1666,9 @@ class Provisioner:
         self._runner = run or self._subprocess_run
         self._locks: dict[str, asyncio.Lock] = {}
         self._sidecar = validate_sidecar_settings(settings)
+        # 依赖 sidecar 三件套已通过校验；失败关闭，绝不半启用。
+        self._database_query = validate_database_query_secrets(
+            settings.database_query_secrets, self._sidecar)
         self._worker_public_key = (
             validate_worker_public_key(settings.worker_public_key)
             if settings.worker_public_key is not None else None)
@@ -2024,7 +2094,10 @@ class Provisioner:
                     existing, workspace_id=workspace_id,
                     config_version=config_version,
                     image=self.settings.image, paths=paths,
-                    public_key_file=self._worker_public_key):
+                    public_key_file=self._worker_public_key,
+                    database_query_env_file=(
+                        self._database_query.env_file
+                        if self._database_query else None)):
                 raise ProvisionerError("container_conflict")
             if not verify_worker_wiring(
                     existing, workspace_id=workspace_id,
@@ -2077,7 +2150,10 @@ class Provisioner:
         argv = build_run_argv(
             image=self.settings.image, workspace_id=workspace_id,
             config_version=config_version, paths=paths, env_file=env_file,
-            public_key_file=self._worker_public_key, cidfile=cidfile)
+            public_key_file=self._worker_public_key, cidfile=cidfile,
+            database_query_env_file=(
+                self._database_query.env_file
+                if self._database_query else None))
         # build_run_argv 以 run 开头；_docker 自行添加 docker 可执行程序，
         # 必须传完整 argv，不能丢弃 run。run_task 与 cidfile 归本次
         # ensure 所有：CLI 超时/取消都必须等它终结后再清理。
@@ -2101,7 +2177,10 @@ class Provisioner:
                         config_version=config_version,
                         image=self.settings.image, paths=paths,
                         sidecar_host=sidecar_host,
-                        public_key_file=self._worker_public_key):
+                        public_key_file=self._worker_public_key,
+                        database_query_env_file=(
+                            self._database_query.env_file
+                            if self._database_query else None)):
                     raise ProvisionerError("container_conflict")
                 report = sanitize_inspect(raw)
                 if not _actual_token_matches(raw, token):
@@ -2529,7 +2608,10 @@ class Provisioner:
                     raw, workspace_id=workspace_id,
                     config_version=config_version,
                     image=self.settings.image, paths=paths,
-                    public_key_file=self._worker_public_key):
+                    public_key_file=self._worker_public_key,
+                    database_query_env_file=(
+                        self._database_query.env_file
+                        if self._database_query else None)):
                 raise ProvisionerError("worker_identity_mismatch")
             if not verify_worker_wiring(
                     raw, workspace_id=workspace_id,
@@ -3065,7 +3147,10 @@ class Provisioner:
                     raw, workspace_id=workspace_id,
                     config_version=config_version,
                     image=self.settings.image, paths=paths,
-                    public_key_file=self._worker_public_key):
+                    public_key_file=self._worker_public_key,
+                    database_query_env_file=(
+                        self._database_query.env_file
+                        if self._database_query else None)):
                 raise ProvisionerError("worker_identity_mismatch")
             try:
                 token = await asyncio.to_thread(
@@ -3131,7 +3216,10 @@ class Provisioner:
                 raw, workspace_id=workspace_id,
                 config_version=report["config_version"],
                 image=self.settings.image, paths=paths,
-                public_key_file=self._worker_public_key):
+                public_key_file=self._worker_public_key,
+                database_query_env_file=(
+                    self._database_query.env_file
+                    if self._database_query else None)):
             raise ProvisionerError("container_conflict")
         sidecar_host = self._sidecar_host(workspace_id)
         wiring_ready = verify_worker_wiring(
@@ -3492,6 +3580,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="sidecar 转发的 control broker host:port")
     parser.add_argument("--worker-public-key", required=True,
                         help="管理员固定的 worker Ed25519 只读公钥文件")
+    parser.add_argument("--database-query-secrets", default="",
+                        help="宿主侧 database-query secrets 目录；"
+                             "提供时 worker 只读挂载 database-query.env")
     parser.add_argument("--gateway-image", default="",
                         help="固定摘要的 gateway 镜像；启用时必填")
     parser.add_argument("--gateway-control-network", default="",
@@ -3526,6 +3617,9 @@ def main(argv: list[str] | None = None) -> int:
                         if args.sidecar_policy else None),
         broker_upstream=args.broker_upstream,
         worker_public_key=Path(args.worker_public_key),
+        database_query_secrets=(
+            Path(args.database_query_secrets)
+            if args.database_query_secrets else None),
         gateway_image=args.gateway_image,
         gateway_control_network=args.gateway_control_network,
         gateway_public_key=(
