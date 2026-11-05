@@ -1,0 +1,37 @@
+version: 1
+project_docs_root: /opt/easel/skills/builtin/project-docs
+state_dir: /workspace/outputs/_analytics/database-query/state
+output_dir: /workspace/outputs/_analytics/database-query/results
+sources:
+  - id: yuanmeng_mall_tracking_readonly
+    secret_env: YUANMENG_MALL_TRACKING_DATABASE_URL
+    allowed_schema: ymkj2.0
+    allowed_tables: [track_event]
+    readonly_account_verified: true
+    enabled: true
+  - id: yuanmeng_space_readonly
+    secret_env: YUANMENG_SPACE_DATABASE_URL
+    allowed_schema: meta_new_sync
+    allowed_tables:
+      - tan_user
+      - tan_vr_device_product
+      - tan_common_order
+      - tan_common_order_goods
+      - tan_class_user
+      - tan_tribe_order
+      - tan_area_bid_order
+      - tan_fixed_yuanmeng_store
+      - tan_store_claim_log
+      - tan_space_piece_log
+      - tan_user_has_nfr
+      - tan_core_group_part
+      - tan_core_rent_order
+      - tan_core_rent_room
+    readonly_account_verified: true
+    enabled: true
+  - id: collectibles_readonly
+    secret_env: COLLECTIBLES_DATABASE_URL
+    allowed_schema: szcp_sync
+    allowed_tables: [fa_user, fa_orders, fa_card_orders]
+    readonly_account_verified: true
+    enabled: true

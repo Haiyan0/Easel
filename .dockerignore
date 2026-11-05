@@ -60,6 +60,14 @@ skills/**/.cache/
 skills/**/cache/
 skills/**/profiles/
 skills/**/.pytest_cache/
+skills/**/config.yaml
+skills/**/config/database-query.yaml
+skills/**/state/
+skills/**/outputs/
+skills/**/.secrets/
+skills/**/.env
+新增的skill/
+skill-test/
 **/*.log
 
 PSScriptAnalyzerSettings.psd1
