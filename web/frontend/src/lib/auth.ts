@@ -97,7 +97,7 @@ export async function loadIdentity(
 export function loginErrorMessage(error: unknown): string {
   if (error instanceof AuthError) {
     if (error.status === 401) {
-      return '邀请无效、已使用或已过期，请联系管理员重新获取。';
+      return '登录码无效、已撤销或账号已禁用，请核对登录码或联系管理员。';
     }
     if (error.status === 403) {
       return '当前来源或账号权限不允许登录。请从管理员提供的地址重新打开，或联系管理员确认账号状态。';

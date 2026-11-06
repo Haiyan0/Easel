@@ -11,6 +11,24 @@ const settingsSource = readFileSync(
   new URL('../../web/frontend/src/lib/controlSettings.ts', import.meta.url), 'utf8');
 const controlSettings = loadTs(settingsSource, {});
 
+test('永久登录码已使用后仍可重复登录并可撤销', () => {
+  const invite = { id: 'code', userId: 'member', createdAt: 1000,
+    expiresAt: 0, redeemedAt: 1001, revokedAt: null };
+  assert.equal(controlSettings.isPendingInvite(invite, 9999999999), true);
+  assert.equal(controlSettings.inviteStatusLabel(invite, 9999999999), '永久有效');
+  assert.equal(controlSettings.isPendingInvite({ ...invite, revokedAt: 1002 }), false);
+  assert.equal(controlSettings.inviteStatusLabel({ ...invite, revokedAt: 1002 }), '已撤销');
+});
+
+test('显式有限期的登录码到期后不可用', () => {
+  const invite = { id: 'code', userId: 'member', createdAt: 1000,
+    expiresAt: 1100, redeemedAt: 1001, revokedAt: null };
+  assert.equal(controlSettings.isPendingInvite(invite, 1099), true);
+  assert.equal(controlSettings.inviteStatusLabel(invite, 1099), '有效');
+  assert.equal(controlSettings.isPendingInvite(invite, 1100), false);
+  assert.equal(controlSettings.inviteStatusLabel(invite, 1100), '已过期');
+});
+
 function loadTs(source, requires) {
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: {

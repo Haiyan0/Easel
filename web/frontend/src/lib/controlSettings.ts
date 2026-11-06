@@ -573,17 +573,17 @@ export function sourceLabel(entry: ChannelSettings): string {
 
 export function isPendingInvite(invite: AdminInvite,
                                 now = Math.floor(Date.now() / 1000)): boolean {
-  return invite.redeemedAt === null && invite.revokedAt === null
-    && invite.expiresAt > now;
+  return invite.revokedAt === null
+    && (invite.expiresAt === 0 || invite.expiresAt > now);
 }
 
 export function inviteStatusLabel(invite: AdminInvite,
                                   now = Math.floor(Date.now() / 1000)):
-  '已兑换' | '已撤销' | '已过期' | '待兑换' {
-  if (invite.redeemedAt !== null) return '已兑换';
+  '永久有效' | '已撤销' | '已过期' | '有效' {
   if (invite.revokedAt !== null) return '已撤销';
+  if (invite.expiresAt === 0) return '永久有效';
   if (invite.expiresAt <= now) return '已过期';
-  return '待兑换';
+  return '有效';
 }
 
 export function errorStatus(error: unknown): number | undefined {

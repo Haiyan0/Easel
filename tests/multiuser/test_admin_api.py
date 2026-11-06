@@ -352,7 +352,7 @@ def test_revoke_sessions_keeps_workspace_conversations_and_runs(tmp_path):
 # 邀请
 # --------------------------------------------------------------------------
 
-def test_invite_issue_list_revoke_and_single_redemption(tmp_path):
+def test_invite_issue_list_revoke_and_repeated_login(tmp_path):
     with admin_api(tmp_path) as (admin_client, member_client, store, auth,
                                  service, admin, second_admin, member, other):
         csrf = login(admin_client, auth, admin, admin)
@@ -365,7 +365,7 @@ def test_invite_issue_list_revoke_and_single_redemption(tmp_path):
         body = issued.json()
         assert set(body) == {"id", "token", "expiresAt"}
         assert body["token"]
-        assert isinstance(body["expiresAt"], int)
+        assert body["expiresAt"] == 0
 
         listing = admin_client.get("/api/admin/invites?limit=50&offset=0")
         assert listing.status_code == 200, listing.text
@@ -381,14 +381,14 @@ def test_invite_issue_list_revoke_and_single_redemption(tmp_path):
         assert body["token"] not in listing.text
         assert "token" not in listing.text.lower()
 
-        # 一次性兑换
+        # 永久可重用，已经登录过的码也可以撤销。
         assert exchange(member_client, body["token"]).status_code == 200
         member_client.cookies.clear()
-        assert exchange(member_client, body["token"]).status_code == 401
+        assert exchange(member_client, body["token"]).status_code == 200
         redeemed = admin_client.delete(
             f"/api/admin/invites/{body['id']}", headers=headers)
-        assert redeemed.status_code == 409
-        assert redeemed.json()["code"] == "invite_redeemed"
+        assert redeemed.status_code == 204
+        assert exchange(member_client, body["token"]).status_code == 401
 
         second = admin_client.post(
             "/api/admin/invites", json={"userId": member.user_id},

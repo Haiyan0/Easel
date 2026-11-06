@@ -319,12 +319,12 @@ def main(argv: list[str] | None = None) -> int:
     p_bootstrap.add_argument("--control-dir", required=True)
     p_bootstrap.add_argument("--name", required=True, help="管理员显示名")
     p_bootstrap.set_defaults(func=cmd_admin_bootstrap)
-    p_invite = admin_sub.add_parser("invite", help="为现有用户签发一次性邀请")
+    p_invite = admin_sub.add_parser("invite", help="为现有用户签发可重复使用的登录码")
     p_invite.add_argument("--control-dir", required=True)
     p_invite.add_argument("--admin-user-id", required=True, help="执行邀请的管理员用户 ID")
     p_invite.add_argument("--user-id", required=True, help="被邀请用户 ID")
-    p_invite.add_argument("--ttl-seconds", type=int, default=604800,
-                          help="邀请有效期秒数（默认 604800）")
+    p_invite.add_argument("--ttl-seconds", type=int, default=0,
+                          help="登录码有效期秒数（默认 0，永久）")
     p_invite.set_defaults(func=cmd_admin_invite)
     p_drain = admin_sub.add_parser(
         "drain", help="drain 所有活动 workspace（停止/备份前）")

@@ -2067,7 +2067,7 @@ def cmd_admin_bootstrap(args) -> int:
 
 
 def cmd_admin_invite(args) -> int:
-    """管理员为现有用户签发一次性邀请；角色由数据库复查。"""
+    """管理员为现有用户签发登录码，默认永久；角色由数据库复查。"""
     try:
         with Store.open(_control_db(args.control_dir)) as store:
             admin = store.get_identity(args.admin_user_id)

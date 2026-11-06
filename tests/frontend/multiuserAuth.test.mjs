@@ -219,7 +219,7 @@ test('login errors keep 401/403/429/503/network semantics', () => {
   });
   const { AuthError } = auth;
   assert.match(auth.loginErrorMessage(new AuthError(401, 'unauthorized')),
-    /已使用|已过期/);
+    /登录码无效|已撤销|已禁用/);
   const forbidden = auth.loginErrorMessage(new AuthError(403, 'forbidden'));
   assert.match(forbidden, /来源|权限/);
   assert.doesNotMatch(forbidden, /邀请无效|已使用|已过期/);

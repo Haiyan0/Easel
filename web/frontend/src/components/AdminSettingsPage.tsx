@@ -363,7 +363,7 @@ export default function AdminSettingsPage({
       setUsers((current) => current.map((item) =>
         item.userId === updated.userId ? updated : item));
       setNotice(updated.disabled
-        ? `已禁用 ${updated.displayName}；旧登录与未兑换邀请已失效。`
+        ? `已禁用 ${updated.displayName}；旧登录与全部登录码已失效。`
         : `已启用 ${updated.displayName}；仍需新邀请才能登录。`);
     }
     setBusy(false);
@@ -394,7 +394,7 @@ export default function AdminSettingsPage({
     }));
     if (result.ok) {
       setIssued(parseIssuedInvite(result.value));
-      setNotice('邀请已签发；明文只显示本次结果。');
+      setNotice('永久登录码已签发，可重复使用；请保存明文，本次关闭后不再显示。');
       await refreshInvites();
     }
     setBusy(false);
@@ -459,7 +459,7 @@ export default function AdminSettingsPage({
             ? '这里修改的是所有成员继承的默认配置；个人覆盖与成员管理分开操作。'
             : showDefaults
               ? '主聊天与能力模型的全体默认；未配置主聊天时成员无法开始对话。'
-              : '创建成员、禁用账号、撤销登录与签发一次性邀请。'}
+              : '创建成员、禁用账号、撤销登录与签发永久登录码；同账号新登录会使旧登录失效。'}
         </p>
       </header>
 
@@ -680,7 +680,7 @@ export default function AdminSettingsPage({
             gap: '8px',
           }} aria-label="邀请签发结果">
             <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-              邀请明文只显示这一次：
+              永久登录码（可重复登录，明文只显示这一次，请保存）：
             </div>
             <code style={{
               wordBreak: 'break-all', fontSize: '13px', color: 'var(--amber)',

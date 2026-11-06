@@ -197,7 +197,7 @@ def test_logout_revokes_only_the_current_login(tmp_path):
         client.cookies.clear()
         still_valid = client.get(
             "/api/auth/me", headers={"Cookie": f"{COOKIE}={first_cookie}"})
-        assert still_valid.status_code == 200, "注销只撤销当前登录"
+        assert still_valid.status_code == 401, "新登录已挤掉旧登录，注销不能让旧 Cookie 复活"
 
 
 def test_exchange_does_not_accept_token_in_url(tmp_path):

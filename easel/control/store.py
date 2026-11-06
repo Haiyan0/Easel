@@ -31,7 +31,7 @@ from typing import Iterator, Literal
 from .types import (ConversationRecord, DomainError, Identity, RunRecord,
                     WorkerHandle, WorkerLease)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 """当前控制库 schema 版本；打开时写入 ``PRAGMA user_version``。"""
 
 # 兼容计划里 CURRENT_SCHEMA_VERSION 的写法
@@ -408,6 +408,17 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # 才能 staging 新候选。进程崩溃也不会丢失待收口归属。
     (
         "ALTER TABLE worker_leases ADD COLUMN pending_attempt_id TEXT NOT NULL DEFAULT ''",
+    ),
+    # 版本 16：旧登录码永久可重用，但撤销/禁用状态不能因升级复活。
+    # 历史多登录只保留最后创建的一份，之后由登录写事务维持单会话。
+    (
+        "UPDATE invites SET revoked_at = CAST(strftime('%s', 'now') AS INTEGER)"
+        " WHERE revoked_at IS NULL AND user_id IN"
+        " (SELECT id FROM users WHERE disabled_at IS NOT NULL)",
+        "UPDATE invites SET expires_at = 0 WHERE revoked_at IS NULL",
+        "UPDATE logins SET revoked_at = CAST(strftime('%s', 'now') AS INTEGER)"
+        " WHERE revoked_at IS NULL AND rowid NOT IN"
+        " (SELECT MAX(rowid) FROM logins WHERE revoked_at IS NULL GROUP BY user_id)",
     ),
 )
 
@@ -858,8 +869,8 @@ class Store:
                 "UPDATE logins SET revoked_at = ? WHERE revoked_at IS NULL",
                 (stamp,)).rowcount
             revoked_invites = self._connection.execute(
-                "UPDATE invites SET revoked_at = ? WHERE revoked_at IS NULL"
-                " AND redeemed_at IS NULL", (stamp,)).rowcount
+                "UPDATE invites SET revoked_at = ? WHERE revoked_at IS NULL",
+                (stamp,)).rowcount
             revoked_tokens = self._connection.execute(
                 "UPDATE broker_tokens SET revoked_at = ?"
                 " WHERE revoked_at IS NULL", (stamp,)).rowcount
@@ -1008,7 +1019,7 @@ class Store:
 
     def admin_set_user_disabled(self, actor: Identity, user_id: str,
                                 disabled: bool) -> sqlite3.Row:
-        """禁用/启用成员；禁用时同步撤销登录与未兑换邀请。
+        """禁用/启用成员；禁用时同步撤销登录与全部登录码。
 
         管理员目标一律拒绝，避免 HTTP 管理入口被锁死。重新启用不会复活
         已撤销的登录或邀请，成员必须取得新邀请。
@@ -1033,10 +1044,10 @@ class Store:
                     "UPDATE logins SET revoked_at = ?"
                     " WHERE user_id = ? AND revoked_at IS NULL",
                     (stamp, target_user_id))
-                # 未兑换邀请同样撤销：重新启用后不能继续使用旧邀请
+                # 已用码仍可重复登录，同样必须撤销，重新启用不能复活旧码。
                 self._connection.execute(
                     "UPDATE invites SET revoked_at = ?"
-                    " WHERE user_id = ? AND redeemed_at IS NULL"
+                    " WHERE user_id = ?"
                     " AND revoked_at IS NULL",
                     (stamp, target_user_id))
             else:
@@ -1076,7 +1087,7 @@ class Store:
                 " LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
 
     def admin_revoke_invite(self, actor: Identity, invite_id: str) -> bool:
-        """按邀请 ID 撤销未兑换邀请；已兑换拒绝，已撤销幂等。"""
+        """按 ID 撤销登录码；使用过的码也可撤销，已撤销幂等。"""
         target_id = _text(invite_id)
         with self._transaction():
             self._require_admin(actor)
@@ -1085,13 +1096,11 @@ class Store:
                 (target_id,)).fetchone()
             if row is None:
                 raise DomainError("not_found", 404)
-            if row["redeemed_at"] is not None:
-                raise DomainError("invite_redeemed", 409)
             if row["revoked_at"] is not None:
                 return False
             self._connection.execute(
                 "UPDATE invites SET revoked_at = ?"
-                " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+                " WHERE id = ? AND revoked_at IS NULL",
                 (_now(), target_id))
             return True
 
@@ -1986,7 +1995,7 @@ class Store:
         with self._transaction():
             cursor = self._connection.execute(
                 "UPDATE invites SET revoked_at = ?"
-                " WHERE token_digest = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+                " WHERE token_digest = ? AND revoked_at IS NULL",
                 (now, _text(token_digest)))
         return cursor.rowcount == 1
 
@@ -2002,16 +2011,19 @@ class Store:
             " JOIN users ON users.id = invites.user_id"
             " JOIN workspaces ON workspaces.owner_user_id = users.id"
             " WHERE invites.token_digest = ?", (_text(token_digest),)).fetchone()
-        if (row is None or row["redeemed_at"] is not None
-                or row["revoked_at"] is not None or row["expires_at"] <= now
+        if (row is None or row["revoked_at"] is not None
+                or (row["expires_at"] != 0 and row["expires_at"] <= now)
                 or row["disabled_at"] is not None):
             return None
         cursor = self._connection.execute(
-            "UPDATE invites SET redeemed_at = ?"
-            " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+            "UPDATE invites SET redeemed_at = COALESCE(redeemed_at, ?)"
+            " WHERE id = ? AND revoked_at IS NULL",
             (now, row["id"]))
         if cursor.rowcount != 1:
             return None
+        self._connection.execute(
+            "UPDATE logins SET revoked_at = ?"
+            " WHERE user_id = ? AND revoked_at IS NULL", (now, row["user_id"]))
         self._connection.execute(
             "INSERT INTO logins (id, user_id, token_digest, csrf_digest,"
             " created_at, last_seen_at, expires_at)"
@@ -2023,10 +2035,10 @@ class Store:
     def redeem_invite(self, token_digest: str, login_id: str,
                       login_token_digest: str, csrf_digest: str,
                       now: int, expires_at: int) -> Identity:
-        """事务内单次兑换邀请并创建登录；任何失效原因统一 401。
+        """事务内以登录码创建登录并挤掉旧登录；失效原因统一 401。
 
-        ``BEGIN IMMEDIATE`` 使两个连接对同一邀请串行化：后到者看到的
-        ``redeemed_at`` 已非空，只能失败。
+        ``BEGIN IMMEDIATE`` 将同账号的并发登录串行化，只有最后一次
+        提交的登录有效。无效登录码不改变现有登录。
         """
         with self._transaction():
             identity = self._redeem_invite_locked(

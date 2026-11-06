@@ -350,7 +350,10 @@ def test_prepare_restored_instance_revokes_sessions_tokens_and_barrier(tmp_path)
             store.authenticate_login(
                 hashlib.sha256(session.token.encode()).hexdigest(),
                 int(time.time()), 3600)
-        # 新的管理员恢复邀请可以兑换一次。
+        # 历史已用码不能因改成可重用而在恢复副本中重新生效。
+        with pytest.raises(DomainError):
+            AuthService(store).exchange(seeded["invite"])
+        # 新的管理员恢复码在明确有效期内可以使用。
         fresh = AuthService(store).exchange(summary["recovery_invite"])
         identity = store.authenticate_login(
             hashlib.sha256(fresh.token.encode()).hexdigest(),

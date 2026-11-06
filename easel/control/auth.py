@@ -25,7 +25,8 @@ _TOKEN_BYTES = 32
 TOKEN_MAX_LENGTH = 512
 """token 长度上限；明显超长的输入直接按非法凭证处理。"""
 
-INVITE_TTL_SECONDS = 604800
+INVITE_TTL_SECONDS = 0
+"""默认永久登录码；显式传入有限 TTL 仍可用于恢复等管理流程。"""
 MAX_INVITE_TTL_SECONDS = 604800
 SESSION_IDLE_SECONDS = 86400
 SESSION_ABSOLUTE_SECONDS = 604800
@@ -105,7 +106,7 @@ class AuthService:
     # ------------------------------------------------------------------
 
     def bootstrap_admin(self, display_name: str) -> tuple[Identity, str]:
-        """本地引导首个管理员并返回一次性邀请明文。仅 CLI 调用。"""
+        """本地引导首个管理员并返回永久登录码明文。仅 CLI 调用。"""
         if not isinstance(display_name, str) or not display_name.strip():
             raise DomainError("invalid_argument", 400)
         if len(display_name) > 200:
@@ -113,7 +114,7 @@ class AuthService:
         token = _new_token()
         now = self._now()
         identity, _ = self._store.bootstrap_admin(
-            display_name.strip(), _digest(token), now, now + self.INVITE_TTL_SECONDS)
+            display_name.strip(), _digest(token), now, 0)
         return identity, token
 
     def issue_invite(self, actor: Identity, user_id: str,
@@ -125,13 +126,13 @@ class AuthService:
         经 AdminService 的 actor-aware 事务边界调用。
         """
         if (type(ttl_seconds) is not int
-                or not 1 <= ttl_seconds <= self.MAX_INVITE_TTL_SECONDS):
+                or not 0 <= ttl_seconds <= self.MAX_INVITE_TTL_SECONDS):
             raise DomainError("invalid_ttl", 400)
         if not isinstance(user_id, str) or not user_id or len(user_id) > 128:
             raise DomainError("invalid_argument", 400)
         token = _new_token()
         now = self._now()
-        expires_at = now + ttl_seconds
+        expires_at = now + ttl_seconds if ttl_seconds else 0
         invite_id = self._store.create_invite(
             actor, user_id, _digest(token), now, expires_at)
         return invite_id, token, expires_at
@@ -142,7 +143,7 @@ class AuthService:
         return self.issue_invite(actor, user_id, ttl_seconds)[1]
 
     def revoke_invite(self, invite: str) -> bool:
-        """撤销尚未兑换的邀请；服务内部/管理操作，不暴露为公开 HTTP。"""
+        """撤销登录码，包括已使用的码；不影响其他登录码。"""
         if not _valid_token(invite):
             return False
         return self._store.revoke_invite(_digest(invite), self._now())
@@ -152,7 +153,7 @@ class AuthService:
     # ------------------------------------------------------------------
 
     def exchange(self, invite: str) -> BrowserSession:
-        """单次兑换邀请并创建登录；登录 token 与邀请 token 不同。
+        """用可重复使用的登录码创建登录，并撤销同账号旧登录。
 
         这是不含来源限速的底层原语；HTTP 入口必须使用
         :meth:`exchange_with_rate_limit` 以获得原子限速与失败记账。

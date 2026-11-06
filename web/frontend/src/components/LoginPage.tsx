@@ -60,7 +60,7 @@ export default function LoginPage({ onAuthenticated, notice }: LoginPageProps) {
           aria-describedby="invite-help"
         />
         <p id="invite-help" className="auth-help">
-          这是一次性邀请，使用后失效；退出后需重新获取。
+          这是绑定账号的永久登录码，可在不同电脑重复使用；新登录会使旧登录失效。
         </p>
         <button
           type="submit"
@@ -75,10 +75,10 @@ export default function LoginPage({ onAuthenticated, notice }: LoginPageProps) {
         <p role="alert" className="auth-error">{error}</p>
       ) : null}
       <details className="auth-help-details">
-        <summary>如何重新获取邀请？</summary>
+        <summary>登录码遗失或失效怎么办？</summary>
         <p>
           联系管理员在 Easel 设置的「成员与邀请」中重新签发。
-          邀请不会自动续期，也不支持公开注册。
+          请保存好登录码；遗失或被撤销后联系管理员重新签发。
         </p>
       </details>
     </AuthFrame>

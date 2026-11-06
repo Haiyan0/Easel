@@ -60,7 +60,7 @@ def test_bootstrap_creates_one_admin_and_one_invite(tmp_path):
         assert scalar(store, "SELECT COUNT(*) FROM users") == 1, "重复引导不得创建用户"
 
 
-def test_invite_is_single_use_and_login_is_revocable(tmp_path):
+def test_invite_is_reusable_and_login_is_revocable(tmp_path):
     with Store.open(tmp_path / "control.sqlite3") as store:
         admin = store.create_user("Owner", "admin")
         member = store.create_user("Member")
@@ -70,13 +70,15 @@ def test_invite_is_single_use_and_login_is_revocable(tmp_path):
         login = auth.exchange(invite)
         assert auth.authenticate(login.token) == member
 
-        with pytest.raises(DomainError) as reused:
-            auth.exchange(invite)
-        assert_error(reused, 401)
+        replacement = auth.exchange(invite)
+        assert auth.authenticate(replacement.token) == member
+        with pytest.raises(DomainError) as replaced:
+            auth.authenticate(login.token)
+        assert_error(replaced, 401)
 
         auth.revoke_all(member.user_id)
         with pytest.raises(DomainError) as revoked:
-            auth.authenticate(login.token)
+            auth.authenticate(replacement.token)
         assert_error(revoked, 401)
 
 
@@ -113,7 +115,7 @@ def test_expired_revoked_and_disabled_invites_all_return_401(tmp_path):
         assert_error(disabled_error, 401)
 
 
-def test_two_connections_racing_for_one_invite_allow_one_login(tmp_path):
+def test_two_connections_racing_for_one_invite_leave_one_active_login(tmp_path):
     path = tmp_path / "control.sqlite3"
     with Store.open(path) as setup:
         admin = setup.create_user("Owner", "admin")
@@ -141,10 +143,10 @@ def test_two_connections_racing_for_one_invite_allow_one_login(tmp_path):
         thread.join(timeout=20)
         assert not thread.is_alive()
 
-    assert len(sessions) == 1, "同一邀请只能兑换一次"
-    assert len(errors) == 1 and errors[0].status == 401
+    assert len(sessions) == 2, "同一登录码可重复登录，最后提交的登录有效"
+    assert errors == []
     with Store.open(path) as store:
-        assert scalar(store, "SELECT COUNT(*) FROM logins") == 1
+        assert scalar(store, "SELECT COUNT(*) FROM logins WHERE revoked_at IS NULL") == 1
 
 
 def test_concurrent_bootstrap_allows_exactly_one_admin(tmp_path):
@@ -425,7 +427,7 @@ def test_invite_creation_rechecks_real_admin_role_and_target_user(tmp_path):
         assert_error(disabled_admin, 403)
 
 
-@pytest.mark.parametrize("ttl", [0, -1, AuthService.MAX_INVITE_TTL_SECONDS + 1, True, 1.5])
+@pytest.mark.parametrize("ttl", [-1, AuthService.MAX_INVITE_TTL_SECONDS + 1, True, 1.5])
 def test_invalid_invite_ttl_is_rejected(tmp_path, ttl):
     with Store.open(tmp_path / "control.sqlite3") as store:
         admin = store.create_user("Owner", "admin")
@@ -447,11 +449,13 @@ def test_revoke_all_role_change_and_disable_visible_across_connections(tmp_path)
 
     with Store.open(path) as store:
         other = AuthService(store, clock=lambda: 1000.0)
-        assert other.authenticate(first.token) == member
+        with pytest.raises(DomainError):
+            other.authenticate(first.token)
+        assert other.authenticate(second.token) == member
 
         store._connection.execute(
             "UPDATE users SET role = 'admin' WHERE id = ?", (member.user_id,))
-        assert other.authenticate(first.token).role == "admin", "角色必须每次从数据库读取"
+        assert other.authenticate(second.token).role == "admin", "角色必须每次从数据库读取"
 
         other.revoke_all(member.user_id)
         for token in (first.token, second.token):
