@@ -63,6 +63,18 @@ RUN pnpm run build:native-system \
  && test -f apps/cli/lib/profile-boot.js \
  && node apps/cli/lib/bin.js --help >/dev/null
 
+# DSH 的 Linux 沙箱链是 bwrap → landlock：基础镜像没有 bwrap，必须自带
+# static-musl 的 landlock-run 启动器，否则所有 bash 调用都会 fail closed
+# （"no sandbox backend is usable"）。build:native-system 的
+# --host-addon-only 只构建 flock 插件并跳过启动器，这里补一次完整构建。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/* \
+ && pnpm exec tsx native/system/scripts/build.ts \
+ && launcher="$(find native/system/packages -path '*/bin/landlock-run' \
+      -type f -print -quit)" \
+ && test -n "${launcher}" && test -x "${launcher}"
+
 # 构建输入与产物摘要进入构建日志，便于复现核对（不含任何凭证）。
 RUN sha256sum pnpm-lock.yaml apps/cli/lib/bin.js
 

@@ -40,10 +40,12 @@ docker build -f deploy/multiuser/Dockerfile.worker \
 
 1. 从公开仓库取固定 commit（按 SHA；必要时回退到固定 tag，随后仍核对完整 SHA）；
 2. `pnpm install --frozen-lockfile` 安装完整构建依赖；
-3. `pnpm run build:native-system` 构建 Linux 原生 flock；
-4. `tsc -b tsconfig.host.json` + `tsdown` Host 构建，产出
+3. `pnpm run build:native-system` 构建 Linux 原生 flock（`--host-addon-only`）；
+4. 安装 `musl-tools` 并执行完整 `native/system/scripts/build.ts`，补出静态
+   musl `landlock-run` 启动器；缺少它时 worker 内所有 bash 调用都会 fail closed；
+5. `tsc -b tsconfig.host.json` + `tsdown` Host 构建，产出
    `apps/cli/lib/bin.js` 与各 workspace 运行产物；
-5. 最终镜像只复制已构建 `/opt/dsh` 与固定 `node`，运行阶段不联网安装。
+6. 最终镜像只复制已构建 `/opt/dsh` 与固定 `node`，运行阶段不联网安装。
 
 `runtime` 阶段以 UID 10001、只读 rootfs 方式运行：
 
@@ -51,8 +53,9 @@ docker build -f deploy/multiuser/Dockerfile.worker \
 python deploy/multiuser/smoke_worker.py --check-files --require-dsh
 ```
 
-它实际校验固定 checkout、CLI 产物、Node 引擎、Linux 原生 flock、profile/
-patch 只读性，并启动真实 Harness 完成 ACP `initialize` 与 `session/new`。
+它实际校验固定 checkout、CLI 产物、Node 引擎、Linux 原生 flock、Landlock
+启动器可探测、profile/patch 只读性，并启动真实 Harness 完成 ACP
+`initialize` 与 `session/new`。
 `acp-profile.json` 或 patch 缺失、commit 不匹配、模型路由未选中
 `easel-broker/deepseek-chat` 都直接使构建失败。
 
@@ -65,6 +68,11 @@ patch 只读性，并启动真实 Harness 完成 ACP `initialize` 与 `session/n
 - `EASEL_BROKER_URL`：`http://easel-sidecar-<workspace_id>:8899`；
 - `EASEL_BROKER_TOKEN`：逐 Run opaque token；
 - `EASEL_WORKSPACE_ID` / `EASEL_RUN_ID`：令牌范围复核身份。
+
+Patch 还把 `/opt/easel/skills/builtin` 加入
+`skill-filesystem.customSkillDirs`：Harness 默认只扫 `/opt/easel/skills`
+一级目录，不加这一项时 `builtin/<name>/SKILL.md` 全部不可见，模型不会收到
+`<available_skills>` 目录。
 
 Sidecar 只对精确 broker 路径把标准 `Authorization: Bearer <token>` 映射
 为 control broker 的 `x-easel-broker-token`；供应商 Key 始终只在 control

@@ -147,6 +147,25 @@ def test_require_dsh_runs_real_acp_profile_and_native_runtime():
         assert marker in harness
 
 
+def test_build_installs_musl_and_builds_landlock_launcher():
+    """DSH 沙箱链要求静态 musl 的 landlock-run；host-addon-only 会跳过它。"""
+    text = _text(DOCKERFILE)
+    assert "musl-tools" in text
+    assert "pnpm exec tsx native/system/scripts/build.ts" in text
+    build_line = next(
+        line for line in text.splitlines()
+        if "pnpm exec tsx native/system/scripts/build.ts" in line)
+    assert "--host-addon-only" not in build_line
+    assert "landlock-run" in text
+
+
+def test_build_smoke_requires_usable_landlock_launcher():
+    smoke = _text(SMOKE)
+    assert "landlock-run" in smoke
+    assert "--probe" in smoke
+    assert "unusable" in smoke
+
+
 def test_worker_image_contains_tunnel_and_openssh_client():
     text = _text(DOCKERFILE)
     assert "COPY deploy/multiuser/db_tunnel.py" in text

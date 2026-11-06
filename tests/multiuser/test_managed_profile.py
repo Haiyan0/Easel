@@ -110,6 +110,14 @@ def test_validator_rejects_default_model_outside_manifest_catalog(tmp_path):
         managed.validate_manifest(manifest, patch_root=tmp_path)
 
 
+def test_patch_exposes_builtin_skills_to_harness():
+    """技能在 skills/builtin/<name>/SKILL.md；DSH 默认只扫 skills 一级目录。"""
+    text = PATCH.read_text(encoding="utf-8")
+    assert "- id: skill-filesystem" in text
+    assert "customSkillDirs:" in text
+    assert "/opt/easel/skills/builtin" in text
+
+
 def test_patch_is_harness_native_and_uses_run_scoped_broker_env():
     text = PATCH.read_text(encoding="utf-8")
     for marker in (

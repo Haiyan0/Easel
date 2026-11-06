@@ -15,6 +15,7 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -271,6 +272,22 @@ def _check_dsh() -> None:
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o222:
             _fail(f"受管 Harness 配置必须只读：{path} mode={oct(mode)}")
+
+    # bwrap 不在镜像内，DSH 只能回退到 landlock；启动器缺失或不生效时
+    # 所有 bash 调用都会 fail closed，必须在构建期就失败。
+    launchers = sorted(
+        (dsh / "native" / "system" / "packages").glob(
+            "linux-*/bin/landlock-run"))
+    if not launchers:
+        _fail("缺少 DSH Landlock 启动器：native/system/packages/*/bin/landlock-run")
+    launcher = launchers[0]
+    if not os.access(launcher, os.X_OK):
+        _fail("DSH Landlock 启动器不可执行")
+    probe = subprocess.run(
+        [str(launcher), "--probe"], capture_output=True, text=True,
+        check=False, timeout=60)
+    if probe.returncode != 0 or "unusable" in probe.stdout:
+        _fail("DSH Landlock 启动器在当前内核不可用")
 
     deploy_dir = Path(__file__).resolve().parent
     if str(deploy_dir) not in sys.path:

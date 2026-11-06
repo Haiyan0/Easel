@@ -21,6 +21,15 @@
     provider: easel-broker
     model: deepseek-chat
 
+# Easel 内置技能位于 /opt/easel/skills/builtin/<name>/SKILL.md。
+# Harness 默认只扫描 $DSH_AGENTS_HOME/skills 的一级子目录（即
+# /opt/easel/skills 下没有 SKILL.md），必须显式把 builtin 加进扫描目录；
+# 否则技能目录为空，模型看不到也调用不到任何内置技能。
+- id: skill-filesystem
+  config:
+    customSkillDirs:
+      - /opt/easel/skills/builtin
+
 - id: llm-pi-ai
   config:
     providers:
