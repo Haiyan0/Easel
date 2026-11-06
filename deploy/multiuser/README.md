@@ -635,7 +635,7 @@ python -m pytest \
 - `EASEL_MASTER_KEY_FILE` 为 32 字节且权限不含 group/world；
 - `EASEL_TEST_CONTROL_URL`/`EASEL_TEST_PREVIEW_URL` 为 HTTPS；
 - `EASEL_TEST_WORKER_IMAGE` 为 `sha256:<64hex>` 固定摘要；
-- `EASEL_TEST_INVITE_A`/`EASEL_TEST_INVITE_B` 为未兑换的一次性邀请；
+- `EASEL_TEST_INVITE_A`/`EASEL_TEST_INVITE_B` 为两个不同账号的有效登录码；默认永久且可重复使用，同账号新登录会使旧登录失效；
 - `EASEL_TEST_BACKUP_SOURCE` 为已有备份，`EASEL_TEST_RESTORE_DEST` 为新/
   空目录；并安装 Playwright/Chromium；
 - `EASEL_TEST_EGRESS_PROXY` 为受控出口代理；检查器会设置

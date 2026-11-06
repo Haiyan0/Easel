@@ -235,11 +235,11 @@ docker exec $ControlContainer python -m easel admin bootstrap `
 
 输出中的 `invite=` 只出现一次，复制后立即使用；不要写入报告或截图。打开 `$PublicOrigin`，粘贴邀请登录。管理员在“成员与邀请”创建用户并签发邀请；每个用户使用独立浏览器 profile/context，不能只用同一浏览器两个标签页。
 
-**bootstrap 创建的是管理员 Owner，仍从同一个登录页进入，没有单独的管理员登录网址。邀请是单次兑换令牌，不是可反复使用的密码；注销后原邀请失效属于当前登录设计。**
+**bootstrap 创建的是管理员 Owner，仍从同一个登录页进入，没有单独的管理员登录网址。默认签发永久登录码，可重复使用；新电脑登录成功会使同账号旧登录失效。旧码升级后也继续绑定原账号和工作区，已撤销或被禁用账号的码不会复活。请妥善保存登录码，明文只在签发时显示一次。**
 
 ### 注销后怎样重新登录管理员
 
-在原 PowerShell 里查出管理员 ID（只读，不输出密钥）：
+保存的永久登录码可以直接再次登录，无需重新签发；只有登录码遗失或被撤销时才执行以下命令。在原 PowerShell 里查出管理员 ID（只读，不输出密钥）：
 
 ```powershell
 docker exec $ControlContainer python -c "import sqlite3; c=sqlite3.connect('file:/srv/easel/control/control.sqlite3?mode=ro',uri=True); print(c.execute('SELECT id, display_name FROM users WHERE role = ?', ('admin',)).fetchall()); c.close()"
@@ -254,7 +254,7 @@ docker exec $ControlContainer python -m easel admin invite `
 if ($LASTEXITCODE -ne 0) { throw '邀请签发失败，检查容器/管理员状态' }
 ```
 
-用途：保留原账号/workspace/历史，仅创建新的单次邀请。复制新 `invite=` 到同一 HTTPS 登录页即可。若新开终端或重建过 control，先加载第 7 节参数，再执行本节开头查询 ControlContainer 的命令；不重复 bootstrap。
+用途：保留原账号/workspace/历史，仅创建新的永久登录码。复制新 `invite=` 到同一 HTTPS 登录页即可。遗失的旧码应在成员管理中撤销，签发新码不会自动撤销旧码。若新开终端或重建过 control，先加载第 7 节参数，再执行本节开头查询 ControlContainer 的命令；不重复 bootstrap。
 
 ### 管理员在哪里配置聊天
 
@@ -389,7 +389,7 @@ if ($LASTEXITCODE -ne 0) { throw '恢复实例启动失败' }
 - 只读校验备份，拒绝错 key、缺文件、改摘要、未来 schema、非空目标、外来卷/路径逃逸；
 - 创建新卷/网络，把恢复材料落到新目标，不覆盖源；
 - `prepare-restore` 先按原清单校验整个 staging；数据库或 workspace 已被篡改时拒绝，DB/manifest/文件集合均不变。只有合法输入才修改 staging 控制库并更新 staging 清单的来源摘要，**原备份不变**；`materialize-restore` 再核对输入与实际复制字节，失败只清理本次目标；
-- 清除旧屏障/旧 lease 身份、撤销旧登录/未兑换邀请/Run token，签发一次性管理员恢复邀请；
+- 清除旧屏障/旧 lease 身份、撤销旧登录/全部旧登录码/Run token，签发有明确有效期的管理员恢复码；
 - 保留 workspace ID、消息和原生会话绑定（容器内 cwd 仍是 `/workspace`）。
 
 读取恢复邀请文件后登录管理员，重新给成员签发邀请。旧 Cookie 应 401；新 Origin 不匹配的写请求应 403。恢复副本启动后先验证 A/B 历史、配置解密、sentinel 和同会话新 Harness 消息；确认后先 Stop 恢复副本，才允许源再次 Start。
