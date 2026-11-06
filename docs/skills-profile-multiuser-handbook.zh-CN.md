@@ -1,6 +1,6 @@
 # Easel 技能加载、画像与多用户架构手册
 
-分析日期：2026-10-13。对象：本地 `C:\Code\Easel` 当前源码。
+分析日期：2026-10-13；增量更新：2026-11-04（新增 4 个技能后复扫）。对象：本地 `C:\Code\Easel` 当前源码。
 
 本文区分三类信息：**源码已实现**、**规范要求**、**改造建议**。没有运行付费模型或发布流程；不把静态检查通过视为模型路由准确率或端到端执行成功的证明。本文讨论项目自带的技能库，与当前 Codex 聊天环境另行提供的 skills 清单不同。
 
@@ -8,8 +8,8 @@
 
 Easel 是一个本地优先的社媒内容工作台：Python 后端组织文件、会话与配置，Agent 执行引擎理解任务并调用本机工具，技能以 Markdown 流程和脚本目录交付。
 
-- 实际扫描到 **114 个 `SKILL.md`**，README 展示的 113 尚未同步。
-- 技能注册主要是**目录发现**，不是为 114 个技能分别注册 Python 函数或 API 工具。
+- 实际扫描到 **118 个 `SKILL.md`**，README 徽章已同步为 118。
+- 技能注册主要是**目录发现**，不是为 118 个技能分别注册 Python 函数或 API 工具。
 - 自然语言路由主要是 **LLM 根据技能描述和任务上下文选择**；Easel 后端没有实现专用的技能向量召回、关键词分类或 Top-K 重排服务。
 - 按需加载包括技能正文和引用资料；脚本通常由工具执行，不需要整体加入模型上下文。
 - “用户画像”是跨平台创作者/内容账号的人设档案，由六份 Markdown 组成，不是登录用户、租户或权限主体。
@@ -28,18 +28,18 @@ Easel 是一个本地优先的社媒内容工作台：Python 后端组织文件�
 | `profiles/<画像>/` | 六维画像及账号长期记忆 | 消息声明当前画像，Agent 读取 |
 | `outputs/<主题>/` | 成品、中间素材、`.easel.json` | 工作流写入，后续步骤读取 |
 
-当前 114 个技能的分布：
+当前 118 个技能的分布：
 
 | layer | 含义 | 数量 |
 |---|---|---:|
 | discover | 发现 | 9 |
 | plan | 策划 | 16 |
-| produce | 制作 | 52 |
+| produce | 制作 | 53 |
 | publish | 发布 | 20 |
-| attribute | 归因 | 11 |
-| general | 画像管理等通用能力 | 6 |
+| attribute | 归因 | 12 |
+| general | 画像管理等通用能力 | 8 |
 
-在每个技能自己的 `references/` 与 `scripts/` 子目录下，递归统计到 172 个参考文件、61 个脚本目录内文件。这个统计不包含共享目录和 vendor 中另行存放的工具，也不等于可执行命令数量。
+在每个技能自己的 `references/` 与 `scripts/` 子目录下，递归统计到 209 个参考文件、76 个脚本目录内文件（不含缓存）。这个统计不包含共享目录和 vendor 中另行存放的工具，也不等于可执行命令数量；参考文件数包含本机保留、未入公开仓库的业务文档。
 
 ### 2.1 OpenClaw 路径：先同步，再由引擎发现
 
@@ -161,7 +161,7 @@ Agent 结合平台、意图、上轮产物查找技能
 | Instructions | SKILL.md 执行步骤 | 命中后读取 | 依赖 Agent 真实调用读取工具 |
 | Resources | references、模板、脚本 | 工作流中按需使用 | 资料读入上下文，脚本通常只执行并返回结果 |
 
-示例：用户要求“从我的账号链接建立人设”。模型选择 `skill-profile-builder`，先读主文件；收集信息时读 `references/onboarding-questions.md`，分析链接时再读 `references/social-link-analysis.md`。已有画像的编辑则应选 `skill-profile-manager`。
+示例：用户要求“从我的账号链接建立人设”。模型选择 `skill-profile-builder`，先读主文件；收集信息时读 `skills/builtin/skill-profile-builder/references/onboarding-questions.md`，分析链接时再读 `skills/builtin/skill-profile-builder/references/social-link-analysis.md`。已有画像的编辑则应选 `skill-profile-manager`。
 
 复杂任务可以组合技能，例如策划 → 卡片文案 → 卡片渲染 → 平台检查。五层是业务分类及编排规则，不是强制每次走完五层的状态机。
 
@@ -169,7 +169,7 @@ Agent 结合平台、意图、上轮产物查找技能
 
 ### 4.3 为什么这个设计能控制规模
 
-常驻说明负责通用规则；短 description 负责区分能力；正文负责步骤；references 承载细节。114 个技能全部 frontmatter 合计约 30,020 字符，**这是文件字符统计，不是实际 prompt token 数**，引擎未必把全部字段原样注入。
+常驻说明负责通用规则；短 description 负责区分能力；正文负责步骤；references 承载细节。118 个技能全部 frontmatter 合计约 30,744 字符，**这是文件字符统计，不是实际 prompt token 数**，引擎未必把全部字段原样注入。
 
 目前控制的是“完整技能说明与资料的按需读取”。没有发现 Easel 自己实现的硬 Top-K 限制、最大 reference 字数预算、描述向量索引或技能路由命中率测试。增加技能仍可能带来描述重叠、选择不稳定和上下文增长。
 
@@ -349,8 +349,8 @@ Set-Location C:\Code\Easel
 本次输出：
 
 ```text
-OK: 114 skills and publisher execution contracts conform
-OK: 306 documented Python commands match their argparse schemas
+OK: 118 skills and publisher execution contracts conform
+OK: 323 documented Python commands match their argparse schemas
 ```
 
 Bash 同步入口是 `bash agents/sync.sh`；Windows 安装器中的同步代码在 `setup.ps1`。完整同步会修改引擎工作区；本次分析没有执行同步、安装或配置变更。

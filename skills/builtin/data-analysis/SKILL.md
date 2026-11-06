@@ -1,6 +1,6 @@
 ---
 name: data-analysis
-description: 对用户提供的 CSV/Excel/JSON 文件或经授权的项目数据库做即席查询、统计、趋势与异常分析，生成图表和可复核的分析报告。当用户需要查一个数、做多维对比、核对指标口径、解释数据异常或交付分析结论时使用。与 data-report 的区别：data-report 把给定数据一键生成完整 HTML 报告页；营销投放 ROI 用 roi-calculator；社媒账号时序数据用 skill-data-tracker 与 skill-publish-analytics。
+description: 对用户提供的 CSV/Excel/JSON 文件或经授权的项目数据库做即席查询、统计、趋势与异常分析，生成图表和可复核的分析报告。当用户想看某个项目或产品的数据、查一个数、做多维对比、核对指标口径、解释数据异常或要一份数据分析报告时使用。与 data-report 的区别：data-report 把给定数据一键生成完整 HTML 报告页；营销投放 ROI 用 roi-calculator；社媒账号时序数据用 skill-data-tracker 与 skill-publish-analytics。
 layer: attribute
 ---
 

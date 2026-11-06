@@ -1,6 +1,6 @@
 ---
 name: project-docs
-description: 查询具体企业或项目的业务数据口径、字段含义、表关联与授权项目目录。当用户需要确认项目 ID、核对指标口径、查找表关系或读取授权业务文档时使用。与 database-query 的区别：本 SKILL 只提供目录与业务语义，不直接执行 SQL；实际查询由 database-query 完成，统计、图表与报告由 data-analysis 完成。
+description: 查询具体企业或项目的业务数据口径、字段含义、表关联与授权项目目录。当用户想看某个公司、项目或产品的业务数据、做数据分析报告，或需要确认项目 ID、核对指标口径、查找表关系时使用。与 database-query 的区别：本 SKILL 只提供目录与业务语义，不直接执行 SQL；实际查询由 database-query 完成，统计、图表与报告由 data-analysis 完成。
 layer: general
 ---
 
