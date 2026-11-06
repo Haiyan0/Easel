@@ -620,7 +620,8 @@ class BrokerService:
                  lease_ttl: int = DEFAULT_LEASE_TTL,
                  lease_clock: Callable[[], float] | None = None,
                  db_runner=None,
-                 model_catalog: tuple[str, ...] | None = None):
+                 model_catalog: tuple[str, ...] | None = None,
+                 upstream_retry_delays: tuple[float, ...] = (0.2, 0.6)):
         if not isinstance(store, Store):
             raise TypeError("store must be a Store")
         if not isinstance(config, ConfigService):
@@ -647,6 +648,14 @@ class BrokerService:
             raise TypeError("lease_clock must be callable")
         if db_runner is not None and not callable(db_runner):
             raise TypeError("db_runner must be callable")
+        if (not isinstance(upstream_retry_delays, tuple)
+                or len(upstream_retry_delays) > 4
+                or any(type(item) not in (int, float)
+                       or not 0 <= item <= 5
+                       for item in upstream_retry_delays)):
+            raise ValueError("upstream_retry_delays is invalid")
+        self._upstream_retry_delays = tuple(
+            float(item) for item in upstream_retry_delays)
         if egress is None:
             egress = EgressGateway(
                 config.egress_policy,
@@ -899,36 +908,11 @@ class BrokerService:
             self.acquire_lease, token, workspace_id, run_id, channel)
         guard = _LeaseGuard(self, lease_id)
         try:
-            client = self._egress.client()
-            guard.bind(client=client)
-            context = client.stream(
-                upstream.method, upstream.url, headers=upstream.headers,
-                content=prepared_body, follow_redirects=False)
-            guard.bind(context=context)
-            # 从等待连接/发送请求体/等待响应头开始就允许心跳丢失终止
-            open_task = asyncio.create_task(context.__aenter__())
-            guard.bind(open_task=open_task, body=prepared_body)
+            guard.bind(body=prepared_body)
             guard.start()
-            gone_task = asyncio.create_task(guard.gone.wait())
-            try:
-                await asyncio.wait({open_task, gone_task},
-                                   return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                gone_task.cancel()
-                try:
-                    await gone_task
-                except asyncio.CancelledError:
-                    pass
-
-            if guard.gone.is_set():
-                try:
-                    response = open_task.result()
-                except BaseException:
-                    response = None
-                guard.bind(response=response)
-                raise DomainError("lease_lost", 503)
-
-            response = open_task.result()
+            response = await self._open_upstream(
+                guard, upstream.method, upstream.url, upstream.headers,
+                prepared_body)
             guard.bind(response=response)
             # 请求体已发送完毕，提前释放 multipart spool（清理会再次 no-op）
             closer = getattr(prepared_body, "aclose", None)
@@ -955,6 +939,65 @@ class BrokerService:
         except BaseException:
             await guard.close()
             raise
+
+    async def _open_upstream(self, guard: "_LeaseGuard", method: str,
+                             url: str, headers: Mapping[str, str],
+                             body: object) -> httpx.Response:
+        """建立上游响应头；只对尚未发送请求的连接阶段错误做有界重试。
+
+        重试必须同时满足：连接尚未建立，且请求体可重放。读写错误、
+        响应头超时或协议错误不能证明上游尚未执行任务，绝不自动重放，
+        避免重复执行或计费。multipart spool 被 httpx 关闭后不可重放，
+        因此只对 JSON/空请求体重试。
+        """
+        replayable = body is None or isinstance(
+            body, (bytes, bytearray, memoryview))
+        delays = self._upstream_retry_delays if replayable else ()
+        for attempt in range(len(delays) + 1):
+            if guard.gone.is_set():
+                raise DomainError("lease_lost", 503)
+            client = self._egress.client()
+            guard.bind(client=client)
+            context = client.stream(
+                method, url, headers=headers, content=body,
+                follow_redirects=False)
+            guard.bind(context=context)
+            # 从等待连接/发送请求体/等待响应头开始就允许心跳丢失终止
+            open_task = asyncio.create_task(context.__aenter__())
+            guard.bind(open_task=open_task)
+            gone_task = asyncio.create_task(guard.gone.wait())
+            try:
+                await asyncio.wait({open_task, gone_task},
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                gone_task.cancel()
+                try:
+                    await gone_task
+                except asyncio.CancelledError:
+                    pass
+
+            if guard.gone.is_set():
+                try:
+                    response = open_task.result()
+                except BaseException:
+                    response = None
+                guard.bind(response=response)
+                raise DomainError("lease_lost", 503)
+
+            try:
+                return open_task.result()
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                # 连接阶段失败，请求尚未发送；清空资源绑定，避免
+                # 最终清理再次操作已关闭的连接。
+                guard.bind(open_task=None, context=None, client=None)
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                if attempt >= len(delays):
+                    raise
+                await asyncio.sleep(delays[attempt])
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _snapshot_id(route: EffectiveRoute) -> str:

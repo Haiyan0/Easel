@@ -517,3 +517,118 @@ def test_issue_reads_route_and_credentials_in_one_transaction(tmp_path):
         assert asyncio.run(call(new_token, "new-model")) == b"ok"
         assert record["url"] == "https://new.example/v1/audio/speech"
         assert record["authorization"] == "Bearer new-key-sentinel"
+
+
+def _stream_response() -> httpx.Response:
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"ok"
+
+        async def aclose(self):
+            pass
+
+    return httpx.Response(200, stream=Stream())
+
+
+def _forward_speech(broker: BrokerService, token: str, member, run) -> bytes:
+    async def call() -> bytes:
+        async def body():
+            yield json.dumps({"model": "tts-default"}).encode()
+
+        response = await broker.forward(
+            token=token, workspace_id=member.workspace_id, run_id=run.id,
+            channel="speech", method="POST", relative_path="audio/speech",
+            headers={"content-type": "application/json"}, body=body())
+        return b"".join([chunk async for chunk in response.chunks()])
+
+    return asyncio.run(call())
+
+
+def test_forward_retries_transient_connect_errors_before_response(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        admin = setup.create_user("Owner", "admin")
+        member = setup.create_user("Member")
+        config = ConfigService(setup, MASTER_KEY)
+        publish_speech(config, admin)
+        run = reserve_run(setup, member)
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise httpx.ConnectError("transient", request=request)
+        return _stream_response()
+
+    with Store.open(path) as store:
+        config = ConfigService(store, MASTER_KEY)
+        broker = BrokerService(
+            store, config, clock=lambda: 1000.0,
+            egress=EgressGateway(transport=httpx.MockTransport(handler)),
+            upstream_retry_delays=(0.0, 0.0))
+        token = broker.issue(member, run.id, "speech")
+        assert _forward_speech(broker, token, member, run) == b"ok"
+
+    assert calls["count"] == 3
+
+
+def test_forward_gives_up_after_bounded_upstream_retries(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        admin = setup.create_user("Owner", "admin")
+        member = setup.create_user("Member")
+        config = ConfigService(setup, MASTER_KEY)
+        publish_speech(config, admin)
+        run = reserve_run(setup, member)
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        raise httpx.ConnectError("down", request=request)
+
+    with Store.open(path) as store:
+        config = ConfigService(store, MASTER_KEY)
+        broker = BrokerService(
+            store, config, clock=lambda: 1000.0,
+            egress=EgressGateway(transport=httpx.MockTransport(handler)),
+            upstream_retry_delays=(0.0, 0.0))
+        token = broker.issue(member, run.id, "speech")
+        with pytest.raises(DomainError) as error:
+            _forward_speech(broker, token, member, run)
+        assert_error(error, 502, "upstream_unavailable")
+
+    assert calls["count"] == 3
+
+
+@pytest.mark.parametrize("error_type", [
+    httpx.ReadTimeout, httpx.ReadError, httpx.WriteError,
+    httpx.RemoteProtocolError,
+])
+def test_forward_never_replays_post_after_possible_upstream_execution(tmp_path, error_type):
+    """上游可能已接收任务时，不因响应头缺失而重复执行或计费。"""
+    path = tmp_path / "control.sqlite3"
+    with Store.open(path) as setup:
+        admin = setup.create_user("Owner", "admin")
+        member = setup.create_user("Member")
+        config = ConfigService(setup, MASTER_KEY)
+        publish_speech(config, admin)
+        run = reserve_run(setup, member)
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        raise error_type("possibly already executed", request=request)
+
+    with Store.open(path) as store:
+        broker = BrokerService(
+            store, ConfigService(store, MASTER_KEY), clock=lambda: 1000.0,
+            egress=EgressGateway(transport=httpx.MockTransport(handler)),
+            upstream_retry_delays=(0.0, 0.0))
+        token = broker.issue(member, run.id, "speech")
+        with pytest.raises(DomainError) as error:
+            _forward_speech(broker, token, member, run)
+        assert_error(error, 502, "upstream_unavailable")
+    assert calls["count"] == 1
