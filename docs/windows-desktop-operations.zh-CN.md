@@ -2,7 +2,7 @@
 
 适用：Windows 11 + Docker Desktop Linux containers + WSL2；命令在 **PowerShell** 执行。2026-11-03 已合入并验证 acceptance 修复，用户已验证聊天。源码统一使用 `C:\Code\Easel`，远程为 `https://github.com/Haiyan0/Easel.git` 的 `feat/multiuser-task1-store` 分支。不要默认 main 包含这组功能。
 
-**第一次使用按第 0～6 节；每天启停看第 7 节；以后更新只看第 10 节。** 不再创建 acceptance、next 或 worktree 代码副本。程序目录与数据目录分开：更新 Git 不会替你备份数据库。
+**第一次使用按第 0～6 节；每天启停看第 7 节；以后更新只看第 10 节（只改 skills 看 10.6）。** 不再创建 acceptance、next 或 worktree 代码副本。程序目录与数据目录分开：更新 Git 不会替你备份数据库。
 
 原 Web 的登录、独立 workspace、聊天、内容库、画像、技能及账号/发布入口已分组验收。真实供应商及平台行为以本人受管配置和授权实测为准；Desktop 通过不等于 Linux 生产门槛通过。Linux 的 XFS、防火墙、IPv6、Chromium 沙箱等仍见 [Linux 手册](linux-docker-operations.zh-CN.md)，未通过项不冒充已通过。
 
@@ -124,7 +124,7 @@ docker image inspect $WorkerImage --format '{{.Id}}'
 docker image inspect $GatewayImage --format '{{.Id}}'
 ```
 
-第一条输出应等于 `$WorkerImage` 保存的 `sha256:...`，第二条应等于 `$GatewayImage`；不是与 `easel-worker:...` 这样的 tag 字符串比较。control 提供登录/配置/前端，worker 执行 Agent，gateway 校验内部请求。`--progress=plain` 避免反复刷新进度占满终端。worker 首次构建较慢，保留缓存，不加 `--no-cache`，不使用只有生命周期的 `--target base` 或 `execution` 替代 runtime。
+第一条输出应等于 `$WorkerImage` 保存的 `sha256:...`，第二条应等于 `$GatewayImage`；不是与 `easel-worker:...` 这样的 tag 字符串比较。control 提供登录/配置/前端，worker 执行 Agent，gateway 校验内部请求。`--progress=plain` 避免反复刷新进度占满终端。worker 首次构建较慢，保留缓存，不加 `--no-cache`，不使用只有生命周期的 `--target base` 或 `execution` 替代 runtime。只更新 skills 时不需要重建 control/gateway，见 10.6。
 
 ## 3. 受管 Agent 配置、出口策略与 CA
 
@@ -497,6 +497,78 @@ $StartArgs | Export-Clixml (Join-Path $DataRoot 'config\start-args.xml')
 **重试与回退：** 构建阶段失败可重试构建；启动已部分执行时先查 Status/Logs，不能强行清屏障或重新初始化。旧镜像不保证能打开新版 schema。需要恢复数据时按第 9 节，从升级前已验证备份恢复，原卷先保留；恢复副本与源不能同时写同一 workspace。Git 回到旧提交本身不等于数据库回滚。
 
 `Update-WorkspaceEasel.ps1` 是已有在线项目的受控 control/provisioner 维护入口，带屏障和身份校验；它不代替完整备份，不适合顺便换 worker、gateway 或 schema。初学者统一使用本节的停机更新路线即可。
+
+### 10.6 只更新 skills：只重建 worker 镜像
+
+skills 在构建期由 `deploy/multiuser/Dockerfile.worker` 的 `COPY skills ./skills`
+写入镜像内 `/opt/easel/skills`。worker 容器根文件系统只读
+（`ReadonlyRootfs=true`），`/opt/easel` 在镜像内也不可写，持久挂载只有
+`/workspace` 和 `/home/easel`。因此**没有受支持的热更新**：`docker cp` /
+`docker exec` 改不进去，容器重建后也会恢复旧文件。只改普通技能时，重建
+worker 镜像并让 worker 用新镜像重建即可；control/gateway 不包含 builtin
+skills，不需要重建。`Update-WorkspaceEasel.ps1` 明确拒绝 worker/gateway
+镜像变化（`update_worker_gateway_image_changed`），不要用它执行本流程。
+
+推荐顺序：先在线构建 worker（构建不会碰运行中的容器；skills 改动若在远端，
+先按 10.3 拉取）→ 按 10.1 正常 Stop → 按 10.2 备份并 verify → 在 10.5 换
+`WorkerImage` 后带 `-UpgradeFromBackup` 启动。10.4 只执行 worker 这一条，
+不构建 control/gateway。
+
+1. 构建新 worker 镜像。`DshCommit` 与当前部署保持一致，以复用构建缓存：
+
+```powershell
+Set-Location C:\Code\Easel
+$DshCommit = '687f282e8625c6b8d11ff58211a90524be2e4317'
+$Release = (git rev-parse HEAD).Trim()
+$Tag = $Release.Substring(0, 12)
+docker build --progress=plain -f deploy/multiuser/Dockerfile.worker `
+  --build-arg "DSH_COMMIT=$DshCommit" -t "easel-worker:$Tag" .
+if ($LASTEXITCODE -ne 0) { throw 'worker 镜像构建失败' }
+$NewWorkerImage = (docker image inspect "easel-worker:$Tag" --format '{{.Id}}').Trim()
+$NewWorkerImage
+```
+
+2. 按 10.1 停止，按 10.2 备份并只读校验（命令不重复）。换镜像后
+   `provisioner-expected.json` 的配置摘要会变化，10.5 的启动必须带
+   `-UpgradeFromBackup`，否则 Stop 完成记录匹配不上，会报
+   `admission_barrier_active`：
+
+```powershell
+$OldWorkerImage = $StartArgs.WorkerImage
+$StartArgs.WorkerImage = $NewWorkerImage
+.\deploy\desktop\Start-WorkspaceEasel.ps1 @StartArgs -UpgradeFromBackup $Backup
+if ($LASTEXITCODE -ne 0) { throw '启动失败：保留屏障和备份，先查 Status/Logs' }
+
+.\deploy\desktop\Status-WorkspaceEasel.ps1 -ProjectName $StartArgs.ProjectName `
+  -DataRoot $DataRoot -Port $StartArgs.Port `
+  -Distro $StartArgs.Distro -ProvisionerGid $StartArgs.ProvisionerGid
+if ($LASTEXITCODE -ne 0) { throw '状态异常' }
+$StartArgs | Export-Clixml (Join-Path $DataRoot 'config\start-args.xml')
+```
+
+3. worker 按需创建。进入一次聊天后核对实际镜像：
+
+```powershell
+docker ps --filter "name=easel-worker-" --format '{{.Names}} {{.Image}}'
+```
+
+`Status` 的 `version_worker_image` 和上面输出的镜像 ID 都应为
+`$NewWorkerImage`。`/workspace` 是 bind 挂载，重建 worker 不会丢聊天记录、
+画像和产物。
+
+注意事项：
+
+- 如果改的是 `skills/shared/scripts/model_registry.py`，control 镜像也会
+  COPY 该文件，需要同时重建 control 并更新 `$StartArgs.Image`，按 10.4/10.5
+  的完整路线执行。
+- worker 镜像从当前工作树构建；工作树里其它未发布代码会一起进镜像。只上
+  skills 时先确认 `git status` 和本次提交范围。skills 改动建议先提交，让
+  `$Tag` 与镜像内容对应；暂不提交时改用 `skills-<日期>` 这类独立 tag，
+  不要覆盖正在使用的旧 tag。
+- 回退：Start 还没执行到 upgrade-complete 时，把 `$StartArgs.WorkerImage`
+  改回 `$OldWorkerImage` 再启动，旧 Stop 完成记录仍能匹配。已经启动成功或
+  已执行 upgrade-complete 后不能直接降回旧镜像；先重新 Stop + 备份，或按
+  第 9 节从 `$Backup` 恢复。不要强清屏障。
 
 ## 11. 数据位置与哪些命令会改数据
 

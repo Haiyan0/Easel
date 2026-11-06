@@ -90,7 +90,7 @@ git pull --ff-only origin feat/multiuser-task1-store
 REV=$(git rev-parse HEAD)
 ```
 
-更新完整顺序是：通知停机 → 正常停止 → 完整备份并 verify → 同目录 pull → 构建镜像 → 用原数据/Key 和匹配备份启动 → 检查登录/历史/新消息。原生 Linux 多人启停脚本尚未等价验收，不把上述拉取代码步骤当作完整生产部署命令；生命周期要求见第 9 节。单人 local 更新使用第 6 节。
+更新完整顺序是：通知停机 → 正常停止 → 完整备份并 verify → 同目录 pull → 构建镜像 → 用原数据/Key 和匹配备份启动 → 检查登录/历史/新消息。原生 Linux 多人启停脚本尚未等价验收，不把上述拉取代码步骤当作完整生产部署命令；生命周期要求见第 9 节。单人 local 更新使用第 6 节。只改 skills 时不走全量更新：单人看 6.3.1，多人看 11.1。
 
 ## 3. 构建单人可用的 Docker 镜像
 
@@ -131,7 +131,7 @@ printf '%s\n' "$LOCAL_IMAGE"
 
 构建失败就先解决最后的安装/网络错误，不继续启动。构建涉及 Python 媒体依赖和 Chromium，耗时可能较长；这里没有声称已在你的服务器构建成功。基础镜像 tag 会变化，升级时应保存实际镜像 ID、源码 SHA 和构建日志，不能只记录 `latest`。
 
-浏览器固定在 /opt/playwright，不被持久 home/app 挂载遮蔽；umask 077 保护新凭证。这个镜像含本地工作台、Node、FFmpeg 和浏览器，默认没有安装 Harness 或其它 Agent CLI。先选“仅聊天模式”确认服务正常；不要把 local 镜像误当成经过多人安全验收的 worker 镜像。
+浏览器固定在 /opt/playwright，不被持久 home/app 挂载遮蔽；umask 077 保护新凭证。这个镜像含本地工作台、Node、FFmpeg 和浏览器，默认没有安装 Harness 或其它 Agent CLI。先选“仅聊天模式”确认服务正常；不要把 local 镜像误当成经过多人安全验收的 worker 镜像。只更新 skills 时不必重建整个 local 镜像，见 6.3.1。
 
 ### 3.2 持久目录和权限
 
@@ -337,6 +337,46 @@ easel_local logs --tail 100
 
 应用目录里的旧格式平台配置也随 apps 归档，但不保证新版本自动迁移。逐项核对必要状态，可能需要重新登录；不要把整棵旧代码复制覆盖新代码。
 
+#### 6.3.1 只更新 skills（单人模式）
+
+单人镜像的 `Dockerfile.local` 使用 `COPY . .`，skills 随镜像构建进
+`/opt/easel/skills`；运行时 `/opt/easel` 又是从 `$APP_ROOT` 挂载进去的可写
+目录（网页需要用临时文件 + rename 原子保存 `.env`）。因此单人模式有两条
+路线：
+
+- **快速同步（只建议单人可信环境）**：停服务几秒，只把源码目录的 `skills/`
+  覆盖到当前 `APP_ROOT`，再启动。不重建镜像；但 `APP_ROOT` 会与 `local.env`
+  登记的镜像 ID/REV 不再完全对应，下一次完整升级前要记录这次手工同步。
+- **完整版本化升级（推荐保留可回滚身份）**：按 6.3 重建 local 镜像并生成
+  新的 `APP_ROOT`。因为 `COPY . .` 会让后续安装层缓存失效，耗时明显更长。
+
+快速同步前先确认 `APP_ROOT` 来自当前 `local.env`，且确实是完整的应用目录：
+
+```bash
+OPS=/srv/easel/ops
+SRC=/srv/easel/src
+APP_ROOT=$(sudo sed -n 's/^EASEL_APP_ROOT=//p' "$OPS/local.env")
+case "$APP_ROOT" in /srv/easel/local/apps/*) ;; *) echo '应用目录配置不符，停止'; exit 1;; esac
+sudo test -f "$APP_ROOT/pyproject.toml" || { echo '目标不是完整应用目录，停止'; exit 1; }
+sudo test -d "$APP_ROOT/skills" || { echo '缺少 skills 目录，停止'; exit 1; }
+sudo test -d "$SRC/skills" || { echo '源码 skills 不存在，停止'; exit 1; }
+easel_local stop easel || { echo '停止失败，暂停同步'; exit 1; }
+sudo install -d -m 0700 /srv/easel/backups || { echo '备份目录创建失败：服务已停止，排查后重试'; exit 1; }
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo tar -czpf "/srv/easel/backups/skills-before-$STAMP.tar.gz" -C "$APP_ROOT" skills || { echo '旧 skills 备份失败：服务已停止，排查后重试'; exit 1; }
+sudo rm -rf "$APP_ROOT/skills" || { echo '删除旧 skills 失败：服务已停止，排查后重试'; exit 1; }
+sudo cp -a "$SRC/skills" "$APP_ROOT/skills" || { echo 'skills 复制失败：先解回备份再启动'; exit 1; }
+sudo chown -R 10001:10001 "$APP_ROOT/skills" || { echo '权限设置失败：先解回备份再启动'; exit 1; }
+easel_local start easel || { echo '启动失败，先查日志'; exit 1; }
+easel_local logs --tail 80
+```
+
+`easel_local` 要在当前 shell 已按 3.3 定义。命令只动 `APP_ROOT/skills`，不碰
+`.env`、outputs、profiles 或 home；覆盖前已把旧 `skills/` 打包到
+`/srv/easel/backups/`。进入一次新会话确认技能列表和新技能可执行。如果新技能
+依赖镜像里未安装的系统包、Python/Node 依赖，快速同步不够，必须走 6.3 完整
+升级。回退时先停服务，把备份的 `skills/` 解回同一位置，再启动。
+
 ## 7. 单人模式常见故障
 
 | 现象 | 排查顺序 |
@@ -375,7 +415,7 @@ GATEWAY_IMAGE=$(sudo docker image inspect "easel-gateway:$REV" --format '{{.Id}}
 printf '%s\n' "$CONTROL_IMAGE" "$WORKER_IMAGE" "$GATEWAY_IMAGE"
 ```
 
-用途：构建真实 Harness runtime 及对应 control/gateway。成功后三个值都是 sha256 镜像 ID；worker 首次构建较慢，不改用 base 镜像、不无缓存重建。镜像内部路径固定 `/opt/easel`、`/opt/dsh`、`/workspace`，不使用 Windows 路径。
+用途：构建真实 Harness runtime 及对应 control/gateway。成功后三个值都是 sha256 镜像 ID；worker 首次构建较慢，不改用 base 镜像、不无缓存重建。镜像内部路径固定 `/opt/easel`、`/opt/dsh`、`/workspace`，不使用 Windows 路径。只更新 skills 时不必重建 control/gateway，见 11.1。
 
 ### 8.2 检查正式隔离前提
 
@@ -637,6 +677,52 @@ sudo docker run --rm --network none --read-only --user 10001:10001 \
 5. **切换程序**：更新固定镜像、provisioner 与源码路径，先启动 provisioner 再重建 control/egress；原 key 与数据不变。启动后复核 stop-status，由 upgrade-complete 更新配置承诺，再按精确身份 reopen，不能无条件 resume。
 6. **放量上线**：先验证受管模型真实回复、登录/历史/隔离/停止，再恢复用户访问，记录时间、版本、镜像、备份与结果。
 7. **失败回滚**：保留故障卷/日志，按第 10.3 节在新目录/新项目恢复旧备份和旧镜像，验证后才切代理；不能直接降镜像继续读新 schema。
+
+### 11.1 只更新 skills（多人服务器）
+
+worker 镜像在 `deploy/multiuser/Dockerfile.worker` 中通过 `COPY skills ./skills`
+写入 `/opt/easel/skills`；worker 容器根文件系统只读，`/opt/easel` 不可写，
+持久挂载只有 `/workspace` 和 `/home/easel`。因此**没有受支持的热更新**：
+`docker cp` / `docker exec` 改不进去，容器重建后也会恢复旧文件。只改普通
+技能时，只重建 worker 镜像；control/gateway 不含 builtin skills，不需要重建。
+
+与 8.1 相同先构建，但只取 worker 摘要：
+
+```bash
+REV=$(git -C /srv/easel/src rev-parse HEAD)
+SRC=/srv/easel/src
+DSH_COMMIT=687f282e8625c6b8d11ff58211a90524be2e4317
+cd "$SRC"
+sudo docker build -f deploy/multiuser/Dockerfile.worker \
+  --build-arg "DSH_COMMIT=$DSH_COMMIT" -t "easel-worker:$REV" . || exit 1
+WORKER_IMAGE=$(sudo docker image inspect "easel-worker:$REV" --format '{{.Id}}') || exit 1
+printf '%s\n' "$WORKER_IMAGE"
+```
+
+保留同一 `DSH_COMMIT`、不加 `--no-cache`，只改 skills 时 DSH/Chromium/依赖层
+会复用缓存。skills 未提交时 `$REV` 仍是旧提交，建议先提交或改用
+`skills-<日期>` tag，不要让 tag 与镜像内容不一致。
+
+然后复用第 11 节第 3–6 步，只替换 `WORKER_IMAGE` 这一个镜像身份；
+`CONTROL_IMAGE`、`GATEWAY_IMAGE`、源码路径和 Key 保持不变。control/egress
+容器仍按包装层的停止/重开顺序处理，不是去换 control 镜像。第 3 步 Stop/
+备份、第 4 步 stop-state/备份匹配、第 5 步 upgrade-complete/reopen 不能跳过：
+worker 镜像摘要变化会改变配置承诺，普通 reopen 会失败。包装层的
+`deployment.json` 必须登记新的 `worker_image`。当前 Linux 原生包装层尚未完成，
+这里描述的是包装层必须实现的契约，不是可直接复制的端到端命令。
+
+更新后进入一次聊天创建 worker，核对实际镜像：
+
+```bash
+sudo docker ps --filter name=easel-worker- --format '{{.Names}} {{.Image}}'
+```
+
+输出应包含 `$WORKER_IMAGE`。持久数据在 `/srv/easel/workspaces`，重建 worker
+不会删除；不要为了换技能删除 workspace 或手工修改 control DB。
+
+如果改的是 `skills/shared/scripts/model_registry.py`，control 镜像也会 COPY
+该文件，必须同时重建 control 并按第 11 节完整切换；普通技能目录只影响
+worker。
 
 第 4–5 步的自动比较、停止 fencing、升级重开协议与 systemd 管理还需 Linux 原生包装层完成并实测。**当前仅改手册不能补出这些生产能力。** 不将 Linux 生产上线写成已完成；可以先完成镜像/基础设施准备，在包装层和隔离门槛验收后执行维护流程。
 
