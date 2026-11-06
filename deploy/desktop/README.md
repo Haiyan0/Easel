@@ -535,6 +535,8 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -ProjectName easel-workspace-desktop
 
 # 2) 启动 WSL provisioner + control + egress
+# 启用 database-query 时追加（目录内需有 database-query.env 与 keys/）：
+#   -DatabaseQuerySecrets C:\Easel\desktop\secrets\database-query
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File deploy/desktop/Start-WorkspaceEasel.ps1 `
   -PublicOrigin https://<your-ngrok-domain> `

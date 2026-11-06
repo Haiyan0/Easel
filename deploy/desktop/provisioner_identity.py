@@ -94,6 +94,8 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
         ("workerPublicSha256", ("keys", "workerPublicSha256")),
         ("gatewayPublicSha256", ("keys", "gatewayPublicSha256")),
         ("policySha256", ("policySha256",)),
+        # 数据库凭据挂载是可选开关；启用/停用必须视为配置漂移。
+        ("databaseQueryEnvFile", ("databaseQueryEnvFile",)),
         # 配置身份相同不代表运行的是新代码；源码摘要与所需动作能力
         # 都必须由实际进程回报。
         ("provisionerSourceSha256", ("sourceSha256",)),
@@ -103,6 +105,11 @@ def compare_identity(expected: dict, identity: dict) -> list[str]:
         if wanted is None:
             continue
         observed = _nested(identity, *path)
+        if (field == "databaseQueryEnvFile" and observed is None
+                and wanted == ""):
+            # 旧版 provisioner 不回报该字段；禁用状态下等价于空路径，
+            # 不能让升级引导误判成不可自动替换的配置漂移。
+            continue
         if not isinstance(observed, str) or observed != wanted:
             mismatches.append(field)
 

@@ -14,7 +14,7 @@
 | 工具层 | 删除平台 `workspace.*` / `sandbox.*` / `artifact_id` 叙述，只保留本地 CLI 与 `saved.path` |
 | 路径 | 命令统一为项目根相对路径 `skills/builtin/database-query/scripts/db_query.py` |
 | 映射文档 | 删除原平台映射文档，改为 `references/easel-mapping.md`，只描述 Easel 本地等价物 |
-| 配置 | 本机默认技能目录 `config.yaml`；多人 Docker 使用 `/workspace/config/database-query.yaml` 并显式 `--config` |
+| 配置 | 本机默认技能目录 `config.yaml`；多人 Docker 使用镜像内 `assets/config.multiuser.yaml`，凭据只走 `--env-file /run/easel-secrets/database-query.env` |
 | 依赖 | `PyYAML`、`SQLAlchemy`、`asyncmy`、`sqlglot` 加入 Easel `pyproject.toml` 与 worker 固定依赖 |
 | 清理 | 未复制 `manifest.yaml`、`config.yaml`、`state/`、`outputs/` 与任何缓存目录 |
 

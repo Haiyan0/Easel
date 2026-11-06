@@ -22,7 +22,9 @@ python skills/builtin/database-query/scripts/db_query.py --config skills/builtin
 python skills/builtin/database-query/scripts/db_query.py --config skills/builtin/database-query/config.yaml projects resolve --project yuanmeng-mall
 ```
 
-多人 Docker worker 的技能目录只读，把 `--config` 换成部署配置路径（例如 `/workspace/config/database-query.yaml`）。
+多人 Docker worker 的技能目录只读，把 `--config` 换成镜像内配置
+`/opt/easel/skills/builtin/database-query/assets/config.multiuser.yaml`；需要查库时凭据只走
+`--env-file /run/easel-secrets/database-query.env`。
 
 ## 口径规则
 

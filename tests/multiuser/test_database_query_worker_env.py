@@ -68,7 +68,7 @@ def test_worker_env_drops_dsn_but_env_file_doctor_passes(tmp_path):
     result = subprocess.run(
         [sys.executable, "-B", str(CLI), "--config", str(config),
          "--env-file", str(env_file), "doctor"],
-        capture_output=True, text=True, env=env, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
     assert result.returncode == 0, result.stderr
     assert '"ok": true' in result.stdout
     assert "dsn-sentinel" not in result.stdout
@@ -80,7 +80,7 @@ def test_worker_env_drops_dsn_but_env_file_doctor_passes(tmp_path):
         [sys.executable, "-B", str(CLI), "--config", str(config),
          "--env-file", str(probe_env), "doctor", "--connect",
          "--project", "sales"],
-        capture_output=True, text=True, env=env, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
     probe_output = probe.stdout + probe.stderr
     assert "database.unsupported_dialect" in probe_output, probe_output
     assert "file-sentinel" not in probe_output
@@ -90,6 +90,6 @@ def test_worker_env_drops_dsn_but_env_file_doctor_passes(tmp_path):
     missing = subprocess.run(
         [sys.executable, "-B", str(CLI), "--config", str(config),
          "doctor", "--connect", "--project", "sales"],
-        capture_output=True, text=True, env=env, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
     missing_output = missing.stdout + missing.stderr
     assert "database.source_unavailable" in missing_output, missing_output

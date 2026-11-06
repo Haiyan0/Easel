@@ -30,6 +30,7 @@ param(
     [string]$WslRepo = '/mnt/c/Code/Easel',
     [string]$WorkspaceRoot = 'C:\Easel\workspaces',
     [string]$DataRoot = 'C:\Easel\desktop',
+    [string]$DatabaseQuerySecrets = '',
     [int]$ProvisionerGid = 1000,
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 180,
     [ValidateRange(1, 600)][int]$LockTimeoutSeconds = 60
@@ -697,6 +698,10 @@ try {
         '-UpdateBarrierId', $barrierId,
         '-RestartProvisionerIfStale',
         '-LifecycleLockHeld')
+    if ($DatabaseQuerySecrets) {
+        # 更新沿用同一 secrets 目录；省略即与旧部署一样保持禁用。
+        $startArguments += @('-DatabaseQuerySecrets', $DatabaseQuerySecrets)
+    }
     $registeredMode = [string]$deployment.publish_mode
     if ($registeredMode) {
         $startArguments += @('-PublishMode', $registeredMode)

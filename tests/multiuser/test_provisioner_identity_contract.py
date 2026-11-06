@@ -56,8 +56,8 @@ def _identity(**overrides):
     return observed
 
 
-def _full_expected():
-    return _expected(
+def _full_expected(**overrides):
+    expected = _expected(
         engineContext="default", engineId="engine",
         workerImage="sha256:" + "b" * 64,
         gatewayImage="sha256:" + "c" * 64,
@@ -69,6 +69,8 @@ def _full_expected():
         policySha256="f" * 64,
         socketUid=1000, socketGid=1000, socketMode="660",
         allowedUid=10001)
+    expected.update(overrides)
+    return expected
 
 
 def test_identity_contract_detects_stale_process_code():
@@ -89,6 +91,26 @@ def test_config_drift_is_not_treated_as_stale_only():
                                  "gateway": "sha256:" + "c" * 64})
     mismatches = identity_contract.compare_identity(_full_expected(), observed)
     assert "workerImage" in mismatches
+
+
+def test_identity_contract_detects_database_query_secret_drift():
+    """启用/停用数据库凭据必须被身份比较识别，不能静默复用旧进程。"""
+    expected = _full_expected(
+        databaseQueryEnvFile=(
+            "/mnt/c/Easel/main-data/secrets/database-query/"
+            "database-query.env"))
+    assert identity_contract.compare_identity(
+        expected, _identity(databaseQueryEnvFile="")) == [
+            "databaseQueryEnvFile"]
+    assert identity_contract.compare_identity(
+        expected,
+        _identity(databaseQueryEnvFile=expected["databaseQueryEnvFile"])) == []
+
+
+def test_identity_contract_tolerates_old_process_with_query_disabled():
+    """禁用数据库查询时，旧版进程不回报该字段不应阻断升级。"""
+    expected = _full_expected(databaseQueryEnvFile="")
+    assert identity_contract.compare_identity(expected, _identity()) == []
 
 
 def test_provisioner_reports_loaded_source_and_actions():

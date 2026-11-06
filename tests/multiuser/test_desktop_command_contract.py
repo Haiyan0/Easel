@@ -29,15 +29,16 @@ EXPECTED_PARAMETERS = {
     "Start-WorkspaceEasel.ps1": {
         "PublicOrigin", "Image", "WorkerImage", "GatewayImage",
         "ProjectName", "Port", "PublishMode", "Distro", "WslRepo",
-        "WorkspaceRoot", "DataRoot", "EgressCaFile", "UpgradeFromBackup",
+        "WorkspaceRoot", "DataRoot", "DatabaseQuerySecrets",
+        "EgressCaFile", "UpgradeFromBackup",
         "ProvisionerGid", "TimeoutSeconds", "LockTimeoutSeconds",
         "UpdateBarrierId", "RestartProvisionerIfStale",
         "LifecycleLockHeld"},
     "Update-WorkspaceEasel.ps1": {
         "PublicOrigin", "Image", "WorkerImage", "GatewayImage",
         "ProjectName", "Port", "Distro", "WslRepo", "WorkspaceRoot",
-        "DataRoot", "ProvisionerGid", "TimeoutSeconds",
-        "LockTimeoutSeconds"},
+        "DataRoot", "DatabaseQuerySecrets", "ProvisionerGid",
+        "TimeoutSeconds", "LockTimeoutSeconds"},
 }
 
 

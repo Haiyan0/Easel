@@ -38,6 +38,11 @@
 .PARAMETER DataRoot
     非秘密公共文件根，默认 C:\Easel\desktop。
 
+.PARAMETER DatabaseQuerySecrets
+    可选的宿主 secrets 目录（Windows 路径），需包含 database-query.env
+    与 keys/ 子目录；传入后 provisioner 才给 worker 挂只读 DSN、给
+    sidecar 挂隧道密钥。省略即保持数据库查询禁用。
+
 .PARAMETER UpdateBarrierId
     受控更新专用：确认调用方已在控制库写入该接纳屏障后，保留屏障完成
     启动，不尝试自动重开。更新脚本在核验新版 control/provisioner 后
@@ -65,6 +70,7 @@ param(
     [string]$WslRepo = '/mnt/c/Code/Easel',
     [string]$WorkspaceRoot = 'C:\Easel\workspaces',
     [string]$DataRoot = 'C:\Easel\desktop',
+    [string]$DatabaseQuerySecrets = '',
     [string]$EgressCaFile = '',
     [string]$UpgradeFromBackup = '',
     [int]$ProvisionerGid = 1000,
@@ -477,6 +483,23 @@ try {
     $socket = "/tmp/easel-runtime/$ProjectName/provisioner.sock"
     $wslWorkspace = ConvertTo-EaselWslPath -Path $WorkspaceRoot
     $wslPublic = ConvertTo-EaselWslPath -Path $publicDir
+    $wslSecrets = ''
+    $wslDatabaseQueryEnv = ''
+    if ($DatabaseQuerySecrets) {
+        # 宿主目录是唯一开关；env 与 keys 缺一即失败关闭，不启动半接线部署。
+        $secretsRoot = [IO.Path]::GetFullPath(
+            $DatabaseQuerySecrets).TrimEnd('\')
+        if (-not (Test-Path -LiteralPath $secretsRoot -PathType Container) -or
+            -not (Test-Path -LiteralPath `
+                (Join-Path $secretsRoot 'database-query.env') `
+                -PathType Leaf) -or
+            -not (Test-Path -LiteralPath `
+                (Join-Path $secretsRoot 'keys') -PathType Container)) {
+            throw 'database_query_secrets_missing'
+        }
+        $wslSecrets = ConvertTo-EaselWslPath -Path $secretsRoot
+        $wslDatabaseQueryEnv = "$wslSecrets/database-query.env"
+    }
     $provisionerSourceSha256 = Get-WslFileSha256 -Distro $Distro `
         -Path "$WslRepo/deploy/multiuser/provisioner.py"
     $requiredProvisionerActions = @(
@@ -492,6 +515,7 @@ try {
         workerPublicSha256 = $trustedPublic.Worker
         gatewayPublicSha256 = $trustedPublic.Gateway
         policySha256 = $trustedPublic.Policy
+        databaseQueryEnvFile = $wslDatabaseQueryEnv
         engineContext = $engineIdentity.Context
         engineId = $engineIdentity.Id
         socketUid = $socketIdentity.Uid
@@ -569,23 +593,30 @@ try {
         }
     }
     if (-not $alreadyRunning) {
+        $provisionerCommand = (
+            'exec python3 deploy/multiuser/provisioner.py' +
+            " --socket $(Quote-Wsl $socket)" +
+            " --workspace-root $(Quote-Wsl $wslWorkspace)" +
+            " --image $(Quote-Wsl $WorkerImage)" +
+            ' --allowed-uid 10001 --quota-mode none --allow-unquotaed' +
+            " --worker-public-key $(Quote-Wsl ($wslPublic + '/worker-public.key'))" +
+            " --sidecar-network $(Quote-Wsl $network)" +
+            " --sidecar-policy $(Quote-Wsl ($wslPublic + '/egress-policy.json'))" +
+            ' --broker-upstream control:7861' +
+            " --gateway-image $(Quote-Wsl $GatewayImage)" +
+            " --gateway-control-network $(Quote-Wsl $network)" +
+            " --gateway-public-key $(Quote-Wsl ($wslPublic + '/gateway-public.pem'))")
+        if ($wslSecrets) {
+            # 只在显式提供 secrets 目录时追加；省略即保持零凭据部署。
+            $provisionerCommand += (
+                " --database-query-secrets $(Quote-Wsl $wslSecrets)")
+        }
         $lines = @(
             '#!/usr/bin/env bash',
             'set -e',
             "cd $(Quote-Wsl $WslRepo)",
             "export PYTHONPATH=$(Quote-Wsl $WslRepo)",
-            ('exec python3 deploy/multiuser/provisioner.py' +
-             " --socket $(Quote-Wsl $socket)" +
-             " --workspace-root $(Quote-Wsl $wslWorkspace)" +
-             " --image $(Quote-Wsl $WorkerImage)" +
-             ' --allowed-uid 10001 --quota-mode none --allow-unquotaed' +
-             " --worker-public-key $(Quote-Wsl ($wslPublic + '/worker-public.key'))" +
-             " --sidecar-network $(Quote-Wsl $network)" +
-             " --sidecar-policy $(Quote-Wsl ($wslPublic + '/egress-policy.json'))" +
-             ' --broker-upstream control:7861' +
-             " --gateway-image $(Quote-Wsl $GatewayImage)" +
-             " --gateway-control-network $(Quote-Wsl $network)" +
-             " --gateway-public-key $(Quote-Wsl ($wslPublic + '/gateway-public.pem'))")
+            $provisionerCommand
         ) -join "`n"
         $logDir = Join-Path $DataRoot 'logs'
         $null = New-Item -ItemType Directory -Path $logDir -Force

@@ -3380,6 +3380,10 @@ class Provisioner:
                 "gatewayPublicSha256": gateway_key,
             },
             "policySha256": policy,
+            # 只回报启用状态与挂载路径；连接串与口令绝不进入身份响应。
+            "databaseQueryEnvFile": (
+                str(self._database_query.env_file)
+                if self._database_query is not None else ""),
             "socket": {
                 "path": str(self.settings.socket_path),
                 "uid": int(socket_stat.st_uid),

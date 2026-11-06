@@ -6,7 +6,7 @@
 
 原 Web 的登录、独立 workspace、聊天、内容库、画像、技能及账号/发布入口已分组验收。真实供应商及平台行为以本人受管配置和授权实测为准；Desktop 通过不等于 Linux 生产门槛通过。Linux 的 XFS、防火墙、IPv6、Chromium 沙箱等仍见 [Linux 手册](linux-docker-operations.zh-CN.md)，未通过项不冒充已通过。
 
-多人 Docker 的 database-query 数据库隧道只支持 Linux 部署（由每 workspace 的 sidecar 常驻转发）；Windows 桌面部署仍运行 sidecar（broker/egress），但不传 `--database-query-secrets`、不启用数据库隧道，需要数据库查询时按 `skills/builtin/database-query/references/setup.md` 第 5 节手工建立 SSH 隧道。
+多人 Docker 的 database-query 数据库隧道由每 workspace 的 sidecar 常驻转发，Linux 与 Windows 桌面使用同一机制。Windows 桌面在启动时传 `-DatabaseQuerySecrets <宿主目录>`（内含 `database-query.env` 与 `keys/`）才会启用；省略该参数即保持数据库查询禁用。Windows 绑定挂载会把私钥呈现为 0777，OpenSSH 会拒绝使用，因此桌面部署的 `tunnel.multiuser.yaml` 只支持 `mode: direct`（数据库端点须可从本机与容器网络直连）；`mode: ssh` 请使用 Linux 部署或节点侧转发。
 
 <a id="9-完整-desktop-多人已装配的正式路线"></a>
 <a id="9-windows-上的多人验证做到哪一步"></a>
@@ -413,6 +413,9 @@ $Distro = $StartArgs.Distro
 $WslRepo = '/mnt/c/Code/Easel'
 $OldControlImage = $StartArgs.Image
 $OldRevision = (git rev-parse HEAD).Trim()
+# 可选：已启用 database-query 时，填写与上次相同的宿主 secrets 目录；
+# 未启用就留空，启动时不要传 -DatabaseQuerySecrets。
+$DatabaseQuerySecrets = 'C:\Easel\main-data\secrets\database-query'
 git status --short
 ```
 
@@ -468,12 +471,19 @@ $StartArgs.GatewayImage = (docker image inspect "easel-gateway:$Tag" --format '{
 $StartArgs.WslRepo = $WslRepo
 ```
 
-第一次较慢，以后 Docker 会复用缓存。不要随意改 DshCommit，不要加 `--no-cache`，也不要删旧镜像。构建失败时旧数据和备份还在，修正网络/构建问题后重试。
+第一次较慢，以后 Docker 会复用缓存。不要随意改 DshCommit，不要加 `--no-cache`，也不要删旧镜像。构建失败时旧数据和备份还在，修正网络/构建问题后重试。只改普通 skills 时不需要构建 control/gateway，按 10.6 只构建 worker。
+
+启用 database-query 时，真实拓扑 `skills/builtin/database-query/assets/tunnel.multiuser.yaml` 必须在构建上下文内（该文件被 git 忽略，不提交）；缺失时 sidecar 记录 `config_invalid` 且不启动任何 forward。
 
 ### 10.5 用备份证明允许升级，启动后检查
 
 ```powershell
-.\deploy\desktop\Start-WorkspaceEasel.ps1 @StartArgs -UpgradeFromBackup $Backup
+$StartExtra = @{}
+if ($DatabaseQuerySecrets) {
+    $StartExtra.DatabaseQuerySecrets = $DatabaseQuerySecrets
+}
+.\deploy\desktop\Start-WorkspaceEasel.ps1 @StartArgs @StartExtra `
+  -UpgradeFromBackup $Backup
 if ($LASTEXITCODE -ne 0) { throw '启动失败，保留屏障、数据和备份，查看日志' }
 .\deploy\desktop\Status-WorkspaceEasel.ps1 -ProjectName $StartArgs.ProjectName `
   -DataRoot $DataRoot -Port $StartArgs.Port -Distro $Distro -ProvisionerGid $StartArgs.ProvisionerGid

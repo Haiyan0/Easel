@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -115,6 +116,43 @@ def test_identity_reports_actual_sanitized_configuration(tmp_path):
     assert "master" not in data.lower()
     assert "private" not in data.lower()
     assert identity["socket"]["gid"] == socket_path.stat().st_gid
+
+
+def _database_query_secrets(tmp_path: Path) -> Path:
+    root = tmp_path / "secrets" / "database-query"
+    (root / "keys").mkdir(parents=True)
+    (root / "database-query.env").write_text(
+        "YUANMENG_SPACE_DATABASE_URL="
+        "mysql+asyncmy://readonly:secret@db-tunnel:13307/meta_new_sync\n",
+        encoding="utf-8")
+    return root
+
+
+def test_identity_reports_database_query_env_path_without_secret_content(
+        tmp_path):
+    """启用数据库凭据时只回报 env 挂载路径，不泄露连接串或口令。"""
+    socket_path = tmp_path / "provisioner.sock"
+    socket_path.touch()
+    secrets = _database_query_secrets(tmp_path)
+    settings = dataclasses.replace(
+        _settings(tmp_path, socket_path), database_query_secrets=secrets)
+    instance = provisioner.Provisioner(settings, run=FakeDocker())
+    identity = asyncio.run(instance.identity())
+    assert identity["databaseQueryEnvFile"] == str(
+        (secrets / "database-query.env").resolve())
+    data = json.dumps(identity, sort_keys=True)
+    assert "mysql+asyncmy" not in data
+    assert "secret@" not in data
+    assert "db-tunnel:13307" not in data
+
+
+def test_identity_reports_empty_database_query_when_disabled(tmp_path):
+    socket_path = tmp_path / "provisioner.sock"
+    socket_path.touch()
+    instance = provisioner.Provisioner(
+        _settings(tmp_path, socket_path), run=FakeDocker())
+    identity = asyncio.run(instance.identity())
+    assert identity["databaseQueryEnvFile"] == ""
 
 
 def test_identity_fails_closed_when_key_read_fails(tmp_path):

@@ -132,9 +132,9 @@ python skills/builtin/database-query/scripts/db_query.py --config skills/builtin
 
 ## 5. SSH 隧道
 
-多人 Docker 不使用桌面手工隧道：provisioner 为每个 workspace 启动 sidecar，按镜像内固定的 `tunnel.multiuser.yaml` 在 `db-tunnel` 别名下常驻转发。不要在 worker 内建隧道，也不要把私钥放进 workspace；私钥只在 sidecar 的只读挂载中。
+多人 Docker（Linux 与 Windows 桌面）都不使用桌面手工隧道：provisioner 为每个 workspace 启动 sidecar，按镜像内固定的 `tunnel.multiuser.yaml` 在 `db-tunnel` 别名下常驻转发。Windows 桌面通过 `Start-WorkspaceEasel.ps1 -DatabaseQuerySecrets <宿主目录>` 启用；Windows 绑定挂载会把私钥呈现为 0777，OpenSSH 会拒绝使用，因此桌面部署只支持 `mode: direct` 拓扑。不要在 worker 内建隧道，也不要把私钥放进 workspace；私钥只在 sidecar 的只读挂载中。
 
-桌面/本机部署仍由维护者手工建立隧道。技能不会自动启动、监督隧道或管理私钥。维护者在本机建立隧道后，把 `secret_env` 指向本机转发端点（例如 `127.0.0.1` 的某个端口）。建议的本机 OpenSSH 参数：
+直接在宿主机运行技能（不经 worker）时，仍由维护者手工建立隧道。技能不会自动启动、监督隧道或管理私钥。维护者在本机建立隧道后，把 `secret_env` 指向本机转发端点（例如 `127.0.0.1` 的某个端口）。建议的本机 OpenSSH 参数：
 
 ```text
 Host db-tunnel

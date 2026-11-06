@@ -516,7 +516,7 @@ sudo docker exec "$WORKER" python /opt/easel/skills/builtin/database-query/scrip
   doctor --connect --project <精确项目 ID>
 ```
 
-`doctor` 不连接数据库；`--connect` 才验证 `db-tunnel` 转发与数据库认证。轮换 DSN 或私钥后必须 drain + stop 并重建对应 worker/sidecar，运行中的容器不会自动看到新文件。Windows 桌面部署仍运行 sidecar（broker/egress），但不传 `--database-query-secrets`、不启用数据库隧道，见 [Windows 手册](windows-desktop-operations.zh-CN.md)。
+`doctor` 不连接数据库；`--connect` 才验证 `db-tunnel` 转发与数据库认证。轮换 DSN 或私钥后必须 drain + stop 并重建对应 worker/sidecar，运行中的容器不会自动看到新文件。Windows 桌面部署使用同一机制，通过 `Start-WorkspaceEasel.ps1 -DatabaseQuerySecrets <宿主目录>` 启用，且只支持 `mode: direct` 拓扑，见 [Windows 手册](windows-desktop-operations.zh-CN.md)。
 
 ## 10. 多人日常停止、完整备份与恢复
 

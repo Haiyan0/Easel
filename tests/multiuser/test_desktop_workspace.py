@@ -105,6 +105,18 @@ def test_compose_required_variables_are_supplied_by_start_and_stop():
         assert not missing, f"{script.name} envArgs missing {missing}"
 
 
+def test_desktop_start_wires_optional_database_query_secrets():
+    """桌面部署必须能把宿主 secrets 目录交给 provisioner 挂载。"""
+    text = START.read_text(encoding="utf-8")
+    assert "[string]$DatabaseQuerySecrets" in text
+    assert "database_query_secrets_missing" in text
+    assert "--database-query-secrets" in text
+    assert "databaseQueryEnvFile" in text
+    update = (DEPLOY / "Update-WorkspaceEasel.ps1").read_text(encoding="utf-8")
+    assert "[string]$DatabaseQuerySecrets" in update
+    assert "'-DatabaseQuerySecrets'" in update
+
+
 def test_initialize_binds_key_creation_and_private_network():
     text = INITIALIZE.read_text(encoding="utf-8")
     assert "--signing-key" in text
