@@ -1,3 +1,4 @@
+import { IconRefresh } from './icons';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { AccountItem, AccountWhoami } from '../lib/api';
 import { useWorkspaceData } from '../lib/workspaceDataContext';
@@ -21,6 +22,7 @@ const STATE_LABEL: Record<string, string> = {
   scanned: '扫码成功',
   sms_required: '需短信验证',
   verifying: '验证中…',
+  window_login: '请在浏览器窗口登录',
   success: '登录成功 ✅',
   expired: '二维码已过期',
   error: '登录出错',
@@ -508,16 +510,14 @@ export default function AccountsPage() {
 
   return (
     <div className="accounts-page">
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+      <div className="page-head">
         <div>
-          <h1 className="page-title">账号登录 Accounts</h1>
-          <p className="page-subtitle">
-            用手机 App 扫码登录，登录态本地持久化，之后发布免登。<br />
-            ⚠️ 平台可能对机房/代理 IP 判风险导致二维码弹不出，需干净/家宽 IP，或在正常网络登录后拷贝登录态目录。
-          </p>
+          <h1 className="page-title">账号登录</h1>
+          <p className="page-subtitle">管理平台账号及登录状态。</p>
         </div>
-        <button className="btn btn-sm" onClick={load}>⟳ 刷新</button>
+        <button className="btn btn-sm" onClick={load}><IconRefresh size={14} /> 刷新</button>
       </div>
+      <div className="accounts-notice">按平台通过扫码或浏览器窗口登录，登录状态保存在本地。若登录页面无法显示，请检查网络或代理环境。</div>
 
       {err && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 12 }}>{err}</div>}
       {terminalMsg && (
@@ -603,7 +603,9 @@ export default function AccountsPage() {
             <div style={{ fontSize: 13, marginBottom: 14,
               color: qr.state === 'success' ? 'var(--green)'
                 : ['error', 'expired'].includes(qr.state) ? 'var(--red)' : 'var(--text-secondary)' }}>
-              {STATE_LABEL[qr.state] || qr.state}{qr.message ? ` — ${qr.message}` : ''}
+              {/* 窗口登录（X）没有二维码，expired 表示「窗口登录超时」而非「二维码过期」 */}
+              {(qr.state === 'expired' && !qr.qr ? '登录超时/未完成' : STATE_LABEL[qr.state]) || qr.state}
+              {qr.message ? ` — ${qr.message}` : ''}
             </div>
             {qr.state === 'sms_required' ? (
               <div style={{ padding: '6px 4px 2px' }}>
@@ -636,6 +638,10 @@ export default function AccountsPage() {
               </div>
             ) : qr.state === 'verifying' ? (
               <div className="loading" style={{ padding: 40 }}><div className="spinner" />正在验证验证码，登录中…</div>
+            ) : qr.state === 'window_login' ? (
+              // 无扫码平台（X）：本机弹有头浏览器窗口，用户在窗口里手动登录
+              <div className="loading" style={{ padding: 40 }}><div className="spinner" />
+                {qr.message || '请在弹出的浏览器窗口中完成登录'}</div>
             ) : qr.state === 'success' ? (
               <div style={{ fontSize: 48, padding: 40 }}>✅</div>
             ) : ['error', 'expired'].includes(qr.state) ? (

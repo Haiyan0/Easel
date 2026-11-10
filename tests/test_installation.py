@@ -87,3 +87,13 @@ def test_invalid_default_does_not_write_config(tmp_path):
     with pytest.raises(ValueError):
         installation.initialize_runtime(tmp_path, "other")
     assert not (tmp_path / "outputs").exists()
+
+
+def test_real_install_linux_creates_environment_before_setup():
+    workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    install_job = workflow.split("\n  install-real:", 1)[1]
+    creation = install_job.index("run: python -m venv .venv")
+    setup = install_job.index("run: bash setup.sh --openclaw")
+    doctor = install_job.index(".venv/bin/easel doctor")
+    assert creation < setup < doctor
+    assert "if: runner.os == 'Linux'" in install_job[:creation].rsplit("- name:", 1)[1]

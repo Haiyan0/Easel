@@ -21,6 +21,9 @@ LEGACY_PROFILE_NAMES = {
     "zhihu": "ZhihuProfile",
     "weixin-channels": "ChannelsProfile",
     "wechat-oa": "WeixinMpProfile",
+    "twitter-x": "TwitterXProfile",
+    "juejin": "JuejinProfile",
+    "toutiao": "ToutiaoProfile",
 }
 STATE_KINDS = frozenset({
     "wechat-config", "wechat-token", "platform-cookie",

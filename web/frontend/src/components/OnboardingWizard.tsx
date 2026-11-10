@@ -4,7 +4,7 @@ import QuestionCards from './QuestionCards';
 import { useWorkspaceData } from '../lib/workspaceDataContext';
 import { workspaceErrorMessage } from '../lib/workspaceData';
 
-const PLATFORMS = ['小红书', '抖音', 'B站', '视频号', '公众号', '微博', '知乎'];
+const PLATFORMS = ['小红书', '抖音', 'B站', '视频号', '公众号', '微博', '知乎', '今日头条'];
 const TONES = ['专业严谨', '轻松幽默', '亲切日常', '犀利吐槽', '治愈温暖', '干货实用'];
 
 interface OnboardingWizardProps {

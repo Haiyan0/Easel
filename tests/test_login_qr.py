@@ -794,7 +794,7 @@ def web_functions():
              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     for node in nodes:
         node.decorator_list = []
-    env = {"json": json, "subprocess": subprocess, "sys": sys, "asyncio": asyncio,
+    env = {"os": os, "json": json, "subprocess": subprocess, "sys": sys, "asyncio": asyncio,
            "_LOGIN_START_LOCKS": {}}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "web/app.py", "exec"), env)
     return env

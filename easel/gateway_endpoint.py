@@ -97,7 +97,7 @@ def configured_port() -> int | None:
     写成人肉字符串 ``"18789"`` 同样会被忽略。bool 虽然也是 int 的子类，但要排掉。
     """
     try:
-        raw = (state_dir() / CONFIG_FILENAME).read_text(encoding="utf-8")
+        raw = (state_dir() / CONFIG_FILENAME).read_text(encoding="utf-8-sig")
         cfg = json.loads(raw)
     except (OSError, ValueError):
         return None

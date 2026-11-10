@@ -145,6 +145,12 @@ def _capture_probes(monkeypatch):
             seen.append((rq.full_url, {k.lower(): v for k, v in dict(rq.headers).items()}))
             return _Resp()
 
+    # 协议测试使用固定公网 DNS，避免本机代理的 Fake-IP 影响 SSRF 检查。
+    resolve = web.socket.getaddrinfo
+    monkeypatch.setattr(web.socket, "getaddrinfo", lambda host, port, *a, **kw:
+                        [(2, 1, 6, "", ("8.8.8.8", 443))]
+                        if host in {"api.anthropic.com", "api.openai.com"}
+                        else resolve(host, port, *a, **kw))
     monkeypatch.setattr(web.urllib.request, "build_opener", lambda *a, **k: _Opener())
     return seen
 

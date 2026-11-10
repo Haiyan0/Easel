@@ -98,7 +98,7 @@ def _configured_providers() -> set[str]:
     if not cfg.is_file():
         return set()
     try:
-        data = json.loads(cfg.read_text(encoding="utf-8"))
+        data = json.loads(cfg.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return set()
     providers = (data.get("models") or {}).get("providers") or {}

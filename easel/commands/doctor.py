@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import shutil
@@ -40,7 +41,7 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def _node_version_ok(strict: bool) -> bool:
+def _node_version_ok(strict: bool, patched: bool = False) -> bool:
     """检查 Node.js 版本。
 
     strict=True 对齐 openclaw@latest（2026.9.x）的引擎：>=24.16.0 <25 || >=26.1.0（25.x/26.0 被排除）。
@@ -57,11 +58,14 @@ def _node_version_ok(strict: bool) -> bool:
         if result.returncode != 0:
             return False
         # e.g. "v24.21.0"
-        m = re.match(r"v(\d+)\.(\d+)", result.stdout.strip())
+        m = re.match(r"v(\d+)\.(\d+)\.(\d+)", result.stdout.strip())
         if not m:
             return False
         major, minor = int(m.group(1)), int(m.group(2))
         if strict:
+            if patched:
+                patch = int(m.group(3))
+                return (major == 24 and (minor, patch) >= (22, 1)) or (major == 26 and (minor, patch) >= (12, 1)) or major >= 27
             return (major == 24 and minor >= 16) or (major == 26 and minor >= 1) or major >= 27
         return (major, minor) >= (22, 19)
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -132,22 +136,29 @@ def _gateway_healthy() -> bool:
         return False
 
 
-def _skills_synced() -> tuple[bool, str]:
+def _skills_synced(ws: Path | None = None) -> tuple[bool, str]:
     """检查 agent 真正读取的那个 workspace 里有没有 skills。
 
     这里的目标目录**不能**硬编码：OpenClaw 的默认布局在 2026.6.x / 2026.9.x 之间变过
     （见 easel/openclaw_workspace.py）。以前这里写死了旧布局，而 sync.sh 写的是新布局，
     于是同步脚本报 "synced"、doctor 报绿，agent 却读不到任何技能（issue #19）。
     """
-    from easel.openclaw_workspace import workspace_dir
+    from easel.skills_sync import agent_workspace
 
-    ws = workspace_dir()
-    skills_dir = ws / "skills"
     try:
+        ws = agent_workspace() if ws is None else ws
+        skills_dir = ws / "skills"
         ok = skills_dir.is_dir() and any(skills_dir.iterdir())
-    except OSError:
-        ok = False
-    return ok, f"agent 实际读取的 workspace 是 {ws}，其中 skills/ 为空或不存在"
+    except (OSError, ValueError, RuntimeError):
+        return False, f"无法检查 workspace {ws} 的 skills/ 目录"
+    state = "存在" if ok else "为空或不存在"
+    return ok, f"agent 实际读取的 workspace 是 {ws}，其中 skills/ {state}"
+
+
+def _skills_fresh(ws: Path | None = None) -> tuple[bool, str]:
+    """Check current repository skill files independently of workspace existence."""
+    from easel.skills_sync import skills_sync_state
+    return skills_sync_state(ws)
 
 
 def _env_key_valid() -> bool:
@@ -178,7 +189,7 @@ def _env_key_valid() -> bool:
     # 认证变量 → 是否已填入非占位值
     auth_vars: dict[str, str] = {}
     try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if line.startswith("#") or "=" not in line:
                 continue
@@ -232,11 +243,16 @@ def _primary_model_cli_available() -> tuple[bool, str]:
     if not cfg_path.is_file():
         return False, ""
     try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return False, ""
-    primary = (((cfg.get("agents") or {}).get("defaults") or {})
-               .get("model") or {}).get("primary") or ""
+    try:
+        model = ((cfg.get('agents') or {}).get('defaults') or {}).get('model')
+        primary = model if isinstance(model, str) else (model or {}).get('primary', '')
+        from easel.model_config import validate_model_ref
+        validate_model_ref(primary)
+    except (AttributeError, TypeError, ValueError) as error:
+        return False, str(error) if isinstance(error, ValueError) else '主模型配置结构无效'
     backend = _cli_backend(primary)
     if not backend:
         return False, ""
@@ -273,12 +289,17 @@ def _primary_model_routable() -> tuple[bool, str]:
     if not cfg_path.is_file():
         return False, f"{cfg_path} 不存在 — 先跑 bash setup.sh（Windows: setup.ps1）"
     try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         return False, f"{cfg_path} 读不出来（{exc}）"
 
-    primary = (((cfg.get("agents") or {}).get("defaults") or {})
-               .get("model") or {}).get("primary") or ""
+    try:
+        model = ((cfg.get('agents') or {}).get('defaults') or {}).get('model')
+        primary = model if isinstance(model, str) else (model or {}).get('primary', '')
+        from easel.model_config import validate_model_ref
+        validate_model_ref(primary)
+    except (AttributeError, TypeError, ValueError) as error:
+        return False, str(error) if isinstance(error, ValueError) else '主模型配置结构无效'
     if not primary:
         return False, "未设置 agents.defaults.model.primary — 重新跑 setup 脚本"
     if "/" not in primary:
@@ -298,12 +319,39 @@ def _primary_model_routable() -> tuple[bool, str]:
         return False, (f"primary 是 {primary}，但 models.providers.{provider} 不存在 —— "
                        "在 .env 填好真实 key 后重新跑 setup 脚本")
     # apiKey / 本地适配器 / OAuth 任一即可。字段名随 OpenClaw 版本变过，这里从宽认。
-    has_auth = bool(str(entry.get("apiKey") or "").strip()) or bool(entry.get("localService")) \
+    api_key = entry.get('apiKey')
+    key_present = bool(api_key)
+    if isinstance(api_key, str):
+        key_present = bool(api_key.strip()) and not re.search(r'replace_me|your[-_]?api[-_]?key|^<.*>$|^\.{3}$|^xxx+$', api_key.strip(), re.I)
+    has_auth = key_present or bool(entry.get("localService")) \
         or any(k for k, v in entry.items() if "oauth" in k.lower() and v)
     if not has_auth:
         return False, (f"models.providers.{provider} 没有 apiKey —— "
                        "在 .env 填好真实 key 后重新跑 setup 脚本")
     return True, ""
+
+
+def _background_exec_policy() -> list[str]:
+    """Read saved notification and compaction choices without printing secrets."""
+    try:
+        cfg = json.loads(_openclaw_config_path().read_text(encoding='utf-8-sig'))
+        tools = cfg.get('tools') or {}
+        defaults = (cfg.get('agents') or {}).get('defaults') or {}
+        notify = (tools.get('exec') or {}).get('notifyOnExit')
+        compaction = (defaults.get('compaction') or {}).get('maxActiveTranscriptBytes')
+        utility = defaults.get('utilityModel')
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ['无法确认后台完成通知与辅助模型配置']
+    notify_state = ('显式开启，后台完成通知可能唤醒模型' if notify is True else
+                    '显式关闭，后台完成不自动触发续跑' if notify is False else
+                    '未设置，行为由所装 OpenClaw 决定' if notify is None else '格式异常')
+    byte_state = (str(compaction) if type(compaction) is int and compaction >= 0 else
+                  compaction if isinstance(compaction, str) and re.fullmatch(r'\d+(?:\.\d+)?(?:[kmg]b?)?', compaction, re.I) else
+                  '未设置' if compaction is None else '格式异常')
+    utility_state = '已显式配置' if isinstance(utility, str) and utility.strip() else '未设置（所装版本可能不支持该字段或推导其它模型）'
+    return [f'tools.exec.notifyOnExit：{notify_state}',
+            f'agents.defaults.compaction.maxActiveTranscriptBytes：{byte_state}',
+            f'agents.defaults.utilityModel：{utility_state}']
 
 
 def _tool_loop_policy() -> list[str]:
@@ -353,6 +401,182 @@ def _tool_loop_policy() -> list[str]:
     return lines
 
 
+_COMPACTION_RESERVE_FLOOR = 20_000
+
+
+def _compaction_threshold(context_window: int) -> int:
+    """按常见默认预留参数估算压缩阈值（token），不代表运行时保证。"""
+    reserve = min(_COMPACTION_RESERVE_FLOOR, context_window // 4)
+    return context_window - reserve
+
+
+_SKILLS_BUDGET_DEFAULTS = {"maxSkillsInPrompt": 200, "maxSkillsPromptChars": 80_000}
+_SKILLS_BUDGET_ENV = {
+    "maxSkillsInPrompt": "EASEL_MAX_SKILLS_IN_PROMPT",
+    "maxSkillsPromptChars": "EASEL_MAX_SKILLS_PROMPT_CHARS",
+}
+_OPENCLAW_SKILLS_DEFAULTS = {"maxSkillsInPrompt": 150, "maxSkillsPromptChars": 18_000}
+
+
+def _builtin_skills_estimate(cfg: dict) -> tuple[int, int]:
+    """源码目录的保守 UTF-16 字符估算，不查询网关或判断运行时资格。"""
+    from easel.openclaw_workspace import config_path
+
+    agents = cfg.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    defaults = agents.get("defaults")
+    defaults = defaults if isinstance(defaults, dict) else {}
+    workspace = defaults.get("workspace")
+    listed = agents.get("list")
+    entries = agents.get("entries")
+    overrides = listed if isinstance(listed, list) else []
+    if isinstance(entries, dict) and isinstance(entries.get("main"), dict):
+        overrides = [*overrides, {**entries["main"], "id": "main"}]
+    for agent in overrides:
+        if isinstance(agent, dict) and agent.get("id") == "main" and agent.get("workspace"):
+            workspace = agent["workspace"]
+    workspace = os.environ.get("EASEL_OPENCLAW_WORKSPACE") or workspace
+    directory = Path(workspace).expanduser() if isinstance(workspace, str) and workspace else config_path().parent / "workspace"
+    paths = sorted((PROJECT_ROOT / "skills" / "builtin").glob("*/SKILL.md"))
+    chars = 1024 if paths else 0
+    for path in paths:
+        source = path.read_text(encoding="utf-8-sig").split("---", 2)
+        if len(source) != 3 or source[0].strip():
+            raise ValueError("invalid skill frontmatter")
+        name = re.search(r"^name:\s*(.+)$", source[1], re.MULTILINE)
+        if name is None or not re.search(r"^description:", source[1], re.MULTILINE):
+            raise ValueError("missing skill metadata")
+        location = str(directory / "skills" / path.parent.name / "SKILL.md")
+        metadata = source[1] + name.group(1) + location
+        chars += len(html.escape(metadata).encode("utf-16-le")) // 2 + 180
+    return len(paths), chars
+
+
+def _skills_budget_updates(cfg: dict, environment=None) -> dict[str, int]:
+    """安装计划：只补缺失叶子键；显式环境覆盖除外，不直接写配置。"""
+    if not isinstance(cfg, dict):
+        raise ValueError("invalid config")
+    skills = cfg.get("skills", {})
+    if not isinstance(skills, dict):
+        raise ValueError("invalid skills config")
+    limits = skills.get("limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("invalid skills limits")
+    if any("$include" in node for node in (cfg, skills, limits)):
+        raise ValueError("unresolved skills config include")
+    environment = os.environ if environment is None else environment
+    count, chars = _builtin_skills_estimate(cfg)
+    defaults = {
+        "maxSkillsInPrompt": max(_SKILLS_BUDGET_DEFAULTS["maxSkillsInPrompt"], count),
+        "maxSkillsPromptChars": max(_SKILLS_BUDGET_DEFAULTS["maxSkillsPromptChars"], chars + 8192),
+    }
+    updates = {}
+    for key, variable in _SKILLS_BUDGET_ENV.items():
+        raw = environment.get(variable, "")
+        if raw:
+            if not re.fullmatch(r"[0-9]+", raw) or len(raw) > 16 or int(raw) > 2**53 - 1:
+                raise ValueError(f"invalid {variable}")
+            updates[key] = int(raw)
+        elif key not in limits:
+            updates[key] = defaults[key]
+    return updates
+
+
+def _skills_catalog_policy(cfg: dict) -> list[str]:
+    skills = cfg.get("skills")
+    limits = skills.get("limits") if isinstance(skills, dict) else None
+    lines = []
+    if not isinstance(limits, dict):
+        lines.append("skills.limits：未设置（技能目录预算走 OpenClaw 默认值）")
+        limits = {}
+    else:
+        described = []
+        for key in _SKILLS_BUDGET_DEFAULTS:
+            value = limits.get(key)
+            if key not in limits:
+                described.append(f"{key} 未设置")
+            elif type(value) is int and value >= 0:
+                described.append(f"{key}={value:,}" + ("（显式为 0）" if value == 0 else ""))
+            else:
+                described.append(f"{key} 格式异常")
+        lines.append("skills.limits：已设置 " + "，".join(described))
+    try:
+        count, chars = _builtin_skills_estimate(cfg)
+    except (OSError, ValueError):
+        count, chars = 0, 0
+    if count:
+        lines.append(f"内置技能目录离线上界估算：{count} 个，完整描述及路径约 {chars:,} UTF-16 字符；"
+                     "不含第三方技能，未检查运行时资格或实际提示")
+        effective = {key: limits.get(key, default) for key, default in _OPENCLAW_SKILLS_DEFAULTS.items()}
+        if all(type(value) is int and value >= 0 for value in effective.values()):
+            if effective["maxSkillsInPrompt"] < count or effective["maxSkillsPromptChars"] < chars:
+                lines.append("目录预算低于离线估算：存在描述精简或目录截断风险；实际遗漏不能由此推定")
+            else:
+                lines.append("目录预算覆盖此离线估算，但不保证运行时技能或描述全部可见")
+    else:
+        lines.append("内置技能目录离线估算未知：源码缺失或元数据不可读")
+    agents = cfg.get("agents")
+    if isinstance(agents, dict):
+        listed = agents.get("list")
+        entries = agents.get("entries")
+        overrides = listed if isinstance(listed, list) else []
+        if isinstance(entries, dict):
+            overrides = [*overrides, *[value for value in entries.values() if isinstance(value, dict)]]
+        if any(isinstance(agent, dict) and ("skillsLimits" in agent or "skills" in agent) for agent in overrides):
+            lines.append("存在 Agent 级 skillsLimits/skills 覆盖：全局预算不能代表该 Agent 的最终目录")
+    lines.append("运行时可见性未知：使用 openclaw --profile easel skills list --json / skills check，"
+                 "并核对当前会话的实际提示快照与截断警告；清单 Eligible 数不等于提示内可见数")
+    return lines
+
+
+def _context_budget_policy() -> list[str]:
+    """描述已保存的上下文预算配置；不改配置，也不假设运行时已加载。"""
+    try:
+        cfg = json.loads(_openclaw_config_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ["无法读取 JSON 配置；上下文预算状态未知"]
+    if not isinstance(cfg, dict):
+        return ["配置根节点不是对象；上下文预算状态未知"]
+
+    lines: list[str] = []
+    agents = cfg.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    context_cap = defaults.get("contextTokens") if isinstance(defaults, dict) else None
+    if type(context_cap) is not int or context_cap <= 0:
+        context_cap = None
+    compaction = defaults.get("compaction") if isinstance(defaults, dict) else None
+    disabled = isinstance(compaction, dict) and compaction.get("enabled") is False
+    if disabled:
+        lines.append("agents.defaults.compaction.enabled：显式关闭；以下仅为默认参数下的参考阈值")
+    models = cfg.get("models")
+    providers = models.get("providers") if isinstance(models, dict) else None
+    if not isinstance(providers, dict):
+        lines.append("models.providers 未设置；无法计算压缩阈值")
+    else:
+        for provider, spec in sorted(providers.items()):
+            if not isinstance(spec, dict):
+                lines.append(f"{provider}：格式异常；无法计算压缩阈值")
+                continue
+            entries = spec.get("models")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                model_id = str(entry.get("id") or "?")
+                window = entry.get("contextWindow")
+                if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+                    lines.append(f"{provider}/{model_id}：未声明 contextWindow；阈值由 OpenClaw 推导")
+                    continue
+                effective = min(window, context_cap) if context_cap is not None else window
+                cap_note = f"；contextTokens 上限 {context_cap:,}" if context_cap is not None else ""
+                lines.append(f"{provider}/{model_id}：声明 {window:,}{cap_note} → "
+                             f"默认参数参考压缩阈值约 {_compaction_threshold(effective):,}")
+
+    lines.extend(_skills_catalog_policy(cfg))
+    return lines
+
+
 def cmd_doctor(_args) -> int:
     print("Easel — 环境检查\n")
     all_ok = True
@@ -380,9 +604,10 @@ def cmd_doctor(_args) -> int:
         # （openclaw@latest）从严要求 24.16+。
         oc_ver = _openclaw_version()
         node_strict = oc_ver is None or oc_ver >= (2026, 9, 0)
-        node_floor = "24.16" if node_strict else "22.19"
+        patched_node = oc_ver is None or (2026, 10, 8) <= oc_ver < (2026, 11, 2)
+        node_floor = "24.22.1" if patched_node else ("24.16" if node_strict else "22.19")
         has_node = shutil.which("node") is not None
-        node_ok = _node_version_ok(node_strict)
+        node_ok = _node_version_ok(node_strict, patched_node)
         node_detail = (f"请安装 Node.js >= {node_floor}: https://nodejs.org/" if not has_node
                        else f"Node.js 版本不满足当前 OpenClaw 要求，请升级到 >= {node_floor}: https://nodejs.org/")
         all_ok &= _check(f"Node.js >= {node_floor}", node_ok, node_detail)
@@ -445,6 +670,13 @@ def cmd_doctor(_args) -> int:
             print(f"    └─ {line}")
         print("    未设置不等于关闭；继承、默认值和运行时支持由 OpenClaw 版本决定。")
         print("    已保存配置不证明网关已加载，也不代表每任务工具调用预算。")
+        for line in _background_exec_policy():
+            print(f"    └─ {line}")
+        print("  OpenClaw 上下文预算（只读配置诊断，不计入环境就绪结果）")
+        for line in _context_budget_policy():
+            print(f"    └─ {line}")
+        print("    阈值按常见默认预留参数估算；所装版本、运行时覆盖和压缩开关可能改变实际行为。")
+        print("    contextWindow 会影响本地请求预算；缓存命中与成本还取决于供应商和提示前缀。")
         # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
         route_ok, route_detail = _primary_model_routable()
         all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
@@ -454,10 +686,21 @@ def cmd_doctor(_args) -> int:
         all_ok &= _check(f"OpenClaw gateway (localhost:{resolve_gateway_port()})", gw_ok,
                           f"运行 python -m easel gateway start（端口来自 {port_source()}）")
 
-        # 5. Skills synced
-        synced, synced_detail = _skills_synced()
-        all_ok &= _check("Skills synced", synced,
-                          f"{synced_detail}；重新运行 setup.ps1（Windows）或 bash agents/sync.sh（Linux/macOS）")
+        # 5. 存在性与内容新旧分开报告，并在同一 workspace 上检查。
+        from easel.skills_sync import agent_workspace
+        try:
+            ws = agent_workspace()
+            synced, synced_detail = _skills_synced(ws)
+            fresh, fresh_detail = _skills_fresh(ws)
+        except (OSError, ValueError, RuntimeError):
+            synced = fresh = False
+            synced_detail = fresh_detail = "无法解析 agent workspace，未确认同步"
+        if not fresh and "python scripts/sync_if_stale.py" not in fresh_detail:
+            fresh_detail += "；运行 python scripts/sync_if_stale.py"
+        all_ok &= _check("Skills synced", synced, synced_detail)
+        all_ok &= _check("Skills up-to-date", fresh, fresh_detail)
+        if fresh:
+            print(f"    └─ {fresh_detail}")
 
     # 6. Key project files
     gateway_label = "scripts/gateway.ps1" if os.name == "nt" else "scripts/gateway.sh"

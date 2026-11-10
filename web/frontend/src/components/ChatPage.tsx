@@ -23,6 +23,7 @@ interface ChatPageProps {
     legacyAgentText?: string,
   ) => void; // 重试：仅对最后一轮；control 暂不提供
   onQuestionAnswered?: (questionId: string) => void;   // 某道问答题提交成功（App 记录答过，重放不再出现）
+  onQuestionClosed?: (id: string, status: string) => void;
   mode?: 'local' | 'control';
   initialInput?: string;
   onInitialInputConsumed?: () => void;
@@ -57,7 +58,7 @@ function greeting(): string {
 }
 
 export default function ChatPage({
-  apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered,
+  apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered, onQuestionClosed,
   initialInput, onInitialInputConsumed,
   attachmentsEnabled = true, attachmentRequiresText = false,
   identityKey, notice, retryAvailable, onRetrySend, reconnectAvailable,
@@ -344,6 +345,7 @@ export default function ChatPage({
               }
             }
             return (
+              <div key={`${i}-${msg.role}`}>
               <MessageBubble
                 key={`${i}-${msg.role}`}
                 message={msg}
@@ -354,6 +356,8 @@ export default function ChatPage({
                 actions={actions}
                 mediaEnabled
               />
+              {!live && msg.questions && <QuestionCards questions={msg.questions} onDone={onQuestionAnswered} onAnswer={onAnswerQuestion} onClosed={onQuestionClosed} />}
+              </div>
             );
           })}
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (

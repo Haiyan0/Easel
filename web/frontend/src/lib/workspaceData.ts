@@ -39,6 +39,7 @@ import {
   fetchScheduleContext as localFetchScheduleContext,
   fetchStatus as localFetchStatus,
   fetchTrends as localFetchTrends,
+  fetchTrendSources as localFetchTrendSources,
   getCredentials as localGetCredentials,
   loginStatus as localLoginStatus,
   logoutAccount as localLogoutAccount,
@@ -142,6 +143,7 @@ export interface AdaptCallbacks {
 export interface AdaptHandle { abort(): void }
 
 export interface WorkspaceData {
+  fetchTrendSources?: typeof localFetchTrendSources;
   fetchStatus(): Promise<WorkspaceStatus>;
   fetchPersonas(): Promise<PersonaItem[]>;
   fetchPersonaFiles(name: string): Promise<{ name: string; files: PersonaFile[] }>;
@@ -1524,6 +1526,7 @@ export const localWorkspaceData: WorkspaceData = {
   uploadFiles: localUploadFiles,
   adoptOversize: localAdoptOversize,
   fetchTrends: localFetchTrends,
+  fetchTrendSources: localFetchTrendSources,
   fetchSchedule: localFetchSchedule,
   fetchScheduleContext: localFetchScheduleContext,
   createSchedule: localCreateSchedule,

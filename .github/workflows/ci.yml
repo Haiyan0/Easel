@@ -67,8 +67,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install settings test dependencies
         run: python -m pip install pytest fastapi httpx uvicorn sse-starlette python-multipart requests websocket-client cryptography
-      - name: Verify user installations and settings
-        run: python -m pytest -q tests/test_runtime_env.py tests/test_openclaw_cmd_resolution.py tests/test_openclaw_cmd_shim.py tests/test_agent_harnesses.py tests/test_pr1.py tests/test_installation.py tests/test_setup_optional_harness.py
+      - name: Verify user installations, settings and skill workspace synchronization
+        run: python -m pytest -q tests/test_runtime_env.py tests/test_openclaw_cmd_resolution.py tests/test_openclaw_cmd_shim.py tests/test_agent_harnesses.py tests/test_pr1.py tests/test_installation.py tests/test_setup_optional_harness.py tests/test_skills_sync.py tests/test_workspace_resolution.py tests/test_doctor_config_path.py
 
   # 两个安装脚本此前在 CI 里零覆盖 —— setup.ps1 把 setup.sh 的版本假设 bug 原样复刻了一
   # 遍却没人发现，根因就在这里。这个 job 全程在 ubuntu 上跑（shellcheck 与 PSScriptAnalyzer
@@ -87,12 +87,15 @@ jobs:
           done
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: '.'
-          severity: warning
-          # 技能自带的 vendor 脚本不在本仓库维护范围内
-          ignore_paths: skills/builtin/video-production/vendor
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+          # 仅检查本仓库维护的脚本；Ubuntu runner 使用现有工具，避免外部 action 下载空包。
+          git ls-files -z -- '*.sh' ':!:skills/builtin/video-production/vendor/**' |
+            xargs -0 --no-run-if-empty shellcheck --severity=warning --format=gcc
 
       # PowerShell 侧：解析 + 静态分析。作者的开发机是 Linux，改 setup.ps1 没法本地验证，
       # 这里是唯一的把关点，所以 Error 级别直接判失败。
@@ -193,6 +196,12 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+
+      # Noninteractive setup.sh reuses a venv but does not create one.
+      # Keep installation and the doctor step on the same Python environment.
+      - name: Create installation environment (Linux)
+        if: runner.os == 'Linux'
+        run: python -m venv .venv
 
       # CI 里没有真 key。doctor 的认证检查是静态的（只判「非空且非占位符」），
       # 给一个语法合法的假值即可走通整条配置链路。

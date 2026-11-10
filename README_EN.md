@@ -83,7 +83,7 @@ Easel follows five connected workflows: **Discover** relevant trends and opportu
 - **Executable Skills:** image, card, voice-over, subtitle, editing, short-drama, and publishing Skills include runnable tools and save deliverables to `outputs/`.
 - **One source, many platforms:** adapt a single idea into Xiaohongshu cards, short video, a Zhihu article, or a short post while respecting platform conventions.
 - **Project-based outputs:** source material, intermediate files, metadata, and final deliverables stay together for revision, retrying, and publishing.
-- **A publishing and learning loop:** Easel supports login, adaptation, and publishing workflows for Xiaohongshu, Douyin, Kuaishou, Zhihu, Bilibili, WeChat Channels, and WeChat Official Accounts, with performance data feeding back into account profiles.
+- **A publishing and learning loop:** Easel supports login, adaptation, and publishing workflows for Xiaohongshu, Douyin, Kuaishou, Zhihu, Bilibili, WeChat Channels, WeChat Official Accounts, and Toutiao, with performance data feeding back into account profiles.
 
 ## 🧭 Five-Layer Content Workflow
 
@@ -94,6 +94,8 @@ Easel follows five connected workflows: **Discover** relevant trends and opportu
 5. **Attribute:** collect views, engagement, comments, and content performance, then preserve useful patterns in the account profile.
 
 ## 🧰 Implemented Capabilities
+
+The trend radar accepts user-defined Python collectors, HTTP services, and RSS/Atom feeds through a versioned data contract. Its existing six platforms use the same pipeline; adding your own source does not require changing the frontend.
 
 | Layer | Capabilities |
 |---|---|
@@ -180,7 +182,7 @@ For faster browsing, each cover opens a lightweight preview of up to one minute.
 
 ## 🚀 Quick Start
 
-Requirements: Linux, macOS, or Windows 10/11, Python 3.10+, and Git. The installer checks Node.js 24.16+ (24.x), 26.1+ (26.x), or 27+ (25.x and 26.0 are unsupported), plus FFmpeg and Playwright/Chromium. It provides a platform-specific guide when Node.js is missing.
+Requirements: Linux, macOS, or Windows 10/11, Python 3.10+, and Git. The installer checks Node.js 24.22.1+ (24.x), 26.12.1+ (26.x), or 27+ (25.x is unsupported), plus FFmpeg and Playwright/Chromium. It provides a platform-specific guide when Node.js is missing.
 
 ```bash
 git clone git@github.com:ZJU-REAL/Easel.git
@@ -320,9 +322,11 @@ Easel uses an isolated `easel` OpenClaw profile and does not overwrite an existi
 
 ## 📑 Documentation
 
+- [Trend collectors: Python scripts / HTTP services / RSS feeds (Chinese)](docs/trend-collectors.md)
 - [Capability map](docs/skill-function-mapping.md)
 - [SKILL interface specification](docs/SKILL-SPEC.md)
 - [Prompt and architecture layers](docs/prompt-stack.md)
+- [Context budget diagnostics](docs/context-budget-diagnostics.md)
 - [Known issues](docs/known-issues_EN.md)
 - [Full acknowledgments](docs/ACKNOWLEDGMENTS.md)
 
@@ -354,6 +358,7 @@ Contributions and discussion are welcome. If you have ideas, questions, or impro
     <td align="center" width="84"><a href="https://github.com/qywMichelle"><img src="https://github.com/qywMichelle.png?size=96" width="72" height="72" alt="qywMichelle"><br><strong>qywMichelle</strong></a></td>
     <td align="center" width="84"><a href="https://github.com/wulinjuan"><img src="https://github.com/wulinjuan.png?size=96" width="72" height="72" alt="wulinjuan"><br><strong>wulinjuan</strong></a></td>
     <td align="center" width="84"><a href="https://github.com/arctanxarc"><img src="https://github.com/arctanxarc.png?size=96" width="72" height="72" alt="arctanxarc"><br><strong>arctanxarc</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/hongxingli319"><img src="https://github.com/hongxingli319.png?size=96" width="72" height="72" alt="hongxingli319"><br><strong>hongxingli319</strong></a></td>
     <td align="center" width="84"><a href="https://github.com/mengyuyuan"><img src="https://github.com/mengyuyuan.png?size=96" width="72" height="72" alt="mengyuyuan"><br><strong>mengyuyuan</strong></a></td>
     <td align="center" width="84"><a href="https://github.com/Dear47"><img src="https://github.com/Dear47.png?size=96" width="72" height="72" alt="Dear47"><br><strong>Dear47</strong></a></td>
   </tr>

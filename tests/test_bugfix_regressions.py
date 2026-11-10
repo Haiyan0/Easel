@@ -443,7 +443,10 @@ def test_video_bgm_music_loop_off_uses_apad_without_stream_loop(monkeypatch, tmp
 
 
 # ── issue #120：空质量门失败，{python} 占位符可替换 ──────────────────
-def test_video_pipeline_gates_empty_phase_fails_and_python_placeholder(monkeypatch, tmp_path):
+@pytest.mark.parametrize("executable", [None, "C:\\Program Files\\Python312\\python.exe"])
+def test_video_pipeline_gates_empty_phase_fails_and_python_placeholder(monkeypatch, tmp_path, executable):
+    if executable is not None:
+        monkeypatch.setattr(sys, "executable", executable)
     aggregate = _load(
         "video_gate_aggregate_fix",
         Path(__file__).resolve().parents[1]
@@ -473,7 +476,7 @@ def test_video_pipeline_gates_empty_phase_fails_and_python_placeholder(monkeypat
     with pytest.raises(SystemExit) as exc:
         aggregate.main()
     assert exc.value.code == 0
-    assert sys.executable in calls[-1][-1]
+    assert calls[-1][-1] == sys.executable.replace("\\", "/") + " -c pass"
 
 
 def test_video_pipeline_stage_respects_empty_gate_failure(monkeypatch, tmp_path):

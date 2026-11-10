@@ -301,11 +301,12 @@ if _SERVICE_MODE == "worker":
         _RUNS = _load_run_manager()
 try:
     from easel.gateway_questions import (
-        GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
+        GatewayClient, GatewayQuestionError, GatewayQuestionClosedError, GatewayUnsupportedError,
         question_bridge_supported)
 except Exception:  # 兼容缺失依赖：问答题桥接降级为关闭
     GatewayClient = None  # type: ignore
     GatewayQuestionError = None  # type: ignore
+    GatewayQuestionClosedError = None  # type: ignore
     GatewayUnsupportedError = None  # type: ignore
     question_bridge_supported = None  # type: ignore
 
@@ -323,6 +324,92 @@ def _qbridge_warn_once(key: str, message: str) -> None:
         return
     _QBRIDGE_WARNED.add(key)
     print(message, file=sys.stderr, flush=True)
+
+def _gateway_question_timing(question: dict) -> dict:
+    return {key: value for key in ("createdAtMs", "expiresAtMs")
+            if isinstance(value := question.get(key), (int, float))
+            and not isinstance(value, bool) and 0 <= value <= 9_007_199_254_740_991}
+
+
+def _gateway_question_state(question: dict | None) -> dict:
+    if question is None:
+        return {"status": "not_found"}
+    status = question.get("status")
+    if status not in {"pending", "answered", "resolved", "cancelled", "expired", "closed"}:
+        status = "unknown"
+    return {"status": status, **_gateway_question_timing(question)}
+
+
+def _poll_gateway_questions(sk: str, proc, emit, stop: threading.Event) -> None:
+    global _QBRIDGE_DISABLED
+    if _QBRIDGE_DISABLED or GatewayClient is None:
+        return
+    if question_bridge_supported is not None and not question_bridge_supported():
+        _QBRIDGE_DISABLED = True
+        _qbridge_warn_once(
+            "unsupported", "[question-bridge] 当前 OpenClaw 版本无 question RPC（需 2026.9.x+），"
+            "已跳过 ask_user 选项卡片桥接，改用文字问答。")
+        return
+    client = None
+    pushed: set[str] = set()
+    pending: set[str] = set()
+    final_check = False
+    try:
+        try:
+            client = GatewayClient()
+            client.connect()
+        except Exception:
+            _QBRIDGE_DISABLED = True
+            _qbridge_warn_once(
+                "connect", "[question-bridge] connect gateway failed，已停用桥接（本进程），"
+                "ask_user 改用文字问答。")
+            return
+        while True:
+            try:
+                items = client.list_questions(session_key=f"agent:main:{sk}", status="pending")
+            except GatewayUnsupportedError:
+                _QBRIDGE_DISABLED = True
+                _qbridge_warn_once(
+                    "unsupported", "[question-bridge] 当前 OpenClaw 版本无 question RPC，"
+                    "已停用 ask_user 选项卡片桥接（需 2026.9.x+）。")
+                return
+            except Exception:
+                if proc.poll() is not None or stop.wait(2):
+                    return
+                continue
+            current = {item["id"] for item in items if item.get("id")}
+            for identifier in sorted(pending - current):
+                try:
+                    status = _gateway_question_state(client.get_question(identifier))["status"]
+                except GatewayQuestionClosedError as error:
+                    status = error.status
+                except GatewayUnsupportedError:
+                    status = "closed"
+                except Exception:
+                    current.add(identifier)
+                    continue
+                if status in ("pending", "unknown"):
+                    current.add(identifier)
+                    continue
+                emit("question_closed", json.dumps({"id": identifier, "status": status}))
+            for item in items:
+                identifier = item.get("id")
+                if identifier and identifier not in pushed:
+                    pushed.add(identifier)
+                    emit("question", json.dumps({
+                        "id": identifier, "questions": item.get("questions", []),
+                        "expiresAtMs": None, **_gateway_question_timing(item),
+                    }, ensure_ascii=False))
+            pending = current
+            if proc.poll() is not None or stop.is_set():
+                if pending and not final_check:
+                    final_check = True
+                    continue
+                return
+            stop.wait(2)
+    finally:
+        if client is not None:
+            client.close()
 
 # 代码/技能来自只读 code_root；产物/画像写 workspace_root；状态写 state_root。
 PROFILES_DIR = _RUNTIME_PATHS.workspace_root / "profiles"
@@ -357,7 +444,33 @@ OPENCLAW_SESSIONS_DIR = _oc_state_dir() / "agents" / "main" / "sessions"
 # 内容取决于网关——支持 extended-thinking 的网关会按档位回传思考流；不支持的（如内网 codewiz，
 # 实测 transcript 里 assistant 只有 text 块、thinking 恒为 0）面板留空，调高档位也不会有内容。
 # 默认 medium：让支持思考的部署直接显示较完整思考；EASEL_THINKING_LEVEL 可覆盖（low 提速 / high 更详尽）。
-THINKING_LEVEL = (os.environ.get("EASEL_THINKING_LEVEL", "").strip() or "medium")
+def _thinking_level_setting() -> str:
+    """思考档位：进程环境优先，其次项目根 .env。
+
+    THINKING_LEVEL 在模块导入时求值，而 .env 并不会被注入 os.environ（app 内部按需解析），
+    所以此前在 .env 里写 EASEL_THINKING_LEVEL 完全无效。对只支持特定档位的模型
+    （如 glm-5.3 仅 off/ultra）会直接报 `Thinking level "medium" is not supported` 导致对话无法开始。
+    """
+    env_val = os.environ.get("EASEL_THINKING_LEVEL", "").strip()
+    if env_val:
+        return env_val
+    try:
+        env_file = Path(__file__).resolve().parent.parent / ".env"
+        file_value = ""
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s:
+                k, _, v = s.partition("=")
+                if k.strip() == "EASEL_THINKING_LEVEL":
+                    file_value = v.strip().strip("\"'")
+        if file_value:
+            return file_value
+    except (OSError, UnicodeError):
+        pass
+    return "medium"
+
+
+THINKING_LEVEL = _thinking_level_setting()
 
 # gateway 进程把原始事件流（token/thinking/收尾）写到的**单个共享文件**。
 # 关键：`openclaw agent` 只是瘦客户端，没有 --raw-stream 标志——只有常驻 gateway 按它自己
@@ -454,6 +567,7 @@ def _heal_openclaw_session(sk: str) -> None:
 # 制作层/直接执行层/chat 超时统一走 easel/timeouts.py（CLI/Web/skill 三入口单一真相源）
 
 SHARED_SCRIPTS = _RUNTIME_PATHS.code_root / "skills" / "shared" / "scripts"
+TOUTIAO_SCRIPTS = _RUNTIME_PATHS.code_root / "skills" / "builtin" / "skill-toutiao-publisher" / "scripts"
 if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
@@ -650,8 +764,16 @@ LOGIN_RUNNERS: dict[str, dict] = {
     "kuaishou": {"name": "快手", "backend": "web", "wp": "kuaishou", "profile": "KuaishouProfile"},
     "weixin-channels": {"name": "微信视频号", "backend": "web", "wp": "weixin-channels", "profile": "ChannelsProfile"},
     "zhihu": {"name": "知乎", "backend": "web", "wp": "zhihu", "profile": "ZhihuProfile"},
+    "juejin": {"name": "掘金", "backend": "web", "wp": "juejin", "profile": "JuejinProfile"},
+    # X 无扫码登录 → login_window：登录时弹有头浏览器窗口由用户手动完成
+    # （web_publisher login-qr --headed 窗口模式，状态走 window_login）；国际站需外网代理
+    # （web_publisher 按 needs_proxy 读 EASEL_PROXY/https_proxy，未配则回退系统代理）。
+    "twitter-x": {"name": "推特 X", "backend": "web", "wp": "twitter-x",
+                  "profile": "TwitterXProfile", "login_window": True},
     "bilibili": {"name": "B站", "backend": "biliup"},
     "douyin": {"name": "抖音", "backend": "douyin", "profile": "DouyinProfile"},
+    # 今日头条：自带专用 publisher（skill-toutiao-publisher），backend=='toutiao' 在各处分派。
+    "toutiao": {"name": "今日头条", "backend": "toutiao", "profile": "ToutiaoProfile"},
     # 微信公众号：扫码登录后台会话（发布+数据都走它），backend=='wechat-oa' 在各处单独分支处理。
     "wechat-oa": {"name": "微信公众号", "backend": "wechat-oa",
                   "profile": "WeixinMpProfile"},
@@ -947,6 +1069,7 @@ SKILL_API_REQUIREMENTS: dict[str, dict] = {
 
 _ENV_ALLOWLIST: set[str] = {
     "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_KEY", "EASEL_DIRECT_API_MODEL",
+    "EASEL_PROXY",   # 设置页「网络代理」持久化（_write_env 支持空串删行=清除）
 }
 for _spec in SKILL_API_REQUIREMENTS.values():
     for _key in _spec.get("settings", []):
@@ -1204,13 +1327,21 @@ def clean_agent_output(raw: str) -> str:
     return '\n'.join(lines).strip()
 
 
+def _easel_proxy() -> str:
+    """EASEL_PROXY 解析链：进程环境变量优先，其次 .env（设置页「网络代理」持久化项）。
+    返回 '' 表示未配置。设置页保存后无需重启——每次起子进程都重新解析。"""
+    from easel.runtime_env import proxy_environment
+    return proxy_environment(dict(os.environ), '', env_file=ENV_FILE).get('EASEL_PROXY', '').strip()
+
+
 def _proxy_env() -> dict[str, str]:
     """返回带外网代理的环境变量（保护内网直连）。"""
-    env = os.environ.copy()
+    from easel.runtime_env import proxy_environment
+
+    env = proxy_environment(dict(os.environ),
+                            'localhost,127.0.0.1,10.*,*.xiaohongshu.com,*.devops.xiaohongshu.com,*.douyin.com,*.kuaishou.com,*.zhihu.com,*.bilibili.com,*.weixin.qq.com,*.qq.com',
+                            env_file=ENV_FILE)
     env.setdefault('EASEL_ROOT', str(PROJECT_ROOT))
-    env.setdefault('http_proxy', os.environ.get('EASEL_PROXY', ''))
-    env.setdefault('https_proxy', os.environ.get('EASEL_PROXY', ''))
-    env.setdefault('no_proxy', 'localhost,127.0.0.1,10.*,*.xiaohongshu.com,*.devops.xiaohongshu.com,*.douyin.com,*.kuaishou.com,*.zhihu.com,*.bilibili.com,*.weixin.qq.com,*.qq.com')
     return env
 
 
@@ -1532,7 +1663,7 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
 
 def _agent_thinking_level() -> str:
     try:
-        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8-sig"))
         agents = data.get("agents", {})
         reference = agents.get("defaults", {}).get("model", {})
         for agent in agents.get("list", []):
@@ -2262,7 +2393,7 @@ def _model_channels(runtime: str | None = None) -> dict:
     try:
         oc = _oc_config_path()
         if not direct and oc.is_file():
-            primary = str(json.loads(oc.read_text(encoding="utf-8"))
+            primary = str(json.loads(oc.read_text(encoding="utf-8-sig"))
                           .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
     except Exception:  # noqa: BLE001
         pass
@@ -2341,7 +2472,7 @@ def _model_channels(runtime: str | None = None) -> dict:
     try:
         oc = _oc_config_path()
         if not direct and oc.is_file():
-            provs = (json.loads(oc.read_text(encoding="utf-8"))
+            provs = (json.loads(oc.read_text(encoding="utf-8-sig"))
                      .get("models", {}).get("providers", {})) or {}
             for pkey, pv in provs.items():
                 if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
@@ -2491,6 +2622,43 @@ async def api_chat_transport_save(req: ChatTransportRequest):
     return _model_channels()
 
 
+class ProxyRequest(BaseModel):
+    proxy: str = ''
+
+
+@app.get("/api/settings/proxy")
+async def api_settings_proxy_get():
+    """读取网络代理配置：source=env（启动环境固定，设置页只读）/ envfile（.env 持久化）/ none。"""
+    proxy = _easel_proxy()
+    source = 'env' if 'EASEL_PROXY' in os.environ else ('envfile' if proxy else 'none')
+    return {'proxy': proxy, 'source': source}
+
+
+@app.post("/api/settings/proxy")
+async def api_settings_proxy_save(req: ProxyRequest):
+    """保存/清除网络代理（写 .env 的 EASEL_PROXY，空串=清除）。
+    立即生效：登录/发布/热点等子进程每次启动都经 _proxy_env 重新解析，无需重启服务。"""
+    if 'EASEL_PROXY' in os.environ:
+        raise HTTPException(409, '启动环境已指定 EASEL_PROXY，设置页无法覆盖；请改启动环境后重启')
+    proxy = (req.proxy or '').strip()
+    if proxy:
+        try:
+            u = urllib.parse.urlsplit(proxy)
+        except ValueError:
+            u = None
+        try:
+            valid = (u is not None and u.scheme in ('http', 'https', 'socks5', 'socks5h')
+                     and bool(u.hostname) and u.port != 0 and u.username is None and u.password is None
+                     and not u.query and not u.fragment and u.path in ('', '/')
+                     and not any(c.isspace() or ord(c) < 32 for c in proxy) and '\\' not in proxy)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise HTTPException(400, '代理地址需形如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（不含用户名密码）')
+    _write_env({'EASEL_PROXY': proxy})   # 空串 → 删除该行（清除代理）
+    return {'ok': True, 'proxy': proxy, 'source': 'envfile' if proxy else 'none'}
+
+
 @app.get("/api/settings/models")
 async def api_settings_models(runtime: str | None = None):
     """模型通道：chat / transcribe（含可编辑的原值；key 只回脱敏）。"""
@@ -2563,7 +2731,7 @@ def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
     """读 openclaw.json 里每个 chat 供应商现存的 (baseUrl, apiKey)。读不到就当空表（不阻断保存）。"""
     try:
         oc = _oc_config_path()
-        provs = json.loads(oc.read_text(encoding='utf-8')).get('models', {}).get('providers', {})
+        provs = json.loads(oc.read_text(encoding='utf-8-sig')).get('models', {}).get('providers', {})
         return {k: (str(v.get('baseUrl') or ''), str(v.get('apiKey') or ''))
                 for k, v in provs.items() if isinstance(v, dict)}
     except Exception:  # noqa: BLE001
@@ -2580,7 +2748,7 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         changed = False
         for pkey in [k for k in list(providers.keys())
@@ -2658,7 +2826,7 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         return f'openclaw 同步失败：{e}'
 
 
-def _sync_anthropic_provider(base: str, key: str) -> str:
+def _sync_anthropic_provider(base: str, key: str, headers: dict | None = None) -> str:
     """把 Web 面板保存的 Anthropic 通道同步成 openclaw.json 里的 anthropic provider。
 
     bash setup.sh 用 oc_write_anthropic 写过同一块配置，但 Web 面板此前只更新 .env ——
@@ -2671,15 +2839,31 @@ def _sync_anthropic_provider(base: str, key: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         target_base = base or 'https://api.anthropic.com'
+        updated_headers = dict(prov.get('headers', {})) if isinstance(prov, dict) and isinstance(prov.get('headers'), dict) else None
+        if updated_headers is not None and key and prov.get('apiKey'):
+            old_key = prov['apiKey']
+            for name, value in list(updated_headers.items()):
+                if value == old_key:
+                    updated_headers[name] = key
+                elif isinstance(value, str) and value == f'Bearer {old_key}':
+                    updated_headers[name] = f'Bearer {key}'
+        if headers is not None:
+            updated_headers = updated_headers or {}
+            for name, value in headers.items():
+                for existing in list(updated_headers):
+                    if existing.lower() == name.lower():
+                        updated_headers.pop(existing)
+                updated_headers[name] = value
         # 早退判据必须把 api 一起算上：否则一个「baseUrl/apiKey 都对、但缺 api」的
         # 残缺 provider（旧版本 Web 面板写出来的就是这样）永远修不回来。
         if isinstance(prov, dict) and prov.get('baseUrl') == target_base \
                 and prov.get('api') == 'anthropic-messages' \
-                and (not key or prov.get('apiKey') == key):
+                and (not key or prov.get('apiKey') == key) \
+                and (updated_headers is None or prov.get('headers') == updated_headers):
             return ''
         new_prov = dict(prov) if isinstance(prov, dict) else {'models': []}
         new_prov['baseUrl'] = target_base
@@ -2692,6 +2876,8 @@ def _sync_anthropic_provider(base: str, key: str) -> str:
         new_prov.setdefault('timeoutSeconds', 600)
         if key:
             new_prov['apiKey'] = key
+        if updated_headers is not None:
+            new_prov['headers'] = updated_headers
         new_prov.setdefault('models', [])
         # 一次性迁移：更早的 Web 面板会把中转站写成一个名叫 relay 的 provider，但从来
         # 不给它填内容，primary 却指过去。本次若没拿到 key，就把 relay 里的捡回来，
@@ -2817,6 +3003,19 @@ async def api_settings_models_save(req: ModelSaveRequest):
             raise HTTPException(400, 'API Key 不能包含空白字符')
         if len(model) > 120 or len(base) > 300 or len(key) > 400:
             raise HTTPException(400, '字段过长，请检查')
+        from easel.model_config import validate_model_ref
+        try:
+            validate_model_ref(model)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
+        if is_chat and slot == 'relay':
+            from easel.model_config import api_headers
+            try:
+                api_headers(key, _cur_env.get('EASEL_LLM_API_KEY_HEADER', 'api-key'),
+                            _cur_env.get('EASEL_LLM_API_KEY_PREFIX', ''),
+                            _cur_env.get('EASEL_LLM_ANTHROPIC_VERSION', '2023-06-01'))
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from None
         # 改 Base URL 但把 Key 留空（留空=沿用旧 Key）＝ 把已存的真 Key 指向新地址，
         # 之后一次「连通性自测」就会把它当 Bearer 送到新地址去。换地址必须重填 Key。
         _be, _ke = _SLOT_ENV_KEYS.get(slot, ('', ''))
@@ -2967,7 +3166,14 @@ async def api_settings_models_save(req: ModelSaveRequest):
             else:
                 sync_base = _cur_prov.get('anthropic', ('', ''))[0]
                 sync_key = ''
-            _an = _sync_anthropic_provider(sync_base, sync_key)
+            sync_headers = None
+            header_key = sync_key or _cur_prov.get('anthropic', ('', ''))[1]
+            if sync_slot == 'relay' and header_key:
+                from easel.model_config import api_headers
+                sync_headers = api_headers(header_key, effective_env.get('EASEL_LLM_API_KEY_HEADER', 'api-key'),
+                                           effective_env.get('EASEL_LLM_API_KEY_PREFIX', ''),
+                                           effective_env.get('EASEL_LLM_ANTHROPIC_VERSION', '2023-06-01'))
+            _an = _sync_anthropic_provider(sync_base, sync_key, sync_headers)
             if _an:
                 note = f'{note}；{_an}' if note else _an
     resp = {"ok": True, "note": note}
@@ -3053,7 +3259,7 @@ def _set_openclaw_primary(primary_ref: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
         if ref.get('primary') == primary_ref:
             return ''
@@ -3077,7 +3283,7 @@ def _declare_anthropic_provider(base: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         if isinstance(prov, dict) and prov.get('baseUrl') == base:
@@ -3932,7 +4138,7 @@ async def api_chat_job_stream(turn_id: str, after: int = 0):
                     # 转义 → 前端 JSON.parse 拿到字符串而非对象 → ask_user 选项
                     # 卡片渲染成空壳。其余事件存原文/dict，与实时流的 dumps 规则
                     # 一致。因此仅 question 按实时流规则原样透传。
-                    if event["event"] == "question" and isinstance(raw, str):
+                    if event["event"] in ("question", "question_closed") and isinstance(raw, str):
                         data_out = raw
                     else:
                         data_out = json.dumps(raw, ensure_ascii=False)
@@ -4267,67 +4473,17 @@ async def api_chat_stream(req: ChatRequest):
         # 背景：OpenClaw 的 ask_user 注册到 gateway 进程内，Easel 前端不消费 question RPC → 选项不可见。
         # 这里在 agent 运行期间每 2s 轮询一次，把新出现的 pending question 以 SSE `question` 事件推送，
         # 前端渲染选项卡片；用户点击后经 /api/chat/question/answer 调 question.resolve 完成回答。
+        question_stop = threading.Event()
+        question_poll_fut = None
+        question_events_open = True
+
+        def emit_question(kind: str, payload: str):
+            if question_events_open:
+                _emit(kind, _scrub_secrets(payload))
+
         if GatewayClient is not None and not _QBRIDGE_DISABLED:
-            def _question_poll():
-                global _QBRIDGE_DISABLED
-                if _QBRIDGE_DISABLED:
-                    return
-                # 版本能力门：旧版本 OpenClaw（<2026.9.x）没有 question.* RPC，连都不连——
-                # 否则每轮 connect 都在网关上触发新的 scope-upgrade 配对申请。只提示一次，走文字问答。
-                if question_bridge_supported is not None and not question_bridge_supported():
-                    _QBRIDGE_DISABLED = True
-                    _qbridge_warn_once(
-                        "unsupported",
-                        "[question-bridge] 当前 OpenClaw 版本无 question RPC（需 2026.9.x+），"
-                        "已跳过 ask_user 选项卡片桥接，改用文字问答。")
-                    return
-                client = None
-                pushed: set[str] = set()
-                try:
-                    client = GatewayClient()
-                    client.connect()
-                except Exception as e:
-                    # connect 失败（如 NOT_PAIRED/scope-upgrade，或网关不可达）：熔断整个桥接，
-                    # 不再每轮重试——否则每轮都会在网关上堆一个新的配对/权限申请。每进程只告警一次。
-                    _QBRIDGE_DISABLED = True
-                    _qbridge_warn_once(
-                        "connect",
-                        f"[question-bridge] connect gateway failed，已停用桥接（本进程），"
-                        f"ask_user 改用文字问答: {e}")
-                    return
-                try:
-                    while proc.poll() is None:
-                        try:
-                            items = client.list_questions(
-                                session_key=f"agent:main:{sk}", status="pending")
-                        except GatewayUnsupportedError as e:
-                            # 连上了但没有 question RPC（版本判断漏网时的兜底）：熔断，安静退出。
-                            _QBRIDGE_DISABLED = True
-                            _qbridge_warn_once(
-                                "unsupported",
-                                f"[question-bridge] 当前 OpenClaw 版本无 question RPC，"
-                                f"已停用 ask_user 选项卡片桥接（需 2026.9.x+）: {e}")
-                            return
-                        except Exception:
-                            time.sleep(2)
-                            continue
-                        for it in items:
-                            qid = it.get("id")
-                            if qid and qid not in pushed:
-                                pushed.add(qid)
-                                _emit("question", json.dumps({
-                                    "id": qid,
-                                    "questions": it.get("questions", []),
-                                    "expiresAtMs": it.get("expiresAtMs"),
-                                }, ensure_ascii=False))
-                        time.sleep(2)
-                finally:
-                    try:
-                        if client is not None:
-                            client.close()
-                    except Exception:
-                        pass
-            loop.run_in_executor(None, _question_poll)
+            question_poll_fut = loop.run_in_executor(
+                None, _poll_gateway_questions, sk, proc, emit_question, question_stop)
 
         def _handle(line: str):
             o = _raw_event_for_run(line, run_info["run_id"])
@@ -4453,8 +4609,14 @@ async def api_chat_stream(req: ChatRequest):
                     to_client("thinking", item["text"])
                 elif item["t"] == "activity":
                     to_client("activity", item["text"])
-                elif item["t"] == "question":
-                    to_client("question", item["text"])
+                elif item["t"] in ("question", "question_closed"):
+                    to_client(item["t"], item["text"])
+            question_stop.set()
+            if question_poll_fut is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(question_poll_fut), timeout=2)
+                except Exception:
+                    pass
             rc = proc.poll()
             # 等 stdout 读完（stopReason 行在进程收尾时才打印，避免 _tail 先发 SENTINEL 时漏读）
             if stdout_fut is not None:
@@ -4523,6 +4685,12 @@ async def api_chat_stream(req: ChatRequest):
                         await asyncio.to_thread(proc.wait, timeout=2)
                     except (OSError, subprocess.TimeoutExpired):
                         pass
+            question_stop.set()
+            question_events_open = False
+            while not q.empty():
+                queued = q.get_nowait()
+                if queued is not SENTINEL and queued["t"] in ("question", "question_closed"):
+                    to_client(queued["t"], queued["text"])
             # 诊断日志：每次对话流收尾都记一行，供事后定位「莫名停下」到底是哪种情况。
             try:
                 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4609,8 +4777,8 @@ async def api_chat_stream(req: ChatRequest):
                 yield {"id": str(item["id"]), "event": "thinking", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "activity":
                 yield {"id": str(item["id"]), "event": "activity", "data": json.dumps(item["text"], ensure_ascii=False)}
-            elif t == "question":
-                yield {"id": str(item["id"]), "event": "question", "data": item["text"]}
+            elif t in ("question", "question_closed"):
+                yield {"id": str(item["id"]), "event": t, "data": item["text"]}
             elif t == "error":
                 yield {"id": str(item["id"]), "event": "error", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "done":
@@ -4632,12 +4800,13 @@ async def api_question_answer(req: QuestionAnswerRequest):
     if req.questionId.startswith("harness_"):
         record = _HARNESS_QUESTIONS.get(req.questionId)
         if record is None:
-            return {"ok": False, "error": "权限或问答请求已过期，请重试"}
+            return {"ok": False, "expired": True, "status": "expired",
+                    "error": "权限或问答请求已过期，请重试"}
         required = {question["questionId"] for question in record["questions"]}
         if set(req.answers or {}) != required:
             raise HTTPException(400, "回答与当前问题不匹配")
         if record["future"].done():
-            return {"ok": False, "error": "请求已回答"}
+            return {"ok": False, "expired": True, "status": "resolved", "error": "请求已回答"}
         record["future"].set_result(req.answers)
         return {"ok": True}
     if _direct_api_enabled():
@@ -4651,6 +4820,9 @@ async def api_question_answer(req: QuestionAnswerRequest):
         client.connect()
         result = client.resolve(req.questionId, req.answers or {}, req.resolvedBy)
         return {"ok": True, "result": result}
+    except GatewayQuestionClosedError as error:
+        return {"ok": False, "expired": True, "status": "expired", "reason": error.reason,
+                "error": "此问题已关闭或过期，答案未发送。请在输入框中继续对话。"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -4681,11 +4853,13 @@ async def api_question_status(req: QuestionStatusRequest):
         for qid in req.questionIds:
             try:
                 q = client.get_question(qid)
-                # QUESTION_NOT_FOUND 抛异常捕获后报 not_found；正常返回则按 status
-                out[qid] = {"status": q.get("status") if q else "not_found"}
-            except GatewayQuestionError as e:
-                # gateway 明确错：问题已清理/不存在 = 已答或已过期，一律 not_found
-                out[qid] = {"status": "not_found"}
+                out[qid] = _gateway_question_state(q)
+            except GatewayQuestionClosedError as error:
+                out[qid] = {"status": error.status}
+            except GatewayUnsupportedError:
+                return {"ok": False, "error": "gateway question status unsupported", "questions": {}}
+            except GatewayQuestionError:
+                out[qid] = {"status": "unknown"}
             except Exception:
                 out[qid] = {"status": "unknown"}   # 网络/连接异常：保持 unknown（前端保留显示，宁不缺题）
         return {"ok": True, "questions": out}
@@ -5216,10 +5390,18 @@ async def _start_login(platform: str, restart: bool = False):
                '--no-proxy',
                '--qr-out', str(qr), '--status-file', str(status),
                '--sms-code-file', str(code_file), '--timeout', str(LOGIN_TIMEOUT)]
+    elif backend == 'toutiao':
+        # 扫码后可能要求绑定手机号；必须弹有头窗口让账号本人填写手机号和验证码。
+        cmd = [sys.executable, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'), 'login',
+               '--qr-out', str(qr), '--status-file', str(status),
+               '--timeout', str(LOGIN_TIMEOUT), '--headed']
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'login-qr',
                '--platform', cfg['wp'], '--qr-out', str(qr), '--status-file', str(status),
                '--timeout', str(LOGIN_TIMEOUT)]
+        if cfg.get('login_window'):
+            # 无扫码平台（X）：弹有头窗口手动登录，前端按 window_login 状态展示提示
+            cmd.append('--headed')
     # 新登录开始 → 清掉旧的 whoami 缓存（登录前可能缓存了「未登录」），避免登录成功后仍读到旧结果
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop(platform, None)
@@ -5545,6 +5727,8 @@ async def _check_account_whoami(platform: str, force: bool = False):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'whoami', '--no-proxy']
     elif backend == 'douyin':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami', '--no-proxy']
+    elif backend == 'toutiao':
+        cmd = [sys.executable, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'), 'whoami']
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
                '--platform', cfg['wp']]
@@ -5651,7 +5835,7 @@ async def api_logout(platform: str):
 
 # 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies 不起浏览器、
 # wechat-oa 走 mp 后台会话 Playwright 拦截数据 XHR）
-ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa"}
+ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa", "juejin", "twitter-x", "toutiao"}
 _analytics_inflight: dict[str, asyncio.Task] = {}
 
 
@@ -5728,6 +5912,10 @@ async def _fetch_analytics(platform: str):
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
                "--cookie", str(_bili_cookie_path())]
+    elif platform == "twitter-x":
+        cmd = [sys.executable, str(SHARED_SCRIPTS / "x_stats.py"), "fetch"]
+    elif platform == "juejin":
+        cmd = [sys.executable, str(SHARED_SCRIPTS / "juejin_stats.py"), "fetch"]
     elif platform == "wechat-oa":
         # 公众号数据走「后台网页端」(mp.weixin.qq.com 管理员会话 + Playwright 拦截数据 XHR)：
         # 开发者 datacube 接口需认证+群发+接口权限，多数号取不到；后台端有登录态即可看到发表记录/数据。
@@ -5777,6 +5965,8 @@ class PublishRequest(BaseModel):
     media: list[str] = []
     tags: str = ''
     persona: str = ''
+    # 存草稿：仅今日头条支持；其他平台收到草稿请求时明确拒绝。
+    draft: bool = False
 
 
 class ManualPublishRequest(BaseModel):
@@ -5834,7 +6024,7 @@ def _read_publish_status(platform: str) -> dict:
 
 
 def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = '',
-                               tags: str = '', ptype: str = '') -> bool:
+                               tags: str = '', ptype: str = '', status: str = 'published') -> bool:
     """发布成功后回流一次日历；失败只返回 False，不影响平台结果。"""
     try:
         scripts_dir = str(SHARED_SCRIPTS)
@@ -5848,7 +6038,7 @@ def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = 
                 cfg['name'], title, note=body[:200],
                 tags=tags, ptype=ptype,
                 source='publish-page', profile=profile,
-                data_path=_schedule_path(), forward_log=True))
+                data_path=_schedule_path(), forward_log=True, status=status))
     except Exception:
         return False
 
@@ -5975,13 +6165,15 @@ async def _stage_managed_media(media: list[str], run_id: str) -> tuple[list[Path
 
 async def _build_publish_command(
         platform: str, title: str, body: str, tags: str,
-        media_paths: list[Path], *, status_dir: Path | None = None) -> dict:
+        media_paths: list[Path], *, status_dir: Path | None = None, draft: bool = False) -> dict:
     """按原平台白名单构造命令；不接受客户端传入命令/URL/路径。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, "未知平台")
     if cfg["backend"] == "unsupported":
         raise HTTPException(400, f"{cfg['name']} 暂不支持一键发布")
+    if draft and platform != "toutiao":
+        raise HTTPException(400, "此平台不支持存草稿，未提交；请明确选择发布方式")
     imgs = [path for path in media_paths
             if path.suffix.lower() in IMAGE_EXTS]
     vids = [path for path in media_paths
@@ -6010,7 +6202,7 @@ async def _build_publish_command(
         cmd += ["--title", title, "--content", body, "--tags", tags, "--exec"]
     elif platform == "bilibili":
         bili_tag = tags.replace("#", "").replace("，", ",").strip().strip(",") or "日常"
-        cmd = ["biliup", "-u", str(_bili_cookie_path()), "upload",
+        cmd = [sys.executable, "-m", "biliup", "-u", str(_bili_cookie_path()), "upload",
                str(vids[0]), "--title", title[:80], "--tid", "36",
                "--copyright", "1", "--tag", bili_tag]
         if body.strip():
@@ -6029,6 +6221,12 @@ async def _build_publish_command(
         cmd += ["--status-file", str(status_file),
                 "--sms-code-file", str(code_file)]
         is_async = True
+    elif platform == "toutiao":
+        cmd = [py, str(TOUTIAO_SCRIPTS / "toutiao_publish.py"),
+               "--content", body, "--title", title, "--tags", tags]
+        if imgs:
+            cmd += ["--images", ",".join(str(path) for path in imgs)]
+        cmd.append("--draft" if draft else "--exec")
     elif platform == "wechat-oa":
         if _mp_login_status().get("state") != "success":
             raise HTTPException(
@@ -6340,11 +6538,12 @@ async def api_publish(platform: str, req: PublishRequest):
         raise HTTPException(400, '选择的画像不存在或名称非法')
     if not req.title.strip() and not req.body.strip():
         raise HTTPException(400, '标题/正文不能为空')
+    is_draft = platform == "toutiao" and req.draft
     media_paths = [
         _safe_output_path(rel) for rel in (req.media or [])
     ]
     job = await _build_publish_command(
-        platform, req.title, req.body, req.tags or '', media_paths)
+        platform, req.title, req.body, req.tags or '', media_paths, draft=req.draft)
     title = job['title']
     tags = req.tags or ''
     publish_type = job['publish_type']
@@ -6362,6 +6561,14 @@ async def api_publish(platform: str, req: PublishRequest):
     ok = proc.returncode == 0
     tail = (proc.stderr or proc.stdout or '').strip().splitlines()
     detail = '\n'.join(tail[-8:])
+    if platform == 'toutiao' and ok:
+        try:
+            receipt = json.loads(proc.stdout or '')
+            ok = isinstance(receipt, dict) and receipt.get('draft_saved' if is_draft else 'published') is True
+        except (ValueError, TypeError):
+            ok = False
+        if not ok:
+            detail = '操作结果未核实，请到平台后台核对，先别重试。'
     try:
         with (OUTPUTS_DIR / '_publish.log').open('a', encoding='utf-8') as lf:
             lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {platform} rc={proc.returncode} ok={ok} =====\n")
@@ -6371,8 +6578,10 @@ async def api_publish(platform: str, req: PublishRequest):
     except Exception:
         pass
     if ok:
-        _record_successful_publish(title, req.body, cfg, profile, tags, publish_type)
-    return {'ok': ok, 'message': '发布成功' if ok else '发布失败（见 detail）', 'detail': detail}
+        _record_successful_publish(title, req.body, cfg, profile, tags, publish_type,
+                                   status='draft' if is_draft else 'published')
+    return {'ok': ok, 'message': ('已存草稿' if is_draft else '发布成功') if ok else '发布失败（见 detail）',
+            'detail': detail}
 
 
 class ProfileBuildRequest(BaseModel):
@@ -6716,9 +6925,83 @@ def _fetch_platform(pf: str) -> list[dict]:
     return []
 
 
+
+# Source commands/URLs are loaded exclusively from a trusted local configuration file.
+# The browser only selects registered IDs; it cannot supply executable commands.
+from easel.trends.service import TrendService, failure_group as trend_failure_group
+from easel.trends.sources import ConfigError as TrendConfigError, load_sources as load_trend_sources
+from easel.trends import management as trend_management
+from easel.trends.protocol import CollectorError as TrendCollectorError, safe_json as trend_safe_json
+from easel.trends.protocol import MAX_MANAGEMENT_BYTES
+
+_TREND_SERVICE = TrendService()
+
+
+def _trend_registry():
+    warnings = []
+    try:
+        environment = read_settings(ENV_FILE)
+        sources = load_trend_sources(PROJECT_ROOT, environment, warnings=warnings)
+        return sources, environment, warnings
+    except Exception:
+        return [], {}, ["热点配置暂时无法读取，请检查本地配置；其他工作台功能不受影响。"]
+
+
+@app.get("/api/trends/sources")
+async def api_trend_sources():
+    sources, _, warnings = _trend_registry()
+    return {"version": 1, "sources": [source.public() for source in sources], "warnings": warnings}
+
+
+def _trend_manager_guard(request: Request):
+    # Check the real transport peer even when Origin/Host have been forged by a remote client.
+    if not _loopback_peer(request) or (request.headers.get("origin") and request.headers["origin"] not in _LOCAL_ORIGINS):
+        raise HTTPException(403, "数据源管理仅允许本机操作")
+
+
+@app.get("/api/trends/manage")
+async def api_trend_manage(request: Request):
+    _trend_manager_guard(request)
+    try:
+        return await asyncio.to_thread(trend_management.describe, PROJECT_ROOT, read_settings(ENV_FILE))
+    except Exception:
+        raise HTTPException(409, "无法读取数据源管理配置，请修复本地配置文件后重试") from None
+
+
+@app.post("/api/trends/manage")
+async def api_trend_manage_write(request: Request):
+    _trend_manager_guard(request)
+    length = request.headers.get("content-length", "")
+    if length and (not length.isascii() or not length.isdigit() or len(length) > 10):
+        raise HTTPException(400, "无效的请求长度")
+    if length.isdigit() and int(length) > MAX_MANAGEMENT_BYTES:
+        raise HTTPException(413, "数据源操作最多 256 KiB")
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > MAX_MANAGEMENT_BYTES:
+            raise HTTPException(413, "数据源操作最多 256 KiB")
+        raw.extend(chunk)
+    try:
+        value = trend_safe_json(bytes(raw), MAX_MANAGEMENT_BYTES)
+        if not isinstance(value, dict):
+            raise TrendConfigError("数据源操作必须是对象")
+        return await asyncio.to_thread(trend_management.update, PROJECT_ROOT, read_settings(ENV_FILE), value)
+    except TrendConfigError as error:
+        raise HTTPException(400, str(error)) from None
+    except TrendCollectorError:
+        raise HTTPException(400, "数据源操作不是有效 JSON 或字段过深") from None
+    except Exception:
+        raise HTTPException(409, "配置保存失败，原配置已保留，请检查文件权限或修复配置") from None
+
+
 @app.get("/api/trends")
-async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
-    pfs = [p.strip() for p in platforms.split(",") if p.strip() in TREND_SOURCES]
+async def api_trends(platforms: str | None = None, limit: int = 12):
+    if platforms is not None and len(platforms) > 8192:
+        raise HTTPException(400, "数据源查询过长")
+    sources, environment, warnings = _trend_registry()
+    registry = {source.id: source for source in sources}
+    pfs = ([source.id for source in sources if source.default] if platforms is None else
+           list(dict.fromkeys(p.strip() for p in platforms.split(",") if p.strip() in registry)))
     now = time.time()
     loop = asyncio.get_event_loop()
     result = []
@@ -6726,6 +7009,15 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
     stale_any = False
     failed: list[str] = []
     for pf in pfs:
+        source = registry[pf]
+        builtin_script = Path(source.options.get("script", "")).resolve() == Path(__file__).resolve().parents[1] / "easel" / "trends" / "builtin.py"
+        if pf not in TREND_SOURCES or not builtin_script:
+            try:
+                group = await asyncio.to_thread(_TREND_SERVICE.get, source, environment, max(1, min(limit, 30)))
+            except Exception:
+                group = trend_failure_group(source)
+            result.append(group)
+            continue
         c = _TREND_CACHE.get(pf)
         cached_at = 0.0
         stale = False
@@ -6766,6 +7058,7 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
             group["stale"] = True
         result.append(group)
     payload = {
+        "version": 1, "warnings": warnings,
         "trends": result,
         "updated": int(max(updated_candidates)) if updated_candidates else 0,
     }

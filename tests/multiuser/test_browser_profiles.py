@@ -331,3 +331,14 @@ def test_exception_inside_persistent_profile_releases_lock(tmp_path):
             raise RuntimeError("boom")
     with manager.persistent_profile("xiaohongshu", "default", timeout=1):
         pass
+
+
+@pytest.mark.parametrize(("platform", "profile"), [
+    ("twitter-x", "TwitterXProfile"), ("juejin", "JuejinProfile"),
+    ("toutiao", "ToutiaoProfile"),
+])
+def test_upstream_platforms_preserve_local_profile_names(monkeypatch, tmp_path, platform, profile):
+    from runtime_paths import browser_profile_dir
+    monkeypatch.setenv("EASEL_SERVICE_MODE", "local")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert browser_profile_dir(platform) == tmp_path / ".easel-browser-profiles" / profile

@@ -1,3 +1,4 @@
+import SettingsSelect from './SettingsSelect';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { saveEnv } from '../lib/api';
 import { AuthError } from '../lib/auth';
@@ -252,14 +253,10 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
                         </span>}
                       </label>
                       {k.choices.length > 0 ? (
-                        <select
-                          className="field"
-                          value={envInputs[k.env] ?? ''}
-                          onChange={(e) => setEnvInputs((p) => ({ ...p, [k.env]: e.target.value }))}
-                        >
-                          <option value="">{k.configured ? `当前：${k.masked}` : `请选择 ${k.env}`}</option>
-                          {k.choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
-                        </select>
+                        <SettingsSelect label={k.label} value={envInputs[k.env] ?? ''}
+                          options={[{ value: '', label: k.configured ? `当前：${k.masked}` : `请选择 ${k.env}` },
+                            ...k.choices.map(choice => ({ value: choice, label: choice }))]}
+                          onChange={(value) => setEnvInputs(p => ({ ...p, [k.env]: value }))} />
                       ) : (
                         <input
                           className="field"
@@ -292,11 +289,10 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
                           </span>}
                         </label>
                         {k.choices.length > 0 ? (
-                          <select className="field" value={envInputs[k.env] ?? ''}
-                            onChange={(e) => setEnvInputs((p) => ({ ...p, [k.env]: e.target.value }))}>
-                            <option value="">{k.configured ? `当前：${k.masked}` : `请选择 ${k.env}`}</option>
-                            {k.choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
-                          </select>
+                          <SettingsSelect label={k.label} value={envInputs[k.env] ?? ''}
+                          options={[{ value: '', label: k.configured ? `当前：${k.masked}` : `请选择 ${k.env}` },
+                            ...k.choices.map(choice => ({ value: choice, label: choice }))]}
+                          onChange={(value) => setEnvInputs(p => ({ ...p, [k.env]: value }))} />
                         ) : (
                           <input
                             className="field"
